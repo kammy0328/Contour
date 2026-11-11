@@ -80,7 +80,7 @@ jobs:
           & C:\ct\python\python.exe -c "import sys; print(sys.version); import numpy, cv2, PySide6, onnxruntime, scipy, PyOpenColorIO; import contour.batch; from contour.ui import main_window, update, gatedlg; from contour.core import gate, updater; assert gate.check('0328'); print('ok', onnxruntime.get_available_providers())" 2>&1 | Tee-Object -FilePath ci\smoke.txt
           if ($LASTEXITCODE -ne 0) { throw "import failed" }
           Push-Location C:\ct\app
-          & C:\ct\python\python.exe -m contour.batch --help 2>&1 | Tee-Object -Append -FilePath ci\smoke.txt
+          & C:\ct\python\python.exe -m contour.batch --help 2>&1 | Tee-Object -Append -FilePath "$env:GITHUB_WORKSPACE\ci\smoke.txt"
           Pop-Location
 
       - name: Replace an earlier build of the same version
