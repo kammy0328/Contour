@@ -83,6 +83,17 @@ jobs:
           & C:\ct\python\python.exe -m contour.batch --help 2>&1 | Tee-Object -Append -FilePath ci\smoke.txt
           Pop-Location
 
+      - name: Replace an earlier build of the same version
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUB_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          $v = "v${{ steps.v.outputs.ver }}"
+          gh release delete $v --repo ${{ github.repository }} --yes --cleanup-tag 2>$null
+          if ($env:PUB_TOKEN) { $env:GH_TOKEN = $env:PUB_TOKEN; gh release delete $v --repo $env:PUBLIC_REPO --yes --cleanup-tag 2>$null }
+          exit 0
+
       - name: Release (private)
         uses: softprops/action-gh-release@v2
         with:
