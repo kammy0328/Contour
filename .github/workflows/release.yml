@@ -33,6 +33,7 @@ jobs:
         id: v
         shell: pwsh
         run: |
+          New-Item -ItemType Directory -Force ci | Out-Null; Start-Transcript -Append -Path ci\log.txt | Out-Null
           $ver = (Select-String -Path contour\core\settings.py -Pattern 'APP_VERSION = "(.+)"').Matches[0].Groups[1].Value
           if ($env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME -ne "v$ver") { throw "tag $env:GITHUB_REF_NAME != APP_VERSION $ver" }
           "ver=$ver" >> $env:GITHUB_OUTPUT
@@ -40,6 +41,7 @@ jobs:
       - name: Embeddable Python
         shell: pwsh
         run: |
+          New-Item -ItemType Directory -Force ci | Out-Null; Start-Transcript -Append -Path ci\log.txt | Out-Null
           New-Item -ItemType Directory -Force build\python | Out-Null
           Invoke-WebRequest "https://www.python.org/ftp/python/$env:PY_VER/python-$env:PY_VER-embed-amd64.zip" -OutFile build\py.zip
           Expand-Archive build\py.zip -DestinationPath build\python -Force
@@ -51,6 +53,7 @@ jobs:
       - name: Build installer
         shell: pwsh
         run: |
+          New-Item -ItemType Directory -Force ci | Out-Null; Start-Transcript -Append -Path ci\log.txt | Out-Null
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
           & $iscc /Qp "/DVer=${{ steps.v.outputs.ver }}" "/DSrc=$PWD" "/DPy=$PWD\build\python" installer\contour.iss
@@ -95,7 +98,25 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
         shell: pwsh
         run: |
+          New-Item -ItemType Directory -Force ci | Out-Null; Start-Transcript -Append -Path ci\log.txt | Out-Null
           gh release create "v${{ steps.v.outputs.ver }}" --repo $env:PUBLIC_REPO --title "Contour ${{ steps.v.outputs.ver }}" --notes-file installer/RELEASE_NOTES.md "dist/Contour_Setup_${{ steps.v.outputs.ver }}.exe" "dist/Contour_Setup_${{ steps.v.outputs.ver }}.exe.sha256"
+
+      - name: Report to the ci-status branch (readable without the Actions API)
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force ci | Out-Null
+          "run ${{ github.run_id }} commit ${{ github.sha }} job ${{ job.status }} $(Get-Date -Format o)" | Set-Content ci\status.txt
+          if (Test-Path C:\ct\setup_log.txt) { Copy-Item C:\ct\setup_log.txt ci\setup_log.txt }
+          Get-ChildItem dist -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name) $($_.Length)" } | Add-Content ci\status.txt
+          Copy-Item -Recurse ci $env:RUNNER_TEMP\ci
+          git config user.name "ci"; git config user.email "ci@users.noreply.github.com"
+          git checkout --orphan ci-status
+          git rm -rf --cached . | Out-Null
+          Get-ChildItem -Force | Where-Object { $_.Name -ne ".git" } | Remove-Item -Recurse -Force
+          Copy-Item -Recurse $env:RUNNER_TEMP\ci\* .
+          git add -A; git commit -q -m "ci ${{ github.run_id }}"
+          git push -f origin ci-status
 
       - uses: actions/upload-artifact@v4
         with:
