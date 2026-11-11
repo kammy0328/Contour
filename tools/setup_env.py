@@ -36,7 +36,13 @@ def say(*a):
 
 def run(args) -> int:
     say(">", " ".join(str(a) for a in args))
-    p = subprocess.run([str(a) for a in args])
+    p = subprocess.run([str(a) for a in args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                       encoding="utf-8", errors="replace")
+    out = p.stdout or ""
+    print(out, flush=True)
+    tail = "\n".join(out.strip().splitlines()[-15:])
+    if tail:
+        say(tail)
     return p.returncode
 
 
@@ -62,9 +68,15 @@ def gpu() -> str:
 
 
 def ffmpeg_found() -> bool:
-    sys.path.insert(0, str(APP))
-    from contour.core import media as M
-    return bool(M.configure_ffmpeg()[0])
+    # in a child process: the packages were installed after this one started (its import caches miss them)
+    code = ("import sys; sys.path.insert(0, %r); from contour.core import media as M; "
+            "print('FOUND' if M.configure_ffmpeg()[0] else 'NONE')") % str(APP)
+    p = subprocess.run([str(PY), "-c", code], capture_output=True, text=True)
+    if "FOUND" in (p.stdout or ""):
+        return True
+    if "NONE" not in (p.stdout or ""):
+        raise RuntimeError((p.stderr or "").strip().splitlines()[-1] if p.stderr else "check failed")
+    return False
 
 
 def get_ffmpeg():
