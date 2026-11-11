@@ -149,7 +149,7 @@ def main():
     # 5. models (once; they live in the data folder and survive updates)
     if not (a.no_models or ci):
         say("[5/5] 모델 확인 (처음 한 번 약 1.1GB)")
-        run([PY, APP / "tools" / "download_models.py"])
+        run([PY, APP / "tools" / "download_models.py", "--max"])
     say("=== 완료")
     return 0
 

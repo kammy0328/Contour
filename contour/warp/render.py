@@ -33,8 +33,14 @@ class RenderReport:
 
 
 def output_base(project: Project, cut: Cut, out: OutputSettings) -> Path:
-    folder = Path(out.out_dir) if out.out_dir else (Path(project.path).parent / "Contour_Renders")
-    name = out.name_pattern.format(cut=cut.name, project=project.name, date=time.strftime("%Y%m%d"))
+    folder = Path(out.out_dir) if out.out_dir else (Path(project.path).parent / "DIAP_Renders")
+    ver = int(getattr(cut, "version", 1) or 1)
+    try:
+        name = out.name_pattern.format(cut=cut.name, project=project.name, date=time.strftime("%Y%m%d"), version=ver)
+    except (KeyError, IndexError):
+        name = cut.name
+    if "{version}" not in out.name_pattern:
+        name = f"{name}_v{ver}"            # every render carries the cut's work version
     return folder / safe_name(name)
 
 
@@ -91,6 +97,15 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
     it is neither closed nor aborted here, and no mattes are written."""
     rep = RenderReport()
     t_start = time.time()
+    # the face layer (parsing, steady skin colour) for cuts analysed before it existed
+    try:
+        from ..track import facelayer as FL, faceparse as FP
+        if tracker is not None and getattr(tracker, "store", None) is not None and FP.available() \
+                and getattr(tracker.store, "has_face", False) and not FL.path_for(tracker).exists():
+            FL.build(tracker, (lambda f, m: progress(0.0, m)) if progress else None, cancel)
+    except Exception:
+        import traceback
+        traceback.print_exc()
     info = cut.info
     a, b = cut.work_range
     n = b - a

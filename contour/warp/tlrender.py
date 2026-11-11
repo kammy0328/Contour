@@ -25,14 +25,14 @@ from ..core import media as M
 from ..core.project import OutputSettings, Project, safe_name
 from ..track import status as ST
 
-FORMATS = [("prores_422_hq", "ProRes 422 HQ (.mov)"), ("prores_4444_xq", "ProRes 4444 XQ + 알파 (.mov)"),
+FORMATS = [("prores_4444_xq", "ProRes 4444 XQ + 알파 (.mov)"), ("prores_422_hq", "ProRes 422 HQ (.mov)"),
            ("hevc_mp4", "H.265 10bit 고화질 (.mp4)")]
 
 
 @dataclass
 class TimelineExport:
     mode: str = "full"                       # full | each | replace
-    format: str = "prores_422_hq"
+    format: str = "prores_4444_xq"
     encoder: str = "auto"                    # H.265: auto | nvenc | x265
     quality: str = "high"                    # H.265: normal | high | max
     include: Dict[str, bool] = field(default_factory=lambda: dict(good=True, bad=True, small=True, none=True,
@@ -211,7 +211,7 @@ def render_timeline(project: Project, exp: TimelineExport, progress: Callable = 
     if not rows:
         raise M.MediaError("타임라인 컷이 없습니다")
     base_info = M.probe(tlm["baked"]) if tlm.get("baked") and Path(tlm["baked"]).exists() else rows[0]["cut"].info
-    folder = Path(exp.out_dir) if exp.out_dir else (Path(project.path).parent / "Contour_Renders")
+    folder = Path(exp.out_dir) if exp.out_dir else (Path(project.path).parent / "DIAP_Renders")
     folder.mkdir(parents=True, exist_ok=True)
     name = safe_name(exp.name or tlm.get("name") or project.name)
     work = [r for r in rows if r["action"] != "skip"]
@@ -279,7 +279,7 @@ def render_timeline(project: Project, exp: TimelineExport, progress: Callable = 
             if cancel and cancel():
                 rep.cancelled = True
                 break
-            path = M.unique_path(str(sub / f"{c.name}{ext}"))
+            path = M.unique_path(str(sub / f"{c.name}_v{int(getattr(c, 'version', 1) or 1)}{ext}"))
             audio = None
             if exp.audio and exp.mode == "each" and c.info.has_audio and c.info.kind == "video":
                 audio = (c.info.path, c.info.offset / c.info.fps, c.info.frames / c.info.fps)

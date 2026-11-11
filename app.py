@@ -1,4 +1,4 @@
-"""Contour — video body reshaping for post-production."""
+"""DIAP: video beauty retouch and body reshaping for post-production (code package: contour)."""
 import os
 import sys
 import time
@@ -49,11 +49,11 @@ def main():
     if sys.platform == "win32":
         try:
             import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("SEWOO.Contour")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("SEWOO.DIAP")
         except Exception:
             pass
     app = QApplication(sys.argv)
-    app.setApplicationName("Contour")
+    app.setApplicationName("DIAP")
     app.setOrganizationName("SEWOO")
     app.setWindowIcon(QIcon(str(HERE / "assets" / "icon.png")))
     from contour.ui import theme

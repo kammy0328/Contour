@@ -165,9 +165,12 @@ def feature_exclusion(lm: np.ndarray, shape) -> np.ndarray:
 
 
 def tone_mask(lm: Optional[np.ndarray], shape, prob: np.ndarray, alpha: Optional[np.ndarray], scope: str,
-              face_w: float, fth: float = 1.5) -> np.ndarray:
+              face_w: float, fth: float = 1.5, body: Optional[np.ndarray] = None) -> np.ndarray:
     """Where skin brightness, tone, saturation and grain apply: the whole face (around the eyes too),
-    softly; only the eyeballs and lips are left out. scope 'all' adds the rest of the visible skin."""
+    softly; only the eyeballs and lips are left out. body: the chosen body regions (body_regions)."""
+    from ..core.project import scope_set
+    if "face" not in scope_set(scope):
+        lm = None
     h, w = shape
     region = np.zeros(shape, np.float32)
     psoft = np.clip(cv2.GaussianBlur(prob, (0, 0), 3.0) * 1.6, 0, 1)
@@ -180,10 +183,9 @@ def tone_mask(lm: Optional[np.ndarray], shape, prob: np.ndarray, alpha: Optional
             fm = np.zeros(shape, np.uint8)
             _poly(fm, poly)
             region = _feather(fm, 0.04 * Wf * fth) * float(np.clip(face_w * 1.5, 0, 1))
-    if scope == "all":
-        body = psoft * (alpha if alpha is not None else 1.0)
-        region = np.maximum(region, body.astype(np.float32))
-    elif alpha is not None:
+    if body is not None:
+        region = np.maximum(region, (psoft * body * (alpha if alpha is not None else 1.0)).astype(np.float32))
+    if alpha is not None:
         region = region * np.clip(alpha * 1.3, 0, 1)
     if lm is not None and Wf > 0:
         L = lm[:, :2]
@@ -264,8 +266,102 @@ def hot_zone_mask(lm: np.ndarray, shape, prob: np.ndarray, fth: float = 1.5) -> 
     return np.clip(f * 1.3, 0, 1) * soft
 
 
+def _steady_body(st, p: int, t: int, r: int = 4):
+    """Shoulders and segment widths for the neck, median over a few frames of the same shot: taken frame by
+    frame, a shoulder joint that wobbles by a few pixels moved the neck's lower edge with it."""
+    kp = st.final[p, t].copy()
+    wd = st.widths[p, t].copy() if st.widths is not None else None
+    N = st.final.shape[1]
+    seg = [s for s in range(max(0, t - r), min(N, t + r + 1)) if st.present[p, s] and st.connected(s, t)]
+    if len(seg) >= 3:
+        for j in (S.L_SH, S.R_SH):
+            pts = st.final[p, seg, j, :2]
+            ok = np.isfinite(pts).all(1)
+            if ok.sum() >= 3 and np.isfinite(kp[j, :2]).all():
+                kp[j, :2] = np.median(pts[ok], 0)
+        if wd is not None:
+            W = st.widths[p, seg]
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                m = np.nanmedian(W, 0)
+            wd = np.where(np.isfinite(m), m, wd)
+    return kp, wd
+
+
+def _capsule(m: np.ndarray, a, b, r: float):
+    if not (np.isfinite(a).all() and np.isfinite(b).all()) or r < 1:
+        return
+    cv2.line(m, (int(round(a[0])), int(round(a[1]))), (int(round(b[0])), int(round(b[1]))), 255,
+             max(1, int(round(2 * r))), cv2.LINE_AA)
+    for q in (a, b):
+        cv2.circle(m, (int(round(q[0])), int(round(q[1]))), int(round(r)), 255, -1, cv2.LINE_AA)
+
+
+def body_regions(regions: set, kp: np.ndarray, hand: Optional[np.ndarray], shape, sx: float, sy: float,
+                 neck: Optional[np.ndarray] = None, fth: float = 1.5) -> Optional[np.ndarray]:
+    """Where on the body the skin retouch may go (0..1), from the joints: neck, shoulders and collarbone,
+    arms, hands, legs. Sizes follow the shoulder width, so a zoom changes nothing. The skin colour model and
+    the person matte decide inside these regions what really is skin."""
+    want = regions - {"face"}
+    if not want or kp is None:
+        return None
+    h, w = shape
+    P = np.full((kp.shape[0], 2), np.nan)
+    ok = np.isfinite(kp[:, :2]).all(1)
+    if kp.shape[1] > 2:
+        ok &= np.nan_to_num(kp[:, 2]) > 0.2
+    P[ok] = kp[ok, :2] * [sx, sy]
+    ls, rs = P[S.L_SH], P[S.R_SH]
+    if not (np.isfinite(ls).all() and np.isfinite(rs).all()):
+        return neck if "neck" in want else None
+    sw = float(np.hypot(*(ls - rs)))
+    if sw < 8:
+        return None
+    m = np.zeros(shape, np.uint8)
+    mid = (ls + rs) / 2
+    hips = [P[S.L_HIP], P[S.R_HIP]]
+    hp = [q for q in hips if np.isfinite(q).all()]
+    down = (np.mean(hp, 0) - mid) if hp else np.array([0.0, sw])
+    down = down / max(1e-6, float(np.hypot(*down)))
+    side = (ls - rs) / sw
+    if "shoulder" in want:
+        # shoulders and collarbone: from just above the shoulder line down about a third of the way to the hips
+        top = 0.12 * sw
+        bot = 0.45 * sw
+        pts = [ls + side * 0.18 * sw - down * top, rs - side * 0.18 * sw - down * top,
+               rs - side * 0.10 * sw + down * bot, ls + side * 0.10 * sw + down * bot]
+        cv2.fillPoly(m, [np.round(np.array(pts)).astype(np.int32)], 255, cv2.LINE_AA)
+    if "arm" in want:
+        for a_, b_, c_ in ((S.L_SH, S.L_EL, S.L_WR), (S.R_SH, S.R_EL, S.R_WR)):
+            _capsule(m, P[a_], P[b_], 0.14 * sw)
+            _capsule(m, P[b_], P[c_], 0.11 * sw)
+    if "hand" in want:
+        for el, wr in ((S.L_EL, S.L_WR), (S.R_EL, S.R_WR)):
+            if np.isfinite(P[wr]).all():
+                d = (P[wr] - P[el]) if np.isfinite(P[el]).all() else np.array([0.0, 1.0])
+                d = d / max(1e-6, float(np.hypot(*d)))
+                _capsule(m, P[wr], P[wr] + d * 0.30 * sw, 0.16 * sw)
+        if hand is not None:
+            H = hand[:, :2] * [sx, sy]
+            okh = np.isfinite(H).all(1)
+            for i0 in range(0, len(H) - 20, 21):
+                pts = H[i0:i0 + 21][okh[i0:i0 + 21]]
+                if len(pts) >= 5:
+                    cv2.fillConvexPoly(m, cv2.convexHull(np.round(pts).astype(np.int32)), 255, cv2.LINE_AA)
+    if "leg" in want:
+        for a_, b_, c_ in ((S.L_HIP, S.L_KN, S.L_AN), (S.R_HIP, S.R_KN, S.R_AN)):
+            _capsule(m, P[a_], P[b_], 0.17 * sw)
+            _capsule(m, P[b_], P[c_], 0.12 * sw)
+    out = _feather(m, 0.05 * sw * fth) if m.any() else np.zeros(shape, np.float32)
+    if "neck" in want and neck is not None:
+        out = np.maximum(out, neck)
+    return out if out.max() > 0 else None
+
+
 def neck_mask(lm: np.ndarray, kp: np.ndarray, widths, shape, sx: float, sy: float, prob: np.ndarray,
-              alpha, fth: float = 1.5, rgb: Optional[np.ndarray] = None, hands: Optional[np.ndarray] = None) -> np.ndarray:
+              alpha, fth: float = 1.5, rgb: Optional[np.ndarray] = None, hands: Optional[np.ndarray] = None,
+              parse: Optional[dict] = None) -> np.ndarray:
     """The neck: from the underside of the jaw down to the neck base, as wide as the neck.
 
     Built from the face first (the jaw line and which way is down), because the shoulders are often the least
@@ -330,6 +426,15 @@ def neck_mask(lm: np.ndarray, kp: np.ndarray, widths, shape, sx: float, sy: floa
             over = (Yl - (1.3 * yref + 4.0)) / max(0.3 * yref, 4.0)
             g = 1.0 - np.clip(cv2.GaussianBlur(over, (0, 0), max(1.0, 0.01 * Wf)), 0, 1)
             f = f * g
+    if parse is not None and parse.get("trust", 0) > 0 and f.max() > 0.01:
+        # the face parser tells the neck from the collar, the shirt, a necklace, hair and a hand in front of it,
+        # which the skin colour cannot when they share the skin's colour. Below its crop it sees nothing: there
+        # the neck only goes on as far as the parser was unsure.
+        tr = float(parse["trust"])
+        gn = np.clip(cv2.GaussianBlur((parse["neck"] + 0.5 * parse["skin"]).astype(np.float32), (0, 0),
+                                      max(1.0, 0.015 * Wf)) * 1.8, 0, 1)
+        cov = cv2.GaussianBlur(parse["cover"], (0, 0), max(1.0, 0.04 * Wf))
+        f = f * (1.0 - tr * (1.0 - cov * gn) * 0.95)
     if hands is not None:
         # a hand or forearm in front of the neck is skin too, and the same person: carved out by its joints
         hm = np.zeros(shape, np.uint8)
@@ -498,9 +603,144 @@ def knee_mask(kp: np.ndarray, widths, shape, sx: float, sy: float, prob: np.ndar
 
 # --------------------------------------------------------------------------- building a frame's jobs
 
-def prepare(cut, tracker, t: int, cache: Optional[dict] = None) -> Optional[RetouchFrame]:
-    """Values and masks for frame t. `cache` (optional dict) keeps masks between calls: masks only
-    depend on the frame, the person and the scope, not on the slider values."""
+VIS_LO = 0.12         # face visibility where the face retouch starts
+VIS_FULL = 0.5        # and where it is at full strength
+STEADY_R = 2          # frames each side
+STEADY_SIGMA = 1.0
+STEADY_LRU = 7
+
+
+def prepare(cut, tracker, t: int, cache: Optional[dict] = None, steady: bool = True) -> Optional[RetouchFrame]:
+    """Values and masks for frame t, held steady through time.
+
+    Every mask is built from one frame's pixels (colour, brightness, the parser's view), and small changes in
+    those (grain, a light flicker, the neck sliding into shadow) made its edges shake or a mask blink on and off
+    between neighbouring frames. Here each mask is averaged with the same person's masks of the frames around it
+    (STEADY_R each side, same shot), each one first moved onto this frame along the face's own motion (a
+    similarity from the stabilised landmarks), so real movement is followed exactly and only the shake goes."""
+    if not steady or tracker.store is None:
+        return _prepare_raw(cut, tracker, t, cache)
+    st = tracker.store
+    try:
+        raw = _raw_cached(cut, tracker, t, cache)
+        if raw is None or raw.empty():
+            return raw
+        import copy as _copy
+        rf = _copy.copy(raw)
+        rf.jobs = []
+        for j in raw.jobs:
+            jj = _copy.copy(j)
+            jj.masks = dict(j.masks)
+            # the slider values are read now, not when the masks were cached
+            pp = cut.params_for(j.pid)
+            jj.v = {k_: pp.amount(k_, t) / 100.0 for k_ in RETOUCH_KEYS}
+            jj.keep = float(np.clip(pp.skin_detail / 100.0, 0, 1))
+            jj.grain_size = float(pp.grain_size)
+            jj.blemish_size = float(np.clip(getattr(pp, "blemish_size", 50.0) / 100.0, 0, 1))
+            if j.skin is not None:
+                jj.skin = _copy.copy(j.skin)
+                jj.skin.strength = float(np.clip(jj.v["skin"], 0, 1))
+                jj.skin.keep = jj.keep
+            rf.jobs.append(jj)
+        return _steady(cut, tracker, st, rf, cache)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        return _prepare_raw(cut, tracker, t, cache)
+
+
+def _sig(cut, tracker) -> tuple:
+    """What the raw masks depend on besides the frame: which ones exist (values on or off), scope, feather."""
+    vals = []
+    for person in cut.targets():
+        pp = cut.params_for(person.id)
+        fth = pp.feather_factor() if hasattr(pp, "feather_factor") else 1.5
+        on = []
+        for k_ in RETOUCH_KEYS:
+            c_ = pp.amounts.get(k_)
+            if c_ is not None and (abs(c_.base) > 1e-4 or any(abs(v_) > 1e-4 for v_ in c_.keys.values())):
+                on.append(k_)
+        vals.append((person.id, pp.skin_scope, round(float(fth), 3), tuple(on)))
+    return (id(tracker.store), getattr(cut, "analysis_version", 0), tuple(vals))
+
+
+def _raw_cached(cut, tracker, s: int, cache):
+    from collections import OrderedDict
+    lru = tracker.__dict__.get("_steady_lru")
+    sig = _sig(cut, tracker)
+    # the session clears its mask cache whenever an edit changes masks: start over then too
+    if lru is None or tracker.__dict__.get("_steady_sig") != sig or (cache is not None and len(cache) == 0):
+        lru = tracker.__dict__["_steady_lru"] = OrderedDict()
+        tracker.__dict__["_steady_sig"] = sig
+    if s in lru:
+        lru.move_to_end(s)
+        return lru[s]
+    rf = _prepare_raw(cut, tracker, s, cache)
+    if rf is not None:
+        for j in rf.jobs:
+            j.masks = {k: v.astype(np.float16) for k, v in j.masks.items()}
+    lru[s] = rf
+    while len(lru) > STEADY_LRU:
+        lru.popitem(last=False)
+    return rf
+
+
+def _steady(cut, tracker, st, rf: RetouchFrame, cache) -> RetouchFrame:
+    t = rf.t
+    px = tracker.proxy
+    N = st.final.shape[1]
+    k = np.array([px.sx, px.sy])
+    for j in rf.jobs:
+        if j.face is None or not j.masks:
+            continue
+        Lt = j.face[:, :2] * k
+        acc = {n: m.astype(np.float32) for n, m in j.masks.items()}
+        wsum = 1.0
+        for d in range(1, STEADY_R + 1):
+            w = float(np.exp(-0.5 * (d / STEADY_SIGMA) ** 2))
+            for s in (t - d, t + d):
+                if not (0 <= s < N) or not st.present[j.p, s] or not st.connected(s, t):
+                    continue
+                if not np.isfinite(st.face[j.p, s, :, :2]).all():
+                    continue
+                rs = _raw_cached(cut, tracker, s, cache)
+                js = next((x for x in rs.jobs if x.pid == j.pid), None) if rs is not None else None
+                if js is None or js.face is None:
+                    continue
+                Ls = js.face[:, :2] * k
+                A, _ = cv2.estimateAffinePartial2D(Ls.astype(np.float32), Lt.astype(np.float32), method=cv2.LMEDS)
+                if A is None:
+                    continue
+                for n in acc:
+                    ms = js.masks.get(n)
+                    if ms is None:
+                        continue              # that frame had none (below threshold): counts as empty
+                    acc[n] += w * cv2.warpAffine(ms.astype(np.float32), A, (acc[n].shape[1], acc[n].shape[0]),
+                                                 flags=cv2.INTER_LINEAR, borderValue=0)
+                wsum += w
+        veto = getattr(j, "veto", None)
+        if veto is not None and wsum > 1.0:
+            h_, w_ = next(iter(acc.values())).shape
+            v_ = cv2.resize(veto.astype(np.float32), (w_, h_), interpolation=cv2.INTER_LINEAR)
+            wf_ = float(np.hypot(*(Lt[16] - Lt[0])))
+            v_ = np.clip(cv2.GaussianBlur(v_, (0, 0), max(1.0, 0.02 * wf_)) * 2.5, 0, 1)
+            # where this frame sees no skin, a neighbour's mask may not hold more than this frame's own
+            for n in acc:
+                own = j.masks[n].astype(np.float32)
+                avg = acc[n] / wsum
+                acc[n] = (own + (avg - own).clip(None, 0) + (avg - own).clip(0, None) * v_) * wsum
+        j.masks = {n: (m / wsum).astype(np.float32) for n, m in acc.items()}
+    return rf
+
+
+def person_masks(cut, tracker, t: int, pid: int) -> Optional[RetouchFrame]:
+    """The selected person's skin area for the K overlay, also before any skin slider was moved (with the
+    person's own region and scope settings), so the area can be checked before retouching."""
+    return _prepare_raw(cut, tracker, t, None, only=pid)
+
+
+def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optional[int] = None) -> Optional[RetouchFrame]:
+    """One frame's masks on their own (see prepare). only: just this person, skin shown even at 0."""
     st = tracker.store
     if st is None:
         return None
@@ -508,7 +748,8 @@ def prepare(cut, tracker, t: int, cache: Optional[dict] = None) -> Optional[Reto
     jobs = []
     rgb_u8 = None
     rgb_f = None
-    for person in cut.targets():
+    people = cut.targets() if only is None else [q for q in cut.persons if q.id == only]
+    for person in people:
         if not st.has(person.id):
             continue
         p = st.index(person.id)
@@ -516,13 +757,18 @@ def prepare(cut, tracker, t: int, cache: Optional[dict] = None) -> Optional[Reto
             continue
         pp = cut.params_for(person.id)
         v = {k: pp.amount(k, t) / 100.0 for k in RETOUCH_KEYS}
+        if only is not None:
+            v["skin"] = max(v["skin"], 0.5)
         if not any(abs(x) > 1e-4 for x in v.values()):
             continue
         face = None
         fw = 0.0
         if st.has_face and np.isfinite(st.face[p, t, :, :2]).all():
             face = st.face[p, t]
-            fw = float(st.face_vis[p, t])
+            # face visibility as a strength: full strength once the face is reasonably sure, so the retouch does
+            # not breathe with small confidence changes (a zoom, a turn); it still fades out where the face is
+            # really doubtful (heavily covered, carried by motion alone for many frames)
+            fw = float(np.clip((float(st.face_vis[p, t]) - VIS_LO) / (VIS_FULL - VIS_LO), 0.0, 1.0))
         sc = float(st.scale[p, t]) if np.isfinite(st.scale[p, t]) else 0.0
         job = Job(p, person.id, v, float(np.clip(pp.skin_detail / 100.0, 0, 1)), pp.skin_scope,
                   float(pp.grain_size), face, fw, sc,
@@ -542,8 +788,14 @@ def prepare(cut, tracker, t: int, cache: Optional[dict] = None) -> Optional[Reto
             if "rgb" not in state:
                 state["rgb"] = np.asarray(px.frame(t))
                 state["rgbf"] = state["rgb"].astype(np.float32) / 255.0
-                state["model"] = SK.frame_model_for(tracker, p, t, state["rgb"], lm)
-                state["prob"] = SK.face_skin_probability(state["rgb"], state["model"], lm if fw > 0.3 else None)
+                from ..track import facelayer as FL
+                layer = FL.load(tracker)
+                fmaps = layer.maps(person.id, t, shape) if (layer is not None and lm is not None) else None
+                centre = layer.colour(person.id, t) if (layer is not None and lm is not None) else None
+                state["parse"] = fmaps
+                state["model"] = SK.frame_model_for(tracker, p, t, state["rgb"], lm, centre)
+                state["prob"] = SK.face_skin_probability(state["rgb"], state["model"], lm if fw > 0.3 else None,
+                                                         fmaps if fw > 0.3 else None)
                 state["alpha"] = SK.person_alpha(tracker, t, p, (px.w, px.h))
             return state
 
@@ -558,11 +810,31 @@ def prepare(cut, tracker, t: int, cache: Optional[dict] = None) -> Optional[Reto
                     cache.pop(next(iter(cache)))
             return m
 
+        from ..core.project import scope_set
+        regions = scope_set(job.scope)
+
+        def body():
+            """The chosen body regions of this person (neck, shoulders, arms, hands, legs), or None."""
+            if not (regions - {"face"}):
+                return None
+            if "body" not in state:
+                kpb, wdb = _steady_body(st, p, t)
+                hd = None
+                if getattr(st, "has_hands", False) and np.isfinite(st.hand[p, t][:, :2]).any():
+                    hd = st.hand[p, t]
+                nk = None
+                if "neck" in regions and lm is not None:
+                    b_ = base()
+                    nk = neck_mask(lm, kpb, wdb, shape, px.sx, px.sy, b_["prob"], b_["alpha"], fth, b_["rgb"], None,
+                                   b_.get("parse"))
+                state["body"] = body_regions(regions, kpb, hd, shape, px.sx, px.sy, nk, fth)
+            return state["body"]
+
         tone_on = any(abs(v.get(k, 0)) > 1e-4 for k in ("skin_bright", "skin_warm", "skin_sat", "grain", "redness"))
         if tone_on:
             def mk_tone():
                 b = base()
-                return tone_mask(lm, shape, b["prob"], b["alpha"], job.scope, fw, fth)
+                return tone_mask(lm, shape, b["prob"], b["alpha"], job.scope, fw, fth, body())
             tm = get("tone", mk_tone, f"{job.scope}:{fth:.2f}")
             if tm.max() > 0.01:
                 job.masks["tone"] = tm
@@ -573,7 +845,7 @@ def prepare(cut, tracker, t: int, cache: Optional[dict] = None) -> Optional[Reto
 
             def mk_skin():
                 b = base()
-                return SK.skin_mask(sj, b["rgb"], px.sx, px.sy, b["alpha"], b["model"])
+                return SK.skin_mask(sj, b["rgb"], px.sx, px.sy, b["alpha"], b["model"], b.get("parse"), body())
             m = get("skin", mk_skin, job.scope)
             if m.max() > 0.01:
                 job.skin = sj
@@ -581,7 +853,7 @@ def prepare(cut, tracker, t: int, cache: Optional[dict] = None) -> Optional[Reto
         if v.get("blemish", 0) > 1e-4 or v.get("shine", 0) > 1e-4:
             def mk_skinx():
                 b = base()
-                reg = tone_mask(lm, shape, b["prob"], b["alpha"], job.scope, fw, fth)
+                reg = tone_mask(lm, shape, b["prob"], b["alpha"], job.scope, fw, fth, body())
                 if lm is not None:
                     reg = reg * (1 - feature_exclusion(lm, shape))
                 return np.clip(reg * np.clip(b["prob"] * 1.4, 0, 1), 0, 1)
@@ -609,7 +881,7 @@ def prepare(cut, tracker, t: int, cache: Optional[dict] = None) -> Optional[Reto
                     return np.clip(ex + (1 - np.clip(b["prob"] * 1.5, 0, 1)), 0, 1)
                 job.masks["excl"] = get("excl", mk_ex)
             if v.get("neck_lines", 0) > 1e-4 or v.get("neck_bumps", 0) > 1e-4:
-                kpn = st.final[p, t]
+                kpn, wdn = _steady_body(st, p, t)
 
                 def mk_neck():
                     b_ = base()
@@ -623,8 +895,8 @@ def prepare(cut, tracker, t: int, cache: Optional[dict] = None) -> Optional[Reto
                             h_[~(np.nan_to_num(h_[:, 2]) >= 1.5)] = np.nan
                         hl.append(h_)
                     hnd = np.concatenate(hl, 0) if hl else None
-                    return neck_mask(lm, kpn, st.widths[p, t], shape, px.sx, px.sy, b_["prob"], b_["alpha"], fth,
-                                     b_["rgb"], hnd)
+                    return neck_mask(lm, kpn, wdn, shape, px.sx, px.sy, b_["prob"], b_["alpha"], fth,
+                                     b_["rgb"], hnd, b_.get("parse"))
                 nm_ = get("neck", mk_neck, f"{fth:.2f}")
                 if nm_.max() > 0.01:
                     job.masks["neck"] = nm_ * fw
@@ -653,6 +925,14 @@ def prepare(cut, tracker, t: int, cache: Optional[dict] = None) -> Optional[Reto
             if km.max() > 0.01:
                 job.masks["knee"] = km
         if job.masks:
+            if "prob" in state:
+                # this frame's own view of what is skin (colour, parser, texture): the steadied masks may not
+                # carry a neighbour's mask onto something that covers the face here (a hand, a sleeve)
+                pr_ = state["prob"]
+                if state.get("alpha") is not None:
+                    pr_ = pr_ * state["alpha"]
+                job.veto = cv2.resize(pr_, (max(1, pr_.shape[1] // 4), max(1, pr_.shape[0] // 4)),
+                                      interpolation=cv2.INTER_AREA).astype(np.float16)
             jobs.append(job)
     if not jobs:
         return None

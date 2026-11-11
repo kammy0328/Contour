@@ -68,6 +68,10 @@ MODELS: Dict[str, dict] = {
     # clothing parsing (SegFormer-B2 fine-tuned on ATR by mattmdjaga): skin / hair / clothes per pixel
     "parse_clothes": dict(kind="parse", label="옷 영역 분석 (SegFormer-B2)", input=(512, 512), size_mb=110,
                           url="https://huggingface.co/mattmdjaga/segformer_b2_clothes/resolve/main/onnx/model.onnx"),
+    # face parsing (SegFormer-B5 on CelebAMask-HQ by jonathandinu, non-commercial): skin / neck / hair per pixel
+    # around each face, for the retouch masks
+    "face_parse": dict(kind="face_parse", label="SegFormer 얼굴 영역 분석", input=(512, 512), size_mb=340,
+                       url="https://huggingface.co/jonathandinu/face-parsing/resolve/main/onnx/model.onnx"),
     # face recognition (OpenCV Zoo SFace, Apache-2.0): telling members apart by face
     "face_sface": dict(kind="face_id", label="SFace 얼굴 인식", input=(112, 112), size_mb=37,
                        url="https://huggingface.co/opencv/face_recognition_sface/resolve/main/face_recognition_sface_2021dec.onnx"),
@@ -217,6 +221,11 @@ def session(path: Path):
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     so.log_severity_level = 3
+    # leave two cores to the rest of the computer (the app's own preview, other programs): an analysis used
+    # every core and made the whole PC sluggish
+    n = os.cpu_count() or 4
+    so.intra_op_num_threads = max(1, n - 2)
+    so.inter_op_num_threads = 1
     if "DmlExecutionProvider" in [p if isinstance(p, str) else p[0] for p in providers()]:
         # DirectML requires sequential execution without memory patterns
         so.enable_mem_pattern = False

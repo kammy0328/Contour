@@ -109,6 +109,74 @@ def _carry(fl: _Flow, X: np.ndarray, t0: int, t1: int, to_flow: np.ndarray) -> T
     return X1, q
 
 
+def _pair(fl: _Flow, X: np.ndarray, t0: int, t1: int, to_flow: np.ndarray) -> Optional[np.ndarray]:
+    """The face's motion t0 -> t1 as a 3x3 similarity in source px (None when the picture cannot tell)."""
+    X1, q = _carry(fl, X, t0, t1, to_flow)
+    if X1 is None:
+        return None
+    # recover the transform from the carried points (exact: _carry applies one similarity to all of them)
+    M, _ = cv2.estimateAffinePartial2D(X.astype(np.float32), X1.astype(np.float32), method=cv2.LMEDS)
+    if M is None:
+        return None
+    return np.vstack([M, [0, 0, 1]])
+
+
+def _apply(A: np.ndarray, X: np.ndarray) -> np.ndarray:
+    return X @ A[:2, :2].T + A[:2, 2]
+
+
+STAB_R = 3            # frames each side
+STAB_SIGMA = 1.4      # frames
+STAB_REJECT = 0.035   # a neighbour's point further than this (face widths) from the median is an expression change
+
+
+def stabilize(fl: _Flow, X: np.ndarray, keep: np.ndarray, to_flow: np.ndarray, breaks: set) -> np.ndarray:
+    """Takes the frame-to-frame shake out of the landmarks without slowing down any real movement.
+
+    Each frame's neighbours (up to STAB_R each side) are brought onto this frame along the picture's own motion
+    (so the head's movement, a pan or a zoom is not averaged away), then averaged per point. A neighbour point
+    that moved relative to the face (a mouth opening, a blink) is left out of the average, so expressions keep
+    their timing. What remains to be averaged is the landmark model's own frame-to-frame noise."""
+    T = len(X)
+    out = X.copy()
+    Mf: list = [None] * T                       # t -> t+1
+    for t in range(T - 1):
+        if keep[t] and keep[t + 1] and t not in breaks:
+            Mf[t] = _pair(fl, X[t], t, t + 1, to_flow)
+    for t in range(T):
+        if not keep[t]:
+            continue
+        cand = [X[t]]
+        wts = [1.0]
+        A = np.eye(3)
+        for s in range(t + 1, min(T, t + STAB_R + 1)):          # later frames, mapped back to t
+            if Mf[s - 1] is None:
+                break
+            A = Mf[s - 1] @ A
+            if keep[s]:
+                cand.append(_apply(np.linalg.inv(A), X[s]))
+                wts.append(float(np.exp(-0.5 * ((s - t) / STAB_SIGMA) ** 2)))
+        B = np.eye(3)
+        for s in range(t - 1, max(-1, t - STAB_R - 1), -1):     # earlier frames, mapped forward to t
+            if Mf[s] is None:
+                break
+            B = B @ Mf[s]
+            if keep[s]:
+                cand.append(_apply(B, X[s]))
+                wts.append(float(np.exp(-0.5 * ((s - t) / STAB_SIGMA) ** 2)))
+        if len(cand) < 3:
+            continue
+        C = np.stack(cand)                                       # (n, 68, 2)
+        w = np.array(wts)[:, None]
+        wf = max(1.0, float(np.hypot(*(X[t, 16] - X[t, 0]))))
+        med = np.median(C, 0)
+        ok = np.linalg.norm(C - med, axis=2) < STAB_REJECT * wf  # (n, 68)
+        ok[0] |= ~ok.any(0)                                      # a point nobody agrees on keeps its own value
+        W = w * ok
+        out[t] = (C * W[..., None]).sum(0) / W.sum(0)[:, None]
+    return out
+
+
 def _dist(A: np.ndarray, B: np.ndarray) -> float:
     wf = max(1.0, float(np.hypot(*(A[16] - A[0]))))
     return float(np.median(np.linalg.norm(A - B, axis=1))) / wf
@@ -221,10 +289,12 @@ def refine(store, fs, frame_range: Tuple[int, int], progress: Optional[Callable]
                 new[t] = C
                 nv[t] = float(np.clip(0.85 - 0.04 * age, 0.4, 0.85)) * (1.0 if both_ok else 0.8)
                 rep["filled"] += 1
+        keep = pres & np.isfinite(new).all((1, 2)) & (nv >= 0.08)
+        if keep.sum() >= 3:
+            new = stabilize(fl, new, keep, to_flow, loc_brk)
         sc = store.face[p, a:b, :, 2:3]
         sc = np.where(np.isfinite(sc), sc, 0.5)
         out = np.concatenate([new, sc], -1).astype(np.float32)
-        keep = pres & np.isfinite(new).all((1, 2)) & (nv >= 0.08)
         out[~keep] = np.nan
         store.face[p, a:b] = out
         store.face_vis[p, a:b] = np.where(keep, nv, 0.0)

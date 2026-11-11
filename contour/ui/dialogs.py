@@ -100,7 +100,33 @@ class SettingsDialog(QDialog):
         for v, t in ((1280, "1280 (빠름)"), (1920, "1920 (권장)"), (2560, "2560 (정밀)")):
             self.proxy.addItem(t, v)
         self.proxy.setCurrentIndex(max(0, self.proxy.findData(s.proxy_long_side)))
-        form.addRow("프록시 긴 변", self.proxy)
+        form.addRow("프록시 해상도", self.proxy)
+        self.ask_proxy = QCheckBox("영상을 불러올 때마다 프록시 해상도 묻기")
+        self.ask_proxy.setChecked(bool(getattr(s, "ask_proxy", True)))
+        form.addRow("", self.ask_proxy)
+        # auto save
+        self.autosave = QCheckBox("자동 저장")
+        self.autosave.setChecked(bool(getattr(s, "autosave", True)))
+        self.as_min = QSpinBox()
+        self.as_min.setRange(1, 60)
+        self.as_min.setSuffix(" 분마다")
+        self.as_min.setValue(int(getattr(s, "autosave_minutes", 5)))
+        self.as_keep = QSpinBox()
+        self.as_keep.setRange(1, 50)
+        self.as_keep.setSuffix(" 개 보관")
+        self.as_keep.setValue(int(getattr(s, "autosave_keep", 10)))
+        asw = QWidget()
+        asl = QHBoxLayout(asw)
+        asl.setContentsMargins(0, 0, 0, 0)
+        asl.addWidget(self.autosave)
+        asl.addWidget(self.as_min)
+        asl.addWidget(self.as_keep)
+        asl.addStretch(1)
+        self.autosave.toggled.connect(self.as_min.setEnabled)
+        self.autosave.toggled.connect(self.as_keep.setEnabled)
+        self.as_min.setEnabled(self.autosave.isChecked())
+        self.as_keep.setEnabled(self.autosave.isChecked())
+        form.addRow("자동 저장", asw)
         self.gpu = QComboBox()
         for v, t in (("auto", "자동"), ("cuda", "CUDA (NVIDIA)"), ("dml", "DirectML"), ("cpu", "CPU")):
             self.gpu.addItem(t, v)
@@ -111,10 +137,13 @@ class SettingsDialog(QDialog):
         rep = Wd.label(gpu_report(), "Faint", 11)
         rep.setWordWrap(True)
         lay.addWidget(rep)
-        note = Wd.label("데이터 폴더에는 모델, 학습 데이터, 벤치마크, 통계가 저장됩니다. 앱 폴더를 새 버전으로 바꿔도 그대로 유지됩니다.",
-                        "Faint", 11)
+        note = Wd.label("데이터 폴더에는 모델, 학습 데이터, 프리셋이 저장됩니다. 업데이트해도 그대로 유지됩니다. "
+                        "자동 저장본은 각 프로젝트 폴더의 autosave에 저장됩니다.", "Faint", 11)
         note.setWordWrap(True)
         lay.addWidget(note)
+        from ..core.settings import APP_NAME, APP_VERSION
+        ver = Wd.label(f"{APP_NAME} 버전 {APP_VERSION}", "Muted", 12)
+        lay.addWidget(ver)
         lay.addWidget(_buttons(self, "저장"))
         self.setMinimumWidth(560)
 
@@ -155,6 +184,10 @@ class SettingsDialog(QDialog):
         s.display = self.display.currentText()
         s.view = self.view.currentText()
         s.proxy_long_side = int(self.proxy.currentData())
+        s.ask_proxy = self.ask_proxy.isChecked()
+        s.autosave = self.autosave.isChecked()
+        s.autosave_minutes = int(self.as_min.value())
+        s.autosave_keep = int(self.as_keep.value())
         if s.gpu != self.gpu.currentData():
             s.gpu = self.gpu.currentData()
             from ..track.models import reset_providers
@@ -371,3 +404,94 @@ class PresetDialog(QDialog):
         name = self.name.currentText().strip()
         groups = [g for g, cb in self.checks.items() if cb.isChecked()]
         return name, groups, self.points.isChecked()
+
+
+class PastePickDialog(QDialog):
+    """Alt+V: which of the copied cut's values to paste. Only values that were changed are listed."""
+
+    EXTRA = [("skin_detail", "질감 유지", 45.0), ("grain_size", "그레인 크기", 1.0), ("blemish_size", "잡티 크기", 50.0),
+             ("skin_scope", "보정 부위", "face,neck"), ("cloth", "옷 그대로", "include"), ("feather", "경계 부드러움", 50.0)]
+
+    def __init__(self, parent, src_cut, frame: int):
+        super().__init__(parent)
+        from ..core.params import PARAMS, default as param_default
+        self.setWindowTitle("골라서 붙여넣기")
+        self.items: Dict[str, QCheckBox] = {}
+        changed: Dict[str, str] = {}
+        for pid, pp in src_cut.params.items():
+            for d in PARAMS:
+                c = pp.amounts.get(d.key)
+                if c is None:
+                    continue
+                v = c.value(frame)
+                if abs(v - param_default(d.key)) > 1e-6 or c.keys:
+                    changed[d.key] = d.label
+            if abs(pp.strength.value(frame) - 100.0) > 1e-6:
+                changed["__strength__"] = "전체 강도"
+            for k, lab, dflt in self.EXTRA:
+                if getattr(pp, k, dflt) != dflt:
+                    changed[k] = lab
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 16, 20, 14)
+        lay.setSpacing(8)
+        lay.addWidget(Wd.label(f"{src_cut.name}에서 바뀐 보정값", "", 14, 600))
+        lay.addWidget(Wd.label("붙여넣을 항목을 고르세요. 인물은 같은 멤버끼리 자동으로 맞춥니다.", "Faint", 11))
+        row = QHBoxLayout()
+        all_b = Wd.button("전체 선택", "ghost")
+        none_b = Wd.button("전체 선택 해제", "ghost")
+        all_b.clicked.connect(lambda: [cb.setChecked(True) for cb in self.items.values()])
+        none_b.clicked.connect(lambda: [cb.setChecked(False) for cb in self.items.values()])
+        row.addWidget(all_b)
+        row.addWidget(none_b)
+        row.addStretch(1)
+        lay.addLayout(row)
+        box = QWidget()
+        g = QGridLayout(box)
+        g.setContentsMargins(0, 0, 0, 0)
+        g.setHorizontalSpacing(18)
+        g.setVerticalSpacing(6)
+        for i, (k, lab) in enumerate(changed.items()):
+            cb = QCheckBox(lab)
+            cb.setChecked(True)
+            g.addWidget(cb, i // 3, i % 3)
+            self.items[k] = cb
+        sc = QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setFrameShape(QScrollArea.NoFrame)
+        sc.setWidget(box)
+        sc.setMinimumHeight(min(320, 40 + 30 * ((len(changed) + 2) // 3)))
+        lay.addWidget(sc, 1)
+        lay.addWidget(_buttons(self, "붙여넣기"))
+        self.setMinimumWidth(460)
+
+    def selected(self) -> List[str]:
+        return [k for k, cb in self.items.items() if cb.isChecked()]
+
+
+class ProxySizeDialog(QDialog):
+    """Proxy resolution for new footage: the preview and every analysis work on it."""
+
+    SIZES = [(1280, "1280", "가장 빠름 · 디스크 적게"), (1920, "1920", "권장"), (2560, "2560", "정밀 · 느림 · 디스크 많이")]
+
+    def __init__(self, parent, current: int):
+        super().__init__(parent)
+        self.setWindowTitle("프록시 해상도")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(22, 18, 22, 14)
+        lay.setSpacing(10)
+        lay.addWidget(Wd.label("프록시 해상도", "", 15, 600))
+        lay.addWidget(Wd.label("미리보기와 분석이 이 해상도로 동작합니다. 렌더는 항상 원본 해상도입니다.", "Faint", 11))
+        self.seg = Wd.Segmented([(str(v), f"{t}  {d}") for v, t, d in self.SIZES], compact=True)
+        cur = current if current in [v for v, _, _ in self.SIZES] else 1920
+        self.seg.set_current(str(cur))
+        lay.addWidget(self.seg)
+        self.na = QCheckBox("다음부터 묻지 않기 (설정에서 바꿀 수 있습니다)")
+        lay.addWidget(self.na)
+        lay.addWidget(_buttons(self, "만들기"))
+        self.setMinimumWidth(520)
+
+    def size(self) -> int:
+        return int(self.seg.current)
+
+    def dont_ask(self) -> bool:
+        return self.na.isChecked()

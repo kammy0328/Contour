@@ -14,14 +14,14 @@ MAX_TRIES = 5
 class GateDialog(QDialog):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Contour")
+        self.setWindowTitle("DIAP")
         self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
         self.setFixedWidth(360)
         self.tries = 0
         v = QVBoxLayout(self)
         v.setContentsMargins(28, 26, 28, 22)
         v.setSpacing(10)
-        t = QLabel("Contour")
+        t = QLabel("DIAP")
         t.setFont(font(20, 600))
         v.addWidget(t)
         s = QLabel(f"버전 {APP_VERSION} · 비밀번호를 입력하세요")

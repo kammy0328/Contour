@@ -69,12 +69,24 @@ class BatchRunner(QObject):
             env = QProcessEnvironment.systemEnvironment()
             env.insert("PYTHONIOENCODING", "utf-8")
             env.insert("PYTHONUNBUFFERED", "1")
+            env.insert("PYTHONWARNINGS", "ignore")
+            import os as _os
+            nthr = str(max(1, (_os.cpu_count() or 4) - 2))
+            for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "OPENCV_FOR_THREADS_NUM"):
+                env.insert(k, nthr)
             p.setProcessEnvironment(env)
+            # messages and warnings go to a file: a full stderr pipe (while the app is busy and not reading it)
+            # used to stop the analysis process in the middle of a cut
+            from ..core.settings import settings as _settings
+            logd = _settings().data_path / "logs"
+            logd.mkdir(parents=True, exist_ok=True)
+            self._errfile = logd / f"batch_{cid}.log"
+            p.setStandardErrorFile(str(self._errfile))
             p.readyReadStandardOutput.connect(self._read)
-            p.readyReadStandardError.connect(lambda pp=p: self._err.append(bytes(pp.readAllStandardError())))
             p.finished.connect(self._finished)
             exe = sys.executable
-            if exe.lower().endswith("pythonw.exe"):
+            if not Path(exe).name.lower().startswith("python.exe"):
+                # pythonw.exe or the DIAP.exe launcher (a renamed pythonw): the console python next to it
                 cand = Path(exe).with_name("python.exe")
                 if cand.exists():
                     exe = str(cand)
@@ -84,7 +96,8 @@ class BatchRunner(QObject):
                             "--all-targets", "1" if self.opts.get("all_targets", True) else "0"])
             if sys.platform == "win32":
                 try:
-                    p.setCreateProcessArgumentsModifier(lambda a: setattr(a, "flags", a.flags | 0x08000000))
+                    # no window, below-normal priority: the computer stays responsive while it analyses
+                    p.setCreateProcessArgumentsModifier(lambda a: setattr(a, "flags", a.flags | 0x08000000 | 0x00004000))
                 except Exception:
                     pass
             self.proc = p
@@ -114,7 +127,17 @@ class BatchRunner(QObject):
 
     def _finished(self, code, _status):
         cid = self.current
-        err = b"\n".join(self._err).decode("utf-8", "replace").strip()
+        err = ""
+        try:
+            ef = getattr(self, "_errfile", None)
+            if ef is not None and ef.exists():
+                lines = [l for l in ef.read_text(encoding="utf-8", errors="replace").splitlines()
+                         if l.strip() and ("Error" in l or "error" in l or "Traceback" in l)]
+                err = "\n".join(lines[-3:])
+                if code == 0:
+                    ef.unlink()
+        except OSError:
+            pass
         ok = code == 0
         if ok:
             self.done += 1

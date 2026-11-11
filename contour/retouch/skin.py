@@ -57,7 +57,8 @@ def skin_jobs(cut, tracker, t: int) -> List[SkinJob]:
         if st.has_face and np.isfinite(st.face[p, t, :, :2]).any():
             face = st.face[p, t]
             fw = float(st.face_vis[p, t])
-        if pp.skin_scope == "face" and (face is None or fw < 0.05):
+        from ..core.project import scope_set
+        if scope_set(pp.skin_scope) == {"face"} and (face is None or fw < 0.05):
             continue
         sc = float(st.scale[p, t]) if np.isfinite(st.scale[p, t]) else 0.0
         head = st.final[p, t, 0:5, :2].copy()
@@ -258,7 +259,115 @@ def _texture_gate(rgb_u8: np.ndarray, lm: np.ndarray) -> Optional[np.ndarray]:
     return out
 
 
-def face_skin_probability(rgb_u8: np.ndarray, model, lm: Optional[np.ndarray]) -> np.ndarray:
+def _ridge_aniso(I: np.ndarray, s: float) -> np.ndarray:
+    """0..1: how line-like the dark (or, for -I, bright) structure at each pixel is (Hessian eigenvalues)."""
+    Ib = cv2.GaussianBlur(I, (0, 0), s)
+    dxx = cv2.Sobel(Ib, cv2.CV_32F, 2, 0, ksize=3)
+    dyy = cv2.Sobel(Ib, cv2.CV_32F, 0, 2, ksize=3)
+    dxy = cv2.Sobel(Ib, cv2.CV_32F, 1, 1, ksize=3)
+    tr = dxx + dyy
+    det = np.sqrt((dxx - dyy) ** 2 + 4 * dxy ** 2)
+    l1, l2 = (tr + det) / 2, (tr - det) / 2
+    return np.where(l1 > 0, (l1 - np.abs(l2)) / (l1 + np.abs(l2) + 1e-6), 0).astype(np.float32)
+
+
+def paint_mask(rgb_u8: np.ndarray, lm: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    """Face paint, drawn veins, tattoos and ink strokes on the face and neck: 1 there, 0 elsewhere.
+
+    They are part of the look and must come through the retouch untouched (not smoothed, not taken for
+    blemishes). Two kinds:
+    - lines: dark (or bluer) than the skin around them, much thinner than a face feature, long and line-shaped
+      (Hessian), well above the skin's own pore texture; found from strong seeds, grown along weaker line
+      pixels so a fine crack is kept whole;
+    - ink strokes: sharply bluer (less red, more blue) than their own surroundings and not brighter; measured
+      against the surroundings, so a blue light on one side of the face is not ink.
+    Sizes follow the face width, so a zoom changes nothing."""
+    if lm is None or not np.isfinite(lm[[0, 8, 16, 27]]).all():
+        return None
+    L = lm[:, :2]
+    Wf = float(np.hypot(*(L[16] - L[0])))
+    if Wf < 60:                         # too small to see paint, and too small to retouch finely
+        return None
+    h, w = rgb_u8.shape[:2]
+    x0, y0 = np.floor(L.min(0) - [0.3 * Wf, 0.7 * Wf]).astype(int)
+    x1, y1 = np.ceil(L.max(0) + [0.3 * Wf, 0.9 * Wf]).astype(int)
+    x0, y0, x1, y1 = max(0, x0), max(0, y0), min(w, x1), min(h, y1)
+    if x1 - x0 < 16 or y1 - y0 < 16:
+        return None
+    roi = rgb_u8[y0:y1, x0:x1]
+    ycc = cv2.cvtColor(roi, cv2.COLOR_RGB2YCrCb).astype(np.float32)
+    Y, Cr, Cb = ycc[..., 0], ycc[..., 1], ycc[..., 2]
+    # the face skin for reference levels: inside the outline, eyes, brows and mouth out
+    poly = face_polygon(lm)
+    reg = np.zeros((h, w), np.uint8)
+    if poly is not None:
+        cv2.fillPoly(reg, [np.round(poly).astype(np.int32)], 1)
+    reg = reg[y0:y1, x0:x1].astype(bool)
+    feat = _features_mask(lm, (h, w))[y0:y1, x0:x1] > 0
+    ref = reg & ~feat
+    if ref.sum() < 200:
+        return None
+    area = np.ones_like(reg)                   # face and neck below it
+    k = max(3, int(0.02 * Wf) | 1)
+    se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    r_y = cv2.morphologyEx(Y, cv2.MORPH_BLACKHAT, se) / (cv2.GaussianBlur(Y, (0, 0), 0.04 * Wf) + 4)
+    r_b = cv2.morphologyEx(Cb, cv2.MORPH_TOPHAT, se)
+    sc = np.maximum(r_y / (np.percentile(r_y[ref], 90) + 1e-4), r_b / (np.percentile(r_b[ref], 90) + 0.5))
+    s = max(0.8, 0.004 * Wf)
+    an = np.maximum(_ridge_aniso(Y, s), _ridge_aniso(-Cb, s))
+    weak = ((sc > 1.6) & (an > 0.35) & area & ~feat).astype(np.uint8)
+    strong = (sc > 2.4) & (an > 0.5)
+    n, lab, stt, _ = cv2.connectedComponentsWithStats(weak, 8)
+    keep = np.zeros_like(weak)
+    if n > 1:
+        seeds = np.unique(lab[strong & (lab > 0)])
+        ok = np.zeros(n, bool)
+        for i in seeds:
+            ln = float(np.hypot(stt[i, 2], stt[i, 3]))
+            ok[i] = ln > 0.04 * Wf and stt[i, 4] < 0.25 * ln * ln
+        keep = ok[lab].astype(np.uint8)
+    crb = cv2.GaussianBlur(Cr, (0, 0), 1.5)
+    cbb = cv2.GaussianBlur(Cb, (0, 0), 1.5)
+    ink = (cbb - float(np.median(Cb[ref]))) - (crb - float(np.median(Cr[ref])))
+    ink_hp = ink - cv2.GaussianBlur(ink, (0, 0), 0.03 * Wf)
+    y_hp = Y - cv2.GaussianBlur(Y, (0, 0), 0.03 * Wf)
+    blob = ((ink_hp > 7) & (y_hp < 2) & area & ~feat).astype(np.uint8)
+    blob = cv2.morphologyEx(blob, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    m = np.maximum(keep, blob)
+    if not m.any():
+        return None
+    m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    out = np.zeros((h, w), np.float32)
+    out[y0:y1, x0:x1] = np.clip(cv2.GaussianBlur(m.astype(np.float32), (0, 0), max(1.0, 0.004 * Wf)) * 1.5, 0, 1)
+    return out
+
+
+def parse_gate(parse: Optional[dict], Wf: float, with_neck: bool = True) -> Optional[np.ndarray]:
+    """1 where the face parser sees skin (or neck) or cannot be trusted, down to 0.03 where it sees something
+    else in front of or around the face: hair, a hand, a light stick, clothes. Outside the parser's crop: 1."""
+    if parse is None or parse.get("trust", 0) <= 0:
+        return None
+    m = parse["skin"] + (parse["neck"] if with_neck else 0)
+    g = np.clip(cv2.GaussianBlur(m.astype(np.float32), (0, 0), max(1.0, 0.012 * Wf)) * 1.7, 0, 1)
+    cov = cv2.GaussianBlur(parse["cover"], (0, 0), max(1.0, 0.03 * Wf))
+    return (1.0 - cov * parse["trust"] * (1.0 - g) * 0.97).astype(np.float32)
+
+
+def face_skin_probability(rgb_u8: np.ndarray, model, lm: Optional[np.ndarray], parse: Optional[dict] = None) -> np.ndarray:
+    gate = None
+    if parse is not None and lm is not None and np.isfinite(lm[[0, 16], :2]).all():
+        gate = parse_gate(parse, float(np.hypot(*(lm[16, :2] - lm[0, :2]))))
+    out = _face_skin_probability(rgb_u8, model, lm, gate, parse.get("tex") if parse is not None else None)
+    if gate is not None:
+        out = out * gate
+    # face paint, tattoos, drawn veins: never retouched
+    pm = paint_mask(rgb_u8, lm) if lm is not None else None
+    if pm is not None:
+        out = out * (1.0 - pm)
+    return out.astype(np.float32)
+
+
+def _face_skin_probability(rgb_u8: np.ndarray, model, lm: Optional[np.ndarray], gate=None, tex=None) -> np.ndarray:
     """Colour model, held up inside the face by the face geometry only where the colour model fails.
 
     With the model re-centred on each frame's own face (frame_model_for) the colour alone finds the skin even
@@ -269,7 +378,9 @@ def face_skin_probability(rgb_u8: np.ndarray, model, lm: Optional[np.ndarray]) -
     pr = face_prior(lm, rgb_u8, model)
     if pr is None:
         return prob
-    tg = _texture_gate(rgb_u8, lm)
+    # the face layer's gate is held steady through time; measured on one frame alone it doubled the mask's
+    # frame-to-frame flicker (grain and compression noise read as texture)
+    tg = tex if tex is not None else _texture_gate(rgb_u8, lm)
     if tg is not None:
         prob = prob * tg
         pr = pr * tg
@@ -293,33 +404,40 @@ def face_skin_probability(rgb_u8: np.ndarray, model, lm: Optional[np.ndarray]) -
         d = max(3, int(0.12 * Wf) | 1)
         mouth = cv2.dilate(mouth, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d)))
     mz = cv2.GaussianBlur(mouth.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.03 * Wf))
+    if gate is not None:
+        pr = pr * gate
     return np.maximum(prob, 0.95 * wgt * pr * (1.0 - mz)).astype(np.float32)
 
 
 # --------------------------------------------------------------------------- mask
 
 def skin_mask(job: SkinJob, rgb_proxy: np.ndarray, sx: float, sy: float, person_alpha: Optional[np.ndarray],
-              model) -> np.ndarray:
-    """float32 0..1 at proxy resolution."""
+              model, parse: Optional[dict] = None, body_region: Optional[np.ndarray] = None) -> np.ndarray:
+    """float32 0..1 at proxy resolution. body_region: the chosen body regions (neck, shoulders, arms, hands,
+    legs) of this person, 0..1, added to the face."""
     h, w = rgb_proxy.shape[:2]
     lm = None
     if job.face is not None:
         lm = job.face.copy()
         lm[:, 0] *= sx
         lm[:, 1] *= sy
-    prob = face_skin_probability(rgb_proxy, model, lm if job.face_w > 0.3 else None)
-    if job.scope == "face":
+    prob = face_skin_probability(rgb_proxy, model, lm if job.face_w > 0.3 else None,
+                                 parse if job.face_w > 0.3 else None)
+    from ..core.project import scope_set
+    regions = scope_set(job.scope)
+    region = np.zeros((h, w), np.float32)
+    if "face" in regions:
         poly = face_polygon(lm) if lm is not None else None
-        if poly is None:
-            return np.zeros((h, w), np.float32)
-        reg = np.zeros((h, w), np.uint8)
-        cv2.fillPoly(reg, [np.round(poly).astype(np.int32)], 255)
-        Wf = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
-        k = max(3, int(0.08 * Wf) | 1)
-        region = cv2.GaussianBlur(reg.astype(np.float32) / 255.0, (k, k), 0)
-        region *= job.face_w
-    else:
-        region = np.ones((h, w), np.float32)
+        if poly is not None:
+            reg = np.zeros((h, w), np.uint8)
+            cv2.fillPoly(reg, [np.round(poly).astype(np.int32)], 255)
+            Wf = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
+            k = max(3, int(0.08 * Wf) | 1)
+            region = cv2.GaussianBlur(reg.astype(np.float32) / 255.0, (k, k), 0) * job.face_w
+    if body_region is not None:
+        region = np.maximum(region, body_region)
+    if region.max() <= 0.0:
+        return np.zeros((h, w), np.float32)
     if person_alpha is not None:
         region = region * person_alpha
     m = prob * region
@@ -344,7 +462,12 @@ def skin_mask(job: SkinJob, rgb_proxy: np.ndarray, sx: float, sy: float, person_
             cv2.circle(hm, (int(round(c[0])), int(round(c[1]))), int(rad), 255, -1)
             k = max(3, int(rad * 0.3) | 1)
             m *= 1.0 - cv2.GaussianBlur(hm.astype(np.float32) / 255.0, (k, k), 0)
+    # edge softening follows the face size (a fixed pixel blur washed a small face's mask out: during a zoom
+    # the retouch faded in instead of holding its strength)
     sig = max(0.8, 0.0025 * h)
+    if lm is not None and np.isfinite(lm[[0, 16], :2]).all():
+        Wf_ = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
+        sig = max(0.6, min(sig, 0.008 * Wf_))
     m = cv2.GaussianBlur(m, (0, 0), sig)
     return np.clip(m, 0, 1).astype(np.float32)
 
@@ -433,13 +556,18 @@ def model_for(tracker, p: int):
     return cache[p]
 
 
-def frame_model_for(tracker, p: int, t: int, rgb_u8: np.ndarray, lm_px: Optional[np.ndarray]):
+def frame_model_for(tracker, p: int, t: int, rgb_u8: np.ndarray, lm_px: Optional[np.ndarray],
+                    centre: Optional[np.ndarray] = None):
     """The person's skin colour model, re-centred on this frame's own face skin when the face is in view.
 
     Under strobes, flashes or coloured light sweeping over the set, the skin's colour changes from frame to
     frame; a model learned once for the shot would drop the skin on those frames (the retouch blinks on and
     off with the light). The spread stays the shot's own, only the centre follows the light."""
     base = model_for(tracker, p)
+    if centre is not None:
+        # the face layer's centre: measured on the parser's skin and held steady over the shot
+        icov = base[1] if base is not None else DEFAULT_MODEL[1]
+        return (np.asarray(centre[:2], np.float64), icov, float(centre[2]))
     if lm_px is None or not np.isfinite(lm_px[:, :2]).all():
         return base
     cache = getattr(tracker, "_skin_fmodels", None)

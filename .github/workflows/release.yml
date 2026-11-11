@@ -1,6 +1,6 @@
 name: release
 
-# Run by a push to main whose commit message has [release], by hand (Actions > release > Run workflow) or by a tag v1.2.3: builds Contour_Setup_1.2.3.exe on Windows, installs it on the runner as a smoke test, and puts
+# Run by a push to main whose commit message has [release], by hand (Actions > release > Run workflow) or by a tag v1.2.3: builds DIAP_Setup_1.2.3.exe on Windows, installs it on the runner as a smoke test, and puts
 # it on a release of this (private) repo. With the secret RELEASES_TOKEN (a token that can write to
 # kammy0328/Contour-Releases) it is also published there, which is where the app looks for updates.
 
@@ -50,6 +50,11 @@ jobs:
           $pth = Get-ChildItem build\python -Filter "python3*._pth" | Select-Object -First 1
           Set-Content -Path $pth.FullName -Encoding ascii -Value @("python312.zip", ".", "Lib\site-packages", "..\app", "import site")
           Get-Content $pth.FullName
+          # DIAP.exe: the windowed python under the app's own name and icon (taskbar, Task Manager, pinning)
+          Invoke-WebRequest "https://github.com/electron/rcedit/releases/download/v2.0.0/rcedit-x64.exe" -OutFile build\rcedit.exe
+          Copy-Item build\python\pythonw.exe build\python\DIAP.exe
+          & build\rcedit.exe build\python\DIAP.exe --set-icon assets\icon.ico --set-version-string FileDescription DIAP --set-version-string ProductName DIAP --set-version-string CompanyName SEWOO --set-version-string OriginalFilename DIAP.exe --set-version-string InternalName DIAP
+          if ($LASTEXITCODE -ne 0) { throw "rcedit failed" }
 
       - name: Build installer
         shell: pwsh
@@ -60,9 +65,9 @@ jobs:
           "iscc: $iscc exists=$(Test-Path $iscc)"
           & $iscc /Qp "/DAppVer=${{ steps.v.outputs.ver }}" "/DSrc=$PWD" "/DPy=$PWD\build\python" installer\contour.iss 2>&1 | Tee-Object -FilePath ci\iscc.txt | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
-          $exe = "dist\Contour_Setup_${{ steps.v.outputs.ver }}.exe"
+          $exe = "dist\DIAP_Setup_${{ steps.v.outputs.ver }}.exe"
           $h = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
-          "$h  Contour_Setup_${{ steps.v.outputs.ver }}.exe" | Set-Content -Encoding ascii "$exe.sha256"
+          "$h  DIAP_Setup_${{ steps.v.outputs.ver }}.exe" | Set-Content -Encoding ascii "$exe.sha256"
           Get-Item $exe | Format-List Name, Length
           Write-Host "SHA256 $h"
 
@@ -72,12 +77,13 @@ jobs:
           CONTOUR_CI: "1"
           QT_QPA_PLATFORM: offscreen
         run: |
-          $exe = "dist\Contour_Setup_${{ steps.v.outputs.ver }}.exe"
+          $exe = "dist\DIAP_Setup_${{ steps.v.outputs.ver }}.exe"
           $p = Start-Process $exe -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/DIR=C:\ct" -PassThru -Wait
           if ($p.ExitCode -ne 0) { throw "installer exit $($p.ExitCode)" }
           Get-Content C:\ct\setup_log.txt
-          Get-Process pythonw -ErrorAction SilentlyContinue | Stop-Process -Force
-          & C:\ct\python\python.exe -c "import sys; print(sys.version); import numpy, cv2, PySide6, onnxruntime, scipy, PyOpenColorIO; import contour.batch; from contour.ui import main_window, update, gatedlg; from contour.core import gate, updater; assert gate.check('0328'); print('ok', onnxruntime.get_available_providers())" 2>&1 | Tee-Object -FilePath ci\smoke.txt
+          Get-Process pythonw, DIAP -ErrorAction SilentlyContinue | Stop-Process -Force
+          if (-not (Test-Path C:\ct\python\DIAP.exe)) { throw "DIAP.exe missing" }
+          & C:\ct\python\python.exe -c "import sys; print(sys.version); import numpy, cv2, PySide6, onnxruntime, scipy, PyOpenColorIO; import contour.batch; from contour.ui import main_window, update, gatedlg; from contour.core import gate, updater; from contour.track import faceparse, facelayer, faceflow; assert gate.check('0328'); print('ok', onnxruntime.get_available_providers())" 2>&1 | Tee-Object -FilePath ci\smoke.txt
           if ($LASTEXITCODE -ne 0) { throw "import failed" }
           Push-Location C:\ct\app
           & C:\ct\python\python.exe -m contour.batch --help 2>&1 | Tee-Object -Append -FilePath "$env:GITHUB_WORKSPACE\ci\smoke.txt"
@@ -98,11 +104,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.v.outputs.ver }}
-          name: Contour ${{ steps.v.outputs.ver }}
+          name: DIAP ${{ steps.v.outputs.ver }}
           target_commitish: ${{ github.sha }}
           files: |
-            dist/Contour_Setup_${{ steps.v.outputs.ver }}.exe
-            dist/Contour_Setup_${{ steps.v.outputs.ver }}.exe.sha256
+            dist/DIAP_Setup_${{ steps.v.outputs.ver }}.exe
+            dist/DIAP_Setup_${{ steps.v.outputs.ver }}.exe.sha256
           body_path: installer/RELEASE_NOTES.md
 
       - name: Publish (public, for updates)
@@ -112,13 +118,13 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force ci | Out-Null; Start-Transcript -Append -Path ci\log.txt | Out-Null
-          gh release create "v${{ steps.v.outputs.ver }}" --repo $env:PUBLIC_REPO --title "Contour ${{ steps.v.outputs.ver }}" --notes-file installer/RELEASE_NOTES.md "dist/Contour_Setup_${{ steps.v.outputs.ver }}.exe" "dist/Contour_Setup_${{ steps.v.outputs.ver }}.exe.sha256" 2>&1 | Tee-Object -Append -FilePath ci\release.txt
+          gh release create "v${{ steps.v.outputs.ver }}" --repo $env:PUBLIC_REPO --title "DIAP ${{ steps.v.outputs.ver }}" --notes-file installer/RELEASE_NOTES.md "dist/DIAP_Setup_${{ steps.v.outputs.ver }}.exe" "dist/DIAP_Setup_${{ steps.v.outputs.ver }}.exe.sha256" 2>&1 | Tee-Object -Append -FilePath ci\release.txt
           if ($LASTEXITCODE -ne 0) { throw "public release failed" }
 
       - uses: actions/upload-artifact@v4
         continue-on-error: true
         with:
-          name: Contour_Setup_${{ steps.v.outputs.ver }}
+          name: DIAP_Setup_${{ steps.v.outputs.ver }}
           path: dist/*
 
       - name: Report (a check run named ci-log carries the log, readable without the Actions API)

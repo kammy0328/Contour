@@ -29,12 +29,12 @@ class ParamDef:
 
 GROUPS: List[Tuple[str, str, str]] = [
     # key, title, hint shown at the right of the header
+    ("skin", "피부", ""),
     ("body", "몸", "− 가늘게  /  + 넓게"),
     ("shape", "키 · 비율", "+ 길게 / 넓게"),
     ("face", "얼굴형", "− 작게 / 짧게"),
     ("features", "이목구비", "− 작게  /  + 크게"),
     ("head", "머리", "+ 크게 / 높게"),
-    ("skin", "피부", ""),
     ("color", "메이크업 · 색", ""),
 ]
 

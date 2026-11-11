@@ -135,8 +135,9 @@ def apply(pp: PartParams, d: dict) -> None:
     sk = d.get("skin")
     if sk:
         pp.skin_detail = float(sk.get("detail", pp.skin_detail))
-        if sk.get("scope") in ("face", "all"):
-            pp.skin_scope = sk["scope"]
+        if sk.get("scope"):
+            from .project import norm_scope
+            pp.skin_scope = norm_scope(sk["scope"])
         pp.grain_size = float(sk.get("grain_size", pp.grain_size))
         pp.blemish_size = float(sk.get("blemish_size", getattr(pp, "blemish_size", 50.0)))
     if "sculpt" in d:

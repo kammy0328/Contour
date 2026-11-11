@@ -22,18 +22,49 @@ def proxy_size(info: MediaInfo, long_side: int) -> Tuple[int, int]:
     return pw, ph
 
 
+SHARED = "proxy_shared.json"       # in a timeline cut's cache: its frames are a stretch of the bake's proxy
+
+
 class Proxy:
     def __init__(self, cache_dir: Path, info: MediaInfo, long_side: int = 1920):
         self.dir = Path(cache_dir)
         self.info = info
         self.w, self.h = proxy_size(info, long_side)
         self.n = info.frames
+        self.offset = 0                 # first frame of this cut inside the (shared) proxy file
+        self.n_file = self.n            # frames in the proxy file
+        self.meta_path = self.dir / "proxy_meta.json"
+        shared = self._shared()
+        if shared is not None:
+            # a stretch of the edited timeline's bake: the bake's one proxy serves every shot
+            self.path, self.meta_path = Path(shared["path"]), Path(shared["meta"])
+            self.offset, self.n_file = int(shared["offset"]), int(shared["n"])
+            self.w, self.h = int(shared["w"]), int(shared["h"])
+        else:
+            m = self.meta()
+            if m.get("complete") and m.get("n") == self.n and m.get("w") and m.get("h"):
+                # keep the size this cut's proxy was made at (the default may have changed since)
+                self.w, self.h = int(m["w"]), int(m["h"])
+            self.path = self.dir / f"proxy_{self.w}x{self.h}.u8"
         self.sx = self.w / info.width
         self.sy = self.h / info.height
-        self.path = self.dir / f"proxy_{self.w}x{self.h}.u8"
-        self.meta_path = self.dir / "proxy_meta.json"
         self._mm: Optional[np.memmap] = None
         self._gray_cache: dict = {}
+
+    def _shared(self) -> Optional[dict]:
+        f = self.dir / SHARED
+        if not f.exists():
+            return None
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+            m = json.loads(Path(d["meta"]).read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not (Path(d["path"]).exists() and m.get("complete")):
+            return None
+        if int(d["offset"]) + self.n > int(m.get("n", 0)):
+            return None
+        return dict(d, w=m["w"], h=m["h"], n=m["n"])
 
     # ------------------------------------------------------------------ state
     def meta(self) -> dict:
@@ -54,16 +85,20 @@ class Proxy:
     def is_valid(self, view_key: str) -> bool:
         m = self.meta()
         return (self.path.exists() and m.get("complete") and m.get("view") == view_key
-                and m.get("w") == self.w and m.get("h") == self.h and m.get("n") == self.n
+                and m.get("w") == self.w and m.get("h") == self.h and m.get("n") == self.n_file
                 and m.get("sig") == self._source_sig())
 
     def has_frames(self) -> bool:
         m = self.meta()
-        return self.path.exists() and m.get("w") == self.w and m.get("h") == self.h and m.get("n") == self.n
+        return self.path.exists() and m.get("w") == self.w and m.get("h") == self.h and m.get("n") == self.n_file
+
+    @property
+    def shared(self) -> bool:
+        return self.n_file != self.n or self.offset != 0
 
     def open(self) -> None:
         if self._mm is None and self.path.exists():
-            self._mm = np.memmap(self.path, dtype=np.uint8, mode="r", shape=(self.n, self.h, self.w, 3))
+            self._mm = np.memmap(self.path, dtype=np.uint8, mode="r", shape=(self.n_file, self.h, self.w, 3))
 
     def close(self) -> None:
         self._mm = None
@@ -74,7 +109,7 @@ class Proxy:
         self.open()
         if self._mm is None:
             return np.zeros((self.h, self.w, 3), np.uint8)
-        i = int(np.clip(i, 0, self.n - 1))
+        i = int(np.clip(i, 0, self.n - 1)) + self.offset
         return np.array(self._mm[i])      # copy: never hand out views of the mapping (Windows file locks)
 
     def gray(self, i: int) -> np.ndarray:
@@ -101,6 +136,15 @@ class Proxy:
     # ------------------------------------------------------------------ build
     def build(self, cm: ColourManager, vs: ViewSettings, progress: Optional[Callable[[float, str], None]] = None,
               cancel: Optional[Callable[[], bool]] = None) -> bool:
+        if self.shared:
+            # never rewrite the bake's shared proxy from one shot: build this shot its own
+            try:
+                (self.dir / SHARED).unlink()
+            except OSError:
+                pass
+            self.offset, self.n_file = 0, self.n
+            self.meta_path = self.dir / "proxy_meta.json"
+            self.path = self.dir / f"proxy_{self.w}x{self.h}.u8"
         self.close()
         self.dir.mkdir(parents=True, exist_ok=True)
         mm = np.memmap(self.path, dtype=np.uint8, mode="w+", shape=(self.n, self.h, self.w, 3))
@@ -180,3 +224,11 @@ class MatteStore:
             self.path.unlink()
         except OSError:
             pass
+
+
+def link_shared(cut_cache_dir: Path, bake_proxy: "Proxy", offset: int) -> None:
+    """Points a timeline shot at the bake's proxy (frames offset .. offset + shot length)."""
+    d = Path(cut_cache_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / SHARED).write_text(json.dumps(dict(path=str(bake_proxy.path), meta=str(bake_proxy.meta_path),
+                                            offset=int(offset))), encoding="utf-8")

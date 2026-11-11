@@ -537,6 +537,13 @@ class CutTracker:
         if any(self.cut.joint_keys.get(pid) for pid in pids):
             self.resolve_all(progress=None)
         self.update_widths()
+        # face layer (parsing + steady skin colour) for the retouch masks
+        try:
+            from . import facelayer as FL
+            FL.build(self, lambda f, m: p_w(0.3 + 0.65 * f, m), cancel)
+        except Exception:
+            import traceback
+            traceback.print_exc()
         p_w(1.0, "완료")
         self.cut.analyzed = True
         self.cut.analysis_version += 1
@@ -887,7 +894,7 @@ class CutTracker:
                 op.first, op.last = min(tr), max(tr)
                 persons.append(op)
             else:
-                role = "target" if p == 0 else "protect"
+                role = "target"                       # everyone is retouched unless the user protects them
                 persons.append(Person(id=pid, name=f"인물 {pid + 1}", color=PERSON_COLORS[pid % len(PERSON_COLORS)],
                                       role=role, profile=prof, first=min(tr), last=max(tr), reid=reid, faces=faces))
         self.cut.persons = persons

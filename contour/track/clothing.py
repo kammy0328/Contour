@@ -20,7 +20,47 @@ CLASSES = ["배경", "모자", "머리카락", "선글라스", "상의", "치마
            "얼굴", "왼 다리", "오른 다리", "왼 팔", "오른 팔", "가방", "스카프"]
 SKIRT, DRESS = 5, 7
 ALL_CLOTHES = {1, 4, 5, 6, 7, 8, 9, 10, 16, 17}
-MODES = ("include", "skirt", "all")
+# "옷 그대로": which garments stay as they are. Only garments found on the person are offered.
+GARMENTS = [("top", "상의", {4, 17}), ("bottom", "바지", {6, 8}), ("skirt", "치마", {5}), ("dress", "원피스", {7})]
+ACCESSORIES = {1, 9, 10, 16}           # hat, shoes, bag: kept whenever clothes are kept
+MODES = ("include", "skirt", "all")    # older projects; now "keep:top,skirt,..."
+
+
+def keep_set(mode: str) -> set:
+    """Garment keys kept by a cloth mode ('include' -> none)."""
+    mode = str(mode or "include")
+    if mode == "include":
+        return set()
+    if mode == "all":
+        return {k for k, _, _ in GARMENTS}
+    if mode == "skirt":
+        return {"skirt", "dress_low"}
+    if mode.startswith("keep:"):
+        return {k for k in mode[5:].split(",") if k}
+    return set()
+
+
+def detected(tracker, p: int, n: int = 12) -> list:
+    """Garment keys seen on this person (more than 1 % of the person's pixels in the sampled frames)."""
+    if not tracker.cloth.exists():
+        return []
+    st = tracker.store
+    ts = [t for t in np.linspace(0, st.n - 1, n).astype(int) if st.present[p, t]]
+    tot = 0
+    cnt = {k: 0 for k, _, _ in GARMENTS}
+    for t in ts:
+        cm = tracker.cloth.get(int(t))
+        lab = tracker.labels(int(t))
+        if cm is None or lab is None:
+            continue
+        own = lab == p
+        tot += int(own.sum())
+        cls = cm.astype(np.int16) - 1
+        for k, _, ids in GARMENTS:
+            cnt[k] += int((own & np.isin(cls, list(ids))).sum())
+    if tot <= 0:
+        return []
+    return [k for k, _, _ in GARMENTS if cnt[k] > 0.01 * tot]
 MEAN = np.array([0.485, 0.456, 0.406], np.float32)
 STD = np.array([0.229, 0.224, 0.225], np.float32)
 
@@ -141,7 +181,8 @@ def ready_for(tracker, pid: int) -> bool:
 
 def keep_mask(tracker, t: int, p: int, mode: str) -> Optional[np.ndarray]:
     """Bool mask (matte resolution) of this person's clothing that stays as it is, or None."""
-    if mode not in ("skirt", "all") or not tracker.cloth.exists():
+    keep = keep_set(mode)
+    if not keep or not tracker.cloth.exists():
         return None
     cm = tracker.cloth.get(t)
     lab = tracker.labels(t)
@@ -149,10 +190,12 @@ def keep_mask(tracker, t: int, p: int, mode: str) -> Optional[np.ndarray]:
         return None
     cls = cm.astype(np.int16) - 1
     own = lab == p
-    if mode == "all":
-        m = own & np.isin(cls, list(ALL_CLOTHES))
-    else:
-        m = own & (cls == SKIRT)
+    ids = set(ACCESSORIES)
+    for k, _, cl in GARMENTS:
+        if k in keep:
+            ids |= cl
+    m = own & np.isin(cls, list(ids))
+    if "dress_low" in keep:
         dress = own & (cls == DRESS)
         if dress.any():
             # a dress is kept from the waist down (the top of it follows the body like any top)

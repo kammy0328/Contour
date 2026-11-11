@@ -210,8 +210,9 @@ class EditSession:
                 self._cache.popitem(last=False)
 
     def result_key(self, t: int, final: bool = False) -> tuple:
+        # the cut is part of the key: a result computed for the previous cut must never show on this one
         return ("res", t, self.vers["geo"], self.vers["ret"], self.vers["trk"], False if final else self.interactive,
-                self.cut.mode if self.cut else "")
+                self.cut.mode if self.cut else "", self.cut.id if self.cut else "")
 
     def cached_result(self, t: int) -> Optional[np.ndarray]:
         with self._lock:
@@ -221,14 +222,28 @@ class EditSession:
         img = self.frame(t)
         if img is None:
             return None
-        key = ("ret_img", t, self.vers["ret"], self.vers["trk"])
+        live = bool(self.interactive)
+        key = ("ret_img", t, self.vers["ret"], self.vers["trk"], live)
         with self._lock:
             if key in self._cache:
                 return self._cache[key]
+            full = ("ret_img", t, self.vers["ret"], self.vers["trk"], False)
+            if live and full in self._cache:
+                return self._cache[full]
         rf = self.retouch(t)
         if rf is not None:
             from ..retouch.engine import apply_rgb
-            img = apply_rgb(img, rf, self.proxy.sx)
+            if live:
+                # while a slider is dragged: the retouch at half size, its change added back onto the full
+                # picture (about 4x faster, the slider follows the hand); full size again on release
+                import cv2 as _cv2
+                h, w = img.shape[:2]
+                small = _cv2.resize(img, (w // 2, h // 2), interpolation=_cv2.INTER_AREA)
+                ds = apply_rgb(small, rf, self.proxy.sx * 0.5).astype(np.int16) - small.astype(np.int16)
+                d = _cv2.resize(ds, (w, h), interpolation=_cv2.INTER_LINEAR)
+                img = np.clip(img.astype(np.int16) + d, 0, 255).astype(np.uint8)
+            else:
+                img = apply_rgb(img, rf, self.proxy.sx)
         self._put(key, img)
         return img
 

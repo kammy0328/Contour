@@ -121,11 +121,17 @@ class RenderQueuePage(QWidget):
         self.clear_done.clicked.connect(self._clear_done)
         self.open_dir.clicked.connect(self._open_dir)
         self.train_after = QCheckBox("큐가 끝나면 누적 모델 학습")
-        self.train_after.setToolTip("밤새 렌더를 걸어 둘 때 켜 두면, 렌더가 끝난 뒤 쌓인 수정 데이터로 새 모델을 학습하고 더 나을 때만 적용합니다")
-        for w in (self.start, self.stop, self.up, self.down, self.rm, self.clear_done, self.open_dir):
+        self.train_after.setChecked(True)
+        self.train_after.hide()                 # learning is automatic; no switch
+        self.add_sel = Wd.button("선택한 컷 추가", "", "list-video", "편집 화면의 컷 리스트·타임라인에서 고른 컷을 큐에 넣습니다")
+        self.add_sel.clicked.connect(self._add_selected)
+        self.bake_all = Wd.button("전체 컷 일괄 렌더 (베이크)", "", "film",
+                                  "편집 타임라인 전체를 베이크 영상과 같은 길이의 한 파일로 출력합니다")
+        self.bake_all.clicked.connect(lambda: self.main._tl_action("export_full", []))
+        for w in (self.start, self.stop, self.add_sel, self.bake_all, self.up, self.down, self.rm, self.clear_done,
+                  self.open_dir):
             bar.addWidget(w)
         bar.addStretch(1)
-        bar.addWidget(self.train_after)
         lay.addLayout(bar)
         self.table = _table(["컷", "프로젝트", "포맷", "프레임", "상태", "진행", "메시지"])
         hh = self.table.horizontalHeader()
@@ -136,6 +142,20 @@ class RenderQueuePage(QWidget):
         lay.addWidget(self.empty)
         self.load()
         self.refresh()
+
+    def _add_selected(self):
+        prj = self.main.session.project
+        if prj is None:
+            return
+        ids = self.main._sel_cut_ids()
+        cuts = [c for c in (prj.cut(i) for i in ids) if c is not None and c.analyzed]
+        if not cuts:
+            self.main.toast("편집 화면에서 분석한 컷을 먼저 고르세요", "warn")
+            return
+        self.main.save()
+        for c in cuts:
+            self.add(prj, c)
+        self.main.toast(f"{len(cuts)}컷을 렌더 큐에 추가했습니다", "ok")
 
     # ------------------------------------------------------------------ persistence
     def _file(self) -> Path:
@@ -221,7 +241,7 @@ class RenderQueuePage(QWidget):
             path = Path(self.items[r].out_path).parent
         elif self.items:
             o = self.items[-1].output.get("out_dir")
-            path = Path(o) if o else Path(self.items[-1].project_path).parent / "Contour_Renders"
+            path = Path(o) if o else Path(self.items[-1].project_path).parent / "DIAP_Renders"
         if path and path.exists():
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
@@ -571,7 +591,7 @@ class DashboardPage(QWidget):
             self.table.setItem(r, 7, _item(time.strftime("%Y-%m-%d %H:%M", time.localtime(c["last"])), color=C["text2"]))
 
     def _csv(self):
-        path, _ = QFileDialog.getSaveFileName(self, "CSV로 내보내기", str(Path.home() / f"Contour_통계_{time.strftime('%Y%m%d')}.csv"),
+        path, _ = QFileDialog.getSaveFileName(self, "CSV로 내보내기", str(Path.home() / f"DIAP_통계_{time.strftime('%Y%m%d')}.csv"),
                                               "CSV (*.csv)")
         if path:
             export_csv(path)

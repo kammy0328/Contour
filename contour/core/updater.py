@@ -46,7 +46,7 @@ def is_newer(v: str, than: str = APP_VERSION) -> bool:
 
 
 def _get(url: str, timeout: float = 15.0) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": f"Contour/{APP_VERSION}",
+    req = urllib.request.Request(url, headers={"User-Agent": f"DIAP/{APP_VERSION}",
                                                "Accept": "application/vnd.github+json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
@@ -91,7 +91,7 @@ def download(r: Release, progress: Optional[Callable[[float, str], None]] = None
     dst = updates_dir() / r.setup_name
     if dst.exists() and r.sha256 and _sha(dst) == r.sha256:
         return dst
-    req = urllib.request.Request(r.setup_url, headers={"User-Agent": f"Contour/{APP_VERSION}"})
+    req = urllib.request.Request(r.setup_url, headers={"User-Agent": f"DIAP/{APP_VERSION}"})
     fd, tmp = tempfile.mkstemp(dir=str(dst.parent), suffix=".part")
     h = hashlib.sha256()
     try:
@@ -139,7 +139,7 @@ def _prune():
 
 
 def installed_dir() -> Optional[Path]:
-    """{app} of an installed build (…\\Contour\\app\\app.py next to …\\Contour\\python), else None (source run)."""
+    """{app} of an installed build (…\\Diap\\app\\app.py next to …\\Diap\\python), else None (source run)."""
     here = Path(__file__).resolve().parents[2]
     root = here.parent
     if (root / "python" / "python.exe").exists() and here.name == "app":
@@ -150,13 +150,13 @@ def installed_dir() -> Optional[Path]:
 def launch_installer(setup: Path) -> None:
     """Runs the installer silently once this app has closed; it starts Contour again when it is done."""
     args = [str(setup), "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS", "/UPDATE=1"]
-    d = installed_dir()
-    if d is not None:
-        args.append(f'/DIR={d}')
+    # no /DIR: the installer keeps an earlier DIAP install's folder, and moves a 1.8 per-user install to
+    # Program Files\Diap
     if sys.platform != "win32":
         subprocess.Popen(args, close_fds=True)
         return
     # a few seconds' wait first: this app's Python must have exited before its files are replaced
-    cmd = "ping -n 5 127.0.0.1 >nul & " + subprocess.list2cmdline(args)
+    # 'start' goes through ShellExecute: the installer (Program Files, needs admin) gets its UAC prompt
+    cmd = "ping -n 5 127.0.0.1 >nul & start \"\" " + subprocess.list2cmdline(args)
     flags = 0x00000008 | 0x00000200 | 0x08000000      # DETACHED_PROCESS | NEW_PROCESS_GROUP | NO_WINDOW
     subprocess.Popen(["cmd", "/c", cmd], close_fds=True, creationflags=flags)

@@ -1,8 +1,9 @@
-; Contour installer (Inno Setup 6). Built by .github/workflows/release.yml:
+; DIAP installer (Inno Setup 6). Built by .github/workflows/release.yml:
+; DIAP installer.
 ;   ISCC /DAppVer=1.8.1 /DSrc=<repo> /DPy=<embeddable python folder> installer\contour.iss
-; Per-user install (no admin): {localappdata}\Programs\Contour
+; Installs for all users in Program Files\Diap (asks for admin rights once per install or update)
 ;   {app}\python   embeddable Python 3.12 + packages (pip, installed by tools\setup_env.py)
-;   {app}\app      Contour itself (replaced on every update)
+; {app}\app      DIAP itself (code package: contour) (replaced on every update)
 ;   {app}\ffmpeg   ffmpeg, fetched once when none is found on the PC
 ; Projects, learned data, presets and models stay in Documents\Contour_Data and are never touched.
 
@@ -18,18 +19,19 @@
 
 [Setup]
 AppId={{0432DE7E-AD09-4B89-8929-0B95959C384F}
-AppName=Contour
+AppName=DIAP
 AppVersion={#AppVer}
-AppVerName=Contour {#AppVer}
+AppVerName=DIAP {#AppVer}
 AppPublisher=SEWOO
-DefaultDirName={localappdata}\Programs\Contour
+DefaultDirName={autopf}\Diap
+DefaultGroupName=DIAP
 DisableDirPage=auto
 DisableProgramGroupPage=yes
-PrivilegesRequired=lowest
+PrivilegesRequired=admin
 OutputDir={#Src}\dist
-OutputBaseFilename=Contour_Setup_{#AppVer}
+OutputBaseFilename=DIAP_Setup_{#AppVer}
 SetupIconFile={#Src}\assets\icon.ico
-UninstallDisplayIcon={app}\app\assets\icon.ico
+UninstallDisplayIcon={app}\python\DIAP.exe
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
@@ -61,16 +63,16 @@ Source: "{#Src}\tools\*"; DestDir: "{app}\app\tools"; Excludes: "__pycache__,*.p
 Source: "{#Src}\assets\*"; DestDir: "{app}\app\assets"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{autoprograms}\Contour"; Filename: "{app}\python\pythonw.exe"; Parameters: """{app}\app\app.py"""; WorkingDir: "{app}\app"; IconFilename: "{app}\app\assets\icon.ico"; AppUserModelID: "SEWOO.Contour"
-Name: "{autodesktop}\Contour"; Filename: "{app}\python\pythonw.exe"; Parameters: """{app}\app\app.py"""; WorkingDir: "{app}\app"; IconFilename: "{app}\app\assets\icon.ico"; AppUserModelID: "SEWOO.Contour"; Tasks: desktop
+Name: "{autoprograms}\DIAP"; Filename: "{app}\python\DIAP.exe"; Parameters: """{app}\app\app.py"""; WorkingDir: "{app}\app"; IconFilename: "{app}\python\DIAP.exe"; AppUserModelID: "SEWOO.DIAP"
+Name: "{autodesktop}\DIAP"; Filename: "{app}\python\DIAP.exe"; Parameters: """{app}\app\app.py"""; WorkingDir: "{app}\app"; IconFilename: "{app}\python\DIAP.exe"; AppUserModelID: "SEWOO.DIAP"; Tasks: desktop
 
 [Run]
 ; first install: visible console (package download takes a while)
 Filename: "{app}\python\python.exe"; Parameters: """{app}\app\tools\setup_env.py"" --learn {code:LearnFlag}"; WorkingDir: "{app}\app"; StatusMsg: "패키지와 모델을 준비하는 중 (처음엔 5~10분)"; Check: not IsUpdate
 ; update: hidden, packages only when they changed
 Filename: "{app}\python\python.exe"; Parameters: """{app}\app\tools\setup_env.py"" --learn auto"; WorkingDir: "{app}\app"; StatusMsg: "업데이트 마무리 중"; Flags: runhidden; Check: IsUpdate
-Filename: "{app}\python\pythonw.exe"; Parameters: """{app}\app\app.py"""; WorkingDir: "{app}\app"; Description: "Contour 실행"; Flags: nowait postinstall skipifsilent
-Filename: "{app}\python\pythonw.exe"; Parameters: """{app}\app\app.py"""; WorkingDir: "{app}\app"; Flags: nowait runasoriginaluser; Check: IsUpdate
+Filename: "{app}\python\DIAP.exe"; Parameters: """{app}\app\app.py"""; WorkingDir: "{app}\app"; Description: "DIAP 실행"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\python\DIAP.exe"; Parameters: """{app}\app\app.py"""; WorkingDir: "{app}\app"; Flags: nowait runasoriginaluser; Check: IsUpdate
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\python"
@@ -79,6 +81,28 @@ Type: filesandordirs; Name: "{app}\ffmpeg"
 Type: files; Name: "{app}\setup_log.txt"
 
 [Code]
+// 1.8.1 was installed per user under %LOCALAPPDATA%\Programs\Contour: removed once the new copy is in place
+// (projects, presets and learned data live in Documents and are not touched)
+procedure RemoveOldPerUserInstall;
+var
+  Un: String;
+  Code: Integer;
+begin
+  if RegQueryStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{0432DE7E-AD09-4B89-8929-0B95959C384F}_is1',
+                         'UninstallString', Un) then
+  begin
+    Un := RemoveQuotes(Un);
+    if FileExists(Un) then
+      Exec(Un, '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART', '', SW_HIDE, ewWaitUntilTerminated, Code);
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    RemoveOldPerUserInstall;
+end;
+
 function IsUpdate: Boolean;
 begin
   Result := ExpandConstant('{param:UPDATE|0}') = '1';

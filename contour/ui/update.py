@@ -57,7 +57,7 @@ class UpdateDialog(QDialog):
         v = QVBoxLayout(self)
         v.setContentsMargins(22, 20, 22, 18)
         v.setSpacing(10)
-        t = QLabel(f"Contour {rel.version}")
+        t = QLabel(f"DIAP {rel.version}")
         t.setFont(font(18, 600))
         v.addWidget(t)
         s = QLabel(f"지금 버전 {APP_VERSION} · 설치 파일 {rel.size / 1e6:.0f} MB · 프로젝트와 학습 데이터는 그대로 남습니다")
@@ -126,7 +126,7 @@ class UpdateDialog(QDialog):
         self.skip.setEnabled(True)
 
     def _install(self, path):
-        self.msg.setText("설치 파일 확인 완료 (SHA-256). 저장하고 Contour를 닫은 뒤 설치합니다.")
+        self.msg.setText("설치 파일 확인 완료 (SHA-256). 저장하고 DIAP을 닫은 뒤 설치합니다. 설치 중 Windows 권한 확인 창이 뜨면 "예"를 누르세요.")
         self.main.save()
         U.launch_installer(__import__("pathlib").Path(path))
         self.accept()

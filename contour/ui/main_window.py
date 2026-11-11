@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
-from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, QUrl
+from PySide6.QtCore import QEvent, QObject, QSize, Qt, QThread, QTimer, QUrl
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
                                QPushButton, QSplitter, QStackedWidget, QToolButton, QVBoxLayout, QWidget)
@@ -64,7 +64,7 @@ class MainWindow(QMainWindow):
         self.sel_pid: Optional[int] = None
         self.selection: Optional[Tuple[int, int]] = None
         self.tool = "edit"
-        self.accuracy = settings().accuracy if settings().accuracy in ("fast", "high", "max") else "high"
+        self.accuracy = "max"                  # always the most precise analysis (no choice in the UI)
         self.activity = ActivityClock()
         self.job: Optional[Job] = None
         self.undo_stack: List[dict] = []
@@ -86,7 +86,13 @@ class MainWindow(QMainWindow):
         self.cache_timer.start(1500)
         self.autosave = QTimer(self)
         self.autosave.timeout.connect(self._autosave)
-        self.autosave.start(60_000)
+        self.apply_autosave_settings()
+        # Windows shutting down / logging off: save now, nothing to ask
+        try:
+            QApplication.instance().commitDataRequest.connect(self._emergency_save)
+            QApplication.instance().setFallbackSessionManagementEnabled(False)
+        except Exception:
+            pass
         self._filter = _ActivityFilter(self)
         QApplication.instance().installEventFilter(self._filter)
         self.setAcceptDrops(True)
@@ -117,6 +123,7 @@ class MainWindow(QMainWindow):
         self.cutlist.cutSelected.connect(self.open_cut)
         self.cutlist.addRequested.connect(self.add_cuts)
         self.cutlist.action.connect(self._cut_action)
+        self.cutlist.menuRequested.connect(self._cut_menu)
         split.addWidget(self.cutlist)
         center = QWidget()
         cv = QVBoxLayout(center)
@@ -156,9 +163,12 @@ class MainWindow(QMainWindow):
         self.tlstrip = TimelineStrip(self.session)
         self.tlstrip.cutSelected.connect(self.open_cut)
         self.tlstrip.action.connect(self._tl_action)
+        self.tlstrip.menuRequested.connect(self._cut_menu)
         self.tlstrip.hide()
         cv.addWidget(self.tlstrip)
         cv.addWidget(tl_wrap)
+        self.tl_wrap = tl_wrap
+        self.split = split
         self.batch = BatchRunner(self)
         self.batch.before_start = self._batch_before
         self.batch.progressed.connect(self._batch_progress)
@@ -197,7 +207,7 @@ class MainWindow(QMainWindow):
         h = QHBoxLayout(bar)
         h.setContentsMargins(14, 0, 12, 0)
         h.setSpacing(10)
-        mark = QLabel("Contour")
+        mark = QLabel("DIAP")
         mark.setFont(font(15, 700))
         mark.setStyleSheet(f"color: {C['text']}; letter-spacing: 0.2px;")
         h.addWidget(mark)
@@ -209,13 +219,13 @@ class MainWindow(QMainWindow):
         self.proj_btn.clicked.connect(self._project_menu)
         h.addWidget(self.proj_btn)
         h.addStretch(1)
-        self.page_tabs = Wd.Segmented([("edit", "편집"), ("queue", "렌더 큐"), ("dash", "통계"), ("models", "누적 학습")])
-        self.page_tabs.setFixedWidth(380)
+        # statistics and cumulative learning run on their own in the background; no tabs for them
+        self.page_tabs = Wd.Segmented([("edit", "편집"), ("queue", "렌더")])
+        self.page_tabs.setFixedWidth(200)
         self.page_tabs.changed.connect(self._page)
         h.addWidget(self.page_tabs)
         h.addStretch(1)
-        self.saved_lbl = QLabel("")
-        self.saved_lbl.setObjectName("Faint")
+        self.saved_lbl = Wd.SaveIndicator()
         h.addWidget(self.saved_lbl)
         self.dev_lbl = QLabel("")
         self.dev_lbl.setObjectName("Faint")
@@ -250,7 +260,7 @@ class MainWindow(QMainWindow):
         h.addSpacing(6)
         h.addWidget(Wd.vline())
         self.ov = {}
-        for key, ic, tip, on in (("skel", "bone", "스켈레톤  S", True), ("heat", "flame", "변형량 히트맵  H", False),
+        for key, ic, tip, on in (("skel", "bone", "스켈레톤  S", True),
                                  ("matte", "layers", "인물 매트  M", False), ("prot", "shield", "보호 선·영역  P", True),
                                  ("skin", "wand-sparkles", "피부 보정 영역  K", False)):
             b = Wd.tool(ic, tip, checkable=True)
@@ -262,9 +272,15 @@ class MainWindow(QMainWindow):
         self.cs_lbl = QLabel("")
         self.cs_lbl.setObjectName("Faint")
         h.addWidget(self.cs_lbl)
-        fit = Wd.tool("maximize", "화면에 맞추기  F")
+        fit = Wd.tool("maximize", "화면에 맞추기  Z")
         fit.clicked.connect(lambda: self.viewer.fit_view())
         h.addWidget(fit)
+        foc = Wd.tool("columns-2", "보정 탭과 미리보기만  Shift+F")
+        foc.clicked.connect(self.toggle_focus)
+        h.addWidget(foc)
+        full = Wd.tool("expand", "전체 화면  Ctrl+F")
+        full.clicked.connect(self.toggle_fullscreen)
+        h.addWidget(full)
         return w
 
     def _transport(self) -> QWidget:
@@ -294,13 +310,25 @@ class MainWindow(QMainWindow):
             if ic == "play":
                 self.play_btn = b
         h.addStretch(1)
-        prev_i = Wd.button("", "ghost", "chevron-left", "이전 확인 필요 구간  Shift+N")
-        next_i = Wd.button("확인 필요", "ghost", "chevron-right", "다음 확인 필요 구간 (추적 신뢰도 낮음·QC)  N")
-        next_i.setLayoutDirection(Qt.RightToLeft)
+        # one pill: ‹ 확인 필요 ›
+        pill = QWidget()
+        pill.setObjectName("Pill")
+        pill.setAttribute(Qt.WA_StyledBackground, True)
+        pill.setStyleSheet(f"QWidget#Pill {{ background: {C['bg2']}; border: 1px solid {C['line2']}; border-radius: 13px; }}"
+                           "QToolButton { border: none; padding: 2px; }")
+        pl = QHBoxLayout(pill)
+        pl.setContentsMargins(4, 0, 4, 0)
+        pl.setSpacing(2)
+        prev_i = Wd.tool("chevron-left", "이전 확인 필요 구간 (추적 신뢰도 낮음)", size=14)
+        next_i = Wd.tool("chevron-right", "다음 확인 필요 구간 (추적 신뢰도 낮음)", size=14)
+        lab_i = Wd.label("확인 필요", "Muted", 11, 500)
         prev_i.clicked.connect(lambda: self.next_issue(-1))
         next_i.clicked.connect(lambda: self.next_issue(1))
-        h.addWidget(prev_i)
-        h.addWidget(next_i)
+        pl.addWidget(prev_i)
+        pl.addWidget(lab_i)
+        pl.addWidget(next_i)
+        pill.setFixedHeight(26)
+        h.addWidget(pill)
         self.edit_busy = QLabel("")
         self.edit_busy.setObjectName("Faint")
         self.edit_busy.setMinimumWidth(90)
@@ -322,22 +350,24 @@ class MainWindow(QMainWindow):
         sc("End", lambda: self.set_frame((self.session.cut.work_range[1] - 1) if self.session.cut else 0))
         sc("I", lambda: self.set_in_out("in"))
         sc("O", lambda: self.set_in_out("out"))
-        sc("N", lambda: self.next_issue(1))
-        sc("Shift+N", lambda: self.next_issue(-1))
         sc("\\", self._ab)
         sc("S", lambda: self.ov["skel"].toggle())
-        sc("H", lambda: self.ov["heat"].toggle())
         sc("M", lambda: self.ov["matte"].toggle())
         sc("P", lambda: self.ov["prot"].toggle())
         sc("K", lambda: self.ov["skin"].toggle())
         sc("V", lambda: self.set_tool("edit"))
         sc("L", lambda: self.set_tool("line"))
-        sc("F", lambda: self.viewer.fit_view())
+        sc("Z", lambda: self.viewer.fit_view())
+        sc("Ctrl+F", self.toggle_fullscreen)
+        sc("Shift+F", self.toggle_focus)
+        sc("Ctrl+C", self.copy_cut_settings)
+        sc("Ctrl+V", self.paste_cut_settings)
+        sc("Alt+V", self.paste_cut_settings_pick)
         sc("Ctrl+S", self.save)
         sc("Ctrl+Z", self.undo)
         sc("Ctrl+Shift+Z", self.redo)
         sc("Ctrl+Y", self.redo)
-        sc("Escape", lambda: self.set_tool("edit"))
+        sc("Escape", lambda: self.toggle_fullscreen() if self.isFullScreen() else self.set_tool("edit"))
         sc("Up", lambda: self.step_cut(-1))
         sc("Down", lambda: self.step_cut(1))
 
@@ -495,20 +525,52 @@ class MainWindow(QMainWindow):
         self.tlstrip.refresh()
         self.proj_btn.setText("프로젝트 없음")
 
-    def save(self):
+    def save(self, quiet: bool = False):
         if self.session.project is None:
             return
+        if not quiet:
+            self.saved_lbl.start("저장 중")
         self.activity.flush()
         try:
             self.session.save()
             self._collect_learning()
-            self.saved_lbl.setText(f"저장됨 {time.strftime('%H:%M')}")
+            self.saved_lbl.done(f"저장됨 {time.strftime('%H:%M')}")
         except Exception as e:
+            self.saved_lbl.done("저장 실패")
             self.show_error("저장 실패", f"{e}\n{traceback.format_exc()}")
 
+    def apply_autosave_settings(self):
+        s = settings()
+        if getattr(s, "autosave", True):
+            self.autosave.start(max(1, int(getattr(s, "autosave_minutes", 5))) * 60_000)
+        else:
+            self.autosave.stop()
+
     def _autosave(self):
-        if self.session.dirty and self.job is None:
-            self.save()
+        """Saves the project and keeps the last N saved states in <project>/autosave (to step back to)."""
+        if not (self.session.dirty and self.job is None and self.session.project is not None):
+            return
+        prj = self.session.project
+        try:
+            d = Path(prj.path) / "autosave"
+            d.mkdir(exist_ok=True)
+            f = Path(prj.path) / "project.json"
+            if f.exists():
+                (d / f"project_{time.strftime('%Y%m%d_%H%M%S')}.json").write_bytes(f.read_bytes())
+            keep = max(1, int(getattr(settings(), "autosave_keep", 10)))
+            old = sorted(d.glob("project_*.json"))
+            for x in old[:-keep]:
+                x.unlink()
+        except OSError:
+            pass
+        self.save(quiet=True)
+
+    def _emergency_save(self, *_):
+        try:
+            if self.session.project is not None and self.session.dirty:
+                self.session.save()
+        except Exception:
+            pass
 
     def _collect_learning(self, force: bool = False):
         s = self.session
@@ -677,7 +739,26 @@ class MainWindow(QMainWindow):
             if st is not None and not (st.has_vis and st.has_face):
                 self.toast("이전 버전에서 분석한 컷입니다. 가려진 관절 판정과 얼굴·피부 보정을 쓰려면 다시 분석하세요.",
                            kind="warn")
+            elif tr is not None and st is not None and st.has_face:
+                self._ensure_facelayer(tr)
         self._refresh_all()
+
+    def _ensure_facelayer(self, tr):
+        """Cuts analysed before 1.9 have no face layer (parsing, steady skin colour): build it once, in the
+        background; the masks use it from then on."""
+        from ..track import facelayer as FL, faceparse as FP
+        if not FP.available() or FL.path_for(tr).exists() or getattr(tr, "_facelayer_building", False):
+            return
+        tr._facelayer_building = True
+
+        def work():
+            try:
+                FL.build(tr)
+            finally:
+                tr._facelayer_building = False
+            tr.__dict__.pop("_steady_lru", None)
+            self.session._mask_cache = {}
+        self.edit_worker.submit(("facelayer", -1), work)
 
     def build_proxy(self):
         s = self.session
@@ -689,14 +770,25 @@ class MainWindow(QMainWindow):
         s.tracker = None
         self.viewer._img_cache.clear()
         self.viewer.update()
-        px = s.make_proxy(cut)
+        if not self._ask_proxy_size():
+            self.viewer.message = "프록시를 만들지 않았습니다. 컷을 다시 누르면 만들 수 있습니다."
+            self.viewer.update()
+            return
         vs = s.view_settings(cut)
         cm = manager()
+        prj = s.project
+        bake = bool(cut.tl and (prj.timeline or {}).get("baked") and Path(prj.timeline["baked"]).exists())
 
         def work(progress, cancelled):
-            ok = px.build(cm, vs, progress, cancelled)
-            if not ok:
-                from ..track.analyze import Cancelled
+            from ..track.analyze import Cancelled
+            if bake:
+                # one proxy for the whole bake, shared by every shot (made once, then each shot opens at once)
+                from ..core.tlimport import build_bake_proxy
+                if not build_bake_proxy(prj, cm, vs, progress, cancelled):
+                    raise Cancelled()
+                return None
+            px = s.make_proxy(cut)
+            if not px.build(cm, vs, progress, cancelled):
                 raise Cancelled()
             return px
 
@@ -704,7 +796,265 @@ class MainWindow(QMainWindow):
             s.open_cut(cut)
             self._after_open()
 
-        self.run_job("프록시 만드는 중", work, done)
+        self.run_job("편집 타임라인 프록시 만드는 중 (한 번만)" if bake else "프록시 만드는 중", work, done)
+
+    def _ask_proxy_size(self) -> bool:
+        """Once per project and app session (when footage first needs a proxy): which proxy resolution."""
+        st = settings()
+        prj = self.session.project
+        key = prj.path if prj else ""
+        asked = getattr(self, "_proxy_asked", set())
+        if not getattr(st, "ask_proxy", True) or key in asked:
+            return True
+        from .dialogs import ProxySizeDialog
+        dlg = ProxySizeDialog(self, st.proxy_long_side)
+        if dlg.exec() != QDialog.Accepted:
+            return False
+        st.proxy_long_side = dlg.size()
+        if dlg.dont_ask():
+            st.ask_proxy = False
+        st.save()
+        asked.add(key)
+        self._proxy_asked = asked
+        return True
+
+    # ================================================================== cut menu (cut list and timeline)
+    def _sel_cut_ids(self) -> list:
+        ids = self.cutlist.selected_ids() if self.cutlist.isVisible() else []
+        if not ids and self.tlstrip.isVisible():
+            ids = self.tlstrip.selected_ids()
+        if not ids and self.session.cut is not None:
+            ids = [self.session.cut.id]
+        return ids
+
+    def _cut_menu(self, ids: list, gpos):
+        from ..core import workstate as WS
+        prj = self.session.project
+        if prj is None or not ids:
+            return
+        cuts = [c for c in (prj.cut(i) for i in ids) if c is not None]
+        if not cuts:
+            return
+        n = len(cuts)
+        tag = f" ({n}컷)" if n > 1 else ""
+        m = QMenu(self)
+        acts = {}
+        states = {WS.state(c) for c in cuts}
+        if states != {"done"}:
+            acts[m.addAction(I.icon("check", 14, C["ok"]), "작업 완료로 표시" + tag)] = "work:done"
+        if "done" in states:
+            acts[m.addAction("작업 중으로 되돌리기" + tag)] = "work:"
+        if states != {"skip"}:
+            acts[m.addAction("작업 불필요로 지정" + tag)] = "work:skip"
+        if "skip" in states:
+            acts[m.addAction("작업 필요로 되돌리기" + tag)] = "work:"
+        m.addSeparator()
+        c0 = cuts[0]
+        if n == 1:
+            acts[m.addAction(f"버전 올리기 (v{c0.version} → v{c0.version + 1})")] = "ver:up"
+            older = sorted(int(v) for v in c0.versions if int(v) < c0.version)
+            a = m.addAction(f"이전 버전으로 (v{older[-1]})" if older else "이전 버전 없음")
+            a.setEnabled(bool(older))
+            acts[a] = "ver:back"
+        else:
+            acts[m.addAction(f"버전 올리기{tag}")] = "ver:up"
+        m.addSeparator()
+        acts[m.addAction("보정값 복사  Ctrl+C")] = "copy"
+        a = m.addAction("보정값 붙여넣기  Ctrl+V" + tag)
+        a.setEnabled(getattr(self, "_copied", None) is not None)
+        acts[a] = "paste"
+        a = m.addAction("골라서 붙여넣기…  Alt+V" + tag)
+        a.setEnabled(getattr(self, "_copied", None) is not None)
+        acts[a] = "paste_pick"
+        m.addSeparator()
+        acts[m.addAction("선택 컷 분석" + tag)] = "analyze"
+        acts[m.addAction("렌더 큐에 추가" + tag)] = "render"
+        if any(c.tl for c in cuts):
+            acts[m.addAction("검수 완료 표시" + tag)] = "reviewed:1"
+        if n == 1:
+            m.addSeparator()
+            acts[m.addAction("이름 바꾸기")] = "rename"
+            acts[m.addAction("원본 파일 위치 열기")] = "reveal"
+            if not c0.tl:
+                acts[m.addAction("프로젝트에서 제거")] = "remove"
+        a = m.exec(gpos)
+        if a not in acts:
+            return
+        act = acts[a]
+        if act.startswith("work:"):
+            self.push_undo()
+            for c in cuts:
+                WS.set_state(c, act[5:])
+            self.session.dirty = True
+            self._after_status_change()
+            self.toast(f"{n}컷: {WS.LABEL.get(act[5:], '작업 상태 자동')}" if act[5:] else f"{n}컷: 작업 상태를 되돌렸습니다", "ok")
+        elif act == "ver:up":
+            for c in cuts:
+                WS.version_up(c)
+            self.session.dirty = True
+            self._after_status_change()
+            self.toast("버전을 올렸습니다: " + ", ".join(f"{c.name} v{c.version}" for c in cuts[:4])
+                       + (" …" if n > 4 else "") + " (작업 내용은 그대로 이어집니다)", "ok")
+        elif act == "ver:back":
+            v = WS.version_back(c0)
+            self.session.dirty = True
+            if self.session.cut is c0:
+                self.session.touch("all")
+                self.viewer._img_cache.clear()
+            self._after_status_change()
+            self._refresh_all()
+            self.toast(f"{c0.name}: v{v}로 돌아갔습니다", "ok")
+        elif act == "copy":
+            self.copy_cut_settings(c0.id)
+        elif act == "paste":
+            self.paste_cut_settings([c.id for c in cuts])
+        elif act == "paste_pick":
+            self.paste_cut_settings_pick([c.id for c in cuts])
+        elif act == "analyze":
+            if any(c.tl for c in cuts):
+                self._tl_action("analyze_force", [c.id for c in cuts])
+            elif n == 1:
+                if self.session.cut is None or self.session.cut.id != c0.id:
+                    self.open_cut(c0.id)
+                self.run_analysis()
+        elif act == "render":
+            self.save()
+            for c in cuts:
+                self.queue_page.add(prj, c)
+            self.toast(f"{n}컷을 렌더 큐에 추가했습니다.")
+        elif act.startswith("reviewed:"):
+            self._tl_action(act, [c.id for c in cuts])
+        else:
+            self._cut_action(act, c0.id)
+
+    def _after_status_change(self):
+        cid = self.session.cut.id if self.session.cut else None
+        self.cutlist.refresh(cid)
+        self.tlstrip.refresh()
+        self.tlstrip.set_current(cid)
+
+    # ---- copy / paste of retouch values between cuts
+    def copy_cut_settings(self, cid: Optional[str] = None):
+        prj = self.session.project
+        if prj is None:
+            return
+        cid = cid or (self._sel_cut_ids() or [None])[0]
+        c = prj.cut(cid) if cid else None
+        if c is None:
+            return
+        self._copied = (c.id, self.frame if (self.session.cut is c) else c.work_range[0])
+        self.toast(f"보정값 복사: {c.name}  (Ctrl+V 붙여넣기 · Alt+V 골라서)", "ok")
+
+    def _map_people(self, src, dst) -> dict:
+        """dst person -> src person: the same member when the cuts are linked, else by appearance, else by size."""
+        from ..core.copyset import suggest_mapping
+        out = {}
+        by_member = {getattr(q, "member", ""): q.id for q in src.persons if getattr(q, "member", "")}
+        for q in dst.persons:
+            mem = getattr(q, "member", "")
+            if mem and mem in by_member:
+                out[q.id] = by_member[mem]
+        rest = [q for q in dst.persons if q.id not in out]
+        if rest:
+            try:
+                sug = suggest_mapping(src, dst)
+            except Exception:
+                sug = {}
+            used = set(out.values())
+            for q in rest:
+                sp = sug.get(q.id)
+                if sp is not None and sp not in used:
+                    out[q.id] = sp
+                    used.add(sp)
+        # still unmatched: pair the remaining people in order (a single-person cut always gets the source's
+        # main person)
+        left_src = [q.id for q in src.persons if q.id not in set(out.values())] or [q.id for q in src.persons][:1]
+        for q in dst.persons:
+            if q.id not in out and left_src:
+                out[q.id] = left_src.pop(0) if len(left_src) > 1 else left_src[0]
+        return out
+
+    def _paste(self, ids: list, keys: Optional[set]):
+        from ..core.copyset import CopyOptions, apply_copy
+        prj = self.session.project
+        cp = getattr(self, "_copied", None)
+        if prj is None or cp is None:
+            self.toast("먼저 Ctrl+C로 보정값을 복사하세요", "warn")
+            return
+        src = prj.cut(cp[0])
+        if src is None:
+            return
+        dsts = [c for c in (prj.cut(i) for i in ids) if c is not None and c.id != src.id]
+        if not dsts:
+            return
+        self.push_undo()
+        n_people = 0
+        for dst in dsts:
+            mapping = self._map_people(src, dst)
+            if keys is None:
+                apply_copy(src, dst, mapping, cp[1], CopyOptions(amounts=True, widths=True, mode=True, protect=True,
+                                                                 roles=False))
+            else:
+                for dpid, spid in mapping.items():
+                    sp = src.params_for(spid).copy_static(cp[1])
+                    dp = dst.params_for(dpid)
+                    for k in keys:
+                        if k in sp.amounts:
+                            dp.amounts[k] = sp.amounts[k]
+                        elif k == "__strength__":
+                            dp.strength = sp.strength
+                        elif hasattr(sp, k):
+                            setattr(dp, k, getattr(sp, k))
+            n_people += len(mapping)
+            if not dst.analyzed:
+                dst.pending_copy = dict(src=src.id, frame=cp[1], keys=sorted(keys) if keys else None)
+        self.session.dirty = True
+        if self.session.cut is not None and any(d is self.session.cut for d in dsts):
+            self.session.touch("all")
+            self.viewer._img_cache.clear()
+        self._after_status_change()
+        self._refresh_all()
+        self.toast(f"{src.name}의 보정값을 {len(dsts)}컷에 붙여넣었습니다" + (f" ({len(keys)}개 항목)" if keys else ""), "ok")
+
+    def paste_cut_settings(self, ids: Optional[list] = None):
+        self._paste(ids or self._sel_cut_ids(), None)
+
+    def paste_cut_settings_pick(self, ids: Optional[list] = None):
+        from .dialogs import PastePickDialog
+        prj = self.session.project
+        cp = getattr(self, "_copied", None)
+        if prj is None or cp is None or prj.cut(cp[0]) is None:
+            self.toast("먼저 Ctrl+C로 보정값을 복사하세요", "warn")
+            return
+        dlg = PastePickDialog(self, prj.cut(cp[0]), cp[1])
+        if not dlg.items:
+            self.toast("복사한 컷에서 바뀐 보정값이 없습니다", "warn")
+            return
+        if dlg.exec() == QDialog.Accepted and dlg.selected():
+            self._paste(ids or self._sel_cut_ids(), set(dlg.selected()))
+
+    # ---- view layouts
+    def toggle_fullscreen(self):
+        if self.isFullScreen():
+            self.showNormal()
+            if getattr(self, "_was_max", False):
+                self.showMaximized()
+        else:
+            self._was_max = self.isMaximized()
+            self.showFullScreen()
+
+    def toggle_focus(self):
+        """Only the preview and the adjustment panel (cut list, timeline strip and timeline hidden)."""
+        on = not getattr(self, "_focus", False)
+        self._focus = on
+        self.cutlist.setVisible(not on)
+        self.tl_wrap.setVisible(not on)
+        if on:
+            self._strip_was = self.tlstrip.isVisible()
+            self.tlstrip.setVisible(False)
+        else:
+            self.tlstrip.setVisible(getattr(self, "_strip_was", False))
+        QTimer.singleShot(0, self.viewer.fit_view)
 
     def _cut_action(self, action: str, cid: str):
         prj = self.session.project
@@ -773,7 +1123,7 @@ class MainWindow(QMainWindow):
 
         self.job.succeeded.connect(ok)
         self.job.failed.connect(fail)
-        self.job.start()
+        self.job.start(QThread.LowPriority)       # the UI stays responsive while it works
 
     def _cancel_job(self):
         if self.job:
@@ -941,6 +1291,24 @@ class MainWindow(QMainWindow):
                 self.toast("분석할 컷이 없습니다 (이미 분석했거나 인물 없음)")
                 return
             self.save()
+            # the bake's shared proxy first (one decode), then every shot's analysis reads from it
+            from ..core.tlimport import bake_proxy, build_bake_proxy, link_bake_proxy
+            tlm = prj.timeline or {}
+            if tlm.get("baked") and Path(tlm["baked"]).exists() and bake_proxy(prj) is None and self.job is None:
+                if not self._ask_proxy_size():
+                    return
+                cm = manager()
+                vs = self.session.view_settings(todo[0])
+
+                def work(progress, cancelled):
+                    from ..track.analyze import Cancelled
+                    if not build_bake_proxy(prj, cm, vs, progress, cancelled):
+                        raise Cancelled()
+
+                self.run_job("편집 타임라인 프록시 만드는 중 (한 번만)", work,
+                             lambda _: self._tl_action("analyze_force", [c.id for c in todo]))
+                return
+            link_bake_proxy(prj)
             run = {c.id: -1.0 for c in todo}
             self.tlstrip.set_running(run, f"분석 대기 {len(todo)}컷")
             self.batch.start(prj.path, [c.id for c in todo], self.accuracy, True)
@@ -1026,7 +1394,7 @@ class MainWindow(QMainWindow):
                            f"· 확인 후 다시 '검수'를 누르면 검수 완료로 표시하고 다음 컷으로 갑니다 (남은 {len(rest)}컷)")
             else:
                 self.toast("모든 컷 검수 완료", "ok")
-        elif action in ("export", "export_sel"):
+        elif action in ("export", "export_sel", "export_full"):
             from .tldialogs import TimelineExportDialog
             if not cuts:
                 self.toast("타임라인이 없습니다. 편집 타임라인을 먼저 불러오세요.", "warn")
@@ -1034,7 +1402,10 @@ class MainWindow(QMainWindow):
             if self.batch.busy:
                 self.toast("일괄 분석이 끝난 뒤 내보내는 것이 안전합니다 (분석 중인 컷은 원본으로 들어갑니다)", "warn")
             self.save()
-            dlg = TimelineExportDialog(self, prj, [c.id for c in sel] if sel else None, self._last_export)
+            last = dict(self._last_export or {})
+            if action == "export_full":
+                last["mode"] = "full"
+            dlg = TimelineExportDialog(self, prj, [c.id for c in sel] if (sel and action == "export_sel") else None, last)
             if dlg.exec() != QDialog.Accepted:
                 return
             exp = dlg.export()
@@ -1262,8 +1633,18 @@ class MainWindow(QMainWindow):
             return
         src = self.session.project.cut(pc.get("src", ""))
         if src is not None:
-            mapping = suggest_mapping(src, cut)
-            apply_copy(src, cut, mapping, int(pc.get("frame", 0)), CopyOptions(**pc.get("opt", {})))
+            if "opt" in pc:
+                mapping = suggest_mapping(src, cut)
+                apply_copy(src, cut, mapping, int(pc.get("frame", 0)), CopyOptions(**pc.get("opt", {})))
+            else:
+                # Ctrl+V / Alt+V onto a cut that was not analysed yet: same paste now that its people are known
+                cut.pending_copy = {}
+                keep = getattr(self, "_copied", None)
+                self._copied = (src.id, int(pc.get("frame", 0)))
+                try:
+                    self._paste([cut.id], set(pc["keys"]) if pc.get("keys") else None)
+                finally:
+                    self._copied = keep
         cut.pending_copy = {}
 
     def rebuild_matte(self):
@@ -1503,6 +1884,33 @@ class MainWindow(QMainWindow):
 
     # ================================================================== people
     def select_person(self, pid: int):
+        """Shift+click adds the person to the selection: they get the selected person's values, and every
+        change from then on goes to all selected people."""
+        cut = self.session.cut
+        sel = set(getattr(self, "sel_pids", set()) or set())
+        if QApplication.keyboardModifiers() & Qt.ShiftModifier and self.sel_pid is not None and cut is not None:
+            if pid in sel and pid != self.sel_pid:
+                sel.discard(pid)
+                self.sel_pids = sel
+                self.inspector.refresh()
+                return
+            if pid != self.sel_pid:
+                self.push_undo()
+                src = cut.params_for(self.sel_pid).copy_static(self.frame)
+                dst = cut.params_for(pid)
+                for k in ("amounts", "strength", "skin_detail", "skin_scope", "grain_size", "blemish_size", "feather"):
+                    setattr(dst, k, getattr(src, k) if k != "amounts" else {kk: c for kk, c in src.amounts.items()})
+                q = cut.person(pid)
+                if q is not None and q.role != "target":
+                    q.role = "target"
+                sel |= {self.sel_pid, pid}
+                self.sel_pids = sel
+                self.session.touch("all")
+                self.viewer.update()
+                self.inspector.refresh()
+                self.toast(f"{len(sel)}명에게 같은 보정값을 적용합니다 (Shift+클릭으로 빼기)", "ok")
+                return
+        self.sel_pids = {pid}
         self.sel_pid = pid
         self.viewer.sel_pid = pid
         self.timeline.sel_pid = pid
@@ -1690,7 +2098,7 @@ class MainWindow(QMainWindow):
             sub.addSeparator()
             sub.addAction("이 인물에 적용", lambda d=d: self.preset_apply(d, "person"))
             if cut is not None and len(cut.targets()) > 1:
-                sub.addAction("이 컷의 보정 대상 모두에 적용", lambda d=d: self.preset_apply(d, "cut"))
+                sub.addAction("이 컷의 보정 인물 모두에 적용", lambda d=d: self.preset_apply(d, "cut"))
             sub.addSeparator()
             sub.addAction("삭제", lambda n=name: self.preset_delete(n))
         m.exec(anchor.mapToGlobal(anchor.rect().bottomLeft()))
@@ -1719,7 +2127,7 @@ class MainWindow(QMainWindow):
         self.session.interactive = False
         self.session.touch("all")
         self._refresh_all()
-        self.toast(f"프리셋 '{d.get('name', '')}'을(를) {'이 인물' if scope == 'person' else f'보정 대상 {len(pids)}명'}에 적용했습니다.",
+        self.toast(f"프리셋 '{d.get('name', '')}'을(를) {'이 인물' if scope == 'person' else f'보정 인물 {len(pids)}명'}에 적용했습니다.",
                    kind="ok")
 
     def preset_save_dialog(self):
@@ -1892,6 +2300,14 @@ class MainWindow(QMainWindow):
             return None
         return cut.params_for(self.sel_pid)
 
+    def _others(self) -> list:
+        """Params of the other people selected with Shift+click (they follow every change)."""
+        cut = self.session.cut
+        sel = getattr(self, "sel_pids", set()) or set()
+        if cut is None:
+            return []
+        return [cut.params_for(p) for p in sel if p != self.sel_pid and cut.person(p) is not None]
+
     @staticmethod
     def _kind_of(part: str) -> str:
         from ..core.params import PARAM
@@ -1906,6 +2322,8 @@ class MainWindow(QMainWindow):
             self.push_undo(coalesce=f"param:{self.sel_pid}:{part}")
         c = pp.strength if part == "__strength__" else pp.amounts[part]
         c.set_at(self.frame, v)
+        for op in self._others():
+            (op.strength if part == "__strength__" else op.amounts[part]).set_at(self.frame, v)
         self.session.interactive = not committed
         self.session.touch(self._kind_of(part))
         self.viewer.update()
@@ -1944,6 +2362,8 @@ class MainWindow(QMainWindow):
         if committed:
             self.push_undo(coalesce=f"feather:{self.sel_pid}")
         pp.feather = float(v)
+        for op in self._others():
+            op.feather = float(v)
         self.session.interactive = not committed
         self.session.touch("all" if committed else "geo")
         self.viewer.update()
@@ -1954,14 +2374,15 @@ class MainWindow(QMainWindow):
             return
         if committed:
             self.push_undo(coalesce=f"skin:{self.sel_pid}:{what}")
-        if what == "detail":
-            pp.skin_detail = float(v)
-        elif what == "grain_size":
-            pp.grain_size = float(v)
-        elif what == "blemish_size":
-            pp.blemish_size = float(v)
-        elif what == "scope":
-            pp.skin_scope = v
+        for q in [pp] + self._others():
+            if what == "detail":
+                q.skin_detail = float(v)
+            elif what == "grain_size":
+                q.grain_size = float(v)
+            elif what == "blemish_size":
+                q.blemish_size = float(v)
+            elif what == "scope":
+                q.skin_scope = v
         self.session.interactive = not committed
         self.session.touch("ret")
         self.viewer.update()
@@ -2544,6 +2965,25 @@ class MainWindow(QMainWindow):
             self.busy.setGeometry(self.center.rect())
 
     def closeEvent(self, e):
+        if self.session.project is not None and self.session.dirty and not getattr(self, "_close_decided", False):
+            m = QMessageBox(self)
+            m.setWindowTitle("DIAP")
+            m.setIcon(QMessageBox.Question)
+            m.setText("저장하지 않은 변경 사항이 있습니다.")
+            m.setInformativeText("저장하고 닫을까요?")
+            b_save = m.addButton("저장하고 닫기", QMessageBox.AcceptRole)
+            b_no = m.addButton("저장 안 하고 닫기", QMessageBox.DestructiveRole)
+            m.addButton("취소", QMessageBox.RejectRole)
+            m.setDefaultButton(b_save)
+            m.exec()
+            if m.clickedButton() is b_save:
+                self.save()
+            elif m.clickedButton() is b_no:
+                self.session.dirty = False
+                self._discard_on_close = True
+            else:
+                e.ignore()
+                return
         if self.queue_page.job is not None:
             if QMessageBox.question(self, "렌더 중", "렌더가 진행 중입니다. 종료하면 현재 렌더는 취소됩니다. 종료할까요?") != QMessageBox.Yes:
                 e.ignore()
@@ -2559,7 +2999,8 @@ class MainWindow(QMainWindow):
             self.job.cancel()
             self.job.wait(5000)
         self.stop_play()
-        self.save()
+        if not getattr(self, "_discard_on_close", False):
+            self.save(quiet=True)
         self.activity.flush()
         self.edit_worker.stop()
         self.edit_worker.wait(3000)

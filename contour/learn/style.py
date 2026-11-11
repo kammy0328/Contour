@@ -286,8 +286,29 @@ def _still(path: str, W: int, H: int) -> np.ndarray:
     mx = 65535.0 if im.dtype == np.uint16 else 255.0
     rgb = cv2.cvtColor(im, cv2.COLOR_BGR2RGB).astype(np.float32) / mx
     if rgb.shape[:2] != (H, W):
-        raise StyleError(f"레퍼런스 이미지 크기가 다릅니다 ({rgb.shape[1]}x{rgb.shape[0]} / {W}x{H})")
+        h0, w0 = rgb.shape[:2]
+        if abs(w0 / h0 - W / H) > 0.01 * (W / H):
+            raise StyleError(f"레퍼런스 이미지 비율이 다릅니다 ({w0}x{h0} / {W}x{H})")
+        # a smaller export of the same frame (a 1080p still of a 4K shot): brought up to size here, and the
+        # comparison puts our own result through the same down-and-up scaling (see _degrader)
+        rgb = cv2.resize(rgb, (W, H), interpolation=cv2.INTER_CUBIC if w0 < W else cv2.INTER_AREA)
+        _STILL_SCALE[path] = w0 / W
     return rgb
+
+
+_STILL_SCALE: dict = {}
+
+
+def _degrader(scale: Optional[float]):
+    """Same loss of detail as the reference still had (exported smaller than the footage), or nothing."""
+    if not scale or scale >= 0.98:
+        return lambda x: x
+
+    def f(x):
+        h, w = x.shape[:2]
+        sm = cv2.resize(x, (max(1, int(round(w * scale))), max(1, int(round(h * scale)))), interpolation=cv2.INTER_AREA)
+        return cv2.resize(sm, (w, h), interpolation=cv2.INTER_CUBIC)
+    return f
 
 
 def find_still_frame(cut, path: str, progress: Callable = None) -> Tuple[int, float]:
@@ -343,6 +364,7 @@ def fit_pair(cut, tracker, after_path: str, progress: Callable = None, cancelled
     mtx = R._matrix_name(info)
     rgb = lambda pl: M.yuv_to_rgb(pl, layout, mtx, info.color_range)
 
+    deg = _degrader(_STILL_SCALE.get(after_path) if still is not None else None)
     if still is not None:
         picks = _pick_at(st, int(at_frame))
     else:
@@ -355,7 +377,7 @@ def fit_pair(cut, tracker, after_path: str, progress: Callable = None, cancelled
         pl = _read(info, t, pf)
         if pl is None:
             continue
-        o = rgb(pl)
+        o = deg(rgb(pl))
         lm = st.face[p, t]
         f = lm[:, :2]
         c = f.mean(0)
@@ -432,7 +454,7 @@ def fit_pair(cut, tracker, after_path: str, progress: Callable = None, cancelled
             else:
                 out = RE.apply_planes([x.copy() for x in fr["planes"]], layout.subsample, layout.max_value, pf, rf, 1.0)
             x0, y0, x1, y1 = fr["box"]
-            b = apply_grade(fr["G"], rgb(out)[y0:y1, x0:x1])
+            b = apply_grade(fr["G"], deg(rgb(out)[y0:y1, x0:x1]))
             a, m = fr["a"], fr["m"]
             dl = cv2.GaussianBlur((b - a) @ K, (0, 0), 3)
             E.append(float(np.sqrt((dl[m] ** 2).mean())) * 1000)

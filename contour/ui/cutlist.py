@@ -4,9 +4,9 @@ from __future__ import annotations
 from typing import Dict, Optional
 
 import numpy as np
-from PySide6.QtCore import QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QPoint, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import (QAbstractItemView, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMenu,
+from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMenu,
                                QStyle, QStyledItemDelegate, QVBoxLayout, QWidget)
 
 from . import widgets as Wd
@@ -59,7 +59,7 @@ class _Delegate(QStyledItemDelegate):
         p.drawText(QRectF(x, r.top() + 8, r.right() - x, 18), Qt.AlignLeft | Qt.AlignVCenter, name)
         info = cut.info
         dur = info.frames / max(1e-6, info.fps)
-        meta = f"{info.width}×{info.height} · {int(dur // 60)}:{int(dur % 60):02d} · {info.frames}f"
+        meta = f"{info.width}×{info.height} · {int(dur // 60)}:{int(dur % 60):02d} · {info.frames}f · v{getattr(cut, 'version', 1)}"
         p.setFont(font(11, 400, tabular=True))
         p.setPen(qc("text3"))
         p.drawText(QRectF(x, r.top() + 27, r.right() - x, 16), Qt.AlignLeft | Qt.AlignVCenter, meta)
@@ -76,6 +76,14 @@ class _Delegate(QStyledItemDelegate):
         p.drawRoundedRect(pr, 9, 9)
         p.setPen(c)
         p.drawText(pr, Qt.AlignCenter, status)
+        # tracking needs a look (automatic check): a small amber note after the pill
+        from ..core import workstate as WS
+        if ((cut.status or {}).get("auto") == "bad" and not (cut.status or {}).get("reviewed")
+                and WS.state(cut) not in ("skip", "done")):
+            p.setPen(qc("warn"))
+            p.setFont(font(10, 500))
+            p.drawText(QRectF(pr.right() + 6, pr.top(), r.right() - pr.right() - 6, 18), Qt.AlignLeft | Qt.AlignVCenter,
+                       "추적 확인")
         p.restore()
 
 
@@ -83,6 +91,7 @@ class CutList(QWidget):
     cutSelected = Signal(str)
     addRequested = Signal()
     action = Signal(str, str)        # action, cut id
+    menuRequested = Signal(list, QPoint)   # selected cut ids, global position
 
     def __init__(self, session, parent=None):
         super().__init__(parent)
@@ -105,11 +114,18 @@ class CutList(QWidget):
         head.addStretch(1)
         head.addWidget(add)
         lay.addLayout(head)
+        from ..core.workstate import STATES
+        self.filter = QComboBox()
+        self.filter.addItem("전체", "")
+        for k, lab in STATES:
+            self.filter.addItem(lab, k)
+        self.filter.currentIndexChanged.connect(lambda _: self.refresh(self._current_id()))
+        lay.addWidget(self.filter)
         self.list = QListWidget()
         self.list.setItemDelegate(_Delegate(self))
         self.list.setStyleSheet("QListWidget { background: transparent; border: none; } QListWidget::item { border: none; }")
         self.list.setMouseTracking(True)
-        self.list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.list.setSelectionMode(QAbstractItemView.ExtendedSelection)     # Shift: range, Ctrl: add
         self.list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.list.currentItemChanged.connect(self._changed)
         self.list.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -122,24 +138,16 @@ class CutList(QWidget):
         self._block = False
 
     def status_of(self, cut):
-        if cut.tl:
-            from ..track import status as ST
-            from .tlstrip import STATUS_COL
-            k = ST.effective(cut)
-            lab = ST.LABEL.get(k, k) + (" · 검수" if (cut.status or {}).get("reviewed") else "")
-            return lab, STATUS_COL.get(k, C["text2"])
-        open_err = [q for q in cut.qc if q.status == "open" and q.severity == "error"]
-        open_warn = [q for q in cut.qc if q.status == "open"]
-        if cut.stats.renders > 0 and not open_err:
-            return "렌더 완료", C["ok"]
-        if open_err:
-            return f"QC 오류 {len(open_err)}", C["error"]
-        if open_warn:
-            return f"QC 확인 {len(open_warn)}", C["warn"]
-        if cut.analyzed:
-            n_t = len(cut.targets())
-            return (f"분석 완료 · 대상 {n_t}명" if n_t else "분석 완료"), C["text2"]
-        return "분석 전", C["text3"]
+        from ..core import workstate as WS
+        k = WS.state(cut)
+        return WS.LABEL[k], WS.COLOR[k]
+
+    def _current_id(self) -> Optional[str]:
+        it = self.list.currentItem()
+        return it.data(Qt.UserRole).id if it is not None else None
+
+    def selected_ids(self):
+        return [it.data(Qt.UserRole).id for it in self.list.selectedItems()]
 
     def set_thumb(self, cut_id: str, rgb: Optional[np.ndarray]):
         if rgb is None:
@@ -153,6 +161,11 @@ class CutList(QWidget):
         self.list.clear()
         prj = self.s.project
         cuts = prj.cuts if prj else []
+        allc = len(cuts)
+        f = self.filter.currentData() if hasattr(self, "filter") else ""
+        if f:
+            from ..core import workstate as WS
+            cuts = [c for c in cuts if WS.state(c) == f]
         for c in cuts:
             it = QListWidgetItem()
             it.setData(Qt.UserRole, c)
@@ -160,9 +173,9 @@ class CutList(QWidget):
             self.list.addItem(it)
             if c.id == current_id:
                 self.list.setCurrentItem(it)
-        self.count.setText(f"{len(cuts)}" if cuts else "")
-        self.empty.setVisible(not cuts)
-        self.list.setVisible(bool(cuts))
+        self.count.setText((f"{len(cuts)}/{allc}" if f else f"{allc}") if allc else "")
+        self.empty.setVisible(not allc)
+        self.list.setVisible(bool(allc))
         self._block = False
 
     def update_rows(self):
@@ -171,22 +184,16 @@ class CutList(QWidget):
     def _changed(self, cur, prev):
         if self._block or cur is None:
             return
+        from PySide6.QtWidgets import QApplication
+        if QApplication.keyboardModifiers() & (Qt.ShiftModifier | Qt.ControlModifier) and len(self.list.selectedItems()) > 1:
+            return                       # building a multi-selection: stay on the open cut
         self.cutSelected.emit(cur.data(Qt.UserRole).id)
 
     def _menu(self, pos):
         it = self.list.itemAt(pos)
         if it is None:
             return
-        cut = it.data(Qt.UserRole)
-        m = QMenu(self)
-        acts = {
-            m.addAction("이름 바꾸기"): "rename",
-            m.addAction("다른 컷에 설정 복사…"): "copy",
-            m.addAction("렌더 큐에 추가"): "render",
-            m.addAction("원본 파일 위치 열기"): "reveal",
-        }
-        m.addSeparator()
-        acts[m.addAction("프로젝트에서 제거")] = "remove"
-        a = m.exec(self.list.viewport().mapToGlobal(pos))
-        if a in acts:
-            self.action.emit(acts[a], cut.id)
+        if not it.isSelected():
+            self.list.clearSelection()
+            it.setSelected(True)
+        self.menuRequested.emit(self.selected_ids(), self.list.viewport().mapToGlobal(pos))

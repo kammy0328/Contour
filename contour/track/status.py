@@ -22,6 +22,8 @@ LABEL = {"none": "리터칭 불필요", "small": "얼굴 작음", "good": "적�
 
 def effective(cut) -> str:
     st = cut.status or {}
+    if st.get("work") == "skip":
+        return "none"                       # marked 작업 불필요 by the user
     return st.get("user") or st.get("auto") or ("none" if cut.tl.get("kind") in ("gap",) else "pending")
 
 

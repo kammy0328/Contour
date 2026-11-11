@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 import numpy as np
-from PySide6.QtCore import QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QPoint, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen
 from PySide6.QtWidgets import (QAbstractItemView, QHBoxLayout, QLabel, QListView, QListWidget, QListWidgetItem,
                                QMenu, QPushButton, QStyle, QStyledItemDelegate, QVBoxLayout, QWidget)
@@ -18,6 +18,7 @@ from . import widgets as Wd
 from .theme import C, font, qc
 from .viewer import np_to_qimage
 from ..track import status as ST
+from ..core import workstate as WS
 
 TW, TH = 132, 74
 STATUS_COL = {"good": C["ok"], "bad": C["error"], "none": C["text3"], "small": C["warn"], "pending": C["text2"],
@@ -57,14 +58,19 @@ class _Delegate(QStyledItemDelegate):
             p.drawImage(QRectF(tr.center().x() - dw / 2, tr.center().y() - dh / 2, dw, dh), th)
             p.restore()
         st = ST.effective(cut)
-        col = QColor(STATUS_COL.get(st, C["text2"]))
+        ws = WS.state(cut)
+        col = QColor(WS.COLOR[ws])
         # status bar under the picture, user override drawn solid, automatic drawn lighter
         bar = QRectF(tr.left(), tr.bottom() - 3, tr.width(), 3)
-        c2 = QColor(col)
-        if not (cut.status or {}).get("user"):
-            c2.setAlpha(190)
-        p.setBrush(c2)
+        p.setBrush(col)
         p.drawRect(bar)
+        # automatic tracking check found something to look at: amber corner
+        if st == "bad" and not (cut.status or {}).get("reviewed"):
+            p.setBrush(qc("warn"))
+            from PySide6.QtCore import QPointF
+            from PySide6.QtGui import QPolygonF
+            q = tr.topRight()
+            p.drawPolygon(QPolygonF([QPointF(q.x() - 14, q.y()), q, QPointF(q.x(), q.y() + 14)]))
         # running / queued
         run = self.strip.running.get(cut.id)
         if run is not None:
@@ -101,7 +107,7 @@ class _Delegate(QStyledItemDelegate):
         p.drawEllipse(QRectF(r.left() + 6, tr.bottom() + 8, 6, 6))
         p.setPen(qc("text2") if not sel else qc("text"))
         p.setFont(font(10, 600))
-        lab = ST.LABEL.get(st, st)
+        lab = WS.LABEL[ws] + (" · 추적 확인" if st == "bad" and ws not in ("skip", "done") else "")
         p.drawText(QRectF(r.left() + 16, tr.bottom() + 3, TW - 10, 15), Qt.AlignLeft | Qt.AlignVCenter, lab)
         p.setPen(qc("text3"))
         p.setFont(font(9, 400, tabular=True))
@@ -116,6 +122,7 @@ class _Delegate(QStyledItemDelegate):
 class TimelineStrip(QWidget):
     cutSelected = Signal(str)
     action = Signal(str, list)          # action, cut ids
+    menuRequested = Signal(list, QPoint)
 
     def __init__(self, session, parent=None):
         super().__init__(parent)
@@ -134,30 +141,39 @@ class TimelineStrip(QWidget):
         self.title.setFont(font(12, 600))
         head.addWidget(self.title)
         self.chips: Dict[str, QPushButton] = {}
-        for k in ORDER:
+        for k, lab in WS.STATES + [("bad", "추적 확인")]:
             b = QPushButton("")
             b.setProperty("kind", "ghost")
             b.setCursor(Qt.PointingHandCursor)
             b.setToolTip("이 상태인 컷 모두 선택")
             b.clicked.connect(lambda _=False, kk=k: self.select_status(kk))
-            b.setStyleSheet(f"QPushButton {{ color: {STATUS_COL[k]}; padding: 1px 8px; }}")
+            b.setStyleSheet(f"QPushButton {{ color: {WS.COLOR.get(k, C['warn'])}; padding: 1px 8px; }}")
             self.chips[k] = b
             head.addWidget(b)
+        self.hide_skip = QPushButton("작업 불필요 숨기기")
+        self.hide_skip.setProperty("kind", "ghost")
+        self.hide_skip.setCheckable(True)
+        self.hide_skip.setToolTip("작업 불필요 컷을 타임라인에서 숨깁니다 (출력에는 그대로 들어갑니다)")
+        self.hide_skip.toggled.connect(lambda _: self.refresh())
+        head.addWidget(self.hide_skip)
         head.addStretch(1)
         self.run_lbl = QLabel("")
         self.run_lbl.setObjectName("Faint")
         head.addWidget(self.run_lbl)
         for key, text, ic, tip in (("analyze", "일괄 분석", "scan", "선택한 컷(없으면 분석 전 컷 전부)을 차례로 분석"),
-                                   ("apply", "일괄 적용", "wand-sparkles", "선택한 컷(없으면 전부)의 보정 대상에 프리셋 적용"),
+                                   ("apply", "일괄 적용", "wand-sparkles", "선택한 컷(없으면 전부)의 보정 인물에 프리셋 적용"),
                                    ("review", "검수", "shield-check", "인식 불량·확인 필요 컷부터 하나씩 확인"),
                                    ("members", "인물", "users", "여러 컷에 나오는 같은 사람 (자동 연결, 이름, 설정 복사)"),
-                                   ("export", "내보내기", "download", "전체 길이 / 컷별 / 리터칭 컷 + XML 출력"),
-                                   ("info", "", "circle-alert", "편집 파일 정보와 경고")):
-            b = Wd.button(text, "ghost" if key != "export" else "primary", ic, tip)
+                                   ("info", "", "circle-alert", "편집 파일과 베이크 영상이 맞지 않는 곳이 있습니다")):
+            b = Wd.button(text, "ghost", ic, tip)
             b.clicked.connect(lambda _=False, kk=key: self.action.emit(kk, self.selected_ids()))
             head.addWidget(b)
             if key == "analyze":
                 self.analyze_btn = b
+            if key == "info":
+                # only when there is something to say (mismatches between the edit and the bake)
+                b.setIcon(__import__("contour.ui.icons", fromlist=["icon"]).icon("circle-alert", 16, C["warn"], C["warn"]))
+                self.info_btn = b
         self.stop_btn = Wd.button("중지", "ghost", "square", "일괄 분석 중지 (지금 컷은 끝까지)")
         self.stop_btn.clicked.connect(lambda: self.action.emit("stop", []))
         self.stop_btn.hide()
@@ -196,6 +212,8 @@ class TimelineStrip(QWidget):
             return
         self.list.clear()
         self._items = {}
+        if self.hide_skip.isChecked():
+            cuts = [c for c in cuts if WS.state(c) != "skip" or c.id == self.current_id]
         for c in cuts:
             if c.id not in self.thumbs:
                 rgb = load_thumb(prj, c.id)
@@ -210,18 +228,24 @@ class TimelineStrip(QWidget):
 
     def update_counts(self):
         cuts = self.cuts()
-        cnt = {k: 0 for k in ORDER}
+        cnt = {k: 0 for k in self.chips}
         for c in cuts:
-            cnt[ST.effective(c)] = cnt.get(ST.effective(c), 0) + 1
+            w = WS.state(c)
+            cnt[w] = cnt.get(w, 0) + 1
+            if ST.effective(c) == "bad" and w not in ("skip", "done") and not (c.status or {}).get("reviewed"):
+                cnt["bad"] += 1
         tl = (self.s.project.timeline or {}) if self.s.project else {}
         n = tl.get("frames", 0)
         fps = tl.get("fps", 24) or 24
         self.title.setText(f"타임라인 · {len(cuts)}컷 · {int(n / fps // 60)}:{int(n / fps % 60):02d}")
+        labels = dict(WS.STATES, bad="추적 확인")
         for k, b in self.chips.items():
-            b.setText(f"{ST.LABEL[k]} {cnt.get(k, 0)}")
+            b.setText(f"{labels[k]} {cnt.get(k, 0)}")
             b.setVisible(cnt.get(k, 0) > 0)
-        reviewed = sum(1 for c in cuts if (c.status or {}).get("reviewed"))
-        self.chips["good"].setToolTip(f"이 상태인 컷 모두 선택 · 검수 완료 {reviewed}/{len(cuts)}")
+        self.hide_skip.setVisible(cnt.get("skip", 0) > 0)
+        # informational notes (two video tracks, flashes that are not edits) are not problems
+        warn = [w for w in (tl.get("warnings") or []) if not w.startswith("비디오 트랙") and "큰 화면 변화" not in w]
+        self.info_btn.setVisible(bool(warn))
         self.list.viewport().update()
 
     def set_current(self, cut_id: Optional[str]):
@@ -245,7 +269,8 @@ class TimelineStrip(QWidget):
     def select_status(self, k: str):
         self.list.clearSelection()
         for c in self.cuts():
-            if ST.effective(c) == k:
+            hit = (ST.effective(c) == "bad" and WS.state(c) not in ("skip", "done")) if k == "bad" else WS.state(c) == k
+            if hit and c.id in self._items:
                 self._items[c.id].setSelected(True)
 
     def neighbour(self, d: int) -> Optional[str]:
@@ -268,21 +293,5 @@ class TimelineStrip(QWidget):
             self.list.clearSelection()
             it.setSelected(True)
         ids = self.selected_ids()
-        if not ids:
-            return
-        m = QMenu(self)
-        acts = {}
-        sm = m.addMenu(f"상태 지정 ({len(ids)}컷)")
-        for k in ("good", "bad", "none", "small", "skip"):
-            acts[sm.addAction(ST.LABEL[k])] = f"status:{k}"
-        sm.addSeparator()
-        acts[sm.addAction("자동 판정으로 되돌리기")] = "status:"
-        acts[m.addAction("검수 완료 표시")] = "reviewed:1"
-        acts[m.addAction("검수 완료 해제")] = "reviewed:0"
-        m.addSeparator()
-        acts[m.addAction("선택 컷 분석 (다시 분석 포함)")] = "analyze_force"
-        acts[m.addAction("선택 컷에 프리셋 적용…")] = "apply"
-        acts[m.addAction("선택 컷 내보내기…")] = "export_sel"
-        a = m.exec(self.list.viewport().mapToGlobal(pos))
-        if a in acts:
-            self.action.emit(acts[a], ids)
+        if ids:
+            self.menuRequested.emit(ids, self.list.viewport().mapToGlobal(pos))

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import os
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -98,6 +99,77 @@ def import_timeline(project: Project, edit_path: str, baked_path: str, progress:
                             seq_start=int(tl.start_frames), drop=tl.drop, offset=off, frames=int(n),
                             width=info.width, height=info.height, align=al, warnings=warn, created=time.time(),
                             shots=len(made))
+    link_bake_proxy(project)
     project.save()
     progress(1.0, "")
     return project.timeline
+
+
+def _same_file(a: str, b: str) -> bool:
+    try:
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+    except Exception:
+        return False
+
+
+def bake_proxy(project: Project):
+    """A complete proxy of the whole bake, if one exists: the project's own (bake_cache), or one made earlier
+    for the bake loaded as a plain cut (dropped in before its XML)."""
+    from .proxy import Proxy
+    from .settings import settings
+    tlm = project.timeline or {}
+    baked = tlm.get("baked")
+    if not baked:
+        return None
+    info = M.probe(baked) if Path(baked).exists() else None
+    if info is None:
+        return None
+    cands = [Path(project.path) / "bake_cache"]
+    cuts_dir = Path(project.path) / "cuts"
+    for c in project.cuts:
+        if not c.tl and c.info.kind == "video" and _same_file(c.source, baked):
+            cands.append(cuts_dir / c.id / "cache")
+    if cuts_dir.exists():
+        # the plain cut may already be gone from the project (it became this timeline); its cache is still there
+        for d in cuts_dir.iterdir():
+            mp = d / "cache" / "proxy_meta.json"
+            if mp.exists() and (d / "cache") not in cands:
+                cands.append(d / "cache")
+    for d in cands:
+        px = Proxy(d, info, settings().proxy_long_side)
+        if px.shared:
+            continue
+        m = px.meta()
+        if m.get("complete") and m.get("n") == info.frames and px.path.exists() and m.get("sig") == px._source_sig():
+            return px
+    return None
+
+
+def link_bake_proxy(project: Project, px=None) -> int:
+    """Points every timeline shot at the bake's proxy. Returns how many shots were linked."""
+    from .proxy import link_shared
+    px = px or bake_proxy(project)
+    if px is None:
+        return 0
+    n = 0
+    for c in project.timeline_cuts():
+        link_shared(project.cache_dir(c), px, int(getattr(c.info, "offset", 0)))
+        n += 1
+    return n
+
+
+def build_bake_proxy(project: Project, cm, vs, progress=None, cancel=None) -> bool:
+    """One proxy for the whole bake (one decode pass), shared by every shot of the timeline."""
+    from .proxy import Proxy
+    from .settings import settings
+    tlm = project.timeline or {}
+    baked = tlm.get("baked")
+    if not baked or not Path(baked).exists():
+        return False
+    info = M.probe(baked)
+    px = Proxy(Path(project.path) / "bake_cache", info, settings().proxy_long_side)
+    if not px.is_valid(vs.key()):
+        if not px.build(cm, vs, progress, cancel):
+            return False
+    link_bake_proxy(project, px)
+    return True

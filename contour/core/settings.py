@@ -12,8 +12,8 @@ import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-APP_NAME = "Contour"
-APP_VERSION = "1.8.1"
+APP_NAME = "DIAP"
+APP_VERSION = "1.9.0"
 
 
 def default_data_dir() -> Path:
@@ -21,7 +21,12 @@ def default_data_dir() -> Path:
         base = Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Documents"
     else:
         base = Path.home()
-    return base / "Contour_Data"
+    # 1.9 renamed the app to DIAP; data learned under the old name stays where it is
+    old = base / "Contour_Data"
+    new = base / "DIAP_Data"
+    if old.exists() and not new.exists():
+        return old
+    return new
 
 
 @dataclass
@@ -41,6 +46,10 @@ class AppSettings:
     output_dir: str = ""
     qc_thresholds: dict = field(default_factory=dict)
     cloth_model_ok: bool = False          # the user has read the clothing model's licence note
+    ask_proxy: bool = True                # ask for the proxy resolution when footage comes in
+    autosave: bool = True
+    autosave_minutes: int = 5
+    autosave_keep: int = 10
     skip_version: str = ""                # an update the user chose to skip
     auto_update_check: bool = True
 

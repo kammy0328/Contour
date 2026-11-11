@@ -39,6 +39,22 @@ def safe_name(s: str) -> str:
 
 # --------------------------------------------------------------------------- animated values
 
+SKIN_REGIONS = [("face", "얼굴"), ("neck", "목"), ("shoulder", "어깨·쇄골"), ("arm", "팔"), ("hand", "손"), ("leg", "다리")]
+
+
+def norm_scope(v) -> str:
+    """Skin regions as 'face,neck,...'. Older projects: 'face' (face only), 'all' (all visible skin)."""
+    keys = [k for k, _ in SKIN_REGIONS]
+    if v == "all":
+        return ",".join(keys)
+    got = [k for k in keys if k in str(v or "").split(",")]
+    return ",".join(got) or "face"
+
+
+def scope_set(v) -> set:
+    return set(norm_scope(v).split(","))
+
+
 @dataclass
 class Curve:
     base: float = 0.0
@@ -107,7 +123,7 @@ class PartParams:
     widths: Dict[str, float] = field(default_factory=lambda: {k: 1.0 for k in WIDTH_KEYS})
     strength: Curve = field(default_factory=lambda: Curve(base=100.0))
     skin_detail: float = 45.0        # % of fine texture kept when smoothing
-    skin_scope: str = "face"         # face | all
+    skin_scope: str = "face,neck"    # skin regions, comma separated: face, neck, shoulder, arm, hand, leg
     grain_size: float = 1.0          # grain particle size (px at 1080p)
     blemish_size: float = 50.0       # 0..100 largest spot the blemish removal takes (share of the face width)
     cloth: str = "include"           # body edits and clothes: include | skirt (skirt, dress below the waist kept) | all
@@ -182,7 +198,7 @@ class PartParams:
         if "strength" in d:
             p.strength = Curve.from_dict(d["strength"])
         p.skin_detail = float(d.get("skin_detail", 45.0))
-        p.skin_scope = d.get("skin_scope", "face") if d.get("skin_scope") in ("face", "all") else "face"
+        p.skin_scope = norm_scope(d.get("skin_scope", "face"))
         p.grain_size = float(d.get("grain_size", 1.0))
         p.blemish_size = float(d.get("blemish_size", 50.0))
         p.cloth = d.get("cloth", "include") if d.get("cloth") in ("include", "skirt", "all") else "include"
@@ -317,12 +333,15 @@ class TrackingSettings:
     @classmethod
     def from_dict(cls, d):
         d = d or {}
-        return cls(**{k: d[k] for k in cls.__dataclass_fields__ if k in d})
+        t = cls(**{k: d[k] for k in cls.__dataclass_fields__ if k in d})
+        t.adapt = True          # learning is always on (no switch in the app any more)
+        t.refiner = True
+        return t
 
 
 @dataclass
 class OutputSettings:
-    format: str = "prores_422_hq"
+    format: str = "prores_4444_xq"
     out_dir: str = ""
     name_pattern: str = "{cut}_reshape"
     include_audio: bool = True
@@ -412,7 +431,9 @@ class Cut:
     retouch_ref: str = ""            # the retoucher's own result of this plate (learned from after analysis)
     style_learned: dict = field(default_factory=dict)   # last style sample learned from retouch_ref
     tl: dict = field(default_factory=dict)       # place in an edited timeline: index, kind, rec_in, rec_out, name, note
-    status: dict = field(default_factory=dict)   # beauty status: auto, reason, user, reviewed, metrics
+    status: dict = field(default_factory=dict)   # beauty status: auto, reason, user, reviewed, metrics, work
+    version: int = 1                              # work version (renders are named _v<version>)
+    versions: dict = field(default_factory=dict)  # str(version) -> snapshot of the work at that version
 
     @property
     def n_frames(self) -> int:
@@ -454,6 +475,7 @@ class Cut:
             "learn": self.learn, "pending_copy": self.pending_copy, "removed": list(self.removed),
             "edit_points": list(self.edit_points), "retouch_ref": self.retouch_ref,
             "style_learned": self.style_learned, "tl": self.tl, "status": self.status,
+            "version": self.version, "versions": self.versions,
         }
 
     @classmethod
@@ -489,6 +511,8 @@ class Cut:
         c.style_learned = dict(d.get("style_learned") or {})
         c.tl = dict(d.get("tl") or {})
         c.status = dict(d.get("status") or {})
+        c.version = max(1, int(d.get("version", 1)))
+        c.versions = dict(d.get("versions") or {})
         return c
 
 

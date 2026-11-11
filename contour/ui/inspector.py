@@ -44,7 +44,7 @@ class _Tab(QWidget):
 # =========================================================================== 보정
 
 class ReshapeTab(_Tab):
-    _expanded = {"body": True}          # remembered while the app runs
+    _expanded = {"skin": True}          # remembered while the app runs
 
     def __init__(self, ctl):
         super().__init__(ctl)
@@ -66,10 +66,12 @@ class ReshapeTab(_Tab):
         self.name.editingFinished.connect(lambda: self.ctl.rename_person(self.name.text()))
         row.addWidget(self.name, 1)
         self.del_btn = Wd.tool("trash-2", "이 인물 삭제 (잘못 잡힌 사람·물체)")
+        self.del_btn.setIcon(I.icon("trash-2", 16, C["error"], C["error"]))
         self.del_btn.clicked.connect(self.ctl.delete_person)
         row.addWidget(self.del_btn)
         pl.addLayout(row)
-        self.role = Wd.Segmented([("target", "보정 대상"), ("protect", "보호"), ("ignore", "제외")], compact=True)
+        self.role = Wd.Segmented([("target", "보정"), ("protect", "보호")], compact=True)
+        self.role.setToolTip("보정: 이 인물에 보정을 적용합니다\n보호: 보정하지 않고, 다른 사람의 변형도 닿지 않게 지킵니다")
         self.role.changed.connect(self.ctl.set_role)
         pl.addWidget(self.role)
         self.add(self.person_box)
@@ -157,6 +159,9 @@ class ReshapeTab(_Tab):
         self.add(w)
         self.lay.addStretch(1)
         self._chips: Dict[int, Wd.Chip] = {}
+        # colour grain only means something once there is grain
+        if "grain" in self.rows and "grain_color" in self.rows:
+            self.rows["grain"].changed.connect(lambda k, v: self._grain_gate(v))
         self.strength.name.setFixedWidth(64)
         self.feather.name.setFixedWidth(64)
         self._retain(self.feather)
@@ -169,28 +174,80 @@ class ReshapeTab(_Tab):
         r.keyb.hide()
 
     def _cloth_row(self):
+        """옷 그대로: on/off, then one checkbox per garment actually found on this person."""
         w = QWidget()
         v = QVBoxLayout(w)
         v.setContentsMargins(0, 6, 0, 2)
         v.setSpacing(4)
         h = QHBoxLayout()
         h.setContentsMargins(0, 0, 0, 0)
-        lab = Wd.label("옷", "", 12)
-        lab.setFixedWidth(64)
-        lab.setToolTip("몸 보정을 옷에도 적용할지 고릅니다")
-        self.cloth = Wd.Segmented([("include", "함께 보정"), ("skirt", "치마 그대로"), ("all", "옷 그대로")], compact=True)
-        self.cloth.setToolTip("함께 보정: 옷을 포함한 실루엣 전체가 바뀝니다\n"
-                              "치마 그대로: 치마와 원피스 아랫단은 그대로 두고 드러난 다리·몸만 바꿉니다\n"
-                              "옷 그대로: 옷은 모두 그대로 두고 드러난 팔·다리·목 같은 피부만 바꿉니다\n"
-                              "(얼굴·머리 보정은 영향 없음)")
-        self.cloth.changed.connect(self.ctl.set_cloth)
-        h.addWidget(lab)
-        h.addWidget(self.cloth, 1)
+        self.cloth_keep = Wd.Toggle()
+        self.cloth_keep.toggled.connect(self._cloth_toggled)
+        h.addWidget(Wd.FieldRow("옷 그대로", self.cloth_keep,
+                                "켜면 옷은 그대로 두고 드러난 팔·다리·목 같은 피부만 바꿉니다. "
+                                "이 인물에게서 찾은 옷 종류만 아래에 나오고, 고른 것만 그대로 둡니다 "
+                                "(얼굴·머리 보정은 영향 없음)"), 1)
         v.addLayout(h)
+        self.garment_box = QWidget()
+        gl = QHBoxLayout(self.garment_box)
+        gl.setContentsMargins(0, 0, 0, 0)
+        gl.setSpacing(10)
+        from ..track.clothing import GARMENTS
+        self.garment_cb: Dict[str, QCheckBox] = {}
+        for k, lab, _ in GARMENTS:
+            cb = QCheckBox(lab)
+            cb.toggled.connect(lambda on, kk=k: self._garment_toggled())
+            gl.addWidget(cb)
+            self.garment_cb[k] = cb
+        gl.addStretch(1)
+        v.addWidget(self.garment_box)
         self.cloth_info = Wd.label("", "Faint", 11)
         self.cloth_info.setWordWrap(True)
         v.addWidget(self.cloth_info)
         return w
+
+    def _cloth_toggled(self, on: bool):
+        if not on:
+            self.ctl.set_cloth("include")
+            return
+        found = [k for k, cb in self.garment_cb.items() if cb.isVisible()]
+        self.ctl.set_cloth("keep:" + ",".join(found or [k for k in self.garment_cb]))
+
+    def _garment_toggled(self):
+        sel = [k for k, cb in self.garment_cb.items() if cb.isChecked() and not cb.isHidden()]
+        if not self.cloth_keep.isChecked():
+            return
+        self.ctl.set_cloth("keep:" + ",".join(sel) if sel else "include")
+
+    def _fill_cloth(self, pp, person, s):
+        from ..track import clothing as CL
+        mode = getattr(pp, "cloth", "include")
+        keep = CL.keep_set(mode)
+        on = mode != "include"
+        self.cloth_keep.blockSignals(True)
+        self.cloth_keep.setChecked(on)
+        self.cloth_keep.blockSignals(False)
+        found = None
+        ready = False
+        if s.tracker is not None and s.tracker.store is not None and s.tracker.store.has(person.id):
+            ready = CL.ready_for(s.tracker, person.id)
+            if ready:
+                found = CL.detected(s.tracker, s.tracker.store.index(person.id))
+        for k, cb in self.garment_cb.items():
+            cb.blockSignals(True)
+            cb.setChecked(k in keep or (k == "dress" and "dress_low" in keep))
+            cb.setVisible(on and found is not None and k in found)
+            cb.blockSignals(False)
+        self.garment_box.setVisible(on and bool(found))
+        info = ""
+        if on and not ready:
+            info = "옷 영역을 분석하는 중입니다. 끝나면 이 인물에게서 찾은 옷이 나옵니다."
+        elif on and found is not None and not found:
+            info = "이 인물에게서 그대로 둘 옷을 찾지 못했습니다."
+        elif on:
+            info = "M 키(매트 보기)로 그대로 두는 옷 영역을 확인할 수 있습니다."
+        self.cloth_info.setText(info)
+        self.cloth_info.setVisible(bool(info))
 
     def _parts_row(self):
         w = QWidget()
@@ -299,12 +356,49 @@ class ReshapeTab(_Tab):
         self.blemish_size.changed.connect(lambda k, val: self.ctl.set_skin("blemish_size", val, False))
         self.blemish_size.committed.connect(lambda k, val: self.ctl.set_skin("blemish_size", val, True))
         v.addWidget(self.blemish_size)
-        self.skin_scope = Wd.Segmented([("face", "얼굴만"), ("all", "얼굴 + 목·팔·다리")], compact=True)
-        self.skin_scope.setToolTip("피부결·피부톤·그레인이 적용되는 범위\n얼굴만: 얼굴 윤곽 안쪽\n전체: 이 인물의 드러난 피부 전체 (옷·머리카락 제외)")
-        self.skin_scope.changed.connect(lambda val: self.ctl.set_skin("scope", val, True))
+        from ..core.project import SKIN_REGIONS
+        self.skin_scope = QWidget()
+        self.skin_scope.setToolTip("피부결·피부톤·그레인이 적용되는 부위 (여러 개 선택, 최소 1개)\n"
+                                   "옷과 머리카락은 어느 부위에서도 제외됩니다")
+        gl = QGridLayout(self.skin_scope)
+        gl.setContentsMargins(0, 2, 0, 2)
+        gl.setHorizontalSpacing(10)
+        gl.setVerticalSpacing(4)
+        self.scope_boxes: Dict[str, QCheckBox] = {}
+        for i, (k, lab) in enumerate(SKIN_REGIONS):
+            cb = QCheckBox(lab)
+            cb.toggled.connect(lambda on, kk=k: self._scope_toggled(kk, on))
+            gl.addWidget(cb, i // 3, i % 3)
+            self.scope_boxes[k] = cb
+        v.addWidget(Wd.label("보정 부위", "", 12))
         v.addWidget(self.skin_scope)
         v.addWidget(Wd.label("K: 피부·색 보정 영역 보기 (변형 결과를 따라 움직입니다)", "Faint", 11))
         return w
+
+    def _grain_gate(self, grain: float):
+        r = self.rows.get("grain_color")
+        if r is not None:
+            on = self.rows["grain"].isEnabled() and abs(float(grain)) > 1e-6
+            r.setEnabled(on)
+            r.setToolTip("" if on else "그레인을 먼저 올리면 쓸 수 있습니다")
+
+    def _scope_toggled(self, key: str, on: bool):
+        sel = [k for k, cb in self.scope_boxes.items() if cb.isChecked()]
+        if not sel:                                   # never nothing: keep the one just unticked
+            cb = self.scope_boxes[key]
+            cb.blockSignals(True)
+            cb.setChecked(True)
+            cb.blockSignals(False)
+            return
+        self.ctl.set_skin("scope", ",".join(sel), True)
+
+    def _set_scope(self, scope: str):
+        from ..core.project import scope_set
+        on = scope_set(scope)
+        for k, cb in self.scope_boxes.items():
+            cb.blockSignals(True)
+            cb.setChecked(k in on)
+            cb.blockSignals(False)
 
     def _toggle_widths(self, on):
         self.width_box.setVisible(on)
@@ -324,10 +418,10 @@ class ReshapeTab(_Tab):
         self._chips.clear()
         persons = [p for p in (cut.persons if cut else [])]
         for i, p in enumerate(persons):
-            badge = {"target": "", "protect": "보호", "ignore": "제외"}[p.role]
+            badge = {"target": "", "protect": "보호", "ignore": "보호"}.get(p.role, "")
             ch = Wd.Chip(p.name, p.color)
             ch.set_text(p.name, badge)
-            ch.setChecked(p.id == self.ctl.sel_pid)
+            ch.setChecked(p.id == self.ctl.sel_pid or p.id in (getattr(self.ctl, "sel_pids", set()) or set()))
             ch.clicked.connect(lambda _=False, pid=p.id: self.ctl.select_person(pid))
             self.chips.addWidget(ch)
             self._chips[p.id] = ch
@@ -339,7 +433,7 @@ class ReshapeTab(_Tab):
             self.name.blockSignals(True)
             self.name.setText(person.name)
             self.name.blockSignals(False)
-            self.role.set_current(person.role)
+            self.role.set_current("protect" if person.role == "ignore" else person.role)
         if cut:
             self.mode.set_current(cut.mode)
         for w in list(self.rows.values()) + [self.strength, self.feather, self.skin_detail, self.grain_size,
@@ -363,16 +457,7 @@ class ReshapeTab(_Tab):
             self.feather.set_value(pp.feather)
             self.grain_size.set_value(pp.grain_size)
             self.blemish_size.set_value(pp.blemish_size)
-            self.cloth.set_current(getattr(pp, "cloth", "include"))
-            info = ""
-            if getattr(pp, "cloth", "include") != "include" and s.tracker is not None:
-                from ..track import clothing as CL
-                if not CL.ready_for(s.tracker, person.id):
-                    info = "옷 영역을 아직 분석하지 않았습니다. 분석이 끝나면 적용됩니다."
-                else:
-                    info = "M 키(매트 보기)로 그대로 두는 옷 영역을 확인할 수 있습니다."
-            self.cloth_info.setText(info)
-            self.cloth_info.setVisible(bool(info))
+            self._fill_cloth(pp, person, s)
             head_on = any(pp._active(k) for k in ("head", "crown", "hair_volume"))
             pinfo = ""
             ready = False
@@ -387,7 +472,7 @@ class ReshapeTab(_Tab):
             self.parts_btn.setText("다시 인식" if ready else "머리 부위 인식")
             self.parts_btn.setVisible(head_on or ready)
             self.parts_info.setVisible(bool(pinfo))
-            self.skin_scope.set_current(pp.skin_scope)
+            self._set_scope(pp.skin_scope)
             for k, r in self.wrows.items():
                 r.set_value(pp.widths.get(k, 1.0))
             n = len(pp.sculpt)
@@ -396,6 +481,8 @@ class ReshapeTab(_Tab):
             self.body_info.setText(f"옮긴 점 {n}개" if n else "")
             for gkey, (head, box) in self.groups.items():
                 head.set_active(any(pp._active(d.key) for d in PARAMS if d.group == gkey))
+            if "grain" in pp.amounts:
+                self._grain_gate(pp.amounts["grain"].value(t))
         else:
             for head, box in self.groups.values():
                 head.set_active(False)
@@ -430,11 +517,6 @@ class TrackTab(_Tab):
         self.add(Wd.Section("분석"))
         self.add(self.status)
         self.add(self.sub)
-        self.acc = Wd.Segmented([("fast", "빠르게"), ("high", "정밀"), ("max", "최고 정밀")], compact=True)
-        self.acc.setToolTip("빠르게: 모델 1개, 1회 추정\n정밀: 모델 앙상블 + 2차 정밀 추정 + 얼굴·손 전용 모델 (권장)\n"
-                            "최고 정밀: 큰 검출 모델, DWPose 추가, 좌우 반전 추정까지 (가장 느림)")
-        self.acc.changed.connect(lambda v: self.ctl.set_accuracy(v))
-        self.add(self.acc)
         self.analyze_btn = Wd.button("분석 시작", "primary", "scan")
         self.analyze_btn.clicked.connect(self.ctl.run_analysis)
         self.add(self.analyze_btn)
@@ -487,28 +569,7 @@ class TrackTab(_Tab):
         self.smooth.committed.connect(lambda k, v: self.ctl.set_tracking("smoothing", v / 100.0))
         self.smooth.setToolTip("카메라 흔들림은 그대로 따라가고, 몸 기준의 떨림만 줄입니다")
         self.add(self.smooth)
-        self.thr = Wd.ParamRow("thr", "확인 기준", 20, 90, 1, "", 20)
-        self.thr.keyb.hide()
-        self.thr.name.setFixedWidth(64)
-        self.thr.committed.connect(lambda k, v: self.ctl.set_tracking("conf_threshold", v / 100.0))
-        self.thr.setToolTip("신뢰도가 이 값보다 낮은 프레임을 타임라인에 빨간색으로 표시합니다")
-        self.add(self.thr)
-        # learning
-        self.add(Wd.Section("수정하면서 학습"))
-        self.t_adapt = Wd.Toggle()
-        self.t_adapt.toggled.connect(lambda v: self.ctl.set_tracking("adapt", v))
-        self.add(Wd.FieldRow("이 클립에 맞춰 학습", self.t_adapt,
-                             "수정한 관절에서 이 클립 인물의 관절 위치 습관과 생김새를 배웁니다"))
-        self.t_ref = Wd.Toggle()
-        self.t_ref.toggled.connect(lambda v: self.ctl.set_tracking("refiner", v))
-        self.ref_row = Wd.FieldRow("누적 학습 모델 사용", self.t_ref, "지난 프로젝트들의 수정으로 학습된 모델")
-        self.add(self.ref_row)
-        self.learn_info = Wd.label("", "Faint", 11)
-        self.learn_info.setWordWrap(True)
-        self.add(self.learn_info)
-        self.relearn = Wd.button("수정 내용으로 전체 다시 계산", "", "sparkles")
-        self.relearn.clicked.connect(self.ctl.relearn_clip)
-        self.add(self.relearn)
+        # learning (clip adaptation, cumulative model, re-solving from corrections) is always on and automatic
         # ranges
         self.add(Wd.Section("구간 (타임라인에서 Shift+드래그로 선택)"))
         self.sel_label = Wd.label("선택된 구간 없음", "Faint", 11)
@@ -533,20 +594,16 @@ class TrackTab(_Tab):
         fx = Wd.button("번호 바로잡기…", "", "git-compare-arrows",
                        "군무에서 두 사람의 번호가 서로 바뀌었거나, 추적이 엉뚱한 사람을 따라간 구간을 바로잡습니다")
         fx.clicked.connect(self.ctl.identity_dialog)
-        bm = Wd.button("벤치마크 등록", "", "flag", "이 컷의 완성된 추적을 모델 평가 기준으로 저장합니다")
-        bm.clicked.connect(self.ctl.register_benchmark)
         g2 = QGridLayout()
         g2.setContentsMargins(0, 0, 0, 0)
         g2.addWidget(m, 0, 0)
         g2.addWidget(fx, 0, 1)
-        g2.addWidget(bm, 1, 0, 1, 2)
         w2 = QWidget()
         w2.setLayout(g2)
         self.add(w2)
         tips = Wd.label("관절 드래그: 위치 수정 (키프레임) · Alt+클릭: 키 삭제\n"
                         "우클릭: 안 보이는 관절로 지정 (가려짐·화면 밖)\n"
-                        "점선 고리: 안 보인다고 판단한 관절, 드래그하면 다시 사용\n"
-                        "N / Shift+N: 다음·이전 확인 필요 구간", "Faint", 11)
+                        "점선 고리: 안 보인다고 판단한 관절, 드래그하면 다시 사용", "Faint", 11)
         tips.setWordWrap(True)
         self.add(Wd.Section("관절 편집"))
         self.add(tips)
@@ -573,14 +630,13 @@ class TrackTab(_Tab):
             self.sub.setText("인물 검출, 포즈 앙상블, 얼굴 융합, 매트, 카메라 움직임을 한 번에 계산합니다.")
             self.analyze_btn.setText("분석 시작")
             self.analyze_btn.setProperty("kind", "primary")
-            self.analyze_btn.setIcon(I.icon("scan", 15, "#1A0E13", "#1A0E13"))
+            self.analyze_btn.setIcon(I.icon("scan", 15, "#FFFFFF", "#FFFFFF"))
         self.analyze_btn.style().unpolish(self.analyze_btn)
         self.analyze_btn.style().polish(self.analyze_btn)
-        self.acc.set_current(self.ctl.accuracy)
         for tg, v in ((self.t_reid, getattr(ts, "reid", True)), (self.t_face, ts.face), (self.t_detail, ts.detail),
                       (self.t_flip, ts.flip_tta),
                       (self.t_flow, ts.point_tracker), (self.t_pass2, ts.second_pass),
-                      (self.t_m, "pose_rtmpose_m" in ts.models), (self.t_adapt, ts.adapt), (self.t_ref, ts.refiner)):
+                      (self.t_m, "pose_rtmpose_m" in ts.models)):
             tg.blockSignals(True)
             tg.setChecked(bool(v))
             tg.blockSignals(False)
@@ -595,16 +651,6 @@ class TrackTab(_Tab):
                               ("이 컷의 매트: RVM (SAM 2로 바꾸려면 아래 버튼)" if cut.analyzed else ""))
         self.rematte.setEnabled(bool(cut.analyzed and st is not None))
         self.smooth.set_value(ts.smoothing * 100)
-        self.thr.set_value(ts.conf_threshold * 100)
-        av = active_version()
-        self.ref_row.setToolTip(f"사용 중: v{av:03d}" if av else "아직 학습된 모델이 없습니다")
-        nkeys = sum(len(fr) for jd in cut.joint_keys.values() for fr in jd.values())
-        learned = 0
-        if st is not None:
-            import numpy as np
-            learned = int((np.abs(st.adapt_bias).sum(-1) > 1e-6).sum())
-        model = f"누적 모델 v{av:03d}" if (av and ts.refiner) else ("누적 모델 없음" if not av else "누적 모델 꺼짐")
-        self.learn_info.setText(f"관절 키 {nkeys}개 · 학습된 관절 보정 {learned}개 · {model}")
         sel = self.ctl.selection
         self.sel_label.setText(f"선택: {sel[0]}~{sel[1]} 프레임 ({sel[1] - sel[0] + 1}f)" if sel else "선택된 구간 없음")
 
@@ -617,7 +663,7 @@ class ProtectTab(_Tab):
         self.add(Wd.Section("인물"))
         self.t_others = Wd.Toggle()
         self.t_others.toggled.connect(lambda v: self.ctl.set_protect("others", v))
-        self.add(Wd.FieldRow("보정 대상이 아닌 인물 보호", self.t_others,
+        self.add(Wd.FieldRow("보정하지 않는 인물 보호", self.t_others,
                              "다른 멤버·엑스트라·소품 매트에는 변형이 닿지 않게 합니다"))
         self.falloff = Wd.ParamRow("falloff", "전환 폭", 0.5, 10, 0.5, "pct1", 0.5)
         self.falloff.keyb.hide()
@@ -818,7 +864,7 @@ class OutputTab(_Tab):
         self.add(Wd.Section("매트 출력"))
         self.t_mp = Wd.Toggle()
         self.t_mp.toggled.connect(lambda v: self.ctl.set_output("matte_person", v))
-        self.add(Wd.FieldRow("보정 대상 인물 매트", self.t_mp, "보정된 모양에 맞춘 인물 알파 (별도 파일)"))
+        self.add(Wd.FieldRow("보정 인물 매트", self.t_mp, "보정된 모양에 맞춘 인물 알파 (별도 파일)"))
         self.t_mw = Wd.Toggle()
         self.t_mw.toggled.connect(lambda v: self.ctl.set_output("matte_warp", v))
         self.add(Wd.FieldRow("변형 영역 마스크", self.t_mw, "픽셀이 움직인 곳 (Resolve·Nuke 후처리용)"))
@@ -826,6 +872,24 @@ class OutputTab(_Tab):
         self.go = Wd.button("렌더 큐에 추가", "primary", "list-video")
         self.go.clicked.connect(self.ctl.enqueue_render)
         self.add(self.go)
+        # edited timeline: how the whole timeline (or the chosen shots) is written out
+        self.tl_box = QWidget()
+        tv = QVBoxLayout(self.tl_box)
+        tv.setContentsMargins(0, 8, 0, 0)
+        tv.setSpacing(6)
+        tv.addWidget(Wd.Section("타임라인 출력"))
+        tv.addWidget(Wd.label("전체 길이 한 파일 · 컷별 개별 파일 · 리터칭 컷만 + 교체용 XML 중에서 고릅니다. "
+                              "작업 불필요 컷과 추적 확인 컷을 넣을지도 여기서 정합니다.", "Faint", 11))
+        row = QHBoxLayout()
+        b_all = Wd.button("타임라인 내보내기…", "", "download")
+        b_all.clicked.connect(lambda: self.ctl._tl_action("export", []))
+        b_sel = Wd.button("선택한 컷만…", "ghost", "download", "컷 리스트나 타임라인에서 고른 컷만 내보냅니다")
+        b_sel.clicked.connect(lambda: self.ctl._tl_action("export_sel", self.ctl._sel_cut_ids()))
+        row.addWidget(b_all)
+        row.addWidget(b_sel)
+        row.addStretch(1)
+        tv.addLayout(row)
+        self.add(self.tl_box)
         self.note = Wd.label("", "Faint", 11)
         self.note.setWordWrap(True)
         self.add(self.note)
@@ -866,16 +930,15 @@ class OutputTab(_Tab):
         self.fmt.setCurrentIndex(max(0, self.fmt.findData(o.format)))
         self.ocs.setCurrentIndex(max(0, self.ocs.findData(o.output_cs or "")))
         self.ocs.setEnabled(bool(cut.input_cs))
-        self.dir.setText(o.out_dir or "프로젝트 옆 Contour_Renders")
+        self.dir.setText(o.out_dir or "프로젝트 옆 DIAP_Renders")
         self.name.setText(o.name_pattern)
         for tg, v in ((self.t_audio, o.include_audio), (self.t_mp, o.matte_person), (self.t_mw, o.matte_warp)):
             tg.blockSignals(True)
             tg.setChecked(v)
             tg.blockSignals(False)
         self.t_audio.setEnabled(info.has_audio)
-        errs = [q for q in cut.qc if q.severity == "error" and q.status == "open"]
-        self.note.setText(f"QC 오류 {len(errs)}개가 남아 있습니다. 렌더 전에 확인하세요." if errs else
-                          "렌더는 원본 해상도·비트뎁스·타임코드를 유지합니다.")
+        self.note.setText("렌더는 원본 해상도·비트뎁스·타임코드를 유지합니다. 파일 이름 끝에 컷 버전(_v1)이 붙습니다.")
+        self.tl_box.setVisible(bool(s.project is not None and s.project.timeline_cuts()))
         self._filling = False
 
 
@@ -890,7 +953,7 @@ class Inspector(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 10, 0, 0)
         lay.setSpacing(0)
-        self.tabs = Wd.Segmented([("reshape", "보정"), ("track", "추적"), ("protect", "보호"), ("qc", "QC"),
+        self.tabs = Wd.Segmented([("reshape", "보정"), ("track", "추적"), ("protect", "보호"),
                                   ("output", "출력")], compact=True)
         wrap = QWidget()
         wl = QHBoxLayout(wrap)
@@ -900,7 +963,7 @@ class Inspector(QWidget):
         lay.addWidget(Wd.hline())
         self.stack = QStackedWidget()
         self.pages = {
-            "reshape": ReshapeTab(ctl), "track": TrackTab(ctl), "protect": ProtectTab(ctl), "qc": QCTab(ctl),
+            "reshape": ReshapeTab(ctl), "track": TrackTab(ctl), "protect": ProtectTab(ctl),
             "output": OutputTab(ctl),
         }
         for k, pg in self.pages.items():
@@ -912,6 +975,8 @@ class Inspector(QWidget):
 
     def show_tab(self, key: str):
         keys = list(self.pages)
+        if key not in self.pages:
+            return
         self.tabs.set_current(key)
         self.stack.setCurrentIndex(keys.index(key))
         self.pages[key].refresh()

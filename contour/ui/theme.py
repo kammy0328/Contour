@@ -1,4 +1,4 @@
-"""Dark theme. Neutral (untinted) greys so the surround never biases colour judgement, one rose accent."""
+"""Dark theme. Neutral (untinted) greys so the surround never biases colour judgement, one blue accent."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -20,10 +20,10 @@ C = dict(
     text="#E8E8E8",
     text2="#A6A6A6",
     text3="#6F6F6F",
-    accent="#F0709A",
-    accent_hi="#F68DB1",
-    accent_lo="#D45A83",
-    accent_soft="#3A2530",
+    accent="#4F8BFF",
+    accent_hi="#76A5FF",
+    accent_lo="#3A6FE0",
+    accent_soft="#1C2740",
     warn="#E8B04A",
     error="#F0564A",
     ok="#5CC8A0",
@@ -88,7 +88,7 @@ QPushButton {{ background: {c['bg2']}; border: 1px solid {c['line2']}; border-ra
 QPushButton:hover {{ background: {c['bg3']}; }}
 QPushButton:pressed {{ background: {c['bg4']}; }}
 QPushButton:disabled {{ color: {c['text3']}; background: {c['bg1']}; border-color: {c['line']}; }}
-QPushButton[kind="primary"] {{ background: {c['accent']}; border: 1px solid {c['accent']}; color: #1A0E13; font-weight: 600; }}
+QPushButton[kind="primary"] {{ background: {c['accent']}; border: 1px solid {c['accent']}; color: #FFFFFF; font-weight: 600; }}
 QPushButton[kind="primary"]:hover {{ background: {c['accent_hi']}; border-color: {c['accent_hi']}; }}
 QPushButton[kind="primary"]:pressed {{ background: {c['accent_lo']}; }}
 QPushButton[kind="primary"]:disabled {{ background: {c['accent_soft']}; border-color: {c['accent_soft']}; color: {c['text3']}; }}
@@ -99,6 +99,7 @@ QToolButton {{ background: transparent; border: 1px solid transparent; border-ra
 QToolButton:hover {{ background: {c['bg3']}; }}
 QToolButton:checked {{ background: {c['bg4']}; border-color: {c['line2']}; }}
 QToolButton:disabled {{ color: {c['text3']}; }}
+QLabel:disabled, QLineEdit:disabled, QCheckBox:disabled {{ color: {c['text3']}; }}
 
 QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QPlainTextEdit {{
     background: {c['bg2']}; border: 1px solid {c['line2']}; border-radius: 6px; padding: 5px 8px;
@@ -113,7 +114,7 @@ QSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::up-button, QDoubleSp
 QCheckBox {{ spacing: 8px; }}
 QCheckBox::indicator {{ width: 14px; height: 14px; border-radius: 4px; border: 1px solid {c['line2']}; background: {c['bg2']}; }}
 QCheckBox::indicator:checked {{ background: {c['accent']}; border-color: {c['accent']};
-    image: url("{icon_file('check', '#1A0E13')}"); }}
+    image: url("{icon_file('check', '#FFFFFF')}"); }}
 
 QSlider::groove:horizontal {{ height: 3px; background: {c['bg4']}; border-radius: 1px; }}
 QSlider::sub-page:horizontal {{ background: {c['accent']}; border-radius: 1px; }}

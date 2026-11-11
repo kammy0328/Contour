@@ -160,8 +160,9 @@ class Viewer(QWidget):
         self._img_cache[key] = img
 
     def _qimg(self, which: str) -> Optional[QImage]:
+        cid = self.s.cut.id if self.s.cut is not None else ""
         if which == "orig":
-            key = ("orig", self.t)
+            key = ("orig", self.t, cid)
             if key in self._img_cache:
                 return self._img_cache[key]
             a = self.s.frame(self.t)
@@ -205,18 +206,19 @@ class Viewer(QWidget):
 
     def _compute_preview(self, key):
         t, rkey = key
-        if self.s.cut is None or rkey != self.s.result_key(t):
-            # settings moved on while waiting: compute what is current now
-            pass
         if self.s.cut is None:
             return None
+        cid = self.s.cut.id
+        rk = self.s.result_key(t)
         a = self.s.result(t)
-        return (t, self.s.result_key(t), a) if a is not None else None
+        return (t, rk, a, cid) if a is not None else None
 
     def _preview_ready(self, key, payload):
         if payload is None:
             return
-        t, rkey, a = payload
+        t, rkey, a, cid = payload
+        if self.s.cut is None or cid != self.s.cut.id:
+            return                      # computed for a cut that is no longer open
         img = np_to_qimage(a)
         self._store_img(("result", rkey), img)
         if t == self.t:
@@ -242,7 +244,8 @@ class Viewer(QWidget):
         return img
 
     def _matte_img(self) -> Optional[QImage]:
-        key = ("matte", self.t, self.s.vers["trk"], self.s.vers["geo"])
+        key = ("matte", self.t, self.s.vers["trk"], self.s.vers["geo"], self.s.cut.id if self.s.cut else "",
+               self.sel_pid)
         if key in self._img_cache:
             return self._img_cache[key]
         tr = self.s.tracker
@@ -286,10 +289,20 @@ class Viewer(QWidget):
         return img
 
     def _skin_img(self) -> Optional[QImage]:
-        key = ("skin", self.t, self.s.vers["ret"], self.s.vers["trk"], self.s.vers["geo"])
+        key = ("skin", self.t, self.s.vers["ret"], self.s.vers["trk"], self.s.vers["geo"],
+               self.s.cut.id if self.s.cut else "", self.sel_pid)
         if key in self._img_cache:
             return self._img_cache[key]
-        rf = self.s.retouch(self.t)
+        # the selected person's area (even before their skin sliders are moved); else everyone retouched
+        rf = None
+        if self.sel_pid is not None and self.s.cut is not None and self.s.tracker is not None:
+            try:
+                from ..retouch.engine import person_masks
+                rf = person_masks(self.s.cut, self.s.tracker, self.t, self.sel_pid)
+            except Exception:
+                rf = None
+        if rf is None or rf.empty():
+            rf = self.s.retouch(self.t)
         if rf is None:
             return None
         m = rf.union()
@@ -301,7 +314,7 @@ class Viewer(QWidget):
             from ..warp.field import warp_image
             m = warp_image(m.astype(np.float32), fr, cv2.INTER_LINEAR)
         rgba = np.zeros(m.shape + (4,), np.uint8)
-        rgba[..., 0], rgba[..., 1], rgba[..., 2] = 240, 112, 154
+        rgba[..., 0], rgba[..., 1], rgba[..., 2] = 79, 139, 255
         rgba[..., 3] = np.clip(m * 170, 0, 255).astype(np.uint8)
         img = np_to_qimage(rgba)
         self._img_cache[key] = img
@@ -363,10 +376,6 @@ class Viewer(QWidget):
             mi = self._matte_img()
             if mi is not None:
                 p.drawImage(r, mi)
-        if self.show_heat and mode != "orig":
-            hi = self._heat_img()
-            if hi is not None:
-                p.drawImage(r, hi)
         if self.show_skin:
             si = self._skin_img()
             if si is not None:
@@ -385,7 +394,14 @@ class Viewer(QWidget):
             self._paint_draft(p)
         if self.message:
             self._tag(p, QRectF(self.rect()).adjusted(12, 12, -12, -12), self.message, left=True, bottom=True)
-        if self.playing and self._play_raw:
+        # the "not computed yet" tag only after several original frames in a row, and it stays a moment:
+        # single frames flipping between result and original made it blink
+        if self.playing:
+            self._raw_run = (getattr(self, "_raw_run", 0) + 1) if self._play_raw else 0
+            if self._raw_run >= 6:
+                self._raw_shown_until = self._paint_n + 12
+        self._paint_n = getattr(self, "_paint_n", 0) + 1
+        if self.playing and getattr(self, "_raw_shown_until", -1) > self._paint_n:
             self._tag(p, r, "미리 계산 전 · 원본")
 
     def _tag(self, p: QPainter, r: QRectF, text: str, left: bool = False, bottom: bool = False):

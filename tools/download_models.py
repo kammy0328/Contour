@@ -9,7 +9,7 @@ from contour.track import models as M  # noqa: E402
 
 def main():
     keys = ["det_yolox_m", "pose_rtmpose_x", "pose_rtmw_x", "pose_rtmpose_m", "face_yunet", "matte_rvm",
-            "face_rtm106", "hand_rtm21", "seg_sam2_s", "face_sface"]
+            "face_rtm106", "hand_rtm21", "seg_sam2_s", "face_sface", "face_parse"]
     if "--max" in sys.argv:
         keys += ["det_yolox_x", "pose_dwpose_l", "seg_sam2_b"]
     for k in keys:

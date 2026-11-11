@@ -6,8 +6,8 @@ from typing import List, Optional, Sequence, Tuple
 from PySide6.QtCore import (QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRect, QRectF, QSize, Qt, QTimer,
                             Signal, Property)
 from PySide6.QtGui import QColor, QFontMetrics, QMouseEvent, QPainter, QPainterPath, QPen, QPolygonF
-from PySide6.QtWidgets import (QAbstractButton, QFrame, QHBoxLayout, QLabel, QLayout, QLineEdit, QProgressBar, QPushButton,
-                               QSizePolicy, QToolButton, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractButton, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLayout, QLineEdit,
+                               QProgressBar, QPushButton, QSizePolicy, QToolButton, QVBoxLayout, QWidget)
 
 from . import icons as I
 from .theme import C, font, qc
@@ -39,7 +39,7 @@ def button(text: str, kind: str = "", icon_name: str = "", tip: str = "") -> QPu
     if kind:
         b.setProperty("kind", kind)
     if icon_name:
-        col = "#1A0E13" if kind == "primary" else C["text"]
+        col = "#FFFFFF" if kind == "primary" else C["text"]
         b.setIcon(I.icon(icon_name, 15, col, col))
         b.setIconSize(QSize(15, 15))
     if tip:
@@ -573,6 +573,111 @@ class FieldRow(QWidget):
 
 # --------------------------------------------------------------------------- busy overlay
 
+class Spinner(QWidget):
+    """A thin arc that turns and breathes (its length eases in and out). Runs only while visible."""
+
+    def __init__(self, size: int = 18, width: float = 2.0, color: str = "", parent=None):
+        super().__init__(parent)
+        self.setFixedSize(size, size)
+        self._w = width
+        self._col = color or C["accent"]
+        self._a = 0.0
+        self._t = QTimer(self)
+        self._t.setInterval(16)
+        self._t.timeout.connect(self._tick)
+        self._n = 0
+
+    def showEvent(self, e):
+        self._t.start()
+        super().showEvent(e)
+
+    def hideEvent(self, e):
+        self._t.stop()
+        super().hideEvent(e)
+
+    def _tick(self):
+        self._a = (self._a + 6.0) % 360.0
+        self._n += 1
+        self.update()
+
+    def paintEvent(self, e):
+        import math
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self._w, self._w, self.width() - 2 * self._w, self.height() - 2 * self._w)
+        p.setPen(QPen(qc("line2"), self._w))
+        p.drawEllipse(r)
+        span = 70 + 160 * (0.5 - 0.5 * math.cos(self._n * 0.05))
+        pen = QPen(QColor(self._col), self._w)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        p.drawArc(r, int(-self._a * 16), int(-span * 16))
+        p.end()
+
+
+def fade_in(w: QWidget, ms: int = 160):
+    """Opacity 0 -> 1 (kept on the widget so it can be faded again)."""
+    eff = w.graphicsEffect()
+    if not isinstance(eff, QGraphicsOpacityEffect):
+        eff = QGraphicsOpacityEffect(w)
+        w.setGraphicsEffect(eff)
+    an = QPropertyAnimation(eff, b"opacity", w)
+    an.setDuration(ms)
+    an.setStartValue(0.0)
+    an.setEndValue(1.0)
+    an.setEasingCurve(QEasingCurve.OutCubic)
+    an.finished.connect(lambda: w.setGraphicsEffect(None))     # no effect left on: keeps painting cheap
+    w._fade = an
+    an.start()
+
+
+class SaveIndicator(QWidget):
+    """Top bar: a small spinner with "저장 중" while saving, then a check and the time, which fades to grey."""
+
+    def __init__(self):
+        super().__init__()
+        h = QHBoxLayout(self)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(6)
+        self.spin = Spinner(12, 1.6)
+        self.check = QLabel()
+        self.check.setPixmap(I.icon("check", 12, C["ok"]).pixmap(12, 12))
+        self.text = QLabel("")
+        self.text.setObjectName("Faint")
+        h.addWidget(self.spin)
+        h.addWidget(self.check)
+        h.addWidget(self.text)
+        self.spin.hide()
+        self.check.hide()
+        self._t = QTimer(self)
+        self._t.setSingleShot(True)
+        self._t.timeout.connect(self._settle)
+
+    def setText(self, t: str):          # old QLabel API
+        self.text.setText(t)
+
+    def start(self, t: str = "저장 중"):
+        self._t.stop()
+        self.check.hide()
+        self.spin.show()
+        self.text.setStyleSheet(f"color: {C['text2']};")
+        self.text.setText(t)
+        self.repaint()
+
+    def done(self, t: str):
+        self.spin.hide()
+        ok = "실패" not in t
+        self.check.setVisible(ok)
+        self.text.setText(t)
+        self.text.setStyleSheet(f"color: {C['ok'] if ok else C['error']};")
+        fade_in(self, 180)
+        self._t.start(1600)
+
+    def _settle(self):
+        self.check.hide()
+        self.text.setStyleSheet("")
+
+
 class BusyOverlay(QWidget):
     cancelRequested = Signal()
 
@@ -589,6 +694,7 @@ class BusyOverlay(QWidget):
         bl.setSpacing(10)
         self.title = QLabel("")
         self.title.setFont(font(14, 600))
+        self.spinner = Spinner(18, 2.0)
         self.msg = QLabel("")
         self.msg.setObjectName("Muted")
         self.msg.setFont(font(12, 400, tabular=True))
@@ -600,7 +706,11 @@ class BusyOverlay(QWidget):
         row = QHBoxLayout()
         row.addWidget(self.msg, 1)
         row.addWidget(self.cancel)
-        bl.addWidget(self.title)
+        th = QHBoxLayout()
+        th.setSpacing(10)
+        th.addWidget(self.spinner)
+        th.addWidget(self.title, 1)
+        bl.addLayout(th)
         bl.addWidget(self.bar)
         bl.addLayout(row)
         box.setFixedWidth(420)
@@ -615,7 +725,10 @@ class BusyOverlay(QWidget):
         self.cancel.setEnabled(True)
         self.setGeometry(self.parentWidget().rect())
         self.raise_()
+        was = self.isVisible()
         self.show()
+        if not was:
+            fade_in(self, 180)
 
     def progress(self, f: float, msg: str = ""):
         self.bar.setValue(int(max(0, min(1, f)) * 1000))
@@ -645,7 +758,10 @@ class Toast(QLabel):
         par = self.parentWidget()
         self.move((par.width() - self.width()) // 2, par.height() - self.height() - 28)
         self.raise_()
+        was = self.isVisible()
         self.show()
+        if not was:
+            fade_in(self, 160)
         self._t.start(ms)
 
 

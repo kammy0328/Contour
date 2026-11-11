@@ -24,7 +24,7 @@ import numpy as np
 FACE_SAME = 0.42        # face cosine where "same person" becomes more likely than not
 REID_SAME = 0.80        # body re-ID cosine (raw features), only within similar outfits
 CONF_LOW = 0.55
-MEMBER_COLORS = ["#F0709A", "#5CC8A0", "#E8B04A", "#6FA8F5", "#B48CF2", "#F28C5C", "#4FD1D9", "#D9D24F",
+MEMBER_COLORS = ["#4F8BFF", "#5CC8A0", "#E8B04A", "#F0709A", "#B48CF2", "#F28C5C", "#4FD1D9", "#D9D24F",
                  "#F25C78", "#8CD96F", "#A3A3F5", "#F5A3D3"]
 
 

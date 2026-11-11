@@ -1,4 +1,4 @@
-"""Timeline: ruler, per-person tracking-confidence ribbons, keyframes, QC markers, work range, playhead."""
+"""Timeline: ruler, per-person tracking-confidence ribbons, keyframes, work range, playhead."""
 from __future__ import annotations
 
 from typing import List, Optional, Tuple
@@ -69,7 +69,6 @@ class Timeline(QWidget):
         if self.params_open:
             for key, label in self._keyed():
                 out.append(("pkey", label, key))
-        out.append(("qc", "QC", None))
         return out
 
     def _params(self):
