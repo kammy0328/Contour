@@ -57,7 +57,8 @@ jobs:
           New-Item -ItemType Directory -Force ci | Out-Null; Start-Transcript -Append -Path ci\log.txt | Out-Null
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
-          & $iscc /Qp "/DVer=${{ steps.v.outputs.ver }}" "/DSrc=$PWD" "/DPy=$PWD\build\python" installer\contour.iss
+          "iscc: $iscc exists=$(Test-Path $iscc)"
+          & $iscc /Qp "/DVer=${{ steps.v.outputs.ver }}" "/DSrc=$PWD" "/DPy=$PWD\build\python" installer\contour.iss 2>&1 | Tee-Object -FilePath ci\iscc.txt | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
           $exe = "dist\Contour_Setup_${{ steps.v.outputs.ver }}.exe"
           $h = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
@@ -115,6 +116,7 @@ jobs:
         run: |
           $log = ""
           if (Test-Path ci\log.txt) { $log = Get-Content ci\log.txt -Raw }
+          Get-ChildItem ci -Filter *.txt -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne "log.txt" } | ForEach-Object { $log += "`n===== $($_.Name) =====`n" + (Get-Content $_.FullName -Raw) }
           if (Test-Path C:\ct\setup_log.txt) { $log += "`n===== setup_log =====`n" + (Get-Content C:\ct\setup_log.txt -Raw) }
           $dist = (Get-ChildItem dist -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name) $($_.Length)" }) -join "`n"
           $text = "job ${{ job.status }}`n$dist`n`n$log"
