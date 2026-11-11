@@ -1,0 +1,7 @@
+# Core (Python 3.12, Windows x64). Versions are the ones Contour was tested with.
+numpy==2.5.3
+opencv-python-headless==5.0.0.93
+opencolorio==2.6.0
+PySide6==6.12.0
+scipy==1.18.1
+onnxruntime-gpu[cuda,cudnn]==1.24.4

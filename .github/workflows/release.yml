@@ -1,0 +1,96 @@
+name: release
+
+# A tag v1.2.3 builds Contour_Setup_1.2.3.exe on Windows, installs it on the runner as a smoke test, and puts
+# it on a release of this (private) repo. With the secret RELEASES_TOKEN (a token that can write to
+# kammy0328/Contour-Releases) it is also published there, which is where the app looks for updates.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PY_VER: "3.12.10"
+  PUBLIC_REPO: kammy0328/Contour-Releases
+
+jobs:
+  build:
+    runs-on: windows-2022
+    env:
+      HAS_PUBLIC_TOKEN: ${{ secrets.RELEASES_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Version
+        id: v
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path contour\core\settings.py -Pattern 'APP_VERSION = "(.+)"').Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME -ne "v$ver") { throw "tag $env:GITHUB_REF_NAME != APP_VERSION $ver" }
+          "ver=$ver" >> $env:GITHUB_OUTPUT
+
+      - name: Embeddable Python
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build\python | Out-Null
+          Invoke-WebRequest "https://www.python.org/ftp/python/$env:PY_VER/python-$env:PY_VER-embed-amd64.zip" -OutFile build\py.zip
+          Expand-Archive build\py.zip -DestinationPath build\python -Force
+          Invoke-WebRequest "https://bootstrap.pypa.io/get-pip.py" -OutFile build\python\get-pip.py
+          $pth = Get-ChildItem build\python -Filter "python3*._pth" | Select-Object -First 1
+          Set-Content -Path $pth.FullName -Encoding ascii -Value @("python312.zip", ".", "Lib\site-packages", "..\app", "import site")
+          Get-Content $pth.FullName
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /Qp "/DVer=${{ steps.v.outputs.ver }}" "/DSrc=$PWD" "/DPy=$PWD\build\python" installer\contour.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+          $exe = "dist\Contour_Setup_${{ steps.v.outputs.ver }}.exe"
+          $h = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          "$h  Contour_Setup_${{ steps.v.outputs.ver }}.exe" | Set-Content -Encoding ascii "$exe.sha256"
+          Get-Item $exe | Format-List Name, Length
+          Write-Host "SHA256 $h"
+
+      - name: Smoke test (install and import)
+        shell: pwsh
+        env:
+          CONTOUR_CI: "1"
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $exe = "dist\Contour_Setup_${{ steps.v.outputs.ver }}.exe"
+          $p = Start-Process $exe -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/DIR=C:\ct" -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw "installer exit $($p.ExitCode)" }
+          Get-Content C:\ct\setup_log.txt
+          Get-Process pythonw -ErrorAction SilentlyContinue | Stop-Process -Force
+          & C:\ct\python\python.exe -c "import sys; print(sys.version); import numpy, cv2, PySide6, onnxruntime, scipy, PyOpenColorIO; import contour.batch; from contour.ui import main_window, update, gatedlg; from contour.core import gate, updater; assert gate.check('0328'); print('ok', onnxruntime.get_available_providers())"
+          if ($LASTEXITCODE -ne 0) { throw "import failed" }
+          Push-Location C:\ct\app
+          & C:\ct\python\python.exe -m contour.batch --help
+          Pop-Location
+
+      - name: Release (private)
+        uses: softprops/action-gh-release@v2
+        if: github.ref_type == 'tag'
+        with:
+          files: |
+            dist/Contour_Setup_${{ steps.v.outputs.ver }}.exe
+            dist/Contour_Setup_${{ steps.v.outputs.ver }}.exe.sha256
+          body_path: installer/RELEASE_NOTES.md
+
+      - name: Publish (public, for updates)
+        if: github.ref_type == 'tag' && env.HAS_PUBLIC_TOKEN == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        shell: pwsh
+        run: |
+          gh release create "v${{ steps.v.outputs.ver }}" --repo $env:PUBLIC_REPO --title "Contour ${{ steps.v.outputs.ver }}" --notes-file installer/RELEASE_NOTES.md "dist/Contour_Setup_${{ steps.v.outputs.ver }}.exe" "dist/Contour_Setup_${{ steps.v.outputs.ver }}.exe.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Contour_Setup_${{ steps.v.outputs.ver }}
+          path: dist/*
