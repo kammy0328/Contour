@@ -1,11 +1,12 @@
 name: release
 
-# Run by hand (Actions > release > Run workflow, or `gh workflow run release.yml`) or by a tag v1.2.3: builds Contour_Setup_1.2.3.exe on Windows, installs it on the runner as a smoke test, and puts
+# Run by a push to main whose commit message has [release], by hand (Actions > release > Run workflow) or by a tag v1.2.3: builds Contour_Setup_1.2.3.exe on Windows, installs it on the runner as a smoke test, and puts
 # it on a release of this (private) repo. With the secret RELEASES_TOKEN (a token that can write to
 # kammy0328/Contour-Releases) it is also published there, which is where the app looks for updates.
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -18,6 +19,8 @@ env:
 
 jobs:
   build:
+    # a push to main builds only when its commit message has [release]
+    if: github.event_name != 'push' || github.ref_type == 'tag' || contains(github.event.head_commit.message, '[release]')
     runs-on: windows-2022
     env:
       HAS_PUBLIC_TOKEN: ${{ secrets.RELEASES_TOKEN != '' }}
