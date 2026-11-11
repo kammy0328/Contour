@@ -1,0 +1,89 @@
+**********************
+PowerShell transcript start
+Start time: 20261111211010
+Username: runnervmm7ud1\runneradmin
+RunAs User: runnervmm7ud1\runneradmin
+Configuration Name: 
+Machine: runnervmm7ud1 (Microsoft Windows NT 10.0.26100.0)
+Host Application: C:\Program Files\PowerShell\7\pwsh.dll -command . 'D:\a\_temp\da2cf5cd-cbb8-4f2c-bc73-651fda4d2005.ps1'
+Process ID: 3456
+PSVersion: 7.6.9
+PSEdition: Core
+GitCommitId: 7.6.9
+OS: Microsoft Windows 10.0.26100
+Platform: Win32NT
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1, 6.0, 7.0
+PSRemotingProtocolVersion: 2.4
+SerializationVersion: 1.1.0.1
+WSManStackVersion: 3.0
+**********************
+PS>$global:?
+True
+**********************
+PowerShell transcript end
+End time: 20261111211011
+**********************
+**********************
+PowerShell transcript start
+Start time: 20261111211011
+Username: runnervmm7ud1\runneradmin
+RunAs User: runnervmm7ud1\runneradmin
+Configuration Name: 
+Machine: runnervmm7ud1 (Microsoft Windows NT 10.0.26100.0)
+Host Application: C:\Program Files\PowerShell\7\pwsh.dll -command . 'D:\a\_temp\f169c565-ac82-4592-a094-da2a2088a345.ps1'
+Process ID: 5116
+PSVersion: 7.6.9
+PSEdition: Core
+GitCommitId: 7.6.9
+OS: Microsoft Windows 10.0.26100
+Platform: Win32NT
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1, 6.0, 7.0
+PSRemotingProtocolVersion: 2.4
+SerializationVersion: 1.1.0.1
+WSManStackVersion: 3.0
+**********************
+python312.zip
+.
+Lib\site-packages
+..\app
+import site
+PS>$global:?
+True
+**********************
+PowerShell transcript end
+End time: 20261111211012
+**********************
+**********************
+PowerShell transcript start
+Start time: 20261111211013
+Username: runnervmm7ud1\runneradmin
+RunAs User: runnervmm7ud1\runneradmin
+Configuration Name: 
+Machine: runnervmm7ud1 (Microsoft Windows NT 10.0.26100.0)
+Host Application: C:\Program Files\PowerShell\7\pwsh.dll -command . 'D:\a\_temp\b6fbc355-fac7-449c-8bea-7b48f1e97249.ps1'
+Process ID: 3208
+PSVersion: 7.6.9
+PSEdition: Core
+GitCommitId: 7.6.9
+OS: Microsoft Windows 10.0.26100
+Platform: Win32NT
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1, 6.0, 7.0
+PSRemotingProtocolVersion: 2.4
+SerializationVersion: 1.1.0.1
+WSManStackVersion: 3.0
+**********************
+
+PS>TerminatingError(): "ISCC failed"
+>> TerminatingError(): "ISCC failed"
+Exception: D:\a\_temp\b6fbc355-fac7-449c-8bea-7b48f1e97249.ps1:6
+Line |
+   6 |  if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+     |                             ~~~~~~~~~~~~~~~~~~~
+     | ISCC failed
+
+PS>$global:?
+False
+**********************
+PowerShell transcript end
+End time: 20261111211013
+**********************
