@@ -12,6 +12,7 @@ on:
 
 permissions:
   contents: write
+  checks: write
 
 env:
   PY_VER: "3.12.10"
@@ -106,20 +107,20 @@ jobs:
           name: Contour_Setup_${{ steps.v.outputs.ver }}
           path: dist/*
 
-      - name: Report to the ci-status branch (readable without the Actions API)
+      - name: Report (a check run named ci-log carries the log, readable without the Actions API)
         if: always()
         shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          New-Item -ItemType Directory -Force ci | Out-Null
-          "run ${{ github.run_id }} commit ${{ github.sha }} job ${{ job.status }} $(Get-Date -Format o)" | Set-Content ci\status.txt
-          if (Test-Path C:\ct\setup_log.txt) { Copy-Item C:\ct\setup_log.txt ci\setup_log.txt }
-          Get-ChildItem dist -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name) $($_.Length)" } | Add-Content ci\status.txt
-          Copy-Item -Recurse ci $env:RUNNER_TEMP\ci
-          git config user.name "ci"; git config user.email "ci@users.noreply.github.com"
-          git checkout --orphan ci-status
-          git rm -rf --cached . | Out-Null
-          Get-ChildItem -Force | Where-Object { $_.Name -ne ".git" } | Remove-Item -Recurse -Force
-          Copy-Item -Recurse $env:RUNNER_TEMP\ci\* .
-          git add -A; git commit -q -m "ci ${{ github.run_id }}"
-          git push -f origin ci-status
-
+          $log = ""
+          if (Test-Path ci\log.txt) { $log = Get-Content ci\log.txt -Raw }
+          if (Test-Path C:\ct\setup_log.txt) { $log += "`n===== setup_log =====`n" + (Get-Content C:\ct\setup_log.txt -Raw) }
+          $dist = (Get-ChildItem dist -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name) $($_.Length)" }) -join "`n"
+          $text = "job ${{ job.status }}`n$dist`n`n$log"
+          if ($text.Length -gt 60000) { $text = $text.Substring($text.Length - 60000) }
+          $body = @{ name = "ci-log"; head_sha = "${{ github.sha }}"; status = "completed"; conclusion = "neutral";
+                     output = @{ title = "job ${{ job.status }}"; summary = $text } } | ConvertTo-Json -Depth 5
+          Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/${{ github.repository }}/check-runs" `
+            -Headers @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = "application/vnd.github+json" } `
+            -Body $body -ContentType "application/json" | Out-Null
