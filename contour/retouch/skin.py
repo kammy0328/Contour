@@ -500,9 +500,15 @@ def smooth_channel(I: np.ndarray, mask: np.ndarray, strength: float, keep: float
     roi = I[y0:y1, x0:x1].astype(np.float32)
     m = mask[y0:y1, x0:x1]
     if relative:
-        sel = m > 0.3
-        lvl = float(np.median(roi[sel])) if sel.sum() > 20 else float(np.median(roi))
-        eps = eps * float(np.clip(lvl / 0.45, 0.15, 2.0)) ** 2
+        # per pixel, from the skin's own local brightness: one level for the whole face let the lit side and
+        # the side in shadow be smoothed differently, and the strength changed as the light moved over the
+        # face (a zoom through a light change): now the same slider does the same everywhere
+        loc = cv2.GaussianBlur(roi, (0, 0), max(2.0, 3.0 * r))
+        eps = eps * np.clip(loc / 0.45, 0.15, 2.0) ** 2
+    # above the middle of the slider the edge threshold rises too: strong retouches (hard light, a beauty
+    # reference that leaves about half of the texture) reach further into contrasty skin. Below 50 % nothing
+    # changes, so earlier settings and presets look the same.
+    eps = eps * (1.0 + 14.0 * max(0.0, float(strength) - 0.5) ** 2)
     base = guided_self(roi, r, eps)
     tone = guided_self(base, 2 * r, eps * 1.6)
     target = tone + (roi - base) * keep

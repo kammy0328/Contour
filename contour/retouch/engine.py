@@ -85,7 +85,7 @@ def _feather(m: np.ndarray, sig: float) -> np.ndarray:
 
 
 def wrinkle_masks(lm: np.ndarray, shape, prob: np.ndarray, which: str, fth: float = 1.5,
-                  wide: float = 1.0) -> np.ndarray:
+                  wide: float = 1.0, paint: Optional[np.ndarray] = None) -> np.ndarray:
     """Nasolabial folds ('naso') or the lines down from the mouth corners ('mouth'). lm in mask px.
     wide > 1: a wider band where the fold is looked for (where it really is differs from face to face)."""
     h, w = shape
@@ -128,7 +128,13 @@ def wrinkle_masks(lm: np.ndarray, shape, prob: np.ndarray, which: str, fth: floa
                    cv2.LINE_AA, 2)
     cz = np.clip(_feather(cz, 0.035 * Wf) * 1.5, 0, 1)
     soft = np.clip(cv2.GaussianBlur(prob, (0, 0), max(1.0, 0.02 * Wf)) * 1.5, 0, 1)
-    return np.clip(f * 1.3, 0, 1) * soft * (1 - lipf) * (1 - cz) * (1 - np.clip(ala * 1.2, 0, 1))
+    out = np.clip(f * 1.3, 0, 1) * soft * (1 - lipf) * (1 - cz) * (1 - np.clip(ala * 1.2, 0, 1))
+    if paint is not None:
+        # face paint, drawn lines and hair strands across the cheek are dark lines too: never "folds" to fill
+        k = max(3, int(0.012 * Wf) | 1)
+        pk = cv2.dilate((paint > 0.2).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+        out = out * (1 - np.clip(cv2.GaussianBlur(pk.astype(np.float32), (0, 0), max(0.8, 0.006 * Wf)) * 1.3, 0, 1))
+    return out
 
 
 def _ala_mask(lm: np.ndarray, shape) -> np.ndarray:
@@ -861,6 +867,11 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             if sx_.max() > 0.01:
                 job.masks["skinx"] = sx_
         if lm is not None and fw > 0.05:
+            def paint():
+                if "paint" not in state:
+                    state["paint"] = SK.paint_mask(base()["rgb"], lm)
+                return state["paint"]
+
             def pa():
                 b = base()
                 return b["prob"] * (b["alpha"] if b["alpha"] is not None else 1.0)
@@ -869,11 +880,11 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             if v.get("shine", 0) > 1e-4:
                 job.masks["hot"] = get("hot", lambda: hot_zone_mask(lm, shape, pa(), fth), f"{fth:.2f}") * fw
             if v["nasolabial"] > 1e-4:
-                job.masks["naso"] = get("naso", lambda: wrinkle_masks(lm, shape, pa(), "naso", fth, 1.7),
+                job.masks["naso"] = get("naso", lambda: wrinkle_masks(lm, shape, pa(), "naso", fth, 1.7, paint()),
                                         f"{fth:.2f}:w") * fw
             if v["mouth_lines"] > 1e-4:
-                job.masks["mouthl"] = get("mouthl", lambda: wrinkle_masks(lm, shape, pa(), "mouth", fth, 1.5),
-                                          f"{fth:.2f}:w") * fw
+                job.masks["mouthl"] = get("mouthl", lambda: wrinkle_masks(lm, shape, pa(), "mouth", fth, 1.5,
+                                                                        paint()), f"{fth:.2f}:w") * fw
             if v["nasolabial"] > 1e-4 or v["mouth_lines"] > 1e-4 or v.get("dark_circle", 0) > 1e-4:
                 def mk_ex():
                     b = base()
@@ -971,7 +982,7 @@ def _lift(I: np.ndarray, m: np.ndarray, k: float, sig: float, keep: float = 0.35
 
 
 def _fold_fill(I: np.ndarray, m: np.ndarray, excl: Optional[np.ndarray], k: float, sig_f: float, sig_s: float,
-               luma: bool = True) -> np.ndarray:
+               luma: bool = True, valley: float = 0.0) -> np.ndarray:
     """Fill in the shading of a crease from the skin around it.
 
     The skin next to the crease (eyes, lips, nostrils and non-skin left out) gives the level the crease
@@ -995,6 +1006,11 @@ def _fold_fill(I: np.ndarray, m: np.ndarray, excl: Optional[np.ndarray], k: floa
     ok = den > 0.05
     sur = np.where(ok, num / np.maximum(den, 1e-3), loc)
     d = sur - loc
+    if luma and valley > 0:
+        # never more than the crease's own depth against the skin right beside it: the broad shading of a
+        # cheek in side light is the face's modelling, not a fold
+        own = cv2.GaussianBlur(roi, (0, 0), valley) - loc
+        d = np.minimum(d, np.clip(own, 0, None) * 1.25)
     if luma:
         d = np.clip(d, 0.0, 0.25)
     else:
@@ -1403,8 +1419,11 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                 band = M(job.masks[name], (hY, wY))
                 # the fold where it really is in the (wide) search band, plus a little of the band itself
                 found = _fold_find(Y, band, wf, max(1.5, fw_ * wf))
-                mY = np.clip(band * (0.25 + 0.95 * found), 0, 1)
-                Y = _fold_fill(Y, mY, exY, 0.95 * k, max(0.8, sf * wf), max(2.0, ss * wf), True)
+                # only where a fold is really found (a quarter of the whole band used to be lifted too: on a
+                # face lit from the side that flattened the cheek's shading, which looked painted over)
+                mY = np.clip(band * (0.06 + 0.95 * found), 0, 1)
+                Y = _fold_fill(Y, mY, exY, 0.95 * k, max(0.8, sf * wf), max(2.0, ss * wf), True,
+                               valley=max(1.5, 1.6 * fw_ * wf))
                 mC = M(mY, (hC, wC))
                 Cb = _fold_fill(Cb, mC, exC, 0.7 * k, max(0.8, sf * wf * cs), max(1.5, ss * wf * cs), False)
                 Cr = _fold_fill(Cr, mC, exC, 0.7 * k, max(0.8, sf * wf * cs), max(1.5, ss * wf * cs), False)
