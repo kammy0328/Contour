@@ -1,13 +1,13 @@
 ; Contour installer (Inno Setup 6). Built by .github/workflows/release.yml:
-;   ISCC /DVer=1.8.1 /DSrc=<repo> /DPy=<embeddable python folder> installer\contour.iss
+;   ISCC /DAppVer=1.8.1 /DSrc=<repo> /DPy=<embeddable python folder> installer\contour.iss
 ; Per-user install (no admin): {localappdata}\Programs\Contour
 ;   {app}\python   embeddable Python 3.12 + packages (pip, installed by tools\setup_env.py)
 ;   {app}\app      Contour itself (replaced on every update)
 ;   {app}\ffmpeg   ffmpeg, fetched once when none is found on the PC
 ; Projects, learned data, presets and models stay in Documents\Contour_Data and are never touched.
 
-#ifndef Ver
-  #define Ver "0.0.0"
+#ifndef AppVer
+  #define AppVer "0.0.0"
 #endif
 #ifndef Src
   #define Src ".."
@@ -19,15 +19,15 @@
 [Setup]
 AppId={{0432DE7E-AD09-4B89-8929-0B95959C384F}
 AppName=Contour
-AppVersion={#Ver}
-AppVerName=Contour {#Ver}
+AppVersion={#AppVer}
+AppVerName=Contour {#AppVer}
 AppPublisher=SEWOO
 DefaultDirName={localappdata}\Programs\Contour
 DisableDirPage=auto
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir={#Src}\dist
-OutputBaseFilename=Contour_Setup_{#Ver}
+OutputBaseFilename=Contour_Setup_{#AppVer}
 SetupIconFile={#Src}\assets\icon.ico
 UninstallDisplayIcon={app}\app\assets\icon.ico
 Compression=lzma2/max

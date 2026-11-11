@@ -58,7 +58,7 @@ jobs:
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
           "iscc: $iscc exists=$(Test-Path $iscc)"
-          & $iscc /Qp "/DVer=${{ steps.v.outputs.ver }}" "/DSrc=$PWD" "/DPy=$PWD\build\python" installer\contour.iss 2>&1 | Tee-Object -FilePath ci\iscc.txt | Out-Null
+          & $iscc /Qp "/DAppVer=${{ steps.v.outputs.ver }}" "/DSrc=$PWD" "/DPy=$PWD\build\python" installer\contour.iss 2>&1 | Tee-Object -FilePath ci\iscc.txt | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
           $exe = "dist\Contour_Setup_${{ steps.v.outputs.ver }}.exe"
           $h = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
