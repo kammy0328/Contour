@@ -116,6 +116,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "public release failed" }
 
       - uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: Contour_Setup_${{ steps.v.outputs.ver }}
           path: dist/*
