@@ -90,8 +90,8 @@ jobs:
           PUB_TOKEN: ${{ secrets.RELEASES_TOKEN }}
         run: |
           $v = "v${{ steps.v.outputs.ver }}"
-          gh release delete $v --repo ${{ github.repository }} --yes --cleanup-tag 2>$null
-          if ($env:PUB_TOKEN) { $env:GH_TOKEN = $env:PUB_TOKEN; gh release delete $v --repo $env:PUBLIC_REPO --yes --cleanup-tag 2>$null }
+          gh release delete $v --repo ${{ github.repository }} --yes --cleanup-tag 2>&1 | Tee-Object -Append -FilePath ci\release.txt
+          if ($env:PUB_TOKEN) { $env:GH_TOKEN = $env:PUB_TOKEN; gh release delete $v --repo $env:PUBLIC_REPO --yes --cleanup-tag 2>&1 | Tee-Object -Append -FilePath ci\release.txt }
           exit 0
 
       - name: Release (private)
@@ -112,7 +112,8 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force ci | Out-Null; Start-Transcript -Append -Path ci\log.txt | Out-Null
-          gh release create "v${{ steps.v.outputs.ver }}" --repo $env:PUBLIC_REPO --title "Contour ${{ steps.v.outputs.ver }}" --notes-file installer/RELEASE_NOTES.md "dist/Contour_Setup_${{ steps.v.outputs.ver }}.exe" "dist/Contour_Setup_${{ steps.v.outputs.ver }}.exe.sha256"
+          gh release create "v${{ steps.v.outputs.ver }}" --repo $env:PUBLIC_REPO --title "Contour ${{ steps.v.outputs.ver }}" --notes-file installer/RELEASE_NOTES.md "dist/Contour_Setup_${{ steps.v.outputs.ver }}.exe" "dist/Contour_Setup_${{ steps.v.outputs.ver }}.exe.sha256" 2>&1 | Tee-Object -Append -FilePath ci\release.txt
+          if ($LASTEXITCODE -ne 0) { throw "public release failed" }
 
       - uses: actions/upload-artifact@v4
         with:
