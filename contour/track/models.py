@@ -250,7 +250,7 @@ def reset_providers() -> None:
     _providers_cache = None
 
 
-def session(path: Path):
+def _session_raw(path: Path):
     import onnxruntime as ort
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -269,6 +269,31 @@ def session(path: Path):
     except Exception:
         # A broken GPU setup should never stop the app: fall back to CPU.
         return ort.InferenceSession(str(path), sess_options=so, providers=["CPUExecutionProvider"])
+
+
+def session(path: Path):
+    """Load an ONNX model. If the file itself cannot be opened (another process holds it, a scanner locks it, a sharing
+    violation, errno 13), load a private copy from the temp folder: a silent loss of a model (the face parser) costs
+    mask quality without any message."""
+    try:
+        return _session_raw(path)
+    except Exception as first:
+        p = Path(path)
+        if not p.is_file():
+            raise
+        import atexit
+        d = Path(tempfile.gettempdir()) / "diap_model_cache" / str(os.getpid())
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            for f in p.parent.iterdir():                       # the model and its external weight files (name.onnx.data)
+                if f.name == p.name or f.name.startswith(p.name + "."):
+                    shutil.copyfile(f, d / f.name)
+            sys.stderr.write(f"MODEL FALLBACK {p.name}: loaded from a copy after: {str(first)[:200]}\n")
+            atexit.register(lambda: shutil.rmtree(d, ignore_errors=True))
+            return _session_raw(d / p.name)
+        except Exception as second:
+            sys.stderr.write(f"MODEL FALLBACK FAILED {p.name}: {str(second)[:200]}\n")
+            raise first
 
 
 def gpu_report() -> str:
