@@ -82,6 +82,12 @@ def _align(r, lm):
     return v
 
 
+def _crop_lm(lm, M):
+    out = lm.copy()
+    out[:, :2] = lm[:, :2] @ M[:, :2].T + M[:, 2]
+    return out
+
+
 def path_for(tracker) -> Path:
     return Path(tracker.project.cache_dir(tracker.cut)) / "facelayer.npz"
 
@@ -189,6 +195,12 @@ def build(tracker, progress: Optional[Callable[[float, str], None]] = None,
                     lm, r = lm2, r2
                     shift[p, t] = sh
         M[p, t] = r["M"]
+        # a dark, blurred or backlit face is read in patches (holes, specks): the retouch then comes out patchy.
+        # Close the gaps (about 6 to 12 % of the face width); eyes, brows and mouth are cut out separately later
+        rel_now = _reliability(r["skin"], _crop_lm(lm, r["M"]))
+        kk = 5 if rel_now >= 0.55 else 9
+        r["skin"] = cv2.morphologyEx(r["skin"].astype(np.float32), cv2.MORPH_CLOSE,
+                                     cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kk, kk))).astype(np.float16)
         skin[p, t] = r["skin"]
         neck[p, t] = r["neck"]
         # the hair/skin texture gate, in the same crop so it can be held steady through time too
