@@ -715,6 +715,7 @@ class CutTracker:
                             o = int(lab[int(cy), int(cx)])
                             if o >= 0 and st.present[o, t]:
                                 seg_owner[fi_] = o
+            granted = set()          # face crops given from a detected face (kept when the track lost another)
             # a frame the person detector missed (the track is bridged across it) has no whole-body face points and
             # often no segmentation either, while the face is in plain view: the detected face goes to the bridged
             # track whose head is on it (a whip pan or someone passing in front used to leave such a frame bare)
@@ -749,7 +750,9 @@ class CutTracker:
             # put them on the hair) is still that person's: it gets the 106-point crops from the face box, and a
             # track that claimed it from outside the owner's pixels (a second track on the same person) loses it
             if fm is not None:
-                has = set(fown)
+                # a track that just lost a face it shared with another (its points spilled onto a neighbour's
+                # face) may still be given its own face below
+                has = set(fown) - lose
                 for fi_, o in seg_owner.items():
                     if o in has:
                         continue
@@ -770,6 +773,7 @@ class CutTracker:
                     rot = float(np.arctan2(f[7] - f[5], f[6] - f[4])) if np.isfinite(f[4:8]).all() else 0.0
                     tight = [fx, fy, fx + fw_, fy + fh_]
                     fvar.append(len(fboxes))
+                    granted.update(range(len(fboxes), len(fboxes) + 3))
                     fboxes += [[fx - 0.12 * fw_, fy - 0.30 * fh_, fx + 1.12 * fw_, fy + 1.08 * fh_], tight, tight]
                     frots += [0.0, 0.0, rot if abs(rot) > np.radians(8) else 0.0]
                     fown += [o, o, o]
@@ -777,7 +781,7 @@ class CutTracker:
             if lose:
                 for pp in lose:
                     st.face_raw[pp, t] = np.nan
-                keep_i = [i for i in range(len(fboxes)) if fown[i] not in lose]
+                keep_i = [i for i in range(len(fboxes)) if fown[i] not in lose or i in granted]
                 remap = {i: k for k, i in enumerate(keep_i)}
                 fvar = [remap[i] for i in fvar if i in remap]
                 fboxes = [fboxes[i] for i in keep_i]
