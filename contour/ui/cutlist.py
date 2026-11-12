@@ -78,7 +78,8 @@ class _Delegate(QStyledItemDelegate):
         p.drawText(pr, Qt.AlignCenter, status)
         # tracking needs a look (automatic check): a small amber note after the pill
         from ..core import workstate as WS
-        if ((cut.status or {}).get("auto") == "bad" and not (cut.status or {}).get("reviewed")
+        from ..track import status as ST
+        if (ST.effective(cut) == "bad" and not (cut.status or {}).get("reviewed")
                 and WS.state(cut) not in ("skip", "done")):
             p.setPen(qc("warn"))
             p.setFont(font(10, 500))

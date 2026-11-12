@@ -21,11 +21,46 @@ LABEL = {"none": "리터칭 불필요", "small": "얼굴 작음", "good": "적�
          "skip": "제외"}
 
 
+def body_edited(cut, pids=None) -> bool:
+    """Body or proportion edits (which follow the body tracking) on these people (any person: None)."""
+    try:
+        from ..core.params import BODY_KEYS, SHAPE_KEYS, default
+    except Exception:
+        return False
+    keys = set(BODY_KEYS) | set(SHAPE_KEYS)
+    for pid, pp in (cut.params or {}).items():
+        try:
+            if pids is not None and int(pid) not in pids:
+                continue
+        except (TypeError, ValueError):
+            pass
+        for k, c in pp.amounts.items():
+            if k not in keys:
+                continue
+            d = default(k)
+            if abs(c.base - d) > 1e-6 or any(abs(v - d) > 1e-6 for v in c.keys.values()):
+                return True
+        if getattr(pp, "body_sculpt", None):
+            return True
+    return False
+
+
 def effective(cut) -> str:
     st = cut.status or {}
     if st.get("work") == "skip":
         return "none"                       # marked 작업 불필요 by the user
-    return st.get("user") or st.get("auto") or ("none" if cut.tl.get("kind") in ("gap",) else "pending")
+    v = st.get("user") or st.get("auto") or ("none" if cut.tl.get("kind") in ("gap",) else "pending")
+    # the body tracking is unsure for someone: a problem only once that body is being reshaped
+    if v == "good" and not st.get("user") and st.get("body_weak") and body_edited(cut, set(st["body_weak"])):
+        return "bad"
+    return v
+
+
+def reason(cut) -> str:
+    st = cut.status or {}
+    if effective(cut) == "bad" and st.get("auto") == "good" and st.get("body_weak"):
+        return st.get("body_reason", "몸 추적 약함")
+    return st.get("reason", "")
 
 
 STILL_RES = 0.008       # body points' deviation from one rigid motion (p90, share of the body's size)
@@ -154,15 +189,20 @@ def evaluate(cut, tracker, make_targets: bool = False) -> dict:
             big = max(r["face_px"] for r in judged)
             major = [r for r in judged if r["face_px"] >= 0.6 * big or r["frames"] >= 0.6 * span]
             hit = lambda r: r.get("face_hit", r["face_share"])
-            weak = [r for r in major if hit(r) < face_ok or r["track"] < track_ok]
-            minor_weak = [r for r in judged if r not in major and (hit(r) < face_ok or r["track"] < track_ok)]
+            # the face decides the retouch; the body tracking only matters for body edits (effective() turns
+            # body_weak into a warning once the body of that person is reshaped)
+            weak = [r for r in major if hit(r) < face_ok]
+            minor_weak = [r for r in judged if r not in major and hit(r) < face_ok]
+            body_weak = [r for r in major if r["track"] < track_ok]
+            if body_weak:
+                r = min(body_weak, key=lambda r: r["track"])
+                res["body_weak"] = [r_["pid"] for r_ in body_weak]
+                res["body_reason"] = f"인물 {r['pid'] + 1}: 몸 추적 신뢰 {r['track'] * 100:.0f}% (몸매 보정 확인)"
             if kind == "transition":
                 res.update(auto="bad", reason="트랜지션 (두 샷이 겹침)")
             elif weak:
-                r = min(weak, key=lambda r: min(hit(r), r["track"]))
-                why = []
-                if hit(r) < face_ok:
-                    why.append(f"얼굴 인식 {hit(r) * 100:.0f}%")
+                r = min(weak, key=lambda r: hit(r))
+                why = [f"얼굴 인식 {hit(r) * 100:.0f}%"]
                 if r["track"] < track_ok:
                     why.append(f"추적 신뢰 {r['track'] * 100:.0f}%")
                 res.update(auto="bad", reason=f"인물 {r['pid'] + 1}: " + ", ".join(why))
@@ -171,6 +211,8 @@ def evaluate(cut, tracker, make_targets: bool = False) -> dict:
                                                f"{min(hit(r) for r in major) * 100:.0f}%"
                                                + (f" · 작은 인물 {len(minor_weak)}명 약함" if minor_weak else ""))
     s = dict(cut.status or {})
+    s.pop("body_weak", None)
+    s.pop("body_reason", None)
     s.update(res)
     cut.status = s
     return s

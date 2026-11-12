@@ -113,7 +113,7 @@ class _Delegate(QStyledItemDelegate):
         p.setFont(font(9, 400, tabular=True))
         n = cut.info.frames
         fm = p.fontMetrics()
-        sub = f"{n}f · " + (cut.tl.get("note") or (cut.status or {}).get("reason") or cut.tl.get("name", ""))
+        sub = f"{n}f · " + (cut.tl.get("note") or ST.reason(cut) or cut.tl.get("name", ""))
         p.drawText(QRectF(r.left() + 6, tr.bottom() + 18, TW, 14), Qt.AlignLeft | Qt.AlignVCenter,
                    fm.elidedText(sub, Qt.ElideRight, TW))
         p.restore()

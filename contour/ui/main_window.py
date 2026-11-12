@@ -1390,7 +1390,7 @@ class MainWindow(QMainWindow):
                 nxt = rest[0]
                 self.open_cut(nxt.id)
                 self.cutlist.refresh(nxt.id)
-                self.toast(f"검수 {nxt.name}: {ST.LABEL[ST.effective(nxt)]} · {(nxt.status or {}).get('reason', '')} "
+                self.toast(f"검수 {nxt.name}: {ST.LABEL[ST.effective(nxt)]} · {ST.reason(nxt)} "
                            f"· 확인 후 다시 '검수'를 누르면 검수 완료로 표시하고 다음 컷으로 갑니다 (남은 {len(rest)}컷)")
             else:
                 self.toast("모든 컷 검수 완료", "ok")
