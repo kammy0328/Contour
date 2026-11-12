@@ -33,8 +33,8 @@ COLOR_R = 3            # frames each side, colour centre median
 
 
 ALIGN_STEP = 0.085     # of the face width in the crop: search grid for a landmark set that sits beside the face
-ALIGN_N = 3            # grid -3..3 steps each way (about 0.25 face widths)
-ALIGN_ON = False       # off: at full size the landmarks of the checked cuts agreed with the parser; kept for later
+ALIGN_N = 4            # grid -4..4 steps each way (about 0.34 face widths)
+ALIGN_ON = True        # slides landmarks that sit beside the face onto it (checked: no change on a cut whose landmarks were right)
 ALIGN_GAIN = 0.10      # IoU the shifted outline must gain before landmarks are moved
 
 
