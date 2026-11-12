@@ -800,6 +800,7 @@ def knee_mask(kp: np.ndarray, widths, shape, sx: float, sy: float, prob: np.ndar
 
 VIS_LO = 0.12         # face visibility where the face retouch starts
 VIS_FULL = 0.5        # and where it is at full strength
+CACHE_BYTES = 900 * 2 ** 20   # the preview's mask cache
 STEADY_R = 2          # frames each side
 STEADY_SIGMA = 1.0
 STEADY_LRU = 7
@@ -1015,8 +1016,13 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             m = fn()
             if cache is not None:
                 cache[key] = m
-                while len(cache) > 400:
-                    cache.pop(next(iter(cache)))
+                # bounded by memory, not by count: at a 1920 proxy every mask is 8 MB, and 400 of them took
+                # over 3 GB in the preview
+                nb = cache.get("__bytes__", 0) + int(getattr(m, "nbytes", 0))
+                while (len(cache) > 401 or nb > CACHE_BYTES) and len(cache) > 2:
+                    k0 = next(k_ for k_ in cache if k_ != "__bytes__")
+                    nb -= int(getattr(cache.pop(k0), "nbytes", 0))
+                cache["__bytes__"] = max(0, nb)
             return m
 
         from ..core.project import scope_set
