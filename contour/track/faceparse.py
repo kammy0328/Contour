@@ -47,7 +47,31 @@ def ready() -> bool:
 class FaceParser:
     def __init__(self):
         from . import models as M
-        self.s = M.session(M.ensure_model(MODEL_KEY))
+        import os
+        base = M.ensure_model(MODEL_KEY)
+        # the parser trained further on the user's own footage (Cloud\step_train.bat) sits next to the original;
+        # delete that file (or set DIAP_NO_TUNED) to go back
+        tuned = Path(str(base)).with_name("face_parse_diap.onnx")
+        # DIAP's own parser (a different network taught by the one above, Cloud\step_train.bat installs it once it
+        # is good enough) comes first; DIAP_NO_OWN goes back
+        own = Path(str(base)).with_name("face_parse_own.onnx")
+        self.tuned = False
+        self.own = False
+        self.s = None
+        if own.exists() and not os.environ.get("DIAP_NO_OWN"):
+            try:
+                self.s = M.session(own)
+                self.own = True
+            except Exception:
+                self.s = None
+        if self.s is None and tuned.exists() and not os.environ.get("DIAP_NO_TUNED"):
+            try:
+                self.s = M.session(tuned)
+                self.tuned = True
+            except Exception:
+                self.s = None
+        if self.s is None:
+            self.s = M.session(base)
         self.inp = self.s.get_inputs()[0].name
 
     @staticmethod

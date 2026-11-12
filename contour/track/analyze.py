@@ -564,6 +564,13 @@ class CutTracker:
         except Exception:
             import traceback
             traceback.print_exc()
+        # originals for later training of the masks and the tracking (Cloud folder, this computer only)
+        try:
+            from . import cloudcollect as CC
+            CC.collect(self)
+        except Exception:
+            import traceback
+            traceback.print_exc()
         p_w(1.0, "완료")
         self.cut.analyzed = True
         self.cut.analysis_version += 1

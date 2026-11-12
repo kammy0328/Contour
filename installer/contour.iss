@@ -44,7 +44,6 @@ RestartApplications=no
 Name: "ko"; MessagesFile: "compiler:Languages\Korean.isl"
 
 [Tasks]
-Name: "learn"; Description: "누적 학습 기능 (PyTorch 약 2.5GB 추가 설치)"; Flags: unchecked
 Name: "desktop"; Description: "바탕화면 바로가기"
 
 [InstallDelete]
@@ -52,7 +51,13 @@ Name: "desktop"; Description: "바탕화면 바로가기"
 Type: filesandordirs; Name: "{app}\app\contour"
 Type: filesandordirs; Name: "{app}\app\tools"
 
+[Dirs]
+; originals gathered for training and the developer's step training live here; the app (not elevated) writes to it
+Name: "{app}\Cloud"; Permissions: users-modify
+Name: "{app}\Cloud\data"; Permissions: users-modify
+
 [Files]
+Source: "{#Src}\cloud\*"; DestDir: "{app}\Cloud"; Excludes: "__pycache__,*.pyc"; Flags: ignoreversion
 Source: "{#Py}\*"; DestDir: "{app}\python"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#Src}\app.py"; DestDir: "{app}\app"; Flags: ignoreversion
 Source: "{#Src}\requirements.txt"; DestDir: "{app}\app"; Flags: ignoreversion
@@ -69,9 +74,9 @@ Name: "{autodesktop}\DIAP"; Filename: "{app}\python\DIAP.exe"; Parameters: """{a
 [Run]
 ; first install into this folder (also the update from 1.8.1, which moves to Program Files): visible console,
 ; the package download takes a while
-Filename: "{app}\python\python.exe"; Parameters: """{app}\app\tools\setup_env.py"" --learn {code:LearnFlag}"; WorkingDir: "{app}\app"; StatusMsg: "패키지와 모델을 준비하는 중 (처음엔 5~10분)"; Check: FirstSetup
+Filename: "{app}\python\python.exe"; Parameters: """{app}\app\tools\setup_env.py"" --learn 1"; WorkingDir: "{app}\app"; StatusMsg: "패키지, 학습 기능, 모델을 준비하는 중 (처음엔 10~20분, 약 3GB)"; Check: FirstSetup
 ; update in place: hidden, packages only when they changed
-Filename: "{app}\python\python.exe"; Parameters: """{app}\app\tools\setup_env.py"" --learn auto"; WorkingDir: "{app}\app"; StatusMsg: "업데이트 마무리 중"; Flags: runhidden; Check: not FirstSetup
+Filename: "{app}\python\python.exe"; Parameters: """{app}\app\tools\setup_env.py"" --learn 1"; WorkingDir: "{app}\app"; StatusMsg: "업데이트 마무리 중"; Flags: runhidden; Check: not FirstSetup
 Filename: "{app}\python\DIAP.exe"; Parameters: """{app}\app\app.py"""; WorkingDir: "{app}\app"; Description: "DIAP 실행"; Flags: nowait postinstall skipifsilent
 Filename: "{app}\python\DIAP.exe"; Parameters: """{app}\app\app.py"""; WorkingDir: "{app}\app"; Flags: nowait runasoriginaluser; Check: IsUpdate
 
@@ -139,10 +144,3 @@ begin
   Result := ExpandConstant('{param:UPDATE|0}') = '1';
 end;
 
-function LearnFlag(Param: String): String;
-begin
-  if WizardIsTaskSelected('learn') then
-    Result := '1'
-  else
-    Result := 'auto';
-end;

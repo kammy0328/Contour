@@ -1,5 +1,9 @@
-# Optional: training the cumulative refiner model on the GPU (about 2.5 GB).
+# Training on the GPU (installed with the app, about 3 GB): the cumulative refiner and the face parser step training.
 --index-url https://download.pytorch.org/whl/cu126
 --extra-index-url https://pypi.org/simple
 torch==2.14.1
+torchvision==0.29.1
 onnx==1.23.2
+transformers==4.46.3
+huggingface-hub<1.0
+safetensors
