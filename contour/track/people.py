@@ -154,6 +154,46 @@ def _face_anchors(rgb: np.ndarray, faces: np.ndarray) -> np.ndarray:
     return np.array(out, np.float32).reshape(-1, 4)
 
 
+def _anchor_poses(rgb: np.ndarray, faces: np.ndarray, extra: np.ndarray, poses: Dict[str, object]):
+    """Pose of each face anchor -> (pose output per model, the boxes kept to their own side).
+
+    With several large faces side by side (a close-up of two or three people) a head-and-shoulders box around
+    one face holds its neighbours' faces too, and the pose models then put the head on whichever face is
+    sharpest: two tracks on the girl in focus, none on the one beside her. Each anchor is looked at with the
+    other faces blanked out, and its box is kept to its own side of them."""
+    n = len(extra)
+    if n < 2:
+        return {k: pe(rgb, extra) for k, pe in poses.items()}, extra
+    H, W = rgb.shape[:2]
+    fill = np.median(rgb.reshape(-1, 3), 0).astype(rgb.dtype)
+    out = {k: [] for k in poses}
+    boxes = extra.copy()
+    ctr = np.array([[f[0] + f[2] / 2, f[1] + f[3] / 2] for f in faces], np.float32)
+    for i in range(n):
+        img = rgb.copy()
+        bx = extra[i].copy()
+        fx, fy, fw, fh = [float(v) for v in faces[i][:4]]
+        for j in range(n):
+            if j == i:
+                continue
+            gx, gy, gw, gh = [float(v) for v in faces[j][:4]]
+            x0, y0 = int(max(0, gx - 0.15 * gw)), int(max(0, gy - 0.25 * gh))
+            x1, y1 = int(min(W, gx + 1.15 * gw)), int(min(H, gy + 1.15 * gh))
+            img[y0:y1, x0:x1] = fill
+            # the box stops halfway to a neighbouring face at about the same height
+            if abs(ctr[j, 1] - ctr[i, 1]) < 0.8 * max(fh, gh):
+                mid = (ctr[i, 0] + ctr[j, 0]) / 2
+                if ctr[j, 0] > ctr[i, 0]:
+                    bx[2] = min(bx[2], max(mid, fx + fw * 1.05))
+                else:
+                    bx[0] = max(bx[0], min(mid, fx - fw * 0.05))
+        boxes[i] = bx
+        for k, pe in poses.items():
+            kp, sc = pe(img, bx[None])
+            out[k].append((kp[0], sc[0]))
+    return {k: (np.stack([a for a, _ in v]), np.stack([b for _, b in v])) for k, v in out.items()}, boxes
+
+
 def _box_iou(a, b) -> float:
     iw = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
     ih = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
@@ -203,7 +243,7 @@ def detect_people(rgb: np.ndarray, det, poses: Dict[str, object], reid=None, fac
             faces = np.zeros((0, 15), np.float32)
         extra = _face_anchors(rgb, faces) if len(faces) else np.zeros((0, 4), np.float32)
         if len(extra):
-            more = {k: pe(rgb, extra) for k, pe in poses.items()}
+            more, extra = _anchor_poses(rgb, faces, extra, poses)
             add = _average(more, len(extra))
             ok = [i for i in range(len(extra)) if _head_in(add[i], faces[i][:4]) >= 2]
             n0 = len(boxes)

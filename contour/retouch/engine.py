@@ -304,6 +304,43 @@ def _capsule(m: np.ndarray, a, b, r: float):
         cv2.circle(m, (int(round(q[0])), int(round(q[1]))), int(round(r)), 255, -1, cv2.LINE_AA)
 
 
+def face_owned(st, t: int, p: int, lm: np.ndarray, alpha: np.ndarray, shape, sx: float, sy: float) -> np.ndarray:
+    """The person matte, with this person's clearly visible face always theirs.
+
+    In a tight group the segmentation sometimes hands a whole face to the person behind (a track that slid onto
+    the head in front) or splits it into stripes between two people; the retouch of that face then dropped out
+    for that frame. A face whose own landmarks are sure is in front of whatever the matte says, except where
+    another person's visible face lies over it."""
+    poly = SK.face_polygon(lm)
+    if poly is None or float(st.face_vis[p, t]) < 0.8:
+        return alpha
+    # the face detector (independent of the landmark models) must see this face here too: landmarks that slid
+    # onto a neighbour's head are not a face to hand pixels to
+    yn = getattr(st, "raw", {}).get("face_yunet")
+    Wf = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
+    if yn is None or not np.nan_to_num(yn[p, t, 0, 2]) > 0:
+        return alpha
+    if float(np.hypot(*(yn[p, t, 0, :2] * [sx, sy] - lm[30, :2]))) > 0.3 * Wf:
+        return alpha
+    h, w = shape
+    face = np.zeros(shape, np.uint8)
+    cv2.fillPoly(face, [np.round(poly).astype(np.int32)], 255)
+    inside = face > 0
+    if not inside.any() or float(alpha[inside].mean()) > 0.9:
+        return alpha                                  # the matte already has it
+    for q in np.nonzero(st.present[:, t])[0]:
+        if q == p or st.face_vis[q, t] < 0.5 or not np.isfinite(st.face[q, t, :, :2]).all():
+            continue
+        oq = st.face[q, t].copy()
+        oq[:, 0] *= sx
+        oq[:, 1] *= sy
+        op = SK.face_polygon(oq)
+        if op is not None:
+            cv2.fillPoly(face, [np.round(op).astype(np.int32)], 0)
+    soft = cv2.GaussianBlur(face.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.02 * Wf))
+    return np.maximum(alpha, soft).astype(np.float32)
+
+
 COVER_SEGS = ("upper_arm_l", "upper_arm_r", "forearm_l", "forearm_r", "thigh_l", "thigh_r", "calf_l", "calf_r")
 
 
@@ -922,6 +959,11 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                         state["prob"] = state["prob"] * (1.0 - cv_)
                     state["cover"] = cv_
                 state["alpha"] = SK.person_alpha(tracker, t, p, (px.w, px.h))
+                if state["alpha"] is not None and lm is not None and fw > 0.5:
+                    try:
+                        state["alpha"] = face_owned(st, t, p, lm, state["alpha"], shape, px.sx, px.sy)
+                    except Exception:
+                        pass
             return state
 
         def get(name, fn, extra=""):

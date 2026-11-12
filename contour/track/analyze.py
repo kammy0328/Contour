@@ -753,6 +753,14 @@ class CutTracker:
                 for fi_, o in seg_owner.items():
                     if o in has:
                         continue
+                    # a track whose face points lie squarely on this face keeps it when it is at least as sure of
+                    # its head as the label map's owner (a track that slid onto the head in front, a mask that
+                    # took in the face in front of its person)
+                    strong = [c_ for c_ in claims.get(fi_, []) if c_[0] >= 0.8 and c_[1] < 0.3]
+                    if strong:
+                        hc = lambda q_: float(np.mean(np.nan_to_num(st.final[q_, t, :3, 2])))
+                        if max(hc(c_[2]) for c_ in strong) >= hc(o) - 0.05:
+                            continue
                     f = yfaces[fi_]
                     fx, fy, fw_, fh_ = [float(v) for v in f[:4]]
                     if max(fw_, fh_) < 40:

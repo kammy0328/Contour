@@ -144,15 +144,74 @@ def _fill_small_holes(hard: np.ndarray, frac: float = 0.002) -> np.ndarray:
     return out
 
 
-def combine(logits: List[Tuple[int, np.ndarray]], rvm: Optional[np.ndarray], shape) -> Tuple[np.ndarray, np.ndarray]:
-    """Per person mask logits at matte size -> (alpha uint8, labels uint8 = pid + 1)."""
+HEAD_PULL = 5.0             # logit units: a person's own visible face over another person's overlapping mask
+
+
+def head_priors(st, t: int, mw: int, mh: int, W: int, H: int, sx: float, sy: float, use_final: bool) -> dict:
+    """pid -> (cx, cy, r, w) at matte size: where each person's face is, how big, how sure (visible face points)."""
+    out = {}
+    kx, ky = mw / W, mh / H
+    for p in np.nonzero(st.present[:, t])[0]:
+        kp = _kp_for(st, p, t, use_final)
+        if kp is None:
+            continue
+        hd = kp[[S.NOSE, S.L_EYE, S.R_EYE]]
+        ok = np.isfinite(hd[:, :2]).all(1) & (np.nan_to_num(hd[:, 2]) >= 0.3)
+        if ok.sum() < 2:
+            continue
+        pts = hd[ok, :2] * [sx * kx, sy * ky]
+        c = pts.mean(0)
+        ears = [kp[j, :2] * [sx * kx, sy * ky] for j in (S.L_EAR, S.R_EAR)
+                if np.isfinite(kp[j, :2]).all() and np.nan_to_num(kp[j, 2]) >= 0.2]
+        span = max([float(np.hypot(*(q - c))) for q in list(pts) + ears] + [0.0])
+        sh = [kp[j, :2] * [sx * kx, sy * ky] for j in (S.L_SH, S.R_SH) if np.isfinite(kp[j, :2]).all()]
+        if len(sh) == 2:
+            span = max(span, 0.22 * float(np.hypot(*(sh[0] - sh[1]))))
+        r = max(3.0, 1.1 * span)
+        wgt = float(np.clip((np.mean(np.nan_to_num(hd[ok, 2])) - 0.3) / 0.4, 0.0, 1.0))
+        if wgt > 0:
+            out[int(st.pids[p])] = (float(c[0]), float(c[1]), r, wgt)
+    return out
+
+
+def combine(logits: List[Tuple[int, np.ndarray]], rvm: Optional[np.ndarray], shape,
+            heads: Optional[dict] = None) -> Tuple[np.ndarray, np.ndarray]:
+    """Per person mask logits at matte size -> (alpha uint8, labels uint8 = pid + 1).
+
+    Where two people's masks overlap the owner is the larger logit. Two near-equal logits used to split a face
+    into stripes of both owners (the decoder's texture), and a mask that took in the face of the person in front
+    won it outright on some frames, so that face lost its retouch on those frames. Logits are now smoothed a
+    little, and around each visible face its own person is pulled up and everyone else down."""
     h, w = shape
     alpha = np.zeros((h, w), np.float32)
     lab = np.zeros((h, w), np.uint8)
     if logits:
-        L = np.stack([l for _, l in logits])
+        sig = max(1.0, 0.002 * max(h, w))
+        L = np.stack([cv2.GaussianBlur(l, (0, 0), sig) for _, l in logits])
+        La = L                                  # for who owns a pixel; L alone says whether it is a person
+        bumps = {}
+        if heads and len(logits) > 1:
+            La = L.copy()
+            yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+            for pid, (cx, cy, r, wg) in heads.items():
+                x0, x1 = int(max(0, cx - 3 * r)), int(min(w, cx + 3 * r + 1))
+                y0, y1 = int(max(0, cy - 3 * r)), int(min(h, cy + 3 * r + 1))
+                if x1 <= x0 or y1 <= y0:
+                    continue
+                b = np.zeros((h, w), np.float32)
+                b[y0:y1, x0:x1] = wg * np.exp(-((xx[y0:y1, x0:x1] - cx) ** 2 + (yy[y0:y1, x0:x1] - cy) ** 2) / (2 * r * r))
+                bumps[pid] = b
+            if bumps:
+                tot = sum(bumps.values())
+                for i, (pid, _l) in enumerate(logits):
+                    own = bumps.get(pid)
+                    others = tot - own if own is not None else tot
+                    # only where this mask is in play at all (a pull never makes a person out of background)
+                    inplay = L[i] > -6
+                    adj = HEAD_PULL * ((own if own is not None else 0.0) - np.clip(others, 0, 1))
+                    La[i] = np.where(inplay, L[i] + adj, L[i])
         Lmax = L.max(0)
-        arg = L.argmax(0)
+        arg = La.argmax(0)
         pids = np.array([pid for pid, _ in logits])
         hard = Lmax > 0
         solid = _fill_small_holes(hard)
@@ -221,7 +280,7 @@ def run(st, proxy, matte, seglab, a: int, b: int, seg_key: str, use_final: bool,
                         continue
                     canvas[my0:my1, mx0:mx1] = cv2.resize(lg, (mx1 - mx0, my1 - my0), interpolation=cv2.INTER_LINEAR)
                     logits.append((int(st.pids[p]), canvas))
-            al, lb = combine(logits, rvm, (mh, mw))
+            al, lb = combine(logits, rvm, (mh, mw), head_priors(st, t, mw, mh, W, H, sx, sy, use_final))
             mm[t] = al
             lm[t] = lb
             if progress:
