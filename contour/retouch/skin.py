@@ -370,6 +370,41 @@ def parse_gate(parse: Optional[dict], Wf: float, with_neck: bool = True) -> Opti
     return (1.0 - cov * parse["trust"] * (1.0 - g) * 0.97).astype(np.float32)
 
 
+def _parse_fill(rgb_u8: np.ndarray, lm: np.ndarray, parse: dict) -> Optional[np.ndarray]:
+    """Skin the face parser is confident about, inside the (slightly widened) face outline, with the eyes, brows,
+    lips and the mouth left out. 0..1."""
+    if parse.get("trust", 0) <= 0 or not np.isfinite(lm[[0, 16], :2]).all():
+        return None
+    poly = face_polygon(lm)
+    if poly is None:
+        return None
+    h, w = rgb_u8.shape[:2]
+    Wf = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
+    reg = np.zeros((h, w), np.uint8)
+    cv2.fillPoly(reg, [np.round(poly).astype(np.int32)], 255)
+    k = max(3, int(0.04 * Wf) | 1)
+    reg = cv2.erode(reg, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))   # inside, not on the edge
+    reg = cv2.GaussianBlur(reg.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.02 * Wf))
+    feat = _features_mask(lm, (h, w))
+    kf = max(3, int(0.06 * Wf) | 1)
+    feat = cv2.dilate(feat, np.ones((kf, kf), np.uint8))
+    featf = cv2.GaussianBlur(feat.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.02 * Wf))
+    mouth = np.zeros((h, w), np.uint8)
+    lp = lm[LIPS, :2]
+    if np.isfinite(lp).all():
+        cv2.fillConvexPoly(mouth, cv2.convexHull(np.round(lp).astype(np.int32)), 255)
+        d = max(3, int(0.12 * Wf) | 1)
+        mouth = cv2.dilate(mouth, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d)))
+    mz = cv2.GaussianBlur(mouth.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.03 * Wf))
+    sk = np.clip((parse["skin"].astype(np.float32) - 0.55) / 0.3, 0, 1)
+    cov = parse.get("cover")
+    if cov is not None:
+        sk = sk * cov                                  # outside the parser's crop it knows nothing
+    tex = parse.get("tex")
+    tg = tex.astype(np.float32) if tex is not None else 1.0       # hair against skin: the texture gate keeps it out
+    return (0.95 * float(np.clip(parse["trust"], 0, 1)) * sk * reg * (1.0 - featf) * (1.0 - mz) * tg).astype(np.float32)
+
+
 def face_skin_probability(rgb_u8: np.ndarray, model, lm: Optional[np.ndarray], parse: Optional[dict] = None) -> np.ndarray:
     gate = None
     if parse is not None and lm is not None and np.isfinite(lm[[0, 16], :2]).all():
@@ -377,6 +412,15 @@ def face_skin_probability(rgb_u8: np.ndarray, model, lm: Optional[np.ndarray], p
     out = _face_skin_probability(rgb_u8, model, lm, gate, parse.get("tex") if parse is not None else None)
     if gate is not None:
         out = out * gate
+    # the colour model alone loses skin that sits in shadow or under a strongly coloured light; where the face
+    # parser is sure it is skin (inside the face outline, off the features) it is skin
+    if parse is not None and lm is not None and gate is not None:
+        try:
+            pf = _parse_fill(rgb_u8, lm, parse)
+            if pf is not None:
+                out = np.maximum(out, pf)
+        except Exception:
+            pass
     # face paint, tattoos, drawn veins: never retouched
     pm = paint_mask(rgb_u8, lm) if lm is not None else None
     if pm is not None:
