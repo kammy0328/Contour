@@ -363,19 +363,49 @@ def limb_cover(st, t: int, lm: np.ndarray, shape, sx: float, sy: float) -> Optio
                 continue
             _capsule(m, a, b, 0.9 * r)
             hit = True
-        if getattr(st, "has_hands", False):
-            H = st.hand[q, t]
-            for i0 in (0, 21):
-                hh = H[i0:i0 + 21]
-                okh = np.isfinite(hh[:, :2]).all(1) & (np.nan_to_num(hh[:, 2]) > 0.4)
-                if okh.sum() < 6:
-                    continue
+        # hands: tracked hand points, else the whole-body model's hand points where it is sure of them
+        tracked = getattr(st, "has_hands", False) and np.isfinite(st.hand[q, t, :, :2]).any()
+        H = st.hand[q, t] if tracked else st.hand_raw[q, t]
+        thr = 0.4 if tracked else 1.5
+        for i0, (el, wr) in ((0, (S.L_EL, S.L_WR)), (21, (S.R_EL, S.R_WR))):
+            hh = H[i0:i0 + 21]
+            okh = np.isfinite(hh[:, :2]).all(1) & (np.nan_to_num(hh[:, 2]) >= thr)
+            pts = None
+            fore = None
+            if np.isfinite(kp[[el, wr], :2]).all():
+                fore = float(np.hypot(*(kp[wr, :2] - kp[el, :2]))) * sx
+            if okh.sum() >= 10:
                 pts = hh[okh, :2] * [sx, sy]
-                if pts[:, 0].max() < x0 or pts[:, 0].min() > x1 or pts[:, 1].max() < y0 or pts[:, 1].min() > y1:
-                    continue
-                hull = cv2.convexHull(np.round(pts).astype(np.int32))
-                cv2.fillConvexPoly(m, hull, 255, cv2.LINE_AA)
-                hit = True
+                # a hand is about as long as the forearm's half and starts at the wrist: points scattered over
+                # half the picture (the model lost the hand) are no hand
+                span = float(np.ptp(pts, 0).max())
+                ref_ = fore if fore and fore > 4 else 0.25 * float(np.nan_to_num(st.scale[q, t])) * sx
+                if ref_ <= 0 or span > 1.1 * ref_:
+                    pts = None
+                elif np.isfinite(kp[wr, :2]).all():
+                    w_ = kp[wr, :2] * [sx, sy]
+                    if float(np.min(np.hypot(*(pts - w_).T))) > 0.5 * ref_:
+                        pts = None
+            if pts is None and np.isfinite(kp[[el, wr], :2]).all() and min(np.nan_to_num(kp[el, 2]), np.nan_to_num(kp[wr, 2])) >= 0.3 \
+                    and st.vis[q, t, wr] == 1:
+                # no hand points: the hand as the forearm's continuation
+                e_, w_ = kp[el, :2] * [sx, sy], kp[wr, :2] * [sx, sy]
+                L = float(np.hypot(*(w_ - e_)))
+                if L > 2:
+                    pts = np.array([w_, w_ + (w_ - e_) / L * 0.45 * L])
+            if pts is None:
+                continue
+            if pts[:, 0].max() < x0 or pts[:, 0].min() > x1 or pts[:, 1].max() < y0 or pts[:, 1].min() > y1:
+                continue
+            if len(pts) == 2:
+                _capsule(m, pts[0], pts[1], 0.5 * float(np.hypot(*(pts[1] - pts[0]))))
+            else:
+                hm = np.zeros(shape, np.uint8)
+                cv2.fillConvexPoly(hm, cv2.convexHull(np.round(pts).astype(np.int32)), 255, cv2.LINE_AA)
+                span = float(np.ptp(pts, 0).max())
+                k = max(3, int(0.15 * span) | 1)
+                m = np.maximum(m, cv2.dilate(hm, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))))
+            hit = True
     if not hit:
         return None
     m = cv2.bitwise_and(m, cv2.dilate(face, np.ones((max(3, int(0.1 * Wf) | 1),) * 2, np.uint8)))
