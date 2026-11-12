@@ -998,6 +998,13 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                         cv_ = limb_cover(st, t, lm, shape, px.sx, px.sy)
                     except Exception:
                         cv_ = None
+                    if cv_ is not None and fmaps is not None:
+                        # the face parser leaves anything in front of the face out of its skin (CelebAMask-HQ
+                        # marks occluders as background): where it is sure of face skin, no limb is in front.
+                        # A cheek resting on a hand, a head lying on an arm put the limb's capsule over the
+                        # whole face and the face lost its retouch (cut 095: 88 % of the skin gone)
+                        sure = np.clip((fmaps["skin"] - 0.5) / 0.35, 0.0, 1.0) * float(fmaps.get("trust", 1.0))
+                        cv_ = (cv_ * (1.0 - sure)).astype(np.float32)
                     if cv_ is not None:
                         state["prob"] = state["prob"] * (1.0 - cv_)
                     state["cover"] = cv_
