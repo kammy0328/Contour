@@ -86,3 +86,23 @@ def version_back(cut) -> int:
     cut.params, cut.persons, cut.mode, cut.protect = tmp.params, tmp.persons, tmp.mode, tmp.protect
     cut.version = v
     return v
+
+
+def all_versions(cut) -> list:
+    """Every version of this cut that can be opened (kept ones and the current), oldest first."""
+    return sorted({int(v) for v in cut.versions} | {int(cut.version)})
+
+
+def version_switch(cut, v: int) -> int:
+    """Open another version of the cut: the current work is kept as its own version, then the chosen one's
+    params, persons, mode and protect become the cut's work."""
+    v = int(v)
+    if v == cut.version or str(v) not in cut.versions:
+        return cut.version
+    cut.versions[str(cut.version)] = _snapshot(cut)
+    snap = cut.versions[str(v)]
+    from .project import Cut
+    tmp = Cut.from_dict(dict(cut.to_dict(), **{k: snap[k] for k in ("params", "persons", "mode", "protect")}))
+    cut.params, cut.persons, cut.mode, cut.protect = tmp.params, tmp.persons, tmp.mode, tmp.protect
+    cut.version = v
+    return v

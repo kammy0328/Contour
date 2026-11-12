@@ -60,16 +60,6 @@ class ReshapeTab(_Tab):
         pl = QVBoxLayout(self.person_box)
         pl.setContentsMargins(0, 6, 0, 0)
         pl.setSpacing(6)
-        row = QHBoxLayout()
-        self.name = QLineEdit()
-        self.name.setPlaceholderText("이름")
-        self.name.editingFinished.connect(lambda: self.ctl.rename_person(self.name.text()))
-        row.addWidget(self.name, 1)
-        self.del_btn = Wd.tool("trash-2", "이 인물 삭제 (잘못 잡힌 사람·물체)")
-        self.del_btn.setIcon(I.icon("trash-2", 16, C["error"], C["error"]))
-        self.del_btn.clicked.connect(self.ctl.delete_person)
-        row.addWidget(self.del_btn)
-        pl.addLayout(row)
         self.role = Wd.Segmented([("target", "보정"), ("protect", "보호")], compact=True)
         self.role.setToolTip("보정: 이 인물에 보정을 적용합니다\n보호: 보정하지 않고, 다른 사람의 변형도 닿지 않게 지킵니다")
         self.role.changed.connect(self.ctl.set_role)
@@ -404,6 +394,15 @@ class ReshapeTab(_Tab):
         self.width_box.setVisible(on)
         self.width_toggle.setIcon(I.icon("chevron-down" if on else "chevron-right", 14))
 
+    def _chip_delete(self, pid: int):
+        self.ctl.sel_pid = pid
+        self.ctl.sel_pids = set()
+        self.ctl.delete_person()
+
+    def _chip_rename(self, pid: int, name: str):
+        self.ctl.sel_pid = pid
+        self.ctl.rename_person(name)
+
     def refresh(self):
         from ..core.params import GROUPS, PARAMS
         s = self.ctl.session
@@ -423,6 +422,9 @@ class ReshapeTab(_Tab):
             ch.set_text(p.name, badge)
             ch.setChecked(p.id == self.ctl.sel_pid or p.id in (getattr(self.ctl, "sel_pids", set()) or set()))
             ch.clicked.connect(lambda _=False, pid=p.id: self.ctl.select_person(pid))
+            ch.setToolTip("더블클릭: 이름 수정 · 마우스를 올리면 오른쪽에 삭제 버튼")
+            ch.deleteRequested.connect(lambda pid=p.id: self._chip_delete(pid))
+            ch.renamed.connect(lambda t, pid=p.id: self._chip_rename(pid, t))
             self.chips.addWidget(ch)
             self._chips[p.id] = ch
         self.no_people.setVisible(not persons)
@@ -430,9 +432,6 @@ class ReshapeTab(_Tab):
         self.person_box.setVisible(person is not None)
         enabled = person is not None and person.role == "target"
         if person is not None:
-            self.name.blockSignals(True)
-            self.name.setText(person.name)
-            self.name.blockSignals(False)
             self.role.set_current("protect" if person.role == "ignore" else person.role)
         if cut:
             self.mode.set_current(cut.mode)

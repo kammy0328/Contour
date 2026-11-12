@@ -5,7 +5,7 @@ from typing import Dict, Optional
 
 import numpy as np
 from PySide6.QtCore import QPoint, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QFontMetrics, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMenu,
                                QStyle, QStyledItemDelegate, QVBoxLayout, QWidget)
 
@@ -14,6 +14,26 @@ from .theme import C, font, qc
 from .viewer import np_to_qimage
 
 ROW_H = 76
+
+
+def label_of(cut) -> str:
+    """Cuts of an edited timeline are listed by their number only (001, 002, ...), not by file name."""
+    if cut.tl:
+        return f"{int(cut.tl.get('index', 0)) + 1:03d}"
+    return cut.name
+
+
+def listed(prj):
+    """Cuts shown in the list. Once a timeline is loaded its cuts replace the whole source video, which is
+    not listed (it would sit above 001 as one long clip)."""
+    cuts = list(prj.cuts) if prj else []
+    if any(c.tl for c in cuts):
+        tl = [c for c in cuts if c.tl]
+        base = (prj.timeline or {}).get("baked")
+        from ..core.tlimport import _same_file
+        rest = [c for c in cuts if not c.tl and not (base and _same_file(c.source, base))]
+        return sorted(tl, key=lambda c: c.tl.get("index", 0)) + rest
+    return cuts
 
 
 class _Delegate(QStyledItemDelegate):
@@ -55,11 +75,22 @@ class _Delegate(QStyledItemDelegate):
         p.setFont(font(12, 600))
         p.setPen(qc("text"))
         fm = p.fontMetrics()
-        name = fm.elidedText(cut.name, Qt.ElideMiddle, int(r.right() - x - 6))
-        p.drawText(QRectF(x, r.top() + 8, r.right() - x, 18), Qt.AlignLeft | Qt.AlignVCenter, name)
+        ver = f"v{int(getattr(cut, 'version', 1) or 1)}"
+        vw = QFontMetrics(font(10, 700)).horizontalAdvance(ver) + 12
+        name = fm.elidedText(label_of(cut), Qt.ElideMiddle, int(r.right() - x - 10 - vw))
+        p.drawText(QRectF(x, r.top() + 8, r.right() - x - vw - 6, 18), Qt.AlignLeft | Qt.AlignVCenter, name)
+        vr = QRectF(r.right() - vw - 4, r.top() + 9, vw, 16)
+        p.setPen(Qt.NoPen)
+        p.setBrush(qc("bg0"))
+        p.drawRoundedRect(vr, 8, 8)
+        p.setFont(font(10, 700))
+        p.setPen(qc("accent"))
+        p.drawText(vr, Qt.AlignCenter, ver)
+        p.setFont(font(12, 600))
+        p.setPen(qc("text"))
         info = cut.info
         dur = info.frames / max(1e-6, info.fps)
-        meta = f"{info.width}×{info.height} · {int(dur // 60)}:{int(dur % 60):02d} · {info.frames}f · v{getattr(cut, 'version', 1)}"
+        meta = f"{info.width}×{info.height} · {int(dur // 60)}:{int(dur % 60):02d} · {info.frames}f"
         p.setFont(font(11, 400, tabular=True))
         p.setPen(qc("text3"))
         p.drawText(QRectF(x, r.top() + 27, r.right() - x, 16), Qt.AlignLeft | Qt.AlignVCenter, meta)
@@ -161,7 +192,7 @@ class CutList(QWidget):
         self._block = True
         self.list.clear()
         prj = self.s.project
-        cuts = prj.cuts if prj else []
+        cuts = listed(prj)
         allc = len(cuts)
         f = self.filter.currentData() if hasattr(self, "filter") else ""
         if f:

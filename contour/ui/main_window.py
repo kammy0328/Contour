@@ -164,6 +164,7 @@ class MainWindow(QMainWindow):
         self.tlstrip.cutSelected.connect(self.open_cut)
         self.tlstrip.action.connect(self._tl_action)
         self.tlstrip.menuRequested.connect(self._cut_menu)
+        self.tlstrip.versionPicked.connect(self.switch_version)
         self.tlstrip.hide()
         cv.addWidget(self.tlstrip)
         cv.addWidget(tl_wrap)
@@ -507,9 +508,10 @@ class MainWindow(QMainWindow):
                     self.cutlist.set_thumb(c.id, th)
         self.tlstrip.thumbs.clear()
         self.tlstrip.refresh()
-        if prj.cuts:
-            self.open_cut(prj.cuts[0].id)
-            self.cutlist.refresh(prj.cuts[0].id)
+        first = self._first_listed(prj)
+        if first is not None:
+            self.open_cut(first.id)
+            self.cutlist.refresh(first.id)
         else:
             self._refresh_all()
             self.viewer.update()
@@ -1087,9 +1089,10 @@ class MainWindow(QMainWindow):
             if was_current:
                 self.session.open_cut(None)
             self.cutlist.refresh()
-            if prj.cuts and was_current:
-                self.open_cut(prj.cuts[0].id)
-                self.cutlist.refresh(prj.cuts[0].id)
+            first = self._first_listed(prj)
+            if first is not None and was_current:
+                self.open_cut(first.id)
+                self.cutlist.refresh(first.id)
             self._refresh_all()
 
     # ================================================================== jobs
@@ -1883,6 +1886,30 @@ class MainWindow(QMainWindow):
         self.viewer.update()
 
     # ================================================================== people
+    @staticmethod
+    def _first_listed(prj):
+        from .cutlist import listed
+        lst = listed(prj)
+        return lst[0] if lst else None
+
+    def switch_version(self, cut_id: str, v: int):
+        from ..core import workstate as WS
+        """Timeline strip: open another version (v1, v2, ...) of a cut."""
+        prj = self.session.project
+        c = prj.cut(cut_id) if prj else None
+        if c is None or int(v) == int(c.version):
+            return
+        self.save()
+        WS.version_switch(c, v)
+        self.session.dirty = True
+        if self.session.cut is c:
+            self.session.touch("all")
+            self.viewer._img_cache.clear()
+        self._after_status_change()
+        self._refresh_all()
+        self.cutlist.update_rows()
+        self.toast(f"{c.name}: v{c.version}으로 바꿨습니다", "ok")
+
     def select_person(self, pid: int):
         """Shift+click adds the person to the selection: they get the selected person's values, and every
         change from then on goes to all selected people."""

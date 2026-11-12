@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import List, Optional, Sequence, Tuple
 
 from PySide6.QtCore import (QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRect, QRectF, QSize, Qt, QTimer,
-                            Signal, Property)
+                            Signal, Property, QEvent)
 from PySide6.QtGui import QColor, QFontMetrics, QMouseEvent, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import (QAbstractButton, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLayout, QLineEdit,
                                QProgressBar, QPushButton, QSizePolicy, QToolButton, QVBoxLayout, QWidget)
@@ -431,12 +431,20 @@ class ParamRow(QWidget):
 # --------------------------------------------------------------------------- person chip
 
 class Chip(QAbstractButton):
+    """A person chip. Hover shows a trash button on the right; double-click edits the name in place."""
+    deleteRequested = Signal()
+    renamed = Signal(str)
+    TRASH = 22
+
     def __init__(self, text: str, color: str, parent=None):
         super().__init__(parent)
         self.setCheckable(True)
         self.text_ = text
         self.color = QColor(color)
         self.badge = ""
+        self._trash_down = False
+        self._edit = None
+        self.setMouseTracking(True)
         self.setCursor(Qt.PointingHandCursor)
         self.setFont(font(12, 500))
         self.setFixedHeight(28)
@@ -445,7 +453,7 @@ class Chip(QAbstractButton):
     def _fit(self):
         fm = QFontMetrics(self.font())
         bw = fm.horizontalAdvance(self.badge) + 12 if self.badge else 0
-        self.setFixedWidth(fm.horizontalAdvance(self.text_) + 34 + bw)
+        self.setFixedWidth(fm.horizontalAdvance(self.text_) + 34 + bw + self.TRASH)
 
     def set_text(self, t: str, badge: str = ""):
         self.text_ = t
@@ -453,30 +461,117 @@ class Chip(QAbstractButton):
         self._fit()
         self.update()
 
+    def _trash_rect(self) -> QRectF:
+        return QRectF(self.width() - self.TRASH - 4, 4, self.TRASH, self.height() - 8)
+
     def paintEvent(self, e):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         sel = self.isChecked()
+        hov = self.underMouse() and self._edit is None
         p.setPen(QPen(self.color if sel else qc("line2"), 1.2))
         p.setBrush(qc("bg3") if sel else (qc("bg2") if not self.underMouse() else qc("bg3")))
         p.drawRoundedRect(r, r.height() / 2, r.height() / 2)
         p.setPen(Qt.NoPen)
         p.setBrush(self.color)
         p.drawEllipse(QPointF(14, r.center().y()), 4.5, 4.5)
-        p.setPen(qc("text") if sel else qc("text2"))
-        fm = QFontMetrics(self.font())
-        tw = fm.horizontalAdvance(self.text_)
-        p.drawText(QRectF(24, 0, tw + 4, r.height()), Qt.AlignVCenter | Qt.AlignLeft, self.text_)
-        if self.badge:
-            p.setPen(qc("text3"))
-            p.setFont(font(11, 500))
-            p.drawText(QRectF(24 + tw + 8, 0, 60, r.height()), Qt.AlignVCenter | Qt.AlignLeft, self.badge)
+        if self._edit is None:
+            p.setPen(qc("text") if sel else qc("text2"))
+            fm = QFontMetrics(self.font())
+            tw = fm.horizontalAdvance(self.text_)
+            p.drawText(QRectF(24, 0, tw + 4, r.height()), Qt.AlignVCenter | Qt.AlignLeft, self.text_)
+            if self.badge:
+                p.setPen(qc("text3"))
+                p.setFont(font(11, 500))
+                p.drawText(QRectF(24 + tw + 8, 0, 60, r.height()), Qt.AlignVCenter | Qt.AlignLeft, self.badge)
+        if hov:
+            tr = self._trash_rect()
+            if self._over_trash:
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(255, 255, 255, 28))
+                p.drawEllipse(tr.center(), 10, 10)
+            ic = I.icon("trash-2", 14, C["error"], C["error"])
+            pm = ic.pixmap(14, 14)
+            p.drawPixmap(int(tr.center().x() - 7), int(tr.center().y() - 7), pm)
+
+    _over_trash = False
+
+    def _hit_trash(self, pos) -> bool:
+        return self.underMouse() and self._edit is None and self._trash_rect().contains(pos.x(), pos.y())
+
+    def mouseMoveEvent(self, e):
+        o = self._hit_trash(e.position())
+        if o != self._over_trash:
+            self._over_trash = o
+            self.setCursor(Qt.ArrowCursor if o else Qt.PointingHandCursor)
+            self.update()
+        super().mouseMoveEvent(e)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton and self._hit_trash(e.position()):
+            self._trash_down = True
+            return
+        super().mousePressEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if self._trash_down:
+            self._trash_down = False
+            if self._trash_rect().contains(e.position().x(), e.position().y()):
+                self.deleteRequested.emit()
+            return
+        super().mouseReleaseEvent(e)
+
+    def mouseDoubleClickEvent(self, e):
+        if e.button() != Qt.LeftButton or self._hit_trash(e.position()):
+            return
+        self._start_edit()
+
+    def _start_edit(self):
+        if self._edit is not None:
+            return
+        ed = QLineEdit(self.text_, self)
+        ed.setFont(self.font())
+        ed.setFrame(False)
+        ed.setStyleSheet(f"QLineEdit {{ background: {C['bg1']}; color: {C['text']}; border: 1px solid {C['accent']};"
+                         " border-radius: 8px; padding: 0 4px; }")
+        ed.setGeometry(22, 3, max(70, self.width() - 22 - 6), self.height() - 6)
+        self._edit = ed
+        self.setFixedWidth(max(self.width(), 150))
+        ed.setGeometry(22, 3, self.width() - 28, self.height() - 6)
+        ed.show()
+        ed.setFocus()
+        ed.selectAll()
+        ed.returnPressed.connect(lambda: self._end_edit(True))
+        ed.editingFinished.connect(lambda: self._end_edit(True))
+        ed.installEventFilter(self)
+
+    def eventFilter(self, o, e):
+        if o is self._edit and e.type() == QEvent.KeyPress and e.key() == Qt.Key_Escape:
+            self._end_edit(False)
+            return True
+        return super().eventFilter(o, e)
+
+    def _end_edit(self, ok: bool):
+        ed = self._edit
+        if ed is None:
+            return
+        self._edit = None
+        t = ed.text().strip()
+        ed.removeEventFilter(self)
+        ed.hide()
+        ed.deleteLater()
+        self._fit()
+        self.update()
+        if ok and t and t != self.text_:
+            self.renamed.emit(t)
 
     def enterEvent(self, e):
         self.update()
 
     def leaveEvent(self, e):
+        self._over_trash = False
+        self.setCursor(Qt.PointingHandCursor)
         self.update()
 
 

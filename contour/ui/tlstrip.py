@@ -26,6 +26,41 @@ STATUS_COL = {"good": C["ok"], "bad": C["error"], "none": C["text3"], "small": C
 ORDER = ["good", "bad", "small", "none", "pending", "skip"]
 
 
+def badge_rect(tr: QRectF, ver: str) -> QRectF:
+    w = 12 + 6.5 * len(ver)
+    return QRectF(tr.right() - w - 4, tr.top() + 4, w, 17)
+
+
+class _List(QListWidget):
+    """The thumbnail row; a click on a version badge opens the version list instead of selecting the cut."""
+    badgeClicked = Signal(object, QPoint)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            it = self.itemAt(e.position().toPoint())
+            if it is not None:
+                cut = it.data(Qt.UserRole)
+                ir = self.visualItemRect(it)
+                r = QRectF(ir).adjusted(4, 3, -4, -3)
+                tr = QRectF(r.left() + 4, r.top() + 4, TW, TH)
+                ver = f"v{int(getattr(cut, 'version', 1) or 1)}"
+                if badge_rect(tr, ver).adjusted(-3, -3, 3, 3).contains(e.position()):
+                    self.badgeClicked.emit(cut, self.viewport().mapToGlobal(e.position().toPoint()))
+                    return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        it = self.itemAt(e.position().toPoint())
+        hand = False
+        if it is not None:
+            cut = it.data(Qt.UserRole)
+            r = QRectF(self.visualItemRect(it)).adjusted(4, 3, -4, -3)
+            tr = QRectF(r.left() + 4, r.top() + 4, TW, TH)
+            hand = badge_rect(tr, f"v{int(getattr(cut, 'version', 1) or 1)}").contains(e.position())
+        self.viewport().setCursor(Qt.PointingHandCursor if hand else Qt.ArrowCursor)
+        super().mouseMoveEvent(e)
+
+
 class _Delegate(QStyledItemDelegate):
     def __init__(self, strip):
         super().__init__()
@@ -80,16 +115,17 @@ class _Delegate(QStyledItemDelegate):
             p.setFont(font(10, 600))
             p.drawText(tr, Qt.AlignCenter, "대기" if run < 0 else f"분석 {run * 100:.0f}%")
             p.setPen(Qt.NoPen)
-        # reviewed tick
-        if (cut.status or {}).get("reviewed"):
-            cr = QRectF(tr.right() - 20, tr.top() + 4, 16, 16)
-            p.setBrush(qc("ok"))
-            p.drawEllipse(cr)
-            pen = QPen(QColor("#10251C"), 2)
-            p.setPen(pen)
-            p.drawLine(cr.left() + 4, cr.center().y(), cr.center().x() - 1, cr.bottom() - 4)
-            p.drawLine(cr.center().x() - 1, cr.bottom() - 4, cr.right() - 3, cr.top() + 4)
-            p.setPen(Qt.NoPen)
+        # version badge (always shown, v1 by default); clicking it lists the cut's versions
+        ver = f"v{int(getattr(cut, 'version', 1) or 1)}"
+        vr = badge_rect(tr, ver)
+        multi = len(WS.all_versions(cut)) > 1
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(0, 0, 0, 170))
+        p.drawRoundedRect(vr, 4, 4)
+        p.setFont(font(10, 700, tabular=True))
+        p.setPen(qc("accent") if multi else qc("text"))
+        p.drawText(vr, Qt.AlignCenter, ver)
+        p.setPen(Qt.NoPen)
         # index
         p.setBrush(QColor(0, 0, 0, 160))
         ir = QRectF(tr.left() + 4, tr.top() + 4, 30, 16)
@@ -123,6 +159,7 @@ class TimelineStrip(QWidget):
     cutSelected = Signal(str)
     action = Signal(str, list)          # action, cut ids
     menuRequested = Signal(list, QPoint)
+    versionPicked = Signal(str, int)     # cut id, version
 
     def __init__(self, session, parent=None):
         super().__init__(parent)
@@ -179,7 +216,8 @@ class TimelineStrip(QWidget):
         self.stop_btn.hide()
         head.addWidget(self.stop_btn)
         lay.addLayout(head)
-        self.list = QListWidget()
+        self.list = _List()
+        self.list.badgeClicked.connect(self._badge_menu)
         self.list.setViewMode(QListView.IconMode)
         self.list.setFlow(QListView.LeftToRight)
         self.list.setWrapping(False)
@@ -283,6 +321,23 @@ class TimelineStrip(QWidget):
         return ids[j] if 0 <= j < len(ids) else None
 
     # ------------------------------------------------------------------ interaction
+    def _badge_menu(self, cut, gpos):
+        vs = WS.all_versions(cut)
+        m = QMenu(self)
+        acts = {}
+        for v in vs:
+            a = m.addAction(f"v{v}" + ("   (현재)" if v == int(cut.version) else ""))
+            a.setCheckable(True)
+            a.setChecked(v == int(cut.version))
+            acts[a] = v
+        if len(vs) == 1:
+            m.addSeparator()
+            n = m.addAction("다른 버전 없음 (컷 우클릭 > 버전 올리기)")
+            n.setEnabled(False)
+        a = m.exec(gpos)
+        if a in acts and acts[a] != int(cut.version):
+            self.versionPicked.emit(cut.id, acts[a])
+
     def _clicked(self, it):
         if len(self.list.selectedItems()) <= 1:
             self.cutSelected.emit(it.data(Qt.UserRole).id)
