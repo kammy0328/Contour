@@ -130,11 +130,53 @@ def wrinkle_masks(lm: np.ndarray, shape, prob: np.ndarray, which: str, fth: floa
     soft = np.clip(cv2.GaussianBlur(prob, (0, 0), max(1.0, 0.02 * Wf)) * 1.5, 0, 1)
     out = np.clip(f * 1.3, 0, 1) * soft * (1 - lipf) * (1 - cz) * (1 - np.clip(ala * 1.2, 0, 1))
     if paint is not None:
-        # face paint, drawn lines and hair strands across the cheek are dark lines too: never "folds" to fill
-        k = max(3, int(0.012 * Wf) | 1)
-        pk = cv2.dilate((paint > 0.2).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
-        out = out * (1 - np.clip(cv2.GaussianBlur(pk.astype(np.float32), (0, 0), max(0.8, 0.006 * Wf)) * 1.3, 0, 1))
+        # face paint, drawn lines and hair strands across the cheek are dark lines too: never "folds" to fill.
+        # But a deep smile line is a thin dark line too, and lies along the band: those are the fold itself
+        pk = _paint_off_fold((paint > 0.2).astype(np.uint8), f, Wf)
+        if pk is not None:
+            k = max(3, int(0.012 * Wf) | 1)
+            pk = cv2.dilate(pk, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+            out = out * (1 - np.clip(cv2.GaussianBlur(pk.astype(np.float32), (0, 0), max(0.8, 0.006 * Wf)) * 1.3, 0, 1))
     return out
+
+
+def _paint_off_fold(pm: np.ndarray, band: np.ndarray, Wf: float) -> Optional[np.ndarray]:
+    """The painted lines that are not the fold: inside the band, a line running along it (within 25 degrees of
+    the band's own direction there) and long enough is the crease itself, not paint or a hair strand."""
+    sel = pm & (band > 0.05).astype(np.uint8)
+    if not sel.any():
+        return None
+    n, lab, stt, cen = cv2.connectedComponentsWithStats(sel, 8)
+    if n <= 1:
+        return None
+    # the band's direction: across it the band's edge gradient, along it the curve
+    bb = cv2.GaussianBlur(band.astype(np.float32), (0, 0), max(1.0, 0.03 * Wf))
+    gx = cv2.Sobel(bb, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(bb, cv2.CV_32F, 0, 1, ksize=3)
+    sw = max(1.0, 0.05 * Wf)
+    jxx = cv2.GaussianBlur(gx * gx, (0, 0), sw)
+    jyy = cv2.GaussianBlur(gy * gy, (0, 0), sw)
+    jxy = cv2.GaussianBlur(gx * gy, (0, 0), sw)
+    keep = np.zeros(n, bool)
+    for i in range(1, n):
+        ys, xs = np.nonzero(lab == i)
+        if len(xs) < 3:
+            continue
+        ln = float(np.hypot(stt[i, 2], stt[i, 3]))
+        cx, cy = int(round(cen[i, 0])), int(round(cen[i, 1]))
+        # the component's own direction
+        P = np.stack([xs - xs.mean(), ys - ys.mean()]).astype(np.float64)
+        ev, evec = np.linalg.eigh(P @ P.T)
+        d_line = evec[:, 1]
+        # the band's: perpendicular to its gradient
+        a, b_, c_ = float(jxx[cy, cx]), float(jxy[cy, cx]), float(jyy[cy, cx])
+        th = 0.5 * np.arctan2(2 * b_, a - c_)              # gradient direction
+        d_band = np.array([-np.sin(th), np.cos(th)])
+        along = abs(float(d_line @ d_band)) > np.cos(np.radians(25))
+        if not (along and ln > 0.05 * Wf):
+            keep[i] = True                                  # paint (or a strand): not to be filled
+    out = keep[lab].astype(np.uint8) | (pm & (band <= 0.05).astype(np.uint8))
+    return out if out.any() else None
 
 
 def _ala_mask(lm: np.ndarray, shape) -> np.ndarray:
