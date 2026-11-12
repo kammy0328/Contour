@@ -429,9 +429,10 @@ def _face_skin_probability(rgb_u8: np.ndarray, model, lm: Optional[np.ndarray], 
 # --------------------------------------------------------------------------- mask
 
 def skin_mask(job: SkinJob, rgb_proxy: np.ndarray, sx: float, sy: float, person_alpha: Optional[np.ndarray],
-              model, parse: Optional[dict] = None, body_region: Optional[np.ndarray] = None) -> np.ndarray:
+              model, parse: Optional[dict] = None, body_region: Optional[np.ndarray] = None,
+              cover: Optional[np.ndarray] = None) -> np.ndarray:
     """float32 0..1 at proxy resolution. body_region: the chosen body regions (neck, shoulders, arms, hands,
-    legs) of this person, 0..1, added to the face."""
+    legs) of this person, 0..1, added to the face. cover: an arm, leg or hand in front of the face (taken out)."""
     h, w = rgb_proxy.shape[:2]
     lm = None
     if job.face is not None:
@@ -440,6 +441,8 @@ def skin_mask(job: SkinJob, rgb_proxy: np.ndarray, sx: float, sy: float, person_
         lm[:, 1] *= sy
     prob = face_skin_probability(rgb_proxy, model, lm if job.face_w > 0.3 else None,
                                  parse if job.face_w > 0.3 else None)
+    if cover is not None:
+        prob = prob * (1.0 - cover)
     from ..core.project import scope_set
     regions = scope_set(job.scope)
     region = np.zeros((h, w), np.float32)

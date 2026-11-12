@@ -311,3 +311,45 @@ def solve_hands(store: TrackStore, fs: Optional[SV.FrameSource], frame_range: Tu
             progress(0.5 * (h + 1), "손 추적")
     store.hand[:, a:b] = out
     store.has_hands = bool(np.isfinite(out[..., :2]).any())
+
+
+def occlusion_fade(store: TrackStore, frame_range: Tuple[int, int], min_size: float, r: int = 3) -> None:
+    """Fade a face out in the frames something passes in front of it (a hand, a leg in a high kick, a light
+    stick, another dancer). The landmark models then still draw a face, on whatever covers it, and its skin
+    colour (a leg, an arm) passes the skin model: the retouch would sit on the cover. The separate face
+    detector (YuNet) does not see a face there while it sees one in the frames around (it keeps seeing heavily
+    motion-blurred faces, so blur alone does not fade), and the 106-point model is much less sure of itself
+    than it is on this face elsewhere.
+
+    min_size: face width (source px) below which the face detector is not expected to find the face."""
+    yn = getattr(store, "raw", {}).get("face_yunet")
+    f106 = getattr(store, "face106_raw", None)
+    if yn is None or f106 is None:
+        return
+    a, b = frame_range
+    P = store.face.shape[0]
+    for p in range(P):
+        det = np.nan_to_num(yn[p, :, 0, 2]) > 0
+        sc = np.where(np.isfinite(f106[p, :, :, 2]).all(1), np.nanmean(f106[p, :, 27:68, 2], 1), np.nan)
+        typ = sc[det & np.isfinite(sc)]
+        if len(typ) < 3:
+            continue
+        typ = float(np.median(typ))
+        if typ <= 0:
+            continue
+        for t in range(a, b):
+            if det[t] or store.face_vis[p, t] <= 0 or not np.isfinite(store.face[p, t, :, :2]).all():
+                continue
+            F = store.face[p, t, :, :2]
+            if float(np.hypot(*(F[16] - F[0]))) < min_size:
+                continue
+            nb = [s for s in range(max(0, t - r), min(store.n, t + r + 1))
+                  if s != t and det[s] and store.connected(min(s, t), max(s, t))]
+            if not nb:
+                continue                      # never seen by the detector around here: nothing to compare with
+            ratio = float(sc[t] / typ) if np.isfinite(sc[t]) else 0.0
+            occ = float(np.clip((0.7 - ratio) / 0.4, 0.0, 1.0))
+            if occ > 0:
+                store.face_vis[p, t] *= (1.0 - occ)
+                if store.face_vis[p, t] < 0.08:
+                    store.face[p, t] = np.nan

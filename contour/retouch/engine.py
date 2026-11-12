@@ -304,6 +304,86 @@ def _capsule(m: np.ndarray, a, b, r: float):
         cv2.circle(m, (int(round(q[0])), int(round(q[1]))), int(round(r)), 255, -1, cv2.LINE_AA)
 
 
+COVER_SEGS = ("upper_arm_l", "upper_arm_r", "forearm_l", "forearm_r", "thigh_l", "thigh_r", "calf_l", "calf_r")
+
+
+def limb_cover(st, t: int, lm: np.ndarray, shape, sx: float, sy: float) -> Optional[np.ndarray]:
+    """0..1 over the face and neck where an arm, a leg or a hand (this person's or anyone's) passes in front.
+
+    A leg in a high kick, a forearm across the face, a hand at the cheek: skin coloured, so the colour model
+    takes it for skin, and a half-covered face still has its landmarks, so the face outline holds the retouch
+    there too. The limb's own joints say where it is; a limb that crosses the middle of the face is in front of
+    it (one behind the head is hidden by it and has no visible joints over the face)."""
+    from ..warp.body import SEGMENTS, SEG_INDEX
+    poly = SK.face_polygon(lm)
+    if poly is None:
+        return None
+    h, w = shape
+    Wf = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
+    if Wf < 12:
+        return None
+    # the face and the neck under it
+    face = np.zeros(shape, np.uint8)
+    down = np.array([0.0, 0.7 * Wf])
+    if np.isfinite(lm[[27, 8], :2]).all():
+        d = lm[8, :2] - lm[27, :2]
+        n_ = float(np.hypot(*d))
+        if n_ > 1e-3:
+            down = d / n_ * 0.7 * Wf
+    zone = cv2.convexHull(np.round(np.vstack([poly, poly + down])).astype(np.int32))
+    cv2.fillConvexPoly(face, zone, 255)
+    x0, y0 = zone[:, 0].min(0) - 0.2 * Wf
+    x1, y1 = zone[:, 0].max(0) + 0.2 * Wf
+    m = np.zeros(shape, np.uint8)
+    hit = False
+    for q in np.nonzero(st.present[:, t])[0]:
+        kp = st.final[q, t]
+        for name in COVER_SEGS:
+            i = SEG_INDEX[name]
+            s = SEGMENTS[i]
+            ja, jb = int(s.a), int(s.b)
+            if not (np.isfinite(kp[[ja, jb], :2]).all()):
+                continue
+            conf = float(min(np.nan_to_num(kp[ja, 2]), np.nan_to_num(kp[jb, 2])))
+            if conf < 0.15 or not (st.vis[q, t, ja] == 1 and st.vis[q, t, jb] == 1):
+                continue
+            a = kp[ja, :2] * [sx, sy]
+            b = kp[jb, :2] * [sx, sy]
+            a = a + (b - a) * float(s.t0)          # upper arm and thigh: not the shoulder or the hip itself
+            # only a limb that reaches over the face box matters
+            if max(a[0], b[0]) < x0 or min(a[0], b[0]) > x1 or max(a[1], b[1]) < y0 or min(a[1], b[1]) > y1:
+                continue
+            wd = st.widths[q, t, i]
+            r = float(np.nanmax(wd)) * sx if np.isfinite(wd).any() else 0.0
+            if not r > 0:
+                sc = float(st.scale[q, t]) if np.isfinite(st.scale[q, t]) else 0.0
+                r = 0.06 * sc * sx
+            r = min(r, 0.6 * Wf)
+            if r < 2:
+                continue
+            _capsule(m, a, b, 0.9 * r)
+            hit = True
+        if getattr(st, "has_hands", False):
+            H = st.hand[q, t]
+            for i0 in (0, 21):
+                hh = H[i0:i0 + 21]
+                okh = np.isfinite(hh[:, :2]).all(1) & (np.nan_to_num(hh[:, 2]) > 0.4)
+                if okh.sum() < 6:
+                    continue
+                pts = hh[okh, :2] * [sx, sy]
+                if pts[:, 0].max() < x0 or pts[:, 0].min() > x1 or pts[:, 1].max() < y0 or pts[:, 1].min() > y1:
+                    continue
+                hull = cv2.convexHull(np.round(pts).astype(np.int32))
+                cv2.fillConvexPoly(m, hull, 255, cv2.LINE_AA)
+                hit = True
+    if not hit:
+        return None
+    m = cv2.bitwise_and(m, cv2.dilate(face, np.ones((max(3, int(0.1 * Wf) | 1),) * 2, np.uint8)))
+    if not m.any():
+        return None
+    return cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.03 * Wf))
+
+
 def body_regions(regions: set, kp: np.ndarray, hand: Optional[np.ndarray], shape, sx: float, sy: float,
                  neck: Optional[np.ndarray] = None, fth: float = 1.5) -> Optional[np.ndarray]:
     """Where on the body the skin retouch may go (0..1), from the joints: neck, shoulders and collarbone,
@@ -802,6 +882,15 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 state["model"] = SK.frame_model_for(tracker, p, t, state["rgb"], lm, centre)
                 state["prob"] = SK.face_skin_probability(state["rgb"], state["model"], lm if fw > 0.3 else None,
                                                          fmaps if fw > 0.3 else None)
+                if lm is not None:
+                    # an arm, a leg or a hand in front of the face: skin coloured, but not this face's skin
+                    try:
+                        cv_ = limb_cover(st, t, lm, shape, px.sx, px.sy)
+                    except Exception:
+                        cv_ = None
+                    if cv_ is not None:
+                        state["prob"] = state["prob"] * (1.0 - cv_)
+                    state["cover"] = cv_
                 state["alpha"] = SK.person_alpha(tracker, t, p, (px.w, px.h))
             return state
 
@@ -851,7 +940,8 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
 
             def mk_skin():
                 b = base()
-                return SK.skin_mask(sj, b["rgb"], px.sx, px.sy, b["alpha"], b["model"], b.get("parse"), body())
+                return SK.skin_mask(sj, b["rgb"], px.sx, px.sy, b["alpha"], b["model"], b.get("parse"), body(),
+                                    b.get("cover"))
             m = get("skin", mk_skin, job.scope)
             if m.max() > 0.01:
                 job.skin = sj

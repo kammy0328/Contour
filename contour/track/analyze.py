@@ -523,6 +523,12 @@ class CutTracker:
             except Exception:
                 import traceback
                 traceback.print_exc()
+        try:
+            from .face import occlusion_fade
+            occlusion_fade(st, (a, b), 40.0 / max(self.proxy.sx, 1e-6))
+        except Exception:
+            import traceback
+            traceback.print_exc()
         solve_hands(st, fs, (a, b), max(0.15, ts.smoothing * 0.7), None)
         self._head_raw = {}
         self.store = st
@@ -693,7 +699,8 @@ class CutTracker:
             # track with most of its face points on it keeps it; the other has no face in this frame
             # the person segmentation says whose face it is: the person whose pixels hold the face's centre
             seg_owner = {}
-            if yfaces is None and fdet is not None and self.seglab.exists():
+            bare = [p for p in pres if not np.isfinite(st.face_raw[p, t, :, :2]).all()]
+            if yfaces is None and fdet is not None and (self.seglab.exists() or bare):
                 if rgb is None:
                     rgb = analysis_view(np.asarray(proxy.frame(t)))
                 yfaces = fdet.detect(rgb, None, target=960)
@@ -708,6 +715,31 @@ class CutTracker:
                             o = int(lab[int(cy), int(cx)])
                             if o >= 0 and st.present[o, t]:
                                 seg_owner[fi_] = o
+            # a frame the person detector missed (the track is bridged across it) has no whole-body face points and
+            # often no segmentation either, while the face is in plain view: the detected face goes to the bridged
+            # track whose head is on it (a whip pan or someone passing in front used to leave such a frame bare)
+            if fm is not None and yfaces is not None and len(yfaces):
+                owned = set(seg_owner.values()) | {o for o in fown}
+                for fi_, f in enumerate(yfaces):
+                    if fi_ in seg_owner or fi_ in claims or float(max(f[2], f[3])) < 40:
+                        continue
+                    ctr = np.array([f[0] + f[2] / 2, f[1] + f[3] / 2])
+                    best, bd = None, 0.7 * float(max(f[2], f[3]))
+                    for p in pres:
+                        if p in owned or np.isfinite(st.face_raw[p, t, :, :2]).all():
+                            continue
+                        hd = st.final[p, t, :3]
+                        if not np.isfinite(hd[:, :2]).all():
+                            hd = st.auto[p, t, :3]
+                        ok = np.isfinite(hd[:, :2]).all(1)
+                        if ok.sum() < 2:
+                            continue
+                        d = float(np.linalg.norm(hd[ok, :2].mean(0) * [sx, sy] - ctr))
+                        if d < bd:
+                            best, bd = p, d
+                    if best is not None:
+                        seg_owner[fi_] = best
+                        owned.add(best)
             lose = set()
             for fi, cl in claims.items():
                 if len(cl) > 1:
