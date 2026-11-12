@@ -68,11 +68,40 @@ def build(tracker, progress: Optional[Callable[[float, str], None]] = None,
     def _wf(p, t):
         F = st.face[p, t, :, :2]
         return float(np.hypot((F[16, 0] - F[0, 0]) * px.sx, (F[16, 1] - F[0, 1]) * px.sy))
+    def _wf_arr(F):
+        return float(np.hypot((F[16, 0] - F[0, 0]) * px.sx, (F[16, 1] - F[0, 1]) * px.sy))
     # faces too small to parse usefully (and to retouch with any detail) are left to the colour model
     still = {q.id for q in getattr(tracker.cut, "persons", []) if getattr(q, "still", False)}
     todo = [(p, t) for p in range(P) for t in range(N)
             if int(st.pids[p]) not in still and st.present[p, t] and np.isfinite(st.face[p, t, :, :2]).all() and st.face_vis[p, t] >= 0.08
             and _wf(p, t) >= MIN_FACE_PX]
+    # frames where the tracker lost the landmarks (hand, hair or a turn over the face) but the person is there and
+    # was seen a few frames away: the face is carried over from the nearest seen frame, and the parser decides
+    # from the pixels what is skin. Its trust (rel) is measured as usual.
+    virt: Dict = {}
+    have_lm = {(p, t) for p, t in todo}
+    for p in range(P):
+        if int(st.pids[p]) in still:
+            continue
+        seen = np.nonzero(st.face_vis[p] >= 0.3)[0]
+        if not len(seen):
+            continue
+        for t in range(N):
+            if (p, t) in have_lm or not st.present[p, t] or np.min(np.abs(seen - t)) > 12:
+                continue
+            try:
+                v = tracker._virtual_face(p, t)
+            except Exception:
+                v = None
+            if v is None or not np.isfinite(v).all():
+                continue
+            lm = np.zeros((v.shape[0], 3), np.float32)
+            lm[:, :2] = v
+            lm[:, 0] /= px.sx
+            lm[:, 1] /= px.sy
+            if _wf_arr(lm) >= MIN_FACE_PX:
+                virt[(p, t)] = lm
+                todo.append((p, t))
     if not todo:
         return None
     parser = FP.FaceParser()
@@ -93,7 +122,7 @@ def build(tracker, progress: Optional[Callable[[float, str], None]] = None,
             rgb = np.ascontiguousarray(np.asarray(px.frame(t)))
             ycc = cv2.cvtColor(rgb, cv2.COLOR_RGB2YCrCb)
             last_t = t
-        lm = st.face[p, t].astype(np.float64).copy()
+        lm = (virt[(p, t)] if (p, t) in virt else st.face[p, t]).astype(np.float64).copy()
         lm[:, 0] *= px.sx
         lm[:, 1] *= px.sy
         r = parser.parse(rgb, lm)

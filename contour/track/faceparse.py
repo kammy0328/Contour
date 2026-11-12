@@ -65,7 +65,16 @@ class FaceParser:
             return None
         eye_c = (le + re_) / 2
         down = np.array([-np.sin(ang), np.cos(ang)])
+        right = np.array([np.cos(ang), np.sin(ang)])
+        # a turned head (profile): the jaw width collapses while the face keeps its height, which cut the crop
+        # to half a face. Frontal eye-to-chin is about 0.85 of the jaw width; size by the larger of the two,
+        # and centre sideways on the visible landmarks.
+        hf = float(np.hypot(*(L[8] - eye_c)))
+        wf = min(max(wf, hf / 0.85), 2.2 * wf)
         c = eye_c + down * 0.45 * wf
+        if hf > 0.85 * float(np.hypot(*(L[16] - L[0]))) * 1.08:
+            off = float((L[:, :2].mean(0) - eye_c) @ right)
+            c = c + right * np.clip(off, -0.35 * wf, 0.35 * wf)
         side = wf / 0.45
         s = SIZE / side
         ca, sa = np.cos(-ang) * s, np.sin(-ang) * s
