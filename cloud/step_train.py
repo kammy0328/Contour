@@ -1,8 +1,9 @@
 """Step training of DIAP's OWN face parser on one collected project (run by the developer with step_train.bat).
 
 Cloud\\data\\<project>\\<cut id>\\*.jpg are the face crops the app gathered while analysing (originals only, no
-labels). The parser DIAP ships today (SegFormer, non-commercial licence) is used as a TEACHER only: it looks at
-clean, normalised and mirrored views of a crop and its averaged answer is the label. The STUDENT is a different
+labels). The parser DIAP ships today (SegFormer, non-commercial licence) is the TEACHER: it looks at clean, normalised
+and mirrored views of a crop and its averaged answer is the label. Stage 1 lets the teacher itself grow on the
+project (self-distillation against the frozen original); stage 2 teaches the student from the grown teacher. The STUDENT is a different
 network that shares no weights with it (ResNet-34 encoder from torchvision + a small decoder, same input and
 output as the parser, so the app can load it in its place). It learns the teacher's answer on the crop as it
 looks in hard shots. Crops of projects trained earlier (Cloud\\_trained) are mixed in, so a new project does
@@ -10,7 +11,7 @@ not push the earlier ones out; trained projects are archived there, never delete
 The student is installed for the app (face_parse_own.onnx) once it agrees with the teacher well enough.
 
   python step_train.py                 choose a project, steps by its size
-  python step_train.py <project> [steps] [--delete|--keep]
+  python step_train.py <project> [steps] [--delete|--keep] [--student-only]
 """
 import os, sys, json, math, random, time, zlib, shutil
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -293,6 +294,89 @@ def export(model, path):
         print("onnx check skipped:", e)
 
 
+def loss_tune(logits, tprob):
+    """teacher tuning: soft cross-entropy where the anchor's averaged views are confident"""
+    conf, _ = tprob.max(1)
+    mask = (conf > 0.6).float()
+    w = torch.ones(19, device=logits.device)
+    w[[1, 2, 17]] = 2.0
+    ce = -(tprob * F.log_softmax(logits, 1) * w.view(1, 19, 1, 1)).sum(1)
+    return (ce * mask).sum() / mask.sum().clamp(min=1)
+
+
+def tune_teacher(tr, weights, old, w_old, val, val_old, steps):
+    """Stage 1: the teacher itself grows. The original parser (frozen) looking at clean, normalised and mirrored
+    views is the anchor; the teacher as tuned so far learns to give that answer on hard-looking crops of this
+    project too. Kept only when it is not worse. Returns the teacher to use (tuned or as it was)."""
+    global BATCH
+    from transformers import SegformerForSemanticSegmentation
+    anchor = SegformerForSemanticSegmentation.from_pretrained(HF).to(dev).eval()
+    for p in anchor.parameters():
+        p.requires_grad_(False)
+    state = os.path.join(MODEL, "face_parse_diap.pt")
+    model = SegformerForSemanticSegmentation.from_pretrained(HF).to(dev)
+    if os.path.exists(state):
+        model.load_state_dict(torch.load(state, map_location=dev))
+    model.eval()
+    base = evaluate(model, anchor, val)
+    base_old = evaluate(model, anchor, val_old) if val_old else None
+    print(f"[1/2 교사] 학습 전 일치율(어렵게 만든 화면): 이 프로젝트 {base:.3f}" + (f", 이전 프로젝트 {base_old:.3f}" if base_old is not None else ""), flush=True)
+    keep_b, BATCH = BATCH, 2
+    try:
+        set_train(model)
+        opt = torch.optim.AdamW(model.parameters(), lr=2e-5, weight_decay=0.01)
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda i: min(1.0, (i + 1) / 100) * 0.5 * (1 + math.cos(math.pi * min(1.0, i / max(1, steps)))))
+        scaler = torch.amp.GradScaler(enabled=dev == "cuda")
+        t0 = time.time()
+        run = 0.0
+        for step in range(steps):
+            opt.zero_grad(set_to_none=True)
+            tot = 0.0
+            for _ in range(4):
+                x, tp = batch(old, w_old, anchor) if (old and rng.random() < REPLAY) else batch(tr, weights, anchor)
+                with torch.autocast(dev, dtype=torch.float16, enabled=dev == "cuda"):
+                    lo = model(pixel_values=x).logits
+                l = loss_tune(lo.float(), tp) / 4
+                scaler.scale(l).backward()
+                tot += float(l.detach())
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(opt); scaler.update(); sched.step()
+            run = 0.95 * run + 0.05 * tot if step else tot
+            if step % 25 == 0:
+                el = time.time() - t0
+                print(f"\r[1/2 교사] 스텝 {step}/{steps}  loss {run:.4f}  {el / 60:.1f}분 경과  남은 시간 약 {el / max(1, step) * (steps - step) / 60:.0f}분   ", end="", flush=True)
+        print()
+    finally:
+        BATCH = keep_b
+    model.eval()
+    after = evaluate(model, anchor, val)
+    after_old = evaluate(model, anchor, val_old) if val_old else None
+    ok = after >= base - 0.003 and (after_old is None or after_old >= base_old - 0.01)
+    print(f"[1/2 교사] 학습 후 {after:.3f} (전 {base:.3f})" + (f", 이전 프로젝트 {after_old:.3f} (전 {base_old:.3f})" if after_old is not None else "")
+          + ("  -> 교사 갱신" if ok else "  -> 좋아지지 않아 교사는 그대로"), flush=True)
+    rec = dict(model="teacher", before=round(base, 4), after=round(after, 4), kept=ok, steps=steps)
+    if ok:
+        torch.save(model.state_dict(), state + ".tmp")
+        os.replace(state + ".tmp", state)
+        tmp = os.path.join(MODEL, "face_parse_diap.onnx")
+        export(model, tmp)
+        md = models_dir()
+        os.makedirs(md, exist_ok=True)
+        shutil.copyfile(tmp, os.path.join(md, "face_parse_diap.onnx"))
+        model = model.to(dev).eval()
+    else:
+        del model
+        model = SegformerForSemanticSegmentation.from_pretrained(HF).to(dev)
+        if os.path.exists(state):
+            model.load_state_dict(torch.load(state, map_location=dev))
+        model.eval()
+    del anchor
+    for p in model.parameters():
+        p.requires_grad_(False)
+    return model, rec
+
+
 def models_dir():
     try:
         from contour.core.settings import settings
@@ -334,12 +418,18 @@ def main():
     val_old = random.Random(5).sample(old, min(60, len(old))) if old else []
     weights = [w for _, w, _ in tr]
     w_old = [w for _, w, _ in old]
-    teacher = SegformerForSemanticSegmentation.from_pretrained(HF).to(dev).eval()
-    tuned = os.path.join(MODEL, "face_parse_diap.pt")
-    if os.path.exists(tuned):                     # the teacher as adapted to this user's footage, when there is one
-        teacher.load_state_dict(torch.load(tuned, map_location=dev))
-    for p in teacher.parameters():
-        p.requires_grad_(False)
+    # stage 1: the teacher grows on this project (skipped with --student-only); stage 2: the student learns from it
+    t_rec = None
+    if "--student-only" in flags:
+        teacher = SegformerForSemanticSegmentation.from_pretrained(HF).to(dev).eval()
+        tuned = os.path.join(MODEL, "face_parse_diap.pt")
+        if os.path.exists(tuned):
+            teacher.load_state_dict(torch.load(tuned, map_location=dev))
+        for p in teacher.parameters():
+            p.requires_grad_(False)
+    else:
+        teacher, t_rec = tune_teacher(tr, weights, old, w_old, val, val_old, max(150, steps // 2))
+    print("[2/2 자체 모델]", flush=True)
     state = os.path.join(MODEL, "face_parse_own.pt")
     model = Student(pretrained=not os.path.exists(state)).to(dev)
     if os.path.exists(state):
@@ -392,7 +482,7 @@ def main():
     use = ok and after >= INSTALL_AT and (after_old is None or after_old >= INSTALL_AT - 0.03)
     rec = dict(project=name, time=time.strftime("%Y-%m-%d %H:%M:%S"), crops=len(items), steps=steps, model="own", before=round(base, 4),
                after=round(after, 4), hard=round(hard, 4), before_old=None if base_old is None else round(base_old, 4),
-               after_old=None if after_old is None else round(after_old, 4), kept=ok, installed=use)
+               after_old=None if after_old is None else round(after_old, 4), kept=ok, installed=use, teacher=t_rec)
     hist.append(rec)
     json.dump(hist, open(hist_f, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
     if not ok:
