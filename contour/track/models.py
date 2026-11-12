@@ -174,7 +174,41 @@ _providers_cache: Optional[List] = None
 _device_label = "CPU"
 
 
+def _nvidia_dll_dirs() -> List[str]:
+    """pip's nvidia-* wheels put nvrtc, cudnn, cublas ... in site-packages\\nvidia\\*\\bin; Windows does not look there on its own."""
+    import glob
+    bases: List[str] = []
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("nvidia")
+        bases += list(getattr(spec, "submodule_search_locations", None) or [])
+    except Exception:
+        pass
+    for p in sys.path:
+        d = os.path.join(p, "nvidia")
+        if os.path.isdir(d) and d not in bases:
+            bases.append(d)
+    out: List[str] = []
+    for b in bases:
+        for d in glob.glob(os.path.join(b, "*", "bin")):
+            if os.path.isdir(d) and d not in out:
+                out.append(d)
+    return out
+
+
 def _preload_cuda() -> None:
+    if os.name == "nt":
+        try:
+            dirs = _nvidia_dll_dirs()
+            for d in dirs:
+                try:
+                    os.add_dll_directory(d)
+                except Exception:
+                    pass
+            if dirs:
+                os.environ["PATH"] = os.pathsep.join(dirs) + os.pathsep + os.environ.get("PATH", "")
+        except Exception:
+            pass
     try:
         import onnxruntime as ort
         if hasattr(ort, "preload_dlls"):
