@@ -32,6 +32,56 @@ REL_R = 6              # frames each side, parser trust
 COLOR_R = 3            # frames each side, colour centre median
 
 
+ALIGN_STEP = 0.085     # of the face width in the crop: search grid for a landmark set that sits beside the face
+ALIGN_N = 3            # grid -3..3 steps each way (about 0.25 face widths)
+ALIGN_ON = False       # off: at full size the landmarks of the checked cuts agreed with the parser; kept for later
+ALIGN_GAIN = 0.10      # IoU the shifted outline must gain before landmarks are moved
+
+
+def _align(r, lm):
+    """In fast motion or blur the tracked landmarks can lie beside the face (the mask then sits on hair, neck or
+    the background). The parser sees the real face in the crop: slide the landmark outline to where it covers
+    the parser's skin best. Returns the shift in image px (x, y), or None when the landmarks are fine."""
+    from ..retouch.skin import face_polygon
+    K = FP.KEEP
+    s = K / FP.SIZE
+    L = lm.copy()
+    L[:, :2] = lm[:, :2] @ r["M"][:, :2].T + r["M"][:, 2]
+    L[:, :2] *= s
+    poly = face_polygon(L)
+    if poly is None:
+        return None
+    wf = float(np.hypot(*(L[16, :2] - L[0, :2])))
+    skin = (r["skin"].astype(np.float32) > 0.5)
+    if skin.sum() < 40 or wf < 10:
+        return None
+    # skin close to the outline only: a neighbour's face further off must not pull it over
+    near = np.zeros((K, K), np.uint8)
+    cv2.fillPoly(near, [np.round(poly).astype(np.int32)], 1)
+    k = max(3, int(0.45 * wf) | 1)
+    near = cv2.dilate(near, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    sk = skin & (near > 0)
+    st_ = ALIGN_STEP * wf
+    best, best_d, base = -1.0, (0.0, 0.0), 0.0
+    for iy in range(-ALIGN_N, ALIGN_N + 1):
+        for ix in range(-ALIGN_N, ALIGN_N + 1):
+            d = np.array([ix * st_, iy * st_])
+            m = np.zeros((K, K), np.uint8)
+            cv2.fillPoly(m, [np.round(poly + d).astype(np.int32)], 1)
+            m = m > 0
+            u = (m | sk).sum()
+            iou = float((m & sk).sum()) / max(1, u)
+            if ix == 0 and iy == 0:
+                base = iou
+            if iou > best + 1e-6 or (abs(iou - best) <= 1e-6 and np.hypot(*d) < np.hypot(*best_d)):
+                best, best_d = iou, (d[0], d[1])
+    if best - base < ALIGN_GAIN or best < 0.30:
+        return None
+    A = r["M"][:, :2].astype(np.float64)
+    v = np.linalg.solve(A, np.array(best_d) / s)
+    return v
+
+
 def path_for(tracker) -> Path:
     return Path(tracker.project.cache_dir(tracker.cut)) / "facelayer.npz"
 
@@ -113,6 +163,7 @@ def build(tracker, progress: Optional[Callable[[float, str], None]] = None,
     rel = np.zeros((P, N), np.float32)
     col = np.full((P, N, 3), np.nan, np.float32)            # Cr, Cb, Y
     have = np.zeros((P, N), bool)
+    shift = np.zeros((P, N, 2), np.float32)        # landmark correction found by the parser, proxy px
     from ..retouch.skin import _features_mask, _texture_gate
     last_t, rgb = -1, None
     for i, (p, t) in enumerate(sorted(todo, key=lambda x: (x[1], x[0]))):
@@ -128,6 +179,15 @@ def build(tracker, progress: Optional[Callable[[float, str], None]] = None,
         r = parser.parse(rgb, lm)
         if r is None:
             continue
+        if ALIGN_ON and (p, t) not in virt:
+            sh = _align(r, lm)
+            if sh is not None:
+                lm2 = lm.copy()
+                lm2[:, :2] += sh
+                r2 = parser.parse(rgb, lm2)
+                if r2 is not None:
+                    lm, r = lm2, r2
+                    shift[p, t] = sh
         M[p, t] = r["M"]
         skin[p, t] = r["skin"]
         neck[p, t] = r["neck"]
@@ -150,6 +210,24 @@ def build(tracker, progress: Optional[Callable[[float, str], None]] = None,
             col[p, t] = [np.median(v[:, 1]), np.median(v[:, 2]), np.median(v[:, 0])]
         if progress and i % 10 == 0:
             progress(i / len(todo), "얼굴 영역 분석")
+    # landmarks that sat beside the face are moved onto it (steadied over a few frames of the same shot), so the
+    # geometry masks (face outline, neck, folds) follow the face and not the drifted tracking
+    if np.abs(shift).sum() > 0:
+        connected = st.connected if hasattr(st, "connected") else (lambda a, b: True)
+        fixed = shift.copy()
+        for p in range(P):
+            for t in range(N):
+                if not have[p, t]:
+                    continue
+                win = [u for u in range(max(0, t - 2), min(N, t + 3)) if have[p, u] and connected(u, t)]
+                fixed[p, t] = np.median(shift[p, win], 0) if len(win) >= 3 else shift[p, t]
+                if np.abs(shift[p, t]).sum() > 0 or np.abs(fixed[p, t]).sum() > 0:
+                    st.face[p, t, :, 0] += fixed[p, t, 0] / px.sx
+                    st.face[p, t, :, 1] += fixed[p, t, 1] / px.sy
+        try:
+            st.face_aligned = int((np.abs(shift).sum(2) > 0).sum())
+        except Exception:
+            pass
     # ---- temporal: within a shot, between frames whose face crop stays put
     conn = st.connected if hasattr(st, "connected") else (lambda a, b: True)
     skin_s = skin.copy()

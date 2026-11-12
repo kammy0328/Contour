@@ -63,8 +63,8 @@ def reason(cut) -> str:
     return st.get("reason", "")
 
 
-STILL_RES = 0.008       # body points' deviation from one rigid motion (p90, share of the body's size)
-STILL_FRAMES = 20       # seen at least this long before a figure can be called a picture
+STILL_RES = 0.010       # body points' deviation from one rigid motion (p90, share of the body's size)
+STILL_FRAMES = 14       # seen at least this long before a figure can be called a picture
 
 
 def still_pictures(st) -> set:
