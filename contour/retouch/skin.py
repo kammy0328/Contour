@@ -93,6 +93,9 @@ def face_polygon(lm: np.ndarray) -> Optional[np.ndarray]:
     return np.vstack([jaw, forehead]).astype(np.float32)
 
 
+EYE_BELOW = 0.30       # of the eye's width: how far below the eye's middle the eye area reaches
+
+
 def _features_mask(lm: np.ndarray, shape: Tuple[int, int]) -> np.ndarray:
     """255 where facial features are (eyes incl. lashes, brows, lips, nostrils)."""
     h, w = shape
@@ -106,8 +109,19 @@ def _features_mask(lm: np.ndarray, shape: Tuple[int, int]) -> np.ndarray:
         c = e.mean(0)
         ew = float(np.hypot(*(e[3] - e[0])))
         ang = float(np.degrees(np.arctan2(e[3][1] - e[0][1], e[3][0] - e[0][0])))
-        cv2.ellipse(m, (int(round(c[0])), int(round(c[1]))), (max(2, int(ew * 0.78)), max(2, int(ew * 0.50))),
+        em = np.zeros((h, w), np.uint8)
+        cv2.ellipse(em, (int(round(c[0])), int(round(c[1]))), (max(2, int(ew * 0.78)), max(2, int(ew * 0.50))),
                     ang, 0, 360, 255, -1)
+        # under the eye only as far as the lower lashes: the skin below them (fine lines, the bag under the
+        # eye) is skin and is retouched; the whole ellipse used to leave it out
+        ax = (e[3] - e[0]) / max(ew, 1e-6)
+        dn = np.array([-ax[1], ax[0]])
+        if np.isfinite(pts[[8, 27]]).all() and float(dn @ (pts[8] - pts[27])) < 0:
+            dn = -dn
+        p0 = c + dn * EYE_BELOW * ew
+        q = [p0 - ax * 2 * ew, p0 + ax * 2 * ew, p0 + ax * 2 * ew + dn * 2 * ew, p0 - ax * 2 * ew + dn * 2 * ew]
+        cv2.fillConvexPoly(em, np.round(np.array(q)).astype(np.int32), 0)
+        m = np.maximum(m, em)
     for idx in (BROW_R, BROW_L):
         b = pts[idx]
         if not np.isfinite(b).all():
@@ -421,8 +435,8 @@ def face_skin_probability(rgb_u8: np.ndarray, model, lm: Optional[np.ndarray], p
                 out = np.maximum(out, pf)
         except Exception:
             pass
-    # face paint, tattoos, drawn veins: never retouched
-    pm = paint_mask(rgb_u8, lm) if lm is not None else None
+    # hair strands over the skin, face paint, tattoos, drawn veins: never retouched (soft edged)
+    pm = soft_paint(rgb_u8, lm) if lm is not None else None
     if pm is not None:
         out = out * (1.0 - pm)
     return out.astype(np.float32)
@@ -468,6 +482,214 @@ def _face_skin_probability(rgb_u8: np.ndarray, model, lm: Optional[np.ndarray], 
     if gate is not None:
         pr = pr * gate
     return np.maximum(prob, 0.95 * wgt * pr * (1.0 - mz)).astype(np.float32)
+
+
+# --------------------------------------------------------------------------- hair strands over the skin
+
+_LK: dict = {}
+STRAND_LO, STRAND_HI = 0.012, 0.026
+STRAND_SEEN = 2.5      # code values (of 255) a strand must differ from the skin beside it to be kept
+NECK_LINE_MAX = 0.15   # dark lines on the neck fainter than this (of the skin's brightness) are neck lines
+PAINT_SEEN = 5.0       # the same for a drawn line
+
+
+def _line_kernels(L, n=12):
+    key = (L, n)
+    if key not in _LK:
+        ks = []
+        for i in range(n):
+            a = np.pi * i / n
+            k = np.zeros((L, L), np.float32)
+            c = (L - 1) / 2.0
+            p0 = (int(round(c - np.cos(a) * c)), int(round(c - np.sin(a) * c)))
+            p1 = (int(round(c + np.cos(a) * c)), int(round(c + np.sin(a) * c)))
+            cv2.line(k, p0, p1, 1.0, 1, cv2.LINE_AA)
+            ks.append(k / k.sum())
+        _LK[key] = ks
+    return _LK[key]
+
+
+def _strand_map(rgb_u8: np.ndarray, Wf: float, dark_only: bool = False, gain: float = 1.0) -> np.ndarray:
+    """Hair strands lying over skin (very thin ones too): 0..1, soft edged.
+
+    A strand is a thin line darker (or lighter) than the skin on BOTH sides of it and much longer than it is
+    wide. Thin structures are taken with a black-hat / top-hat a few pixels wide (the edge between a lit cheek
+    and its shadow does not answer to it, a hair does), relative to the local brightness. What makes it a
+    strand is its length: the thin-structure map is averaged along short straight segments in twelve directions,
+    and only pixels that lie on a line in some direction are kept, so pores, grain and moles drop out while a
+    faint single hair stays whole. The result is widened by a pixel and feathered: the retouch leaves the strand
+    alone, takes the skin right beside it, and the border between the two never shows as a line."""
+    h, w = rgb_u8.shape[:2]
+    # a 2-D float array (0..255) is taken as the brightness itself
+    y = rgb_u8.astype(np.float32) if rgb_u8.ndim == 2 else cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    y = cv2.GaussianBlur(y, (0, 0), 0.6)
+    base = cv2.GaussianBlur(y, (0, 0), max(2.0, 0.03 * Wf)) + 8.0
+    k1 = max(3, int(0.012 * Wf) | 1)
+    k2 = max(5, int(0.022 * Wf) | 1)
+    kb = max(9, int(0.07 * Wf) | 1)
+    def hat(k, op):
+        return cv2.morphologyEx(y, op, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))) / base
+    Rd = np.maximum(hat(k1, cv2.MORPH_BLACKHAT), hat(k2, cv2.MORPH_BLACKHAT))
+    Rl = np.maximum(hat(k1, cv2.MORPH_TOPHAT), hat(k2, cv2.MORPH_TOPHAT))
+    # thin only: a hair is all there at the small scale; a shadow, a lip line, a nostril keeps growing with the
+    # kernel (the wide hat sees much more of it than the narrow one)
+    Bd, Bl = hat(kb, cv2.MORPH_BLACKHAT), hat(kb, cv2.MORPH_TOPHAT)
+    thin_d = np.clip((Rd / (Bd + 1e-4) - 0.45) / 0.3, 0, 1)
+    thin_l = np.clip((Rl / (Bl + 1e-4) - 0.45) / 0.3, 0, 1)
+    if dark_only:
+        Rl = Rl * 0.0
+    R = np.minimum(np.maximum(Rd * thin_d, 0.8 * Rl * thin_l), 0.25)
+    # a strand that can hardly be seen (a faint hair on the shadow side of a face) is not worth a hole in the
+    # retouch: there the skin is cleaned and the hair goes with it
+    R = R * np.clip((np.maximum(Rd, Rl) * base - STRAND_SEEN) / 3.0, 0, 1)
+    L = max(9, int(0.065 * Wf) | 1)
+    LR = np.zeros((h, w), np.float32)
+    acc = np.zeros((h, w), np.float32)
+    ks = _line_kernels(L)
+    for k in ks:
+        r_ = cv2.filter2D(R, cv2.CV_32F, k, borderType=cv2.BORDER_REFLECT)
+        LR = np.maximum(LR, r_)
+        acc += r_
+    # a line answers in one direction only; a mole, a nostril, a speck answers the same in all of them
+    aniso = (LR - acc / len(ks)) / (LR + 1e-4)
+    lo, hi = STRAND_LO / gain, STRAND_HI / gain          # gain > 1: fainter lines are taken too (skin lines)
+    on_line = np.clip((LR - lo) / (hi - lo), 0, 1) * np.clip((aniso - 0.45) / 0.2, 0, 1)
+    thin = np.clip((R - 0.5 * lo) / (1.0 * lo), 0, 1)
+    core = on_line * thin
+    # specks left in noisy shadow: a strand piece is at least a twentieth of the face wide
+    n, lab, stats, _ = cv2.connectedComponentsWithStats((core > 0.25).astype(np.uint8), connectivity=8)
+    span = np.hypot(stats[:, cv2.CC_STAT_WIDTH], stats[:, cv2.CC_STAT_HEIGHT])
+    ok = span >= max(7.0, 0.045 * Wf)
+    ok[0] = False
+    core = core * ok[lab]
+    # a faint strand answers in pieces: each kept piece is followed along the weaker answer joined to it, so the
+    # strand is taken whole (a weak answer with no sure piece on it stays out: that is skin texture)
+    weak = np.clip((LR - 0.45 * lo) / (0.55 * lo), 0, 1) * np.clip((aniso - 0.35) / 0.2, 0, 1) * \
+        np.clip((R - 0.2 * lo) / (0.6 * lo), 0, 1)
+    n2, lab2 = cv2.connectedComponents(((weak > 0.3) | (core > 0.25)).astype(np.uint8), connectivity=8)
+    if n2 > 1:
+        keep = np.zeros(n2, bool)
+        keep[np.unique(lab2[core > 0.25])] = True
+        keep[0] = False
+        core = np.maximum(core, 0.9 * weak * keep[lab2])
+    core = cv2.dilate(core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    soft = cv2.GaussianBlur(core, (0, 0), max(0.9, 0.005 * Wf))
+    return np.clip(soft * 1.5, 0, 1).astype(np.float32)
+
+
+def strand_mask(rgb_u8: np.ndarray, lm: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    """Hair strands over the face and neck of this person (0..1, soft), on the whole image; None without a face."""
+    if lm is None or not np.isfinite(lm[[0, 8, 16, 27], :2]).all():
+        return None
+    L = lm[:, :2]
+    Wf = float(np.hypot(*(L[16] - L[0])))
+    if Wf < 60:
+        return None
+    h, w = rgb_u8.shape[:2]
+    x0, y0 = np.floor(L.min(0) - [0.35 * Wf, 0.7 * Wf]).astype(int)
+    x1, y1 = np.ceil(L.max(0) + [0.35 * Wf, 0.9 * Wf]).astype(int)
+    x0, y0, x1, y1 = max(0, x0), max(0, y0), min(w, x1), min(h, y1)
+    if x1 - x0 < 16 or y1 - y0 < 16:
+        return None
+    out = np.zeros((h, w), np.float32)
+    out[y0:y1, x0:x1] = _strand_map(np.ascontiguousarray(rgb_u8[y0:y1, x0:x1]), Wf)
+    return out
+
+
+def soft_paint(rgb_u8: np.ndarray, lm: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    """What the skin retouch leaves alone on a face: hair strands (thin, feathered) and face paint.
+
+    The paint finder took strands lying over a cheek for drawn lines: in broken, wide, hard-edged pieces, so the
+    cheek beside a strand lost its retouch and the border showed. Strands now have their own finder; a paint
+    line that is really a strand is dropped from the paint, and what is left of the paint gets a soft edge too."""
+    pm = paint_mask(rgb_u8, lm)
+    sm = strand_mask(rgb_u8, lm)
+    if sm is None:
+        return pm
+    if pm is None:
+        return sm
+    Wf = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
+    n, lab, stats, _ = cv2.connectedComponentsWithStats((pm > 0.5).astype(np.uint8), connectivity=8)
+    if n > 1:
+        near = cv2.dilate((sm > 0.3).astype(np.uint8), np.ones((5, 5), np.uint8))
+        hit = np.bincount(lab.ravel(), weights=near.ravel().astype(np.float64), minlength=n) / np.maximum(1, stats[:, cv2.CC_STAT_AREA])
+        drop = hit > 0.2
+        drop[0] = False
+        pm = pm * (~drop[lab])
+    # what the paint finder takes on the shadow side of a face is the edge of the shadow and hairs that can
+    # hardly be seen, not paint: a drawn line is thin (the narrow hat holds most of what the wide one sees) and
+    # visibly darker or bluer than the skin beside it. Pieces that are neither are skin, and are retouched
+    n, lab, stats, _ = cv2.connectedComponentsWithStats((pm > 0.5).astype(np.uint8), connectivity=8)
+    if n > 1:
+        ycc = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2YCrCb).astype(np.float32)
+        yy = cv2.GaussianBlur(ycc[..., 0], (0, 0), 0.6)
+        k2 = max(5, int(0.022 * Wf) | 1)
+        kb = max(9, int(0.07 * Wf) | 1)
+        se2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k2, k2))
+        nar = cv2.morphologyEx(yy, cv2.MORPH_BLACKHAT, se2)
+        wid = cv2.morphologyEx(yy, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kb, kb)))
+        blu = cv2.morphologyEx(ycc[..., 2], cv2.MORPH_TOPHAT, se2)
+        cnt = np.maximum(1, stats[:, cv2.CC_STAT_AREA]).astype(np.float64)
+        lr = lab.ravel()
+        m_n = np.bincount(lr, weights=nar.ravel().astype(np.float64), minlength=n) / cnt
+        m_w = np.bincount(lr, weights=wid.ravel().astype(np.float64), minlength=n) / cnt
+        m_b = np.bincount(lr, weights=blu.ravel().astype(np.float64), minlength=n) / cnt
+        ink = m_b >= 3.0
+        drop = ~ink & ((m_n < PAINT_SEEN) | (m_n < 0.3 * m_w))
+        drop[0] = False
+        gone = cv2.dilate(drop[lab].astype(np.uint8), np.ones((5, 5), np.uint8))
+        pm = pm * (1 - gone)
+    pm = np.clip(cv2.GaussianBlur(pm.astype(np.float32), (0, 0), max(0.9, 0.005 * Wf)) * 1.3, 0, 1)
+    out = np.maximum(pm, sm).astype(np.float32)
+    return _neck_lines_back(out, rgb_u8, lm, Wf)
+
+
+def _neck_lines_back(out: np.ndarray, rgb_u8: np.ndarray, lm: np.ndarray, Wf: float) -> np.ndarray:
+    """Below the jaw a faint thin dark line is a neck line, not a hair. Taken for a strand it was cut out of the
+    skin, and the neck line removal never saw it."""
+    L = lm[:, :2]
+    if not np.isfinite(L[[8, 27]]).all():
+        return out
+    ax = L[8] - L[27]
+    n_ = float(np.hypot(*ax))
+    if n_ < 1e-3:
+        return out
+    ax = ax / n_
+    h, w = out.shape
+    n, lab, stats, cen = cv2.connectedComponentsWithStats((out > 0.3).astype(np.uint8), connectivity=8)
+    if n <= 1:
+        return out
+    hull = np.zeros((h, w), np.uint8)
+    cv2.fillConvexPoly(hull, cv2.convexHull(np.round(L).astype(np.int32)), 1)
+    y = cv2.GaussianBlur(cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2GRAY).astype(np.float32), (0, 0), 0.6)
+    k2 = max(5, int(0.022 * Wf) | 1)
+    se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k2, k2))
+    loc = cv2.GaussianBlur(y, (0, 0), max(2.0, 0.03 * Wf)) + 4.0
+    bh = cv2.morphologyEx(y, cv2.MORPH_BLACKHAT, se) / loc
+    th = cv2.morphologyEx(y, cv2.MORPH_TOPHAT, se) / loc
+    drop = np.zeros(n, bool)
+    for i in range(1, n):
+        x0, y0, bw, bh_, area = stats[i]
+        if area < 6:
+            continue
+        if float((cen[i] - L[8]) @ ax) < -0.12 * Wf:            # above the chin: the face
+            continue
+        sub = lab[y0:y0 + bh_, x0:x0 + bw] == i
+        if hull[y0:y0 + bh_, x0:x0 + bw][sub].mean() > 0.3:
+            continue
+        dk = float(np.percentile(bh[y0:y0 + bh_, x0:x0 + bw][sub], 75))
+        lt = float(np.percentile(th[y0:y0 + bh_, x0:x0 + bw][sub], 75))
+        # a neck line is a faint dark line (a tenth of the skin's brightness); a hair over the neck is
+        # either light (blond, a highlight) or clearly darker than that. A necklace chain can be as faint, but
+        # it is long (it goes round the neck or hangs down the chest) and beads or links glint along it
+        span = float(np.hypot(bw, bh_))
+        gl = float(np.percentile(th[y0:y0 + bh_, x0:x0 + bw][cv2.dilate(sub.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0], 97))
+        if dk > lt and dk < NECK_LINE_MAX and span < 0.6 * Wf and gl < 0.25:
+            drop[i] = True
+    if drop.any():
+        gone = cv2.dilate(drop[lab].astype(np.uint8), np.ones((5, 5), np.uint8))
+        out = out * (1 - gone)
+    return out
 
 
 # --------------------------------------------------------------------------- mask

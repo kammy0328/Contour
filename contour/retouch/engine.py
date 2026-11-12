@@ -1498,9 +1498,191 @@ def _bump_soften(Y, Cb, Cr, mY, mC, k: float, wf: float, cs: float):
     return Y, Cb, Cr
 
 
-def _crease_lift(Y, Cb, Cr, mY, k: float, width: float):
+CHIN_DIMPLE = 0.0      # 0..1: soften a pebbled chin, only on frames where it shows (set by the caller; no slider yet)
+FACE_LINES = 0.0       # 0..1: fill fine lines on the face skin (forehead, under the eyes, cheeks)
+CHIN_LO, CHIN_HI = 0.045, 0.085
+
+
+def chin_zone(shape, lm: np.ndarray, wf: float) -> Optional[np.ndarray]:
+    """The chin between the lower lip and the jaw (soft), lm in px of `shape`."""
+    if lm is None or not np.isfinite(lm[[57, 8], :2]).all():
+        return None
+    a, b = lm[57, :2], lm[8, :2]
+    c = 0.4 * a + 0.6 * b
+    v = b - a
+    L = float(np.hypot(*v))
+    if L < 4:
+        return None
+    m = np.zeros(shape, np.uint8)
+    cv2.ellipse(m, (int(c[0]), int(c[1])), (max(2, int(0.42 * L)), max(2, int(0.24 * wf))),
+                float(np.degrees(np.arctan2(v[1], v[0]))), 0, 360, 255, -1)
+    return cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.03 * wf))
+
+
+def _dimple_map(Y: np.ndarray, wf: float) -> np.ndarray:
+    """Pits and bumps a hundredth of the face wide (a pebbled chin): the determinant of the Hessian, so the
+    edge of a shadow or the lip line (curved one way only) does not answer."""
+    sg = max(1.0, 0.01 * wf)
+    ys = cv2.GaussianBlur(Y, (0, 0), sg)
+    base = cv2.GaussianBlur(Y, (0, 0), 4 * sg) + 8.0 / 255.0
+    xx = cv2.Sobel(ys, cv2.CV_32F, 2, 0, ksize=3)
+    yy = cv2.Sobel(ys, cv2.CV_32F, 0, 2, ksize=3)
+    xy = cv2.Sobel(ys, cv2.CV_32F, 1, 1, ksize=3)
+    return np.sqrt(np.maximum(xx * yy - xy * xy, 0)) * sg * sg / base
+
+
+def _chin_dimple(Y: np.ndarray, lm: Optional[np.ndarray], skin: np.ndarray, wf: float, k: float) -> np.ndarray:
+    """Soften a pebbled chin (the chin muscle pulled tight). How pebbled the chin is, is measured on this very
+    frame: on a frame where the chin is smooth the amount is 0 and nothing is touched, and it rises with the
+    dimples. The broad light and shade of the chin stay as they are."""
+    z = chin_zone(Y.shape, lm, wf)
+    if z is None:
+        return Y
+    r_ = _roi(z, int(0.15 * wf) + 8)
+    if r_ is None:
+        return Y
+    y0, y1, x0, x1 = r_
+    roi = Y[y0:y1, x0:x1].astype(np.float32)
+    zz, ss = z[y0:y1, x0:x1], skin[y0:y1, x0:x1]
+    reg = (zz > 0.5) & (ss > 0.5)
+    if reg.sum() < 40:
+        return Y
+    s = float(np.percentile(_dimple_map(roi, wf)[reg], 90))
+    amt = float(np.clip((s - CHIN_LO) / (CHIN_HI - CHIN_LO), 0, 1)) * k
+    if amt < 0.02:
+        return Y
+    m = (zz * ss * amt).astype(np.float32)
+    r = max(2, int(round(0.03 * wf)))
+    out = SK.smooth_channel(roi, m, 1.0, 0.0, r, eps=0.003, relative=True)
+    d = out - roi
+    sig = max(3.0, 4.0 * r)
+    low = cv2.GaussianBlur(d, (0, 0), sig) / np.maximum(cv2.GaussianBlur(m, (0, 0), sig), 0.05)
+    Yo = Y.astype(np.float32, copy=True)
+    Yo[y0:y1, x0:x1] = out - m * np.clip(low, -0.2, 0.2)
+    return Yo
+
+
+THIN_LO, THIN_HI = 0.4, 0.7
+LINE_DEEP_LO, LINE_DEEP_HI = 0.20, 0.32   # a skin line is at most this much darker than the skin beside it
+
+
+def neck_axis(lm: Optional[np.ndarray]):
+    """Unit vector down the face (nose bridge to chin): the direction the neck runs in, picture coordinates."""
+    if lm is None or not np.isfinite(lm[[27, 8], :2]).all():
+        return None
+    v = lm[8, :2] - lm[27, :2]
+    n = float(np.hypot(*v))
+    return None if n < 1e-3 else (float(v[0] / n), float(v[1] / n))
+
+
+def jaw_hold(lm: Optional[np.ndarray], shape, scale: float, wf: float) -> Optional[np.ndarray]:
+    """1 off the jaw line, 0 on it (soft): the shadow line under the jaw and chin is the face's outline, not a
+    neck line, and stays. lm in source px, scale = px of `shape` per source px, wf in px of `shape`."""
+    if lm is None or not np.isfinite(lm[2:15, :2]).all():
+        return None
+    m = np.zeros(shape, np.uint8)
+    pts = np.round(lm[2:15, :2] * scale).astype(np.int32)
+    cv2.polylines(m, [pts], False, 255, max(1, int(round(0.07 * wf))), cv2.LINE_AA)
+    return 1.0 - cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.025 * wf))
+
+
+def _things(Y: np.ndarray, m: np.ndarray, wf: float) -> Optional[np.ndarray]:
+    """Thin things lying on the skin that are not skin (a necklace chain, a cord, a strap, a dark hair): 0..1.
+    Much darker than the skin beside them, or glinting. The skin smoothing leaves them alone (it used to
+    soften a chain on the chest, which no mask left out)."""
+    r = _roi(m, int(0.1 * wf) + 4)
+    if r is None:
+        return None
+    y0, y1, x0, x1 = r
+    roi = cv2.GaussianBlur(Y[y0:y1, x0:x1].astype(np.float32), (0, 0), 1.5)
+    base = cv2.GaussianBlur(roi, (0, 0), max(2.0, 0.045 * wf)) + 0.02
+    kn = max(3, int(round(0.03 * wf)) | 1)
+    se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kn, kn))
+    dk = cv2.morphologyEx(roi, cv2.MORPH_BLACKHAT, se) / base
+    gl = cv2.morphologyEx(roi, cv2.MORPH_TOPHAT, se) / base
+    kd = max(3, int(round(0.012 * wf)) | 1)
+    t = np.maximum(_ss(LINE_DEEP_LO, LINE_DEEP_HI, dk), _ss(0.3, 0.5, gl))
+    t = cv2.dilate(t, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kd, kd)))
+    out = np.zeros(Y.shape, np.float32)
+    out[y0:y1, x0:x1] = np.clip(cv2.GaussianBlur(t, (0, 0), max(1.0, 0.006 * wf)) * 1.4, 0, 1)
+    return out
+
+
+FOLD_EPS, FOLD_R = 0.005, 0.08
+
+
+def neck_zone(lm: Optional[np.ndarray], shape, scale: float, wf: float) -> Optional[np.ndarray]:
+    """1 on the neck proper (from the jaw down about half a face width), fading to 0 below it. A thin chain on
+    the collarbone or the chest looks to every measure like a neck line (as faint, as thin, skin coloured
+    through its links); what tells them apart is where they are. Neck lines are on the neck."""
+    if lm is None or not np.isfinite(lm[0:17, :2]).all():
+        return None
+    m = np.zeros(shape, np.uint8)
+    cv2.fillConvexPoly(m, cv2.convexHull(np.round(lm[:, :2] * scale).astype(np.int32)), 1)
+    dist = cv2.distanceTransform(1 - m, cv2.DIST_L2, 3)
+    return (1.0 - _ss(0.34 * wf, 0.48 * wf, dist)).astype(np.float32)
+
+
+def _fold_flat(Y: np.ndarray, m: np.ndarray, wf: float, k: float) -> np.ndarray:
+    """The soft folds of a neck (rings across it, wider and fainter than a line): the faint light and dark
+    bands between the size of the skin's texture and a twelfth of the face are taken out with an edge-keeping
+    filter, so the strong shading of the neck's own build (tendons, the jaw's shadow) is an edge and stays, and
+    the broad light and shade is given back. The skin's fine texture is not touched."""
+    r = _roi(m, int(0.25 * wf) + 4)
+    if r is None or k < 1e-4:
+        return Y
+    y0, y1, x0, x1 = r
+    roi = Y[y0:y1, x0:x1].astype(np.float32)
+    mm = m[y0:y1, x0:x1].astype(np.float32)
+    loc = cv2.GaussianBlur(roi, (0, 0), max(2.0, 0.1 * wf))
+    eps = FOLD_EPS * np.clip(loc / 0.45, 0.15, 2.0) ** 2
+    b1 = SK.guided_self(roi, max(1, int(round(0.008 * wf))), eps)
+    b2 = SK.guided_self(b1, max(2, int(round(FOLD_R * wf))), eps)
+    d = b2 - b1
+    sig = max(3.0, 0.16 * wf)
+    low = cv2.GaussianBlur(d * mm, (0, 0), sig) / np.maximum(cv2.GaussianBlur(mm, (0, 0), sig), 0.05)
+    out = Y.astype(np.float32, copy=True)
+    out[y0:y1, x0:x1] = roi + k * mm * (d - np.clip(low, -0.2, 0.2))
+    return out
+
+
+def nose_hold(lm: Optional[np.ndarray], shape, scale: float, wf: float) -> Optional[np.ndarray]:
+    """1 off the nose, 0 on it (soft): the lines down the sides of the nose are its shape. No line filler may
+    lift them (on a soft or motion-blurred face they are all that is left of the nose)."""
+    if lm is None or not np.isfinite(lm[27:36, :2]).all():
+        return None
+    m = np.zeros(shape, np.uint8)
+    cv2.fillConvexPoly(m, cv2.convexHull(np.round(lm[27:36, :2] * scale).astype(np.int32)), 255)
+    k = max(3, int(round(0.14 * wf)) | 1)
+    m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    return 1.0 - cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.02 * wf))
+
+
+def neck_dir(mY: np.ndarray, lm: Optional[np.ndarray], scale: float):
+    """The direction the neck runs in, from the chin to the middle of the neck mask (so a tilted head, whose
+    face points one way while the neck goes another, is followed); the face's own axis when that fails."""
+    try:
+        if lm is not None and np.isfinite(lm[8, :2]).all():
+            ys, xs = np.nonzero(mY > 0.3)
+            if len(xs) > 50:
+                v = np.array([xs.mean(), ys.mean()]) - lm[8, :2] * scale
+                n = float(np.hypot(*v))
+                if n > 4:
+                    return (float(v[0] / n), float(v[1] / n))
+    except Exception:
+        pass
+    return neck_axis(lm)
+
+
+def _crease_lift(Y, Cb, Cr, mY, k: float, width: float, axis=None, hold: Optional[np.ndarray] = None,
+                 fine_lines: bool = True):
     """Fill thin dark creases (neck lines): a dark valley, curved strongly across and hardly along, darker than
-    the skin around it by more than its texture. Only the crease's shading is lifted; broad shading stays."""
+    the skin around it by more than its texture. Only the crease's shading is lifted; broad shading stays.
+
+    axis: the direction the neck runs in. A neck line lies across the neck; the shading of the neck's own
+    build (the tendons and the hollow between them, the edge of the jaw's shadow) runs along it, and was lifted
+    as if it were a crease, which made the neck's shading lighter than the original. With an axis only valleys
+    lying across it are taken. hold: 0 where nothing may be lifted (the jaw line)."""
     r = _roi(mY, int(3 * width) + 6)
     if r is None or k < 1e-4:
         return Y, Cb, Cr
@@ -1529,11 +1711,71 @@ def _crease_lift(Y, Cb, Cr, mY, k: float, width: float):
     l2 = 0.5 * (tr - disc)
     line = np.where(l1 > 1e-6, 1 - _ss(0.25, 0.6, np.abs(l2) / np.maximum(l1, 1e-6)), 0.0).astype(np.float32)
     score = _ss(1.0, 2.6, D / tex) * _ss(0.004, 0.02, D) * line
+    # thin only: a neck line is all there under a narrow black-hat; the shading of the neck's own build (the
+    # tendons, the hollow between them, the shadow under the jaw) keeps growing as the kernel widens
+    kn = max(3, int(round(1.6 * width)) | 1)
+    kw = max(kn + 4, int(round(6.0 * width)) | 1)
+    bn = cv2.morphologyEx(Ys, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kn, kn)))
+    bw = cv2.morphologyEx(Ys, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kw, kw)))
+    thin = _ss(THIN_LO, THIN_HI, cv2.GaussianBlur(bn, (0, 0), sig_s * 2) / (cv2.GaussianBlur(bw, (0, 0), sig_s * 2) + 1e-4))
+    score = score * thin
+    if axis is not None:
+        # the direction of strongest curvature is across the valley: for a fold lying across the neck that is
+        # along the neck. The neck's own shading (tendons, the hollow between them) lies the other way
+        phi = 0.5 * np.arctan2(2 * Ixy, Ixx - Iyy)
+        along = np.abs(np.cos(phi) * axis[0] + np.sin(phi) * axis[1])
+        score = score * _ss(0.6, 0.85, cv2.GaussianBlur(along, (0, 0), max(1.0, 0.5 * width)))
+    # faint long lines: in grain they are below the skin's own texture at any one point and only show along
+    # their length, so they are found by the line finder that also finds hair strands (dark lines only). A
+    # hair over the neck is not in the mask (the skin mask leaves it out), so only neck lines are lifted here
+    fine = None
+    try:
+        if fine_lines:
+                fine = SK._strand_map(np.clip(roi, 0, 1) * 255.0, width / 0.018, dark_only=True, gain=1.6)
+    except Exception:
+        fine = None
+    if fine is not None:
+        score = np.maximum(score, fine)
+    if hold is not None:
+        score = score * hold[y0:y1, x0:x1]
     rd = max(1, int(round(0.4 * width)))
     score = cv2.dilate(score, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rd + 1, 2 * rd + 1)))
     sp = np.clip(cv2.GaussianBlur(score, (0, 0), max(0.6, 0.3 * width)) * 1.3, 0, 1) * mm
     Yo = Y.astype(np.float32, copy=True)
-    Yo[y0:y1, x0:x1] = roi + k * sp * D
+    lift = sp * D
+    rs = cv2.GaussianBlur(roi, (0, 0), 0.8)
+    D2 = np.clip(base - rs, 0, 0.25)
+    if fine is not None:
+        # a line a couple of pixels wide is filled from the picture itself, not from its blurred copy
+        fs = cv2.dilate(fine, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+        fs = np.clip(cv2.GaussianBlur(fs, (0, 0), max(0.6, 0.2 * width)) * 2.2, 0, 1) * np.clip(mm * 1.5, 0, 1)
+        if hold is not None:
+            fs = fs * hold[y0:y1, x0:x1]
+        lift = np.maximum(lift, fs * D2)
+    # a necklace chain, a cord, a strap, a hair is a thin dark line on the skin too. What tells it from a skin
+    # line: it is far darker than the skin beside it, it glints (beads, links), or it has lost the skin's
+    # colour (a crease is skin in shade and keeps it; a chain or a black cord is grey). None of these is lifted
+    kd = max(3, int(round(1.2 * width)) | 1)
+    sed = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kd, kd))
+    seg = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3 * kd, 3 * kd))
+    rq = cv2.GaussianBlur(roi, (0, 0), 1.5)                 # grain alone reaches a fifth of the brightness at 0.8
+    deep = cv2.dilate(np.clip(base - rq, 0, 1) / (base + 0.02), sed)
+    glint = cv2.dilate(cv2.morphologyEx(rq, cv2.MORPH_TOPHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kn, kn)))
+                       / (base + 0.02), seg)
+    thing = np.maximum(_ss(LINE_DEEP_LO, LINE_DEEP_HI, deep), _ss(0.3, 0.5, glint))
+    try:
+        if Cb is not None and Cr is not None:
+            hh, ww = Y.shape
+            cm = np.hypot(cv2.resize(Cb, (ww, hh), interpolation=cv2.INTER_LINEAR)[y0:y1, x0:x1] if Cb.shape != Y.shape else Cb[y0:y1, x0:x1],
+                          cv2.resize(Cr, (ww, hh), interpolation=cv2.INTER_LINEAR)[y0:y1, x0:x1] if Cr.shape != Y.shape else Cr[y0:y1, x0:x1])
+            cm = cv2.GaussianBlur(cm.astype(np.float32), (0, 0), 1.5)
+            cref = _gm(cm, w, sig_l) + 1e-4
+            grey = cv2.dilate(np.clip(1.0 - cm / cref, 0, 1), sed)
+            thing = np.maximum(thing, _ss(0.5, 0.75, grey) * _ss(0.015, 0.03, cref))
+    except Exception:
+        pass
+    lift = lift * (1.0 - np.clip(cv2.GaussianBlur(thing, (0, 0), max(1.0, 0.5 * width)) * 1.5, 0, 1))
+    Yo[y0:y1, x0:x1] = roi + k * lift
     return Yo, Cb, Cr
 
 
@@ -1620,6 +1862,13 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
         if "skin" in job.masks and v["skin"] > 1e-4 and job.skin is not None:
             mY = M(job.masks["skin"], (hY, wY))
             mC = M(job.masks["skin"], (hC, wC))
+            try:
+                th_ = _things(Y, mY, wf)
+                if th_ is not None:
+                    mY = mY * (1.0 - th_)
+                    mC = mC * (1.0 - M(th_, (hC, wC)))
+            except Exception:
+                pass
             r = SK.radius_px(job.skin, y_per_src)
             Y = SK.smooth_channel(Y, mY, job.skin.strength, job.keep, r, relative=True)
             rc = max(1, int(round(r * cs)))
@@ -1639,11 +1888,28 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                 # only where a fold is really found (a quarter of the whole band used to be lifted too: on a
                 # face lit from the side that flattened the cheek's shading, which looked painted over)
                 mY = np.clip(band * (0.06 + 0.95 * found), 0, 1)
+                if key == "nasolabial":
+                    nh_ = nose_hold(job.face, (hY, wY), y_per_src, wf)
+                    if nh_ is not None:
+                        mY = mY * nh_
                 Y = _fold_fill(Y, mY, exY, 0.95 * k, max(0.8, sf * wf), max(2.0, ss * wf), True,
                                valley=max(1.5, 1.6 * fw_ * wf))
                 mC = M(mY, (hC, wC))
                 Cb = _fold_fill(Cb, mC, exC, 0.7 * k, max(0.8, sf * wf * cs), max(1.5, ss * wf * cs), False)
                 Cr = _fold_fill(Cr, mC, exC, 0.7 * k, max(0.8, sf * wf * cs), max(1.5, ss * wf * cs), False)
+        # 2a. fine lines on the face skin, and a pebbled chin (both only where they are found)
+        if (FACE_LINES > 1e-4 or CHIN_DIMPLE > 1e-4) and "skin" in job.masks and job.face is not None and v["skin"] > 1e-4:
+            lmY = np.asarray(job.face, np.float32)[:, :2] * y_per_src
+            skY = M(job.masks["skin"], (hY, wY))
+            if FACE_LINES > 1e-4:
+                mfl = skY if exY is None else skY * (1.0 - exY)
+                nh_ = nose_hold(job.face, (hY, wY), y_per_src, wf)
+                if nh_ is not None:
+                    mfl = mfl * nh_
+                Y, Cb, Cr = _crease_lift(Y, Cb, Cr, mfl, float(np.clip(FACE_LINES, 0, 1)), max(1.5, 0.012 * wf),
+                                         None, jaw_hold(job.face, (hY, wY), y_per_src, wf))
+            if CHIN_DIMPLE > 1e-4:
+                Y = _chin_dimple(Y, lmY, skY, wf, float(np.clip(CHIN_DIMPLE, 0, 1)))
         # 2b. dark circles: lift the under-eye shading to the cheek's level, cool/purple cast to skin colour
         if "dark" in job.masks and v.get("dark_circle", 0) > 1e-4:
             k = float(np.clip(v["dark_circle"], 0, 1))
@@ -1670,7 +1936,15 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
         # 3b. neck lines
         if "neck" in job.masks and v.get("neck_lines", 0) > 1e-4:
             k = float(np.clip(v["neck_lines"], 0, 1))
-            Y, Cb, Cr = _crease_lift(Y, Cb, Cr, M(job.masks["neck"], (hY, wY)), k, max(1.5, 0.018 * wf))
+            lmj = job.face
+            mN = M(job.masks["neck"], (hY, wY))
+            nz_ = neck_zone(lmj, (hY, wY), y_per_src, wf)
+            if nz_ is not None:
+                mN = mN * nz_
+            jh_ = jaw_hold(lmj, (hY, wY), y_per_src, wf)
+            Y, Cb, Cr = _crease_lift(Y, Cb, Cr, mN, k, max(1.5, 0.018 * wf), None, jh_)
+            # the soft folds (rings) of the neck, wider and fainter than a line
+            Y = _fold_flat(Y, mN if jh_ is None else mN * jh_, wf, k)
         # 3b'. goose bumps on the neck: softened, never wiped
         if "neck" in job.masks and v.get("neck_bumps", 0) > 1e-4:
             k = float(np.clip(v["neck_bumps"], 0, 1))
