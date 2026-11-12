@@ -94,8 +94,34 @@ def is_downloaded(key: str) -> bool:
     p = model_path(key)
     files = MODELS.get(key, {}).get("files")
     if files:
-        return all((p / Path(u).name).exists() for u in files)
-    return p.exists()
+        return all(_usable(p / Path(u).name) for u in files)
+    return _usable(p)
+
+
+def _usable(p: Path) -> bool:
+    """present and readable by this user (a file can exist and still be closed to us: see _set_aside)"""
+    if not p.is_file():
+        return False
+    try:
+        with open(p, "rb") as fh:
+            fh.read(16)
+        return True
+    except PermissionError:
+        return not _set_aside(p)
+    except OSError:
+        return True
+
+
+def _set_aside(p: Path) -> bool:
+    """1.9.0's installer downloaded models elevated through tempfile.mkdtemp, whose owner-only ACL (Administrators)
+    stayed on the files: the normal user could not open them and the analysis ran without them, silently.
+    Such a file is renamed (the folder still lets the user do that) so it is downloaded again."""
+    import time
+    try:
+        p.rename(p.with_name(p.name + f".noaccess{int(time.time())}"))
+        return True
+    except OSError:
+        return False
 
 
 def _download(url: str, dst: Path, progress: Optional[Callable[[float, str], None]], label: str) -> None:
@@ -130,7 +156,7 @@ def ensure_model(key: str, progress: Optional[Callable[[float, str], None]] = No
         files = spec["files"]
         for i, url in enumerate(files):
             dst = out / Path(url).name
-            if dst.exists():
+            if _usable(dst):
                 continue
 
             def prog(f, msg, i=i):
@@ -138,11 +164,13 @@ def ensure_model(key: str, progress: Optional[Callable[[float, str], None]] = No
                     progress((i + f) / len(files), msg)
             _download(url, dst, prog, spec["label"])
         return out
-    if out.exists():
+    if _usable(out):
         return out
     url = spec["url"]
     out.parent.mkdir(parents=True, exist_ok=True)
-    tmpdir = Path(tempfile.mkdtemp(dir=str(out.parent)))
+    # a plain folder, not tempfile.mkdtemp: mkdtemp's owner-only ACL would stay on the model (see _set_aside)
+    tmpdir = out.parent / f".download_{key}_{os.getpid()}"
+    tmpdir.mkdir(parents=True, exist_ok=True)
     try:
         fname = tmpdir / Path(url.split("?")[0]).name
         try:

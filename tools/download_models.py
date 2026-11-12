@@ -7,7 +7,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from contour.track import models as M  # noqa: E402
 
 
+def reset_acl():
+    """Windows: models downloaded by 1.9.0's elevated installer kept an Administrators-only ACL. The installer runs
+    this elevated again: give every file in the models folder the folder's inherited permissions back."""
+    if sys.platform != "win32":
+        return
+    import subprocess
+    root = M.model_path("det_yolox_m").parent.parent
+    if root.exists():
+        try:
+            subprocess.run(["icacls", str(root), "/reset", "/T", "/C", "/Q"], capture_output=True, timeout=300)
+        except Exception:
+            pass
+
+
 def main():
+    reset_acl()
     keys = ["det_yolox_m", "pose_rtmpose_x", "pose_rtmw_x", "pose_rtmpose_m", "face_yunet", "matte_rvm",
             "face_rtm106", "hand_rtm21", "seg_sam2_s", "face_sface", "face_parse"]
     if "--max" in sys.argv:
