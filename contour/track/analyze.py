@@ -537,6 +537,20 @@ class CutTracker:
         if any(self.cut.joint_keys.get(pid) for pid in pids):
             self.resolve_all(progress=None)
         self.update_widths()
+        # posters, photos and screens on the set: a figure that never moves is a picture, not someone to
+        # retouch (its mask would sit on the print, and it would count as a face in the cut's status). Only
+        # for people new in this analysis: a role the user chose stays.
+        try:
+            from .status import still_pictures
+            new = getattr(self, "_new_pids", set())
+            pics = still_pictures(st) & new if new else set()
+            for q in self.cut.persons:
+                if q.id in pics:
+                    q.role, q.still = "protect", True
+                    q.name = f"{q.name} (사진)"
+        except Exception:
+            import traceback
+            traceback.print_exc()
         # face layer (parsing + steady skin colour) for the retouch masks
         try:
             from . import facelayer as FL
@@ -832,6 +846,10 @@ class CutTracker:
         centers = faces[:, 0:2] + faces[:, 2:4] / 2
         k = int(np.argmin(np.linalg.norm(centers - c, axis=1)))
         fc = faces[k]
+        # the search box reaches past this head: a face a whole face width away is someone else's (a head seen
+        # from behind, next to a face turned towards it)
+        if np.linalg.norm(centers[k] - c) > 0.8 * max(float(fc[2]), float(fc[3])):
+            return
         lm = fc[4:14].reshape(5, 2) / [sx, sy]
         s = float(fc[14])
         out = st.raw["face_yunet"][p, t]
@@ -883,6 +901,7 @@ class CutTracker:
     def _update_persons(self, tracklets, dets, pids: List[int]) -> None:
         old = {p.id: p for p in self.cut.persons}
         persons = []
+        self._new_pids = set()
         for p, (tr, pid) in enumerate(zip(tracklets, pids)):
             apps = [dets[f][i]["app"] for f, i in tr.items() if dets[f][i]["app"].any()]
             prof = np.mean(apps, 0).tolist() if apps else []
@@ -895,6 +914,7 @@ class CutTracker:
                 persons.append(op)
             else:
                 role = "target"                       # everyone is retouched unless the user protects them
+                self._new_pids.add(int(pid))
                 persons.append(Person(id=pid, name=f"인물 {pid + 1}", color=PERSON_COLORS[pid % len(PERSON_COLORS)],
                                       role=role, profile=prof, first=min(tr), last=max(tr), reid=reid, faces=faces))
         self.cut.persons = persons

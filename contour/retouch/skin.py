@@ -220,6 +220,9 @@ def face_prior(lm: Optional[np.ndarray], rgb_u8: np.ndarray, model) -> Optional[
     return pr.astype(np.float32)
 
 
+_TEX_MIN = 1.2          # floor of the cheeks' fine-structure level on a dark face (code values)
+
+
 def _texture_gate(rgb_u8: np.ndarray, lm: np.ndarray) -> Optional[np.ndarray]:
     """Hair is strands: much more fine structure than the skin of the same face. Bleached or light brown hair
     has the skin's colour, and a fringe over a face tilted down sits right where the forehead would be; the
@@ -242,17 +245,22 @@ def _texture_gate(rgb_u8: np.ndarray, lm: np.ndarray) -> Optional[np.ndarray]:
     hp = y - cv2.GaussianBlur(y, (0, 0), s1)
     E = np.sqrt(cv2.GaussianBlur(hp * hp, (0, 0), max(1.5, 0.025 * Wf)))
     # reference: both cheeks and the nose bridge
-    ref = []
+    ref, yref = [], []
     for i, j in ((1, 31), (15, 35), (28, 29)):
         c = (L[i] + L[j]) / 2 - [x0, y0]
         r = max(2, int(0.05 * Wf))
         cy, cx = int(c[1]), int(c[0])
         if 0 <= cy < E.shape[0] and 0 <= cx < E.shape[1]:
             ref.append(E[max(0, cy - r):cy + r + 1, max(0, cx - r):cx + r + 1].ravel())
+            yref.append(y[max(0, cy - r):cy + r + 1, max(0, cx - r):cx + r + 1].ravel())
     if not ref:
         return None
     e0 = float(np.median(np.concatenate(ref)))
-    e0 = max(e0, 0.6)                                  # never finer than 8-bit steps
+    # never finer than 8-bit steps. On a dark, flat, compressed face the block edges and grain are a code value
+    # or two and would read as hair everywhere (a blotchy gate); strands that matter stand out by more than that.
+    # A well lit face keeps its own measure (blonde hair on a smooth bright face is only a little finer than skin)
+    yr = float(np.median(np.concatenate(yref))) if yref else 128.0
+    e0 = max(e0, 0.6 + (_TEX_MIN - 0.6) * float(np.clip((70.0 - yr) / 40.0, 0.0, 1.0)))
     g = np.clip((3.2 * e0 - E) / (1.6 * e0), 0, 1)
     out = np.ones((h, w), np.float32)
     out[y0:y1, x0:x1] = cv2.GaussianBlur(g, (0, 0), max(1.0, 0.012 * Wf))
@@ -269,6 +277,10 @@ def _ridge_aniso(I: np.ndarray, s: float) -> np.ndarray:
     det = np.sqrt((dxx - dyy) ** 2 + 4 * dxy ** 2)
     l1, l2 = (tr + det) / 2, (tr - det) / 2
     return np.where(l1 > 0, (l1 - np.abs(l2)) / (l1 + np.abs(l2) + 1e-6), 0).astype(np.float32)
+
+
+_PAINT_MIN_Y = 3.0      # code values of darkening that count as the skin's own texture at the least
+_PAINT_MIN_B = 2.0      # the same for the blue (Cb) difference
 
 
 def paint_mask(rgb_u8: np.ndarray, lm: Optional[np.ndarray]) -> Optional[np.ndarray]:
@@ -312,7 +324,12 @@ def paint_mask(rgb_u8: np.ndarray, lm: Optional[np.ndarray]) -> Optional[np.ndar
     se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
     r_y = cv2.morphologyEx(Y, cv2.MORPH_BLACKHAT, se) / (cv2.GaussianBlur(Y, (0, 0), 0.04 * Wf) + 4)
     r_b = cv2.morphologyEx(Cb, cv2.MORPH_TOPHAT, se)
-    sc = np.maximum(r_y / (np.percentile(r_y[ref], 90) + 1e-4), r_b / (np.percentile(r_b[ref], 90) + 0.5))
+    # the skin's own texture sets the scale, but never below a few code values: a dark, flat, heavily compressed
+    # face has almost no texture, and its block edges and grain (one or two code values) read as drawn lines
+    y_ref = float(np.median(Y[ref]))
+    n_y = max(float(np.percentile(r_y[ref], 90)), _PAINT_MIN_Y / (y_ref + 4))
+    n_b = max(float(np.percentile(r_b[ref], 90)) + 0.5, _PAINT_MIN_B)
+    sc = np.maximum(r_y / (n_y + 1e-4), r_b / n_b)
     s = max(0.8, 0.004 * Wf)
     an = np.maximum(_ridge_aniso(Y, s), _ridge_aniso(-Cb, s))
     weak = ((sc > 1.6) & (an > 0.35) & area & ~feat).astype(np.uint8)

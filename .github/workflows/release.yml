@@ -89,6 +89,41 @@ jobs:
           & C:\ct\python\python.exe -m contour.batch --help 2>&1 | Tee-Object -Append -FilePath "$env:GITHUB_WORKSPACE\ci\smoke.txt"
           Pop-Location
 
+      - name: Update from 1.8.1 (per user) to this version (Program Files)
+        shell: pwsh
+        env:
+          CONTOUR_CI: "1"
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          Start-Transcript -Append -Path ci\log.txt | Out-Null
+          $out = "$env:GITHUB_WORKSPACE\ci\upgrade.txt"
+          Copy-Item C:\ct\setup_log.txt ci\setup_ct.txt -ErrorAction SilentlyContinue
+          # the smoke test's machine-wide copy out first: the user's PC has only 1.8.1
+          $p = Start-Process C:\ct\unins000.exe -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -PassThru -Wait
+          Start-Sleep 8
+          "uninstall C:\ct exit $($p.ExitCode) left=$(Test-Path C:\ct\python)" | Tee-Object -Append -FilePath $out
+          Invoke-WebRequest "https://github.com/$env:PUBLIC_REPO/releases/download/v1.8.1/Contour_Setup_1.8.1.exe" -OutFile old.exe
+          $p = Start-Process .\old.exe -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -PassThru -Wait
+          $old = "$env:LOCALAPPDATA\Programs\Contour"
+          "1.8.1 exit $($p.ExitCode) present=$(Test-Path "$old\python\python.exe")" | Tee-Object -Append -FilePath $out
+          if (-not (Test-Path "$old\python\python.exe")) { throw "1.8.1 did not install" }
+          Get-Process pythonw, python, DIAP -ErrorAction SilentlyContinue | Stop-Process -Force
+          # exactly what 1.8.1's updater runs
+          $exe = "$env:GITHUB_WORKSPACE\dist\DIAP_Setup_${{ steps.v.outputs.ver }}.exe"
+          $p = Start-Process $exe -ArgumentList "/SILENT","/SUPPRESSMSGBOXES","/NORESTART","/CLOSEAPPLICATIONS","/UPDATE=1","/DIR=$old" -PassThru -Wait
+          for ($i = 0; $i -lt 30 -and (Test-Path "$old\python"); $i++) { Start-Sleep 2 }
+          Get-Process pythonw, DIAP -ErrorAction SilentlyContinue | Stop-Process -Force
+          $new = "C:\Program Files\Diap"
+          $key = Test-Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{0432DE7E-AD09-4B89-8929-0B95959C384F}_is1"
+          "update exit $($p.ExitCode) new=$(Test-Path "$new\python\DIAP.exe") app=$(Test-Path "$new\app\app.py") stamp=$(Test-Path "$new\python\.contour_packages") old_left=$(Test-Path "$old\python") old_key=$key" | Tee-Object -Append -FilePath $out
+          Get-Content "$new\setup_log.txt" -ErrorAction SilentlyContinue | Select-Object -Last 15 | Tee-Object -Append -FilePath $out
+          if ($p.ExitCode -ne 0) { throw "update exit $($p.ExitCode)" }
+          if (-not (Test-Path "$new\app\app.py")) { throw "not installed to Program Files" }
+          if (-not (Test-Path "$new\python\.contour_packages")) { throw "packages not installed" }
+          if (Test-Path "$old\python") { throw "old per-user copy still there" }
+          & "$new\python\python.exe" -c "import contour.core.settings as s, onnxruntime, PySide6, cv2; print('ok', s.APP_NAME, s.APP_VERSION)" 2>&1 | Tee-Object -Append -FilePath $out
+          if ($LASTEXITCODE -ne 0) { throw "import failed after update" }
+
       - name: Replace an earlier build of the same version
         shell: pwsh
         env:

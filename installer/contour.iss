@@ -67,10 +67,11 @@ Name: "{autoprograms}\DIAP"; Filename: "{app}\python\DIAP.exe"; Parameters: """{
 Name: "{autodesktop}\DIAP"; Filename: "{app}\python\DIAP.exe"; Parameters: """{app}\app\app.py"""; WorkingDir: "{app}\app"; IconFilename: "{app}\python\DIAP.exe"; AppUserModelID: "SEWOO.DIAP"; Tasks: desktop
 
 [Run]
-; first install: visible console (package download takes a while)
-Filename: "{app}\python\python.exe"; Parameters: """{app}\app\tools\setup_env.py"" --learn {code:LearnFlag}"; WorkingDir: "{app}\app"; StatusMsg: "패키지와 모델을 준비하는 중 (처음엔 5~10분)"; Check: not IsUpdate
-; update: hidden, packages only when they changed
-Filename: "{app}\python\python.exe"; Parameters: """{app}\app\tools\setup_env.py"" --learn auto"; WorkingDir: "{app}\app"; StatusMsg: "업데이트 마무리 중"; Flags: runhidden; Check: IsUpdate
+; first install into this folder (also the update from 1.8.1, which moves to Program Files): visible console,
+; the package download takes a while
+Filename: "{app}\python\python.exe"; Parameters: """{app}\app\tools\setup_env.py"" --learn {code:LearnFlag}"; WorkingDir: "{app}\app"; StatusMsg: "패키지와 모델을 준비하는 중 (처음엔 5~10분)"; Check: FirstSetup
+; update in place: hidden, packages only when they changed
+Filename: "{app}\python\python.exe"; Parameters: """{app}\app\tools\setup_env.py"" --learn auto"; WorkingDir: "{app}\app"; StatusMsg: "업데이트 마무리 중"; Flags: runhidden; Check: not FirstSetup
 Filename: "{app}\python\DIAP.exe"; Parameters: """{app}\app\app.py"""; WorkingDir: "{app}\app"; Description: "DIAP 실행"; Flags: nowait postinstall skipifsilent
 Filename: "{app}\python\DIAP.exe"; Parameters: """{app}\app\app.py"""; WorkingDir: "{app}\app"; Flags: nowait runasoriginaluser; Check: IsUpdate
 
@@ -83,24 +84,54 @@ Type: files; Name: "{app}\setup_log.txt"
 [Code]
 // 1.8.1 was installed per user under %LOCALAPPDATA%\Programs\Contour: removed once the new copy is in place
 // (projects, presets and learned data live in Documents and are not touched)
+const
+  OldKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{0432DE7E-AD09-4B89-8929-0B95959C384F}_is1';
+
+function NoSlash(S: String): String;
+begin
+  Result := Lowercase(RemoveBackslashUnlessRoot(S));
+end;
+
 procedure RemoveOldPerUserInstall;
 var
-  Un: String;
+  Un, Loc: String;
   Code: Integer;
 begin
-  if RegQueryStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{0432DE7E-AD09-4B89-8929-0B95959C384F}_is1',
-                         'UninstallString', Un) then
+  if not RegQueryStringValue(HKCU, OldKey, 'UninstallString', Un) then
+    exit;
+  if not RegQueryStringValue(HKCU, OldKey, 'InstallLocation', Loc) then
+    Loc := ExtractFileDir(RemoveQuotes(Un));
+  // never run the old uninstaller over this very install: it would delete python, app and ffmpeg in it
+  if NoSlash(Loc) = NoSlash(ExpandConstant('{app}')) then
   begin
-    Un := RemoveQuotes(Un);
-    if FileExists(Un) then
-      Exec(Un, '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART', '', SW_HIDE, ewWaitUntilTerminated, Code);
+    RegDeleteKeyIncludingSubkeys(HKCU, OldKey);
+    exit;
   end;
+  Un := RemoveQuotes(Un);
+  if FileExists(Un) then
+    Exec(Un, '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART', '', SW_HIDE, ewWaitUntilTerminated, Code);
+end;
+
+// 1.8.1's updater passes its own folder (/DIR=...\AppData\Local\Programs\Contour): DIAP goes to Program Files
+procedure InitializeWizard;
+var
+  D: String;
+begin
+  D := Lowercase(WizardForm.DirEdit.Text);
+  if (Pos(Lowercase(ExpandConstant('{localappdata}')), D) = 1) or (Pos('\appdata\local\programs\', D) > 0) then
+    WizardForm.DirEdit.Text := ExpandConstant('{autopf}\Diap');
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
     RemoveOldPerUserInstall;
+end;
+
+// packages not installed in this folder yet (setup_env.py writes the stamp when they are)
+function FirstSetup: Boolean;
+begin
+  Result := not FileExists(ExpandConstant('{app}\python\.contour_packages'));
 end;
 
 function IsUpdate: Boolean;

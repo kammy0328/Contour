@@ -69,8 +69,9 @@ def build(tracker, progress: Optional[Callable[[float, str], None]] = None,
         F = st.face[p, t, :, :2]
         return float(np.hypot((F[16, 0] - F[0, 0]) * px.sx, (F[16, 1] - F[0, 1]) * px.sy))
     # faces too small to parse usefully (and to retouch with any detail) are left to the colour model
+    still = {q.id for q in getattr(tracker.cut, "persons", []) if getattr(q, "still", False)}
     todo = [(p, t) for p in range(P) for t in range(N)
-            if st.present[p, t] and np.isfinite(st.face[p, t, :, :2]).all() and st.face_vis[p, t] >= 0.08
+            if int(st.pids[p]) not in still and st.present[p, t] and np.isfinite(st.face[p, t, :, :2]).all() and st.face_vis[p, t] >= 0.08
             and _wf(p, t) >= MIN_FACE_PX]
     if not todo:
         return None
@@ -143,6 +144,11 @@ def build(tracker, progress: Optional[Callable[[float, str], None]] = None,
                     # the crops follow the face: neighbouring maps line up unless the crop's scale jumped
                     sc = np.hypot(*M[p, s, 0, :2]) / max(1e-6, np.hypot(*M[p, t, 0, :2]))
                     if not 0.92 < sc < 1.08:
+                        continue
+                    # nor across a light flicker: a frame gone dark sees no hair texture and little skin, and
+                    # would wash out what the lit frame next to it sees clearly
+                    ya, yb = col[p, s, 2], col[p, t, 2]
+                    if np.isfinite(ya) and np.isfinite(yb) and abs(ya - yb) > 0.35 * max(ya, yb) + 6:
                         continue
                     w = float(np.exp(-0.5 * (d / T_SIGMA) ** 2))
                     acc_s += w * skin[p, s].astype(np.float32)

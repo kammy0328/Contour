@@ -11,9 +11,10 @@ from __future__ import annotations
 
 from typing import Optional
 
+import cv2
 import numpy as np
 
-SMALL_FACE = 60          # source px, face width (jaw to jaw)
+SMALL_FACE = 60          # px, face width (jaw to jaw) on a 1920 wide source (scaled for larger ones)
 FACE_OK = 0.8            # share of a person's frames with a usable face
 TRACK_OK = 0.3           # share of a person's frames with confident body tracking (neck, shoulders)
 LABEL = {"none": "리터칭 불필요", "small": "얼굴 작음", "good": "적용 양호", "bad": "인식 불량", "pending": "분석 전",
@@ -25,6 +26,46 @@ def effective(cut) -> str:
     if st.get("work") == "skip":
         return "none"                       # marked 작업 불필요 by the user
     return st.get("user") or st.get("auto") or ("none" if cut.tl.get("kind") in ("gap",) else "pending")
+
+
+STILL_RES = 0.008       # body points' deviation from one rigid motion (p90, share of the body's size)
+STILL_FRAMES = 20       # seen at least this long before a figure can be called a picture
+
+
+def still_pictures(st) -> set:
+    """Ids of figures that never move on their own: people on posters, photos, screens. The person detector
+    finds them like anyone else; their body points follow one rigid motion (the camera's) through the whole
+    shot, within the models' own repeatability, which a living person (breathing, swaying, talking) does not."""
+    out = set()
+    if st is None:
+        return out
+    K = st.final[:, :, :17, :]
+    for p, pid in enumerate(st.pids):
+        pres = np.nonzero(st.present[p])[0]
+        ref = None
+        res = []
+        for t in pres:
+            if t > 0 and ref is not None and (st.jump[t - 1] if t - 1 < len(st.jump) else False):
+                ref = None
+            k = K[p, t]
+            ok = np.isfinite(k[:, :2]).all(1) & (np.nan_to_num(k[:, 2]) > 0.5)
+            if ok.sum() < 4:
+                continue
+            if ref is None:
+                ref = (k, ok)
+                continue
+            m = ok & ref[1]
+            if m.sum() < 4:
+                continue
+            A, _ = cv2.estimateAffinePartial2D(ref[0][m, :2].astype(np.float32), k[m, :2].astype(np.float32))
+            if A is None:
+                continue
+            q = ref[0][m, :2] @ A[:, :2].T + A[:, 2]
+            size = max(float(np.ptp(k[m, :2], 0).max()), 1.0)
+            res.append(float(np.median(np.linalg.norm(q - k[m, :2], axis=1)) / size))
+        if len(res) + 1 >= STILL_FRAMES and float(np.quantile(res, 0.9)) < STILL_RES:
+            out.add(int(pid))
+    return out
 
 
 def face_widths(st, p: int) -> np.ndarray:
@@ -49,6 +90,9 @@ def evaluate(cut, tracker, make_targets: bool = False) -> dict:
             face_ok, small_face, track_ok = r_["face_ok"], r_["small"], r_["track_ok"]
     except Exception:
         pass
+    # face size in source pixels, judged against an HD frame: on a 4K source a 60 px face is half as large on
+    # screen, and its retouch shows as little
+    small_face *= max(1.0, float(getattr(cut.info, "width", 1920) or 1920) / 1920.0)
     kind = cut.tl.get("kind", "clip")
     if kind == "gap":
         res["reason"] = "검정/빈 구간"
@@ -60,7 +104,11 @@ def evaluate(cut, tracker, make_targets: bool = False) -> dict:
         a, b = cut.work_range
         span = max(1, b - a)
         rows = []
+        still = {q.id for q in cut.persons if getattr(q, "still", False)}
+        yn = getattr(st, "raw", {}).get("face_yunet")
         for p, pid in enumerate(st.pids):
+            if int(pid) in still:
+                continue                    # a poster or photo: not someone the shot is about
             pres = st.present[p]
             n = int(pres.sum())
             if n < max(3, 0.15 * span):
@@ -68,7 +116,23 @@ def evaluate(cut, tracker, make_targets: bool = False) -> dict:
             w = face_widths(st, p)
             seen = np.isfinite(w)
             med = float(np.nanmedian(w)) if seen.any() else 0.0
+            # frames the face should have been followed in: where it was, or where the separate face detector
+            # (YuNet) saw one. A face behind a cushion, a hand or a turned head is not a miss.
+            exp = seen.copy()
+            if yn is not None and p < yn.shape[0]:
+                det = pres & (np.nan_to_num(yn[p, :, 0, 2]) > 0)
+                # only a face on this person's own head (the detector's search box also reaches a neighbour's)
+                hd = st.final[p, :, :5, :2]
+                ok_h = np.isfinite(hd).all(2) & (np.nan_to_num(st.final[p, :, :5, 2]) > 0.3)
+                for t in np.nonzero(det)[0]:
+                    pts = hd[t][ok_h[t]]
+                    if len(pts) >= 2:
+                        spread = max(float(np.ptp(pts, 0).max()), 1.0)
+                        if np.linalg.norm(pts.mean(0) - yn[p, t, 0, :2]) > 1.2 * spread:
+                            det[t] = False
+                exp |= det
             rows.append(dict(pid=int(pid), frames=n, face_share=float(seen.sum() / n), face_px=round(med, 1),
+                             face_hit=float(seen.sum() / max(1, int(exp.sum()))),
                              track=float((st.auto_conf[p][pres] >= cut.tracking.conf_threshold).mean())))
         res["metrics"] = dict(persons=rows)
         faces = [r for r in rows if r["face_share"] >= 0.2]
@@ -81,7 +145,7 @@ def evaluate(cut, tracker, make_targets: bool = False) -> dict:
             if make_targets:
                 ids = {r["pid"] for r in main}
                 for q in cut.persons:
-                    if q.id in ids and q.role != "ignore":
+                    if q.id in ids and q.role != "ignore" and not getattr(q, "still", False):
                         q.role = "target"
             tg = {q.id for q in cut.persons if q.role == "target"}
             judged = [r for r in main if r["pid"] in tg] or main
@@ -89,21 +153,22 @@ def evaluate(cut, tracker, make_targets: bool = False) -> dict:
             # A dancer at the back who is followed badly is noted, but does not fail the cut.
             big = max(r["face_px"] for r in judged)
             major = [r for r in judged if r["face_px"] >= 0.6 * big or r["frames"] >= 0.6 * span]
-            weak = [r for r in major if r["face_share"] < face_ok or r["track"] < track_ok]
-            minor_weak = [r for r in judged if r not in major and (r["face_share"] < face_ok or r["track"] < track_ok)]
+            hit = lambda r: r.get("face_hit", r["face_share"])
+            weak = [r for r in major if hit(r) < face_ok or r["track"] < track_ok]
+            minor_weak = [r for r in judged if r not in major and (hit(r) < face_ok or r["track"] < track_ok)]
             if kind == "transition":
                 res.update(auto="bad", reason="트랜지션 (두 샷이 겹침)")
             elif weak:
-                r = min(weak, key=lambda r: min(r["face_share"], r["track"]))
+                r = min(weak, key=lambda r: min(hit(r), r["track"]))
                 why = []
-                if r["face_share"] < face_ok:
-                    why.append(f"얼굴 인식 {r['face_share'] * 100:.0f}%")
+                if hit(r) < face_ok:
+                    why.append(f"얼굴 인식 {hit(r) * 100:.0f}%")
                 if r["track"] < track_ok:
                     why.append(f"추적 신뢰 {r['track'] * 100:.0f}%")
                 res.update(auto="bad", reason=f"인물 {r['pid'] + 1}: " + ", ".join(why))
             else:
                 res.update(auto="good", reason=f"얼굴 {len(judged)}명 · 주요 인물 최소 인식 "
-                                               f"{min(r['face_share'] for r in major) * 100:.0f}%"
+                                               f"{min(hit(r) for r in major) * 100:.0f}%"
                                                + (f" · 작은 인물 {len(minor_weak)}명 약함" if minor_weak else ""))
     s = dict(cut.status or {})
     s.update(res)

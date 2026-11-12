@@ -243,6 +243,7 @@ class Person:
     faces: List[List[float]] = field(default_factory=list)  # a few face features (unit vectors)
     member: str = ""                 # who this is across the edited timeline (Project.members id)
     member_conf: float = 0.0         # how sure the automatic link is (0..1); user links are 1
+    still: bool = False              # a poster, photo or screen on the set (found by analysis; protected)
 
     def to_dict(self):
         return asdict(self)
