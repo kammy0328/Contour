@@ -1575,15 +1575,49 @@ def neck_axis(lm: Optional[np.ndarray]):
     return None if n < 1e-3 else (float(v[0] / n), float(v[1] / n))
 
 
+_MCACHE: dict = {}
+
+
+def _cached(name: str, lm: np.ndarray, shape, scale: float, wf: float, make):
+    """The face masks below depend only on the landmarks and the frame size; they are asked for more than once
+    per face per frame (by several retouch steps), and are made once."""
+    key = (name, np.asarray(lm[:, :2], np.float32).tobytes(), tuple(shape), float(scale), float(wf))
+    hit = _MCACHE.get(key)
+    if hit is None:
+        if len(_MCACHE) > 48:
+            _MCACHE.clear()
+        hit = _MCACHE[key] = make()
+    return hit
+
+
+def _window(shape, pts: np.ndarray, margin: float):
+    """The part of the frame within `margin` px of `pts` (x0, y0, x1, y1). A mask drawn there and blurred is
+    the same as one drawn on the whole frame, as long as the margin covers the drawing's reach and the blur's."""
+    h, w = shape[:2]
+    m = int(np.ceil(margin)) + 2
+    x0, y0 = np.floor(pts.min(0)).astype(int) - m
+    x1, y1 = np.ceil(pts.max(0)).astype(int) + m + 1
+    return max(0, x0), max(0, y0), min(w, x1), min(h, y1)
+
+
 def jaw_hold(lm: Optional[np.ndarray], shape, scale: float, wf: float) -> Optional[np.ndarray]:
     """1 off the jaw line, 0 on it (soft): the shadow line under the jaw and chin is the face's outline, not a
     neck line, and stays. lm in source px, scale = px of `shape` per source px, wf in px of `shape`."""
     if lm is None or not np.isfinite(lm[2:15, :2]).all():
         return None
-    m = np.zeros(shape, np.uint8)
-    pts = np.round(lm[2:15, :2] * scale).astype(np.int32)
-    cv2.polylines(m, [pts], False, 255, max(1, int(round(0.07 * wf))), cv2.LINE_AA)
-    return 1.0 - cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.025 * wf))
+    def make():
+        pts = np.round(lm[2:15, :2] * scale).astype(np.int32)
+        th = max(1, int(round(0.07 * wf)))
+        sig = max(1.0, 0.025 * wf)
+        x0, y0, x1, y1 = _window(shape, pts, th + 8 * sig + 4)
+        out = np.ones(shape[:2], np.float32)
+        if x1 <= x0 or y1 <= y0:
+            return out
+        m = np.zeros((y1 - y0, x1 - x0), np.uint8)
+        cv2.polylines(m, [pts - np.array([x0, y0], np.int32)], False, 255, th, cv2.LINE_AA)
+        out[y0:y1, x0:x1] = 1.0 - cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0), sig)
+        return out
+    return _cached("jaw", lm, shape, scale, wf, make)
 
 
 def _things(Y: np.ndarray, m: np.ndarray, wf: float) -> Optional[np.ndarray]:
@@ -1617,10 +1651,18 @@ def neck_zone(lm: Optional[np.ndarray], shape, scale: float, wf: float) -> Optio
     through its links); what tells them apart is where they are. Neck lines are on the neck."""
     if lm is None or not np.isfinite(lm[0:17, :2]).all():
         return None
-    m = np.zeros(shape, np.uint8)
-    cv2.fillConvexPoly(m, cv2.convexHull(np.round(lm[:, :2] * scale).astype(np.int32)), 1)
-    dist = cv2.distanceTransform(1 - m, cv2.DIST_L2, 3)
-    return (1.0 - _ss(0.34 * wf, 0.48 * wf, dist)).astype(np.float32)
+    def make():
+        hull = cv2.convexHull(np.round(lm[:, :2] * scale).astype(np.int32))
+        x0, y0, x1, y1 = _window(shape, hull.reshape(-1, 2), 1.0 * wf + 8)      # the chamfer paths need room
+        out = np.zeros(shape[:2], np.float32)
+        if x1 <= x0 or y1 <= y0:
+            return out
+        m = np.zeros((y1 - y0, x1 - x0), np.uint8)
+        cv2.fillConvexPoly(m, hull - np.array([x0, y0], np.int32), 1)
+        dist = cv2.distanceTransform(1 - m, cv2.DIST_L2, 3)
+        out[y0:y1, x0:x1] = 1.0 - _ss(0.34 * wf, 0.48 * wf, dist)
+        return out
+    return _cached("neckzone", lm, shape, scale, wf, make)
 
 
 def _fold_flat(Y: np.ndarray, m: np.ndarray, wf: float, k: float) -> np.ndarray:
@@ -1651,11 +1693,20 @@ def nose_hold(lm: Optional[np.ndarray], shape, scale: float, wf: float) -> Optio
     lift them (on a soft or motion-blurred face they are all that is left of the nose)."""
     if lm is None or not np.isfinite(lm[27:36, :2]).all():
         return None
-    m = np.zeros(shape, np.uint8)
-    cv2.fillConvexPoly(m, cv2.convexHull(np.round(lm[27:36, :2] * scale).astype(np.int32)), 255)
-    k = max(3, int(round(0.14 * wf)) | 1)
-    m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
-    return 1.0 - cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.02 * wf))
+    def make():
+        hull = cv2.convexHull(np.round(lm[27:36, :2] * scale).astype(np.int32))
+        k = max(3, int(round(0.14 * wf)) | 1)
+        sig = max(1.0, 0.02 * wf)
+        x0, y0, x1, y1 = _window(shape, hull.reshape(-1, 2), k + 8 * sig + 4)
+        out = np.ones(shape[:2], np.float32)
+        if x1 <= x0 or y1 <= y0:
+            return out
+        m = np.zeros((y1 - y0, x1 - x0), np.uint8)
+        cv2.fillConvexPoly(m, hull - np.array([x0, y0], np.int32), 255)
+        m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+        out[y0:y1, x0:x1] = 1.0 - cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0), sig)
+        return out
+    return _cached("nose", lm, shape, scale, wf, make)
 
 
 def neck_dir(mY: np.ndarray, lm: Optional[np.ndarray], scale: float):
