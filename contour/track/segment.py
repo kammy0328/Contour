@@ -302,14 +302,35 @@ def _merged(pr, insts) -> dict:
     return out
 
 
-def _assign(pr, insts) -> dict:
-    """index in pr -> index in insts, one instance per person at most, best total score."""
-    if not pr or not insts:
-        return {}
+def _head_in(inst, hc) -> bool:
+    x0, y0, x1, y1 = inst["rect"]
+    lg = inst["lg"]
+    gx = int((hc[0] - x0) / max(x1 - x0, 1e-6) * lg.shape[1])
+    gy = int((hc[1] - y0) / max(y1 - y0, 1e-6) * lg.shape[0])
+    return 0 <= gx < lg.shape[1] and 0 <= gy < lg.shape[0] and bool(lg[gy, gx] > 0)
+
+
+def _scores(pr, insts, hcs) -> np.ndarray:
+    """(people, instances) match scores. A person whose own face is seen (hcs[i] = its centre, else None) can only
+    be an instance that face is in, when there is one: the face is who the person is (its retouch goes by the
+    label), the body joints of two people tight together are often on the wrong one."""
     S_ = np.zeros((len(pr), len(insts)), np.float32)
     for i, (p, bx, pos, neg) in enumerate(pr):
         for k, ins in enumerate(insts):
             S_[i, k] = _match_score(bx, pos, ins)
+        if hcs and hcs[i] is not None:
+            inside = np.array([_head_in(ins, hcs[i]) for ins in insts], bool)
+            if inside.any():
+                S_[i, ~inside] = -1.0
+                S_[i, inside] = np.maximum(S_[i, inside], MATCH_MIN) + 0.2
+    return S_
+
+
+def _assign(pr, insts, hcs=None) -> dict:
+    """index in pr -> index in insts, one instance per person at most, best total score."""
+    if not pr or not insts:
+        return {}
+    S_ = _scores(pr, insts, hcs)
     out = {}
     try:
         from scipy.optimize import linear_sum_assignment
@@ -349,35 +370,18 @@ def decode_frame(seg, rgb, st, t: int, sx: float, sy: float, W: int, H: int, mw:
             insts = finder.find(full, FIND_MIN)
         except Exception:
             insts = []
+    hcs = []
+    for p, bx, pos, neg in pr:
+        hp = heads.get(int(st.pids[p])) if heads else None
+        hcs.append((hp[0] * W / mw, hp[1] * H / mh) if hp and hp[3] >= 0.5 else None)
     merged = _merged(pr, insts)
     shared = {i: k for k, who in merged.items() for i in who}        # person -> the instance they share
     if merged:
         keep = [k for k in range(len(insts)) if k not in merged]
-        sub = _assign(pr, [insts[k] for k in keep])
+        sub = _assign(pr, [insts[k] for k in keep], hcs)
         assigned = {i: keep[k] for i, k in sub.items() if i not in shared}
     else:
-        assigned = _assign(pr, insts)
-    if heads and insts:
-        # a track whose body joints sit on someone else (two people tight together) but whose own face is seen:
-        # the instance that face is in, if nobody took it
-        free = [k for k in range(len(insts)) if k not in assigned.values() and k not in merged]
-        for i, (p, bx, pos, neg) in enumerate(pr):
-            hp = heads.get(int(st.pids[p]))
-            if i in assigned or i in shared or not hp or hp[3] < 0.5 or not free:
-                continue
-            cx, cy = hp[0] * W / mw, hp[1] * H / mh
-            best = None
-            for k in free:
-                x0, y0, x1, y1 = insts[k]["rect"]
-                lg = insts[k]["lg"]
-                gx = int((cx - x0) / max(x1 - x0, 1e-6) * lg.shape[1])
-                gy = int((cy - y0) / max(y1 - y0, 1e-6) * lg.shape[0])
-                if 0 <= gx < lg.shape[1] and 0 <= gy < lg.shape[0] and lg[gy, gx] > 0 \
-                        and (best is None or insts[k]["score"] > insts[best]["score"]):
-                    best = k
-            if best is not None:
-                assigned[i] = best
-                free.remove(best)
+        assigned = _assign(pr, insts, hcs)
     small = sorted([i for i, x in enumerate(pr) if (x[1][3] - x[1][1]) < SMALL_PERSON * H],
                    key=lambda i: pr[i][1][3] - pr[i][1][1])[:MAX_CLOSEUPS]
     taken = set(assigned.values()) | set(merged)
@@ -400,8 +404,11 @@ def decode_frame(seg, rgb, st, t: int, sx: float, sy: float, W: int, H: int, mw:
                 except Exception:
                     cins = []
                 best, bk = MATCH_MIN, -1
+                hin = [_head_in(ins, hcs[i]) for ins in cins] if hcs[i] is not None else []
                 for k, ins in enumerate(cins):
                     sc = _match_score(bx, pos, ins)
+                    if any(hin):
+                        sc = -1.0 if not hin[k] else max(sc, MATCH_MIN) + 0.2
                     if i in assigned:                      # the same person the whole frame gave this track
                         sc *= 0.5 + 0.5 * min(1.0, _box_iou(ins["box"], insts[assigned[i]]["box"]) / 0.5)
                     if sc > best:
