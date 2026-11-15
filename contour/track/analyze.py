@@ -557,6 +557,18 @@ class CutTracker:
         except Exception:
             import traceback
             traceback.print_exc()
+        # a track SAM 3.1's person finder never confirms (a shadow on a glossy wall, a reflection, a coat on a
+        # chair): not retouched unless the user says so. Only for people new in this analysis.
+        try:
+            from . import segment as SG
+            new = getattr(self, "_new_pids", set())
+            for q in self.cut.persons:
+                if q.id in new and q.id in SG.unconfirmed(getattr(self, "_seg_stats", None)) and not getattr(q, "still", False):
+                    q.role = "protect"
+                    q.name = f"{q.name} (확인)"
+        except Exception:
+            import traceback
+            traceback.print_exc()
         # face layer (parsing + steady skin colour) for the retouch masks
         try:
             from . import facelayer as FL
@@ -1003,8 +1015,8 @@ class CutTracker:
                 if not self.matte.exists():
                     self.matte.create()
                     self.matte.close()
-                SG.run(st, self.proxy, self.matte, self.seglab, a, b, SG.model_for(accuracy), use_final,
-                       progress, cancel, matter)
+                self._seg_stats = SG.run(st, self.proxy, self.matte, self.seglab, a, b, SG.model_for(accuracy),
+                                         use_final, progress, cancel, matter)
                 self._label_cache.clear()
                 return
             except Exception as e:          # no model / no memory: the RVM matte still works

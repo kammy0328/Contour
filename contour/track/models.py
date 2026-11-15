@@ -68,6 +68,10 @@ MODELS: Dict[str, dict] = {
     "seg_sam31": dict(kind="seg", label="SAM 3.1 인물 분할", input=(1008, 1008), size_mb=940,
                       files=[HF_SAM31 + f for f in SAM31_FILES],
                       bundle={"sam31_encoder_gpu.onnx": "image-encoder-gpu.onnx"}),
+    # SAM 3.1 finder (same export): every "person" in the picture as an instance mask. Its Attention operators are
+    # rewritten on this computer (onnx_patch, needs the onnx package) into finder-gpu.onnx, which CUDA runs.
+    "seg_sam31_find": dict(kind="seg", label="SAM 3.1 인물 찾기", input=(1008, 1008), size_mb=120,
+                           files=[HF_SAM31 + "finder/finder.onnx"], patch={"finder.onnx": "finder-gpu.onnx"}),
     # SAM 2.1 tiny video tracker (Meta, Apache-2.0), ONNX export with the memory modules by square-zero-labs
     # (Apache-2.0): follows each dancer by their own pixels through crossings (group-dance identities)
     "track_sam2v": dict(kind="track", label="SAM 2.1 비디오 추적 (tiny)", input=(1024, 1024), size_mb=190,
@@ -102,7 +106,8 @@ def is_downloaded(key: str) -> bool:
     files = MODELS.get(key, {}).get("files")
     if files:
         return all(_usable(p / Path(u).name) for u in files) and \
-            all((p / n).is_file() for n in (MODELS[key].get("bundle") or {}).values())
+            all((p / n).is_file() for n in list((MODELS[key].get("bundle") or {}).values())
+                + list((MODELS[key].get("patch") or {}).values()))
     return _usable(p)
 
 
@@ -171,6 +176,12 @@ def ensure_model(key: str, progress: Optional[Callable[[float, str], None]] = No
                 if progress:
                     progress((i + f) / len(files), msg)
             _download(url, dst, prog, spec["label"])
+        for src_name, dst_name in (spec.get("patch") or {}).items():
+            if not (out / dst_name).is_file():
+                from .onnx_patch import patch as _patch          # ImportError without onnx: the caller falls back
+                tmp = out / (dst_name + ".part")
+                _patch(str(out / src_name), str(tmp), True)
+                os.replace(tmp, out / dst_name)
         for src_name, dst_name in (spec.get("bundle") or {}).items():
             src, dst = Path(__file__).parent / "data" / src_name, out / dst_name
             if src.is_file() and (not dst.is_file() or dst.stat().st_size != src.stat().st_size):

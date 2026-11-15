@@ -176,7 +176,7 @@ def head_priors(st, t: int, mw: int, mh: int, W: int, H: int, sx: float, sy: flo
 
 
 def combine(logits: List[Tuple[int, np.ndarray]], rvm: Optional[np.ndarray], shape,
-            heads: Optional[dict] = None) -> Tuple[np.ndarray, np.ndarray]:
+            heads: Optional[dict] = None, extra: Optional[List[np.ndarray]] = None) -> Tuple[np.ndarray, np.ndarray]:
     """Per person mask logits at matte size -> (alpha uint8, labels uint8 = pid + 1).
 
     Where two people's masks overlap the owner is the larger logit. Two near-equal logits used to split a face
@@ -228,13 +228,234 @@ def combine(logits: List[Tuple[int, np.ndarray]], rvm: Optional[np.ndarray], sha
             alpha = np.maximum(alpha, rvm * (1.0 - np.clip(near, 0, 1)))
     elif rvm is not None:
         alpha = rvm
+    # people the finder saw that tracking does not follow (extras, a figure on a poster): in the matte, nobody's
+    for e in (extra or []):
+        alpha = np.maximum(alpha, np.where(lab == 0, np.clip(0.5 + e / 3.0, 0.0, 1.0), 0.0))
     return np.clip(alpha * 255 + 0.5, 0, 255).astype(np.uint8), lab
+
+
+def _canvas(lg: np.ndarray, rect, W: int, H: int, mw: int, mh: int) -> Optional[np.ndarray]:
+    x0, y0, x1, y1 = rect
+    canvas = np.full((mh, mw), -20.0, np.float32)
+    mx0, my0 = int(round(x0 * mw / W)), int(round(y0 * mh / H))
+    mx1, my1 = int(round(x1 * mw / W)), int(round(y1 * mh / H))
+    if mx1 - mx0 < 2 or my1 - my0 < 2:
+        return None
+    canvas[my0:my1, mx0:mx1] = cv2.resize(lg, (mx1 - mx0, my1 - my0), interpolation=cv2.INTER_LINEAR)
+    return canvas
+
+
+FIND_MIN = 0.30             # a finder instance this sure can be a tracked person (tracking vouches for it)
+FIND_SURE = 0.50            # this sure, it is a person even when tracking does not follow it
+MATCH_MIN = 0.35            # joints inside + box overlap a person needs with an instance
+GHOST_KEEP = 0.25           # a click mask of which less than this is left outside the found people is dropped
+
+
+def _box_iou(a, b) -> float:
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    ua = max(1e-6, (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - ix * iy)
+    return ix * iy / ua
+
+
+def _inside(pos, inst) -> float:
+    """Share of a person's visible joints that fall in a finder instance's mask."""
+    if len(pos) == 0:
+        return 0.0
+    x0, y0, x1, y1 = inst["rect"]
+    lg = inst["lg"]
+    gx = ((pos[:, 0] - x0) / max(x1 - x0, 1e-6) * lg.shape[1]).astype(int)
+    gy = ((pos[:, 1] - y0) / max(y1 - y0, 1e-6) * lg.shape[0]).astype(int)
+    ok = (gx >= 0) & (gx < lg.shape[1]) & (gy >= 0) & (gy < lg.shape[0])
+    return float((lg[gy[ok], gx[ok]] > 0).sum()) / len(pos)
+
+
+def _match_score(bx, pos, inst) -> float:
+    """How well a finder instance is this tracked person: the share of the person's visible joints inside the
+    instance's mask, and the overlap of the two boxes."""
+    biou = _box_iou(bx, inst["box"])
+    if len(pos) == 0:
+        return 0.7 * biou
+    return 0.6 * _inside(pos, inst) + 0.4 * biou
+
+
+def _merged(pr, insts) -> dict:
+    """instance index -> [indices in pr] for an instance that holds two or more tracked people (the finder took a
+    tight pair for one person): each of them has most visible joints inside it, has no better instance of their own,
+    and is clearly smaller than it. Such an instance cannot say who is who: its people are told apart by clicks,
+    inside it."""
+    if len(pr) < 2 or not insts:
+        return {}
+    best = []
+    for p, bx, pos, neg in pr:
+        sc = [_match_score(bx, pos, ins) for ins in insts]
+        best.append(int(np.argmax(sc)))
+    out = {}
+    for k, ins in enumerate(insts):
+        b_ = ins["box"]
+        area = max(1e-6, float((b_[2] - b_[0]) * (b_[3] - b_[1])))
+        who = [i for i, (p, bx, pos, neg) in enumerate(pr)
+               if best[i] == k and len(pos) >= 3 and _inside(pos, ins) >= 0.6
+               and float((bx[2] - bx[0]) * (bx[3] - bx[1])) < 0.75 * area]
+        if len(who) >= 2:
+            out[k] = who
+    return out
+
+
+def _assign(pr, insts) -> dict:
+    """index in pr -> index in insts, one instance per person at most, best total score."""
+    if not pr or not insts:
+        return {}
+    S_ = np.zeros((len(pr), len(insts)), np.float32)
+    for i, (p, bx, pos, neg) in enumerate(pr):
+        for k, ins in enumerate(insts):
+            S_[i, k] = _match_score(bx, pos, ins)
+    out = {}
+    try:
+        from scipy.optimize import linear_sum_assignment
+        r, c = linear_sum_assignment(-S_)
+        for i, k in zip(r, c):
+            if S_[i, k] >= MATCH_MIN:
+                out[int(i)] = int(k)
+    except Exception:
+        used = set()
+        for i, k in sorted(((i, k) for i in range(len(pr)) for k in range(len(insts))), key=lambda ik: -S_[ik]):
+            if S_[i, k] < MATCH_MIN:
+                break
+            if i not in out and k not in used:
+                out[i] = k
+                used.add(k)
+    return out
+
+
+def decode_frame(seg, rgb, st, t: int, sx: float, sy: float, W: int, H: int, mw: int, mh: int,
+                 use_final: bool, finder=None, heads: Optional[dict] = None) -> Tuple[dict, List[np.ndarray]]:
+    """Everybody on frame t: (pid -> dict(p, bx, pos, neg, canvas (matte size mask logits), src), extra).
+
+    With `finder` (SAM 3.1's "person" finder): the frame is first split into the people in it, each a mask of their
+    own, by a model trained to tell overlapping people apart (who is in front, whose arm it is). Every tracked person
+    takes the instance their visible joints and box fall in (src "find"); people small in the frame take theirs from
+    a close-up. Only a tracked person the finder has nothing for is decoded from clicks as before (src "click"), and
+    then never over a found person; one that is left with next to nothing (a track sitting on someone else) is
+    dropped. extra: the people the finder is sure of that tracking does not follow."""
+    pr = prompts(st, t, sx, sy, W, H, use_final)
+    dec, extra = {}, []
+    if not pr:
+        return dec, extra
+    full = seg.encode(rgb)
+    insts = []
+    if finder is not None:
+        try:
+            insts = finder.find(full, FIND_MIN)
+        except Exception:
+            insts = []
+    merged = _merged(pr, insts)
+    shared = {i: k for k, who in merged.items() for i in who}        # person -> the instance they share
+    if merged:
+        keep = [k for k in range(len(insts)) if k not in merged]
+        sub = _assign(pr, [insts[k] for k in keep])
+        assigned = {i: keep[k] for i, k in sub.items() if i not in shared}
+    else:
+        assigned = _assign(pr, insts)
+    if heads and insts:
+        # a track whose body joints sit on someone else (two people tight together) but whose own face is seen:
+        # the instance that face is in, if nobody took it
+        free = [k for k in range(len(insts)) if k not in assigned.values() and k not in merged]
+        for i, (p, bx, pos, neg) in enumerate(pr):
+            hp = heads.get(int(st.pids[p]))
+            if i in assigned or i in shared or not hp or hp[3] < 0.5 or not free:
+                continue
+            cx, cy = hp[0] * W / mw, hp[1] * H / mh
+            best = None
+            for k in free:
+                x0, y0, x1, y1 = insts[k]["rect"]
+                lg = insts[k]["lg"]
+                gx = int((cx - x0) / max(x1 - x0, 1e-6) * lg.shape[1])
+                gy = int((cy - y0) / max(y1 - y0, 1e-6) * lg.shape[0])
+                if 0 <= gx < lg.shape[1] and 0 <= gy < lg.shape[0] and lg[gy, gx] > 0 \
+                        and (best is None or insts[k]["score"] > insts[best]["score"]):
+                    best = k
+            if best is not None:
+                assigned[i] = best
+                free.remove(best)
+    small = sorted([i for i, x in enumerate(pr) if (x[1][3] - x[1][1]) < SMALL_PERSON * H],
+                   key=lambda i: pr[i][1][3] - pr[i][1][1])[:MAX_CLOSEUPS]
+    taken = set(assigned.values()) | set(merged)
+    inst_cv = [None] * len(insts)
+
+    def icv(k):
+        if inst_cv[k] is None:
+            inst_cv[k] = _canvas(insts[k]["lg"], insts[k]["rect"], W, H, mw, mh)
+        return inst_cv[k]
+
+    for i, (p, bx, pos, neg) in enumerate(pr):
+        pid = int(st.pids[p])
+        cv, src = None, None
+        enc = full
+        if i in small:
+            enc = seg.encode(rgb, _closeup_rect(bx, W, H))
+            if finder is not None:
+                try:
+                    cins = finder.find(enc, FIND_MIN)
+                except Exception:
+                    cins = []
+                best, bk = MATCH_MIN, -1
+                for k, ins in enumerate(cins):
+                    sc = _match_score(bx, pos, ins)
+                    if i in assigned:                      # the same person the whole frame gave this track
+                        sc *= 0.5 + 0.5 * min(1.0, _box_iou(ins["box"], insts[assigned[i]]["box"]) / 0.5)
+                    if sc > best:
+                        best, bk = sc, k
+                if bk >= 0:
+                    cv, src = _canvas(cins[bk]["lg"], cins[bk]["rect"], W, H, mw, mh), "find"
+        if cv is None and i in assigned:
+            cv, src = icv(assigned[i]), "find"
+        if cv is None:
+            lg, q = seg.segment(enc, bx, pos, neg)
+            if lg is None:
+                continue
+            cv, src = _canvas(lg, enc["rect"], W, H, mw, mh), "click"
+            if cv is not None and i in shared and icv(shared[i]) is not None:
+                cv, src = np.minimum(cv, icv(shared[i]) + 2.0), "pair"      # told apart by clicks, inside the pair's mask
+        if cv is None:
+            continue
+        dec[pid] = dict(p=p, bx=bx, pos=pos, neg=neg, canvas=cv, src=src)
+    if insts:
+        # a click mask never over a found person (someone else's, or one nobody tracks)
+        found = [d["canvas"] for d in dec.values() if d["src"] in ("find", "pair")]
+        for k, ins in enumerate(insts):
+            if k not in taken and ins["score"] >= FIND_SURE and icv(k) is not None:
+                extra.append(icv(k))
+        others = found + extra
+        if others:
+            omax = np.max(np.stack(others), 0)
+            for pid in list(dec):
+                d = dec[pid]
+                if d["src"] != "click":
+                    continue
+                before = int((d["canvas"] > 0).sum())
+                cut = np.minimum(d["canvas"], -omax)
+                hp = heads.get(pid) if heads else None
+                if hp and hp[3] >= 0.5:
+                    # this track's own face is seen (two tracks on one person, or a face the finder gave to the
+                    # body in front): around it the click mask stays, so the face keeps its owner and its retouch
+                    yy, xx = np.ogrid[0:mh, 0:mw]
+                    disc = (xx - hp[0]) ** 2 + (yy - hp[1]) ** 2 <= (1.5 * hp[2]) ** 2
+                    d["canvas"] = np.where(disc, d["canvas"], cut)
+                    continue
+                d["canvas"] = cut
+                if before and int((d["canvas"] > 0).sum()) < GHOST_KEEP * before:
+                    del dec[pid]
+    return dec, extra
 
 
 def run(st, proxy, matte, seglab, a: int, b: int, seg_key: str, use_final: bool,
         progress: Optional[Callable[[float, str], None]] = None, cancel: Optional[Callable[[], bool]] = None,
-        matter=None) -> None:
-    """Fill the matte (and the person labels) for frames a..b."""
+        matter=None) -> dict:
+    """Fill the matte (and the person labels) for frames a..b. Returns pid -> {"find", "pair", "click", "none"}:
+    on how many frames the person's mask came from the finder, from clicks inside a pair, from clicks alone, or was
+    left out (a track the finder has nobody for is not a person: a shadow, a reflection)."""
+    stats: dict = {}
     from .infer import make_segmenter
     try:
         seg = make_segmenter(seg_key)
@@ -244,6 +465,14 @@ def run(st, proxy, matte, seglab, a: int, b: int, seg_key: str, use_final: bool,
         import sys
         sys.stderr.write(f"SAM 3.1 could not be loaded ({str(e)[:200]}), using SAM 2.1\n")
         seg = make_segmenter("seg_sam2_b" if "max" in str(seg_key) else "seg_sam2_s")
+    finder = None
+    if type(seg).__name__ == "Segmenter31":
+        try:
+            from .infer import Finder31
+            finder = Finder31()
+        except Exception as e:                  # the finder is a refinement: without it, clicks as before
+            import sys
+            sys.stderr.write(f"SAM 3.1 finder could not be loaded ({str(e)[:200]}): masks from tracking prompts only\n")
     mw, mh = matte.w, matte.h
     W, H = proxy.w, proxy.h
     sx, sy = proxy.sx, proxy.sy
@@ -263,32 +492,15 @@ def run(st, proxy, matte, seglab, a: int, b: int, seg_key: str, use_final: bool,
             rvm = None
             if matter is not None:
                 rvm = matter(cv2.resize(rgb, (mw, mh), interpolation=cv2.INTER_AREA))
-            pr = prompts(st, t, sx, sy, W, H, use_final)
-            logits = []
-            if pr:
-                full = None
-                small = sorted([i for i, x in enumerate(pr) if (x[1][3] - x[1][1]) < SMALL_PERSON * H],
-                               key=lambda i: pr[i][1][3] - pr[i][1][1])[:MAX_CLOSEUPS]
-                for i, (p, bx, pos, neg) in enumerate(pr):
-                    if i in small:
-                        rect = _closeup_rect(bx, W, H)
-                        enc = seg.encode(rgb, rect)
-                    else:
-                        if full is None:
-                            full = seg.encode(rgb)
-                        enc = full
-                    lg, q = seg.segment(enc, bx, pos, neg)
-                    if lg is None:
-                        continue
-                    x0, y0, x1, y1 = enc["rect"]
-                    canvas = np.full((mh, mw), -20.0, np.float32)
-                    mx0, my0 = int(round(x0 * mw / W)), int(round(y0 * mh / H))
-                    mx1, my1 = int(round(x1 * mw / W)), int(round(y1 * mh / H))
-                    if mx1 - mx0 < 2 or my1 - my0 < 2:
-                        continue
-                    canvas[my0:my1, mx0:mx1] = cv2.resize(lg, (mx1 - mx0, my1 - my0), interpolation=cv2.INTER_LINEAR)
-                    logits.append((int(st.pids[p]), canvas))
-            al, lb = combine(logits, rvm, (mh, mw), head_priors(st, t, mw, mh, W, H, sx, sy, use_final))
+            heads = head_priors(st, t, mw, mh, W, H, sx, sy, use_final)
+            dec, extra = decode_frame(seg, rgb, st, t, sx, sy, W, H, mw, mh, use_final, finder, heads)
+            logits = [(pid, d["canvas"]) for pid, d in dec.items()]
+            if finder is not None:
+                for p in np.nonzero(st.present[:, t])[0]:
+                    pid = int(st.pids[p])
+                    s_ = stats.setdefault(pid, {"find": 0, "pair": 0, "click": 0, "none": 0})
+                    s_[dec[pid]["src"] if pid in dec else "none"] += 1
+            al, lb = combine(logits, rvm, (mh, mw), heads, extra)
             mm[t] = al
             lm[t] = lb
             if progress:
@@ -299,3 +511,14 @@ def run(st, proxy, matte, seglab, a: int, b: int, seg_key: str, use_final: bool,
         del mm, lm
         matte.close()
         seglab.close()
+    return stats
+
+
+def unconfirmed(stats: dict, min_frames: int = 8, share: float = 0.2) -> set:
+    """Tracked people the finder saw as a person on fewer than `share` of their frames."""
+    out = set()
+    for pid, s_ in (stats or {}).items():
+        n = sum(s_.values())
+        if n >= min_frames and (s_["find"] + s_["pair"]) < share * n:
+            out.add(int(pid))
+    return out

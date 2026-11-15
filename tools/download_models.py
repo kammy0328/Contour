@@ -24,7 +24,7 @@ def reset_acl():
 def main():
     reset_acl()
     keys = ["det_yolox_m", "pose_rtmpose_x", "pose_rtmw_x", "pose_rtmpose_m", "face_yunet", "matte_rvm",
-            "face_rtm106", "hand_rtm21", "seg_sam31", "seg_sam2_s", "face_sface", "face_parse"]
+            "face_rtm106", "hand_rtm21", "seg_sam31", "seg_sam31_find", "seg_sam2_s", "face_sface", "face_parse"]
     if "--max" in sys.argv:
         keys += ["det_yolox_x", "pose_dwpose_l", "seg_sam2_b"]
     for k in keys:

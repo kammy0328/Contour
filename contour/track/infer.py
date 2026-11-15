@@ -396,6 +396,7 @@ class Segmenter31:
     (data/sam31_encoder_gpu.onnx, same weights file), which runs on the GPU (about 0.4 s)."""
 
     SIZE = 1008
+    PICK = "best"            # "first": mask 0 (the export's rule for a box or several clicks); "best": by score and prompts
 
     def __init__(self, key: str = "seg_sam31"):
         d = M.ensure_model(key)
@@ -445,6 +446,10 @@ class Segmenter31:
             return None, 0.0
         masks = masks.reshape(-1, masks.shape[-2], masks.shape[-1])
         iou = iou.reshape(-1)
+        if self.PICK == "first":
+            # the export's own rule: with a box or several clicks the first mask is the answer (the other three are
+            # the readings of ONE ambiguous click: part, whole, group)
+            return masks[0].astype(np.float32), float(iou[0]) if len(iou) else 0.0
         best, bi = -1e9, 0
         for k in range(masks.shape[0]):
             m = masks[k]
@@ -461,3 +466,42 @@ class Segmenter31:
 
 def make_segmenter(key: str):
     return Segmenter31(key) if key == "seg_sam31" else Segmenter(key)
+
+
+
+class Finder31:
+    """SAM 3.1's finder with the phrase "person": every person in the picture as a mask of their own (up to 200),
+    with a score and a box. It tells overlapping people apart by itself, which point prompts do not.
+
+    The phrase's encoding is fixed, so it is shipped (data/sam31_text_person.npz: the text encoder's output for
+    "person", SAM License) and the 700 MB text encoder is never downloaded."""
+
+    def __init__(self, key: str = "seg_sam31_find"):
+        from pathlib import Path
+        d = M.ensure_model(key)
+        self.sess = M.session(d / "finder-gpu.onnx")
+        txt = np.load(str(Path(__file__).parent / "data" / "sam31_text_person.npz"))
+        self.const = {"text": txt["text"].astype(np.float32), "text_pad": txt["text_pad"],
+                      "box_tokens": np.zeros((0, 1, 256), np.float32)}
+        self.names = [i.name for i in self.sess.get_inputs()]
+
+    def find(self, enc: dict, min_score: float = 0.5) -> list:
+        """enc from Segmenter31.encode. -> [dict(score, box (x0,y0,x1,y1) in rgb px, lg (288x288 mask logits over
+        enc['rect']), rect)] by falling score."""
+        feed = {}
+        for n in self.names:
+            feed[n] = enc["emb"][n] if n in enc["emb"] else self.const[n]
+        logits, presence, boxes, masks = self.sess.run(None, feed)
+        sig = lambda v: 1.0 / (1.0 + np.exp(-np.asarray(v, np.float32)))
+        sc = sig(logits[0]) * float(sig(presence.reshape(-1)[0]))
+        x0, y0, x1, y1 = enc["rect"]
+        w, h = x1 - x0, y1 - y0
+        out = []
+        for k in np.argsort(-sc):
+            if sc[k] < min_score:
+                break
+            cx, cy, bw, bh = [float(v) for v in boxes[0, k]]
+            out.append(dict(score=float(sc[k]), rect=enc["rect"], lg=masks[0, k].astype(np.float32),
+                            box=np.array([x0 + (cx - bw / 2) * w, y0 + (cy - bh / 2) * h,
+                                          x0 + (cx + bw / 2) * w, y0 + (cy + bh / 2) * h], np.float32)))
+        return out
