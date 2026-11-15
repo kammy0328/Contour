@@ -25,7 +25,8 @@ MAX_CLOSEUPS = 6
 
 
 def model_for(accuracy: str) -> str:
-    return "seg_sam2_b" if accuracy == "max" else "seg_sam2_s"
+    """SAM 3.1 for every accuracy (1.9.4). run() falls back to SAM 2.1 if it cannot be loaded."""
+    return "seg_sam31"
 
 
 def _kp_for(st, p: int, t: int, use_final: bool) -> Optional[np.ndarray]:
@@ -234,8 +235,15 @@ def run(st, proxy, matte, seglab, a: int, b: int, seg_key: str, use_final: bool,
         progress: Optional[Callable[[float, str], None]] = None, cancel: Optional[Callable[[], bool]] = None,
         matter=None) -> None:
     """Fill the matte (and the person labels) for frames a..b."""
-    from .infer import Segmenter
-    seg = Segmenter(seg_key)
+    from .infer import make_segmenter
+    try:
+        seg = make_segmenter(seg_key)
+    except Exception as e:
+        if seg_key != "seg_sam31":
+            raise
+        import sys
+        sys.stderr.write(f"SAM 3.1 could not be loaded ({str(e)[:200]}), using SAM 2.1\n")
+        seg = make_segmenter("seg_sam2_b" if "max" in str(seg_key) else "seg_sam2_s")
     mw, mh = matte.w, matte.h
     W, H = proxy.w, proxy.h
     sx, sy = proxy.sx, proxy.sy
@@ -284,7 +292,7 @@ def run(st, proxy, matte, seglab, a: int, b: int, seg_key: str, use_final: bool,
             mm[t] = al
             lm[t] = lb
             if progress:
-                progress((t - a + 1) / max(1, b - a), f"SAM 2 인물 분할 {t - a + 1}/{b - a}")
+                progress((t - a + 1) / max(1, b - a), f"SAM 인물 분할 {t - a + 1}/{b - a}")
     finally:
         mm.flush()
         lm.flush()
