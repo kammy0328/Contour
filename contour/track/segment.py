@@ -329,7 +329,7 @@ def _assign(pr, insts) -> dict:
 
 
 def decode_frame(seg, rgb, st, t: int, sx: float, sy: float, W: int, H: int, mw: int, mh: int,
-                 use_final: bool, finder=None) -> Tuple[dict, List[np.ndarray]]:
+                 use_final: bool, finder=None, heads: Optional[dict] = None) -> Tuple[dict, List[np.ndarray]]:
     """Everybody on frame t: (pid -> dict(p, bx, pos, neg, canvas (matte size mask logits), src), extra).
 
     With `finder` (SAM 3.1's "person" finder): the frame is first split into the people in it, each a mask of their
@@ -357,6 +357,27 @@ def decode_frame(seg, rgb, st, t: int, sx: float, sy: float, W: int, H: int, mw:
         assigned = {i: keep[k] for i, k in sub.items() if i not in shared}
     else:
         assigned = _assign(pr, insts)
+    if heads and insts:
+        # a track whose body joints sit on someone else (two people tight together) but whose own face is seen:
+        # the instance that face is in, if nobody took it
+        free = [k for k in range(len(insts)) if k not in assigned.values() and k not in merged]
+        for i, (p, bx, pos, neg) in enumerate(pr):
+            hp = heads.get(int(st.pids[p]))
+            if i in assigned or i in shared or not hp or hp[3] < 0.5 or not free:
+                continue
+            cx, cy = hp[0] * W / mw, hp[1] * H / mh
+            best = None
+            for k in free:
+                x0, y0, x1, y1 = insts[k]["rect"]
+                lg = insts[k]["lg"]
+                gx = int((cx - x0) / max(x1 - x0, 1e-6) * lg.shape[1])
+                gy = int((cy - y0) / max(y1 - y0, 1e-6) * lg.shape[0])
+                if 0 <= gx < lg.shape[1] and 0 <= gy < lg.shape[0] and lg[gy, gx] > 0 \
+                        and (best is None or insts[k]["score"] > insts[best]["score"]):
+                    best = k
+            if best is not None:
+                assigned[i] = best
+                free.remove(best)
     small = sorted([i for i, x in enumerate(pr) if (x[1][3] - x[1][1]) < SMALL_PERSON * H],
                    key=lambda i: pr[i][1][3] - pr[i][1][1])[:MAX_CLOSEUPS]
     taken = set(assigned.values()) | set(merged)
@@ -413,7 +434,16 @@ def decode_frame(seg, rgb, st, t: int, sx: float, sy: float, W: int, H: int, mw:
                 if d["src"] != "click":
                     continue
                 before = int((d["canvas"] > 0).sum())
-                d["canvas"] = np.minimum(d["canvas"], -omax)
+                cut = np.minimum(d["canvas"], -omax)
+                hp = heads.get(pid) if heads else None
+                if hp and hp[3] >= 0.5:
+                    # this track's own face is seen (two tracks on one person, or a face the finder gave to the
+                    # body in front): around it the click mask stays, so the face keeps its owner and its retouch
+                    yy, xx = np.ogrid[0:mh, 0:mw]
+                    disc = (xx - hp[0]) ** 2 + (yy - hp[1]) ** 2 <= (1.5 * hp[2]) ** 2
+                    d["canvas"] = np.where(disc, d["canvas"], cut)
+                    continue
+                d["canvas"] = cut
                 if before and int((d["canvas"] > 0).sum()) < GHOST_KEEP * before:
                     del dec[pid]
     return dec, extra
@@ -421,8 +451,11 @@ def decode_frame(seg, rgb, st, t: int, sx: float, sy: float, W: int, H: int, mw:
 
 def run(st, proxy, matte, seglab, a: int, b: int, seg_key: str, use_final: bool,
         progress: Optional[Callable[[float, str], None]] = None, cancel: Optional[Callable[[], bool]] = None,
-        matter=None) -> None:
-    """Fill the matte (and the person labels) for frames a..b."""
+        matter=None) -> dict:
+    """Fill the matte (and the person labels) for frames a..b. Returns pid -> {"find", "pair", "click", "none"}:
+    on how many frames the person's mask came from the finder, from clicks inside a pair, from clicks alone, or was
+    left out (a track the finder has nobody for is not a person: a shadow, a reflection)."""
+    stats: dict = {}
     from .infer import make_segmenter
     try:
         seg = make_segmenter(seg_key)
@@ -459,9 +492,15 @@ def run(st, proxy, matte, seglab, a: int, b: int, seg_key: str, use_final: bool,
             rvm = None
             if matter is not None:
                 rvm = matter(cv2.resize(rgb, (mw, mh), interpolation=cv2.INTER_AREA))
-            dec, extra = decode_frame(seg, rgb, st, t, sx, sy, W, H, mw, mh, use_final, finder)
+            heads = head_priors(st, t, mw, mh, W, H, sx, sy, use_final)
+            dec, extra = decode_frame(seg, rgb, st, t, sx, sy, W, H, mw, mh, use_final, finder, heads)
             logits = [(pid, d["canvas"]) for pid, d in dec.items()]
-            al, lb = combine(logits, rvm, (mh, mw), head_priors(st, t, mw, mh, W, H, sx, sy, use_final), extra)
+            if finder is not None:
+                for p in np.nonzero(st.present[:, t])[0]:
+                    pid = int(st.pids[p])
+                    s_ = stats.setdefault(pid, {"find": 0, "pair": 0, "click": 0, "none": 0})
+                    s_[dec[pid]["src"] if pid in dec else "none"] += 1
+            al, lb = combine(logits, rvm, (mh, mw), heads, extra)
             mm[t] = al
             lm[t] = lb
             if progress:
@@ -472,3 +511,14 @@ def run(st, proxy, matte, seglab, a: int, b: int, seg_key: str, use_final: bool,
         del mm, lm
         matte.close()
         seglab.close()
+    return stats
+
+
+def unconfirmed(stats: dict, min_frames: int = 8, share: float = 0.2) -> set:
+    """Tracked people the finder saw as a person on fewer than `share` of their frames."""
+    out = set()
+    for pid, s_ in (stats or {}).items():
+        n = sum(s_.values())
+        if n >= min_frames and (s_["find"] + s_["pair"]) < share * n:
+            out.add(int(pid))
+    return out
