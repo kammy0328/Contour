@@ -461,3 +461,27 @@ class Segmenter31:
 
 def make_segmenter(key: str):
     return Segmenter31(key) if key == "seg_sam31" else Segmenter(key)
+
+
+class DepthEstimator:
+    """Depth Anything V2 Small (ONNX): relative inverse depth of a picture, larger = nearer the camera."""
+
+    MEAN = np.array([0.485, 0.456, 0.406], np.float32)
+    STD = np.array([0.229, 0.224, 0.225], np.float32)
+    LONG = 518
+
+    def __init__(self, key: str = "depth_dav2_s"):
+        self.sess = M.session(M.ensure_model(key))
+        self.inp = self.sess.get_inputs()[0].name
+
+    def __call__(self, rgb: np.ndarray, out_wh: Optional[Tuple[int, int]] = None) -> np.ndarray:
+        """rgb uint8 (H,W,3) -> float32 (H,W) (or out_wh), larger = nearer. Arbitrary scale and offset per picture."""
+        H, W = rgb.shape[:2]
+        k = self.LONG / max(H, W)
+        h, w = max(14, int(round(H * k / 14)) * 14), max(14, int(round(W * k / 14)) * 14)
+        x = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+        x = ((x - self.MEAN) / self.STD).transpose(2, 0, 1)[None].astype(np.float32)
+        d = self.sess.run(None, {self.inp: x})[0]
+        d = np.asarray(d, np.float32).reshape(d.shape[-2], d.shape[-1])
+        ow, oh = out_wh if out_wh else (W, H)
+        return cv2.resize(d, (ow, oh), interpolation=cv2.INTER_LINEAR)

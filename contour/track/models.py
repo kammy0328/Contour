@@ -68,6 +68,10 @@ MODELS: Dict[str, dict] = {
     "seg_sam31": dict(kind="seg", label="SAM 3.1 인물 분할", input=(1008, 1008), size_mb=940,
                       files=[HF_SAM31 + f for f in SAM31_FILES],
                       bundle={"sam31_encoder_gpu.onnx": "image-encoder-gpu.onnx"}),
+    # Depth Anything V2 Small (Apache-2.0), ONNX export by onnx-community: relative depth of the frame, used to tell
+    # who is in front where two people's masks overlap
+    "depth_dav2_s": dict(kind="depth", label="Depth Anything V2 small 깊이", input=(518, 518), size_mb=95,
+                         url="https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx"),
     # SAM 2.1 tiny video tracker (Meta, Apache-2.0), ONNX export with the memory modules by square-zero-labs
     # (Apache-2.0): follows each dancer by their own pixels through crossings (group-dance identities)
     "track_sam2v": dict(kind="track", label="SAM 2.1 비디오 추적 (tiny)", input=(1024, 1024), size_mb=190,

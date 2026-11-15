@@ -180,9 +180,56 @@ ORDER_PULL = 8.0            # logit units: the person in front over the one behi
 CORE_LOGIT = 1.5            # a pixel this far inside a mask counts as that person's solid body
 
 
+DEPTH_PULL = 8.0            # logit units taken from a person whose own depth does not fit the pixel
+DEPTH_TAU = 0.10            # depth misfit (share of the people's depth range) at which the pull is full
+DEPTH_SIGMA = 0.12          # of sqrt(mask area): how far a person's own depth is carried into an overlap
+
+
+def depth_fit(L: np.ndarray, depth: np.ndarray) -> Optional[np.ndarray]:
+    """(n,h,w) misfit 0..1 of every person's own depth to the picture's depth, on the pixels two or more masks claim.
+
+    A person's own depth near a pixel = the depth of the pixels only that person claims, carried over by a normalised
+    blur. An overlapped pixel whose depth is the front person's belongs to the front person, wherever the masks leak:
+    a back mask that takes in the occluder, a front mask that spills on the body behind, an arm in front of a torso
+    that is itself behind. People at the same depth (side by side, touching) get the same fit: nothing changes."""
+    n, h, w = L.shape
+    M = L > 0
+    cnt = M.sum(0)
+    over = cnt >= 2
+    if n < 2 or not over.any():
+        return None
+    union = cnt >= 1
+    lo, hi = np.percentile(depth[union], [5, 95])
+    rng = float(max(hi - lo, 1e-6))
+    fit = np.zeros((n, h, w), np.float32)
+    known = np.zeros((n, h, w), bool)
+    for i in range(n):
+        ex = (M[i] & (cnt == 1)).astype(np.float32)
+        area = float(M[i].sum())
+        if ex.sum() < 16:
+            continue
+        sig = float(np.clip(DEPTH_SIGMA * np.sqrt(area), 3.0, 0.08 * max(h, w)))
+        den = cv2.GaussianBlur(ex, (0, 0), sig)
+        num = cv2.GaussianBlur(ex * depth, (0, 0), sig)
+        ok = den > 0.02
+        dexp = np.where(ok, num / np.maximum(den, 1e-6), 0.0)
+        # further from the person's exclusive pixels than the blur reaches: the person's overall depth
+        far = ~ok
+        if far.any():
+            dexp = np.where(far, float(np.median(depth[ex > 0])), dexp)
+        fit[i] = np.clip(np.abs(depth - dexp) / rng / DEPTH_TAU, 0.0, 1.0)
+        known[i] = True
+    # a person with no pixels of their own (wholly inside other masks) says nothing: neutral
+    for i in range(n):
+        if not known[i].any():
+            fit[i] = 0.5
+    fit[:, ~over] = 0.0
+    return fit
+
+
 def combine(logits: List[Tuple[int, np.ndarray]], rvm: Optional[np.ndarray], shape,
-            heads: Optional[dict] = None, order: Optional[List[Tuple[int, int, float]]] = None
-            ) -> Tuple[np.ndarray, np.ndarray]:
+            heads: Optional[dict] = None, order: Optional[List[Tuple[int, int, float]]] = None,
+            depth: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
     """Per person mask logits at matte size -> (alpha uint8, labels uint8 = pid + 1).
 
     Where two people's masks overlap the owner is, in this order of say: the person who is in front (`order`, from
@@ -213,8 +260,11 @@ def combine(logits: List[Tuple[int, np.ndarray]], rvm: Optional[np.ndarray], sha
                 b[y0:y1, x0:x1] = wg * np.exp(-((xx[y0:y1, x0:x1] - cx) ** 2 + (yy[y0:y1, x0:x1] - cy) ** 2) / (2 * r * r))
                 bumps[pid] = b
         pairs = [(f, b_, c) for f, b_, c in (order or []) if f in pid_idx and b_ in pid_idx]
-        if bumps or pairs:
+        dfit = depth_fit(L, depth) if depth is not None and len(logits) > 1 else None
+        if bumps or pairs or dfit is not None:
             La = L.copy()
+        if dfit is not None:
+            La = La - DEPTH_PULL * dfit
         if bumps:
             tot = sum(bumps.values())
             for i, (pid, _l) in enumerate(logits):
@@ -223,7 +273,7 @@ def combine(logits: List[Tuple[int, np.ndarray]], rvm: Optional[np.ndarray], sha
                 # only where this mask is in play at all (a pull never makes a person out of background)
                 inplay = L[i] > -6
                 adj = HEAD_PULL * ((own if own is not None else 0.0) - np.clip(others, 0, 1))
-                La[i] = np.where(inplay, L[i] + adj, L[i])
+                La[i] = La[i] + np.where(inplay, adj, 0.0)
         for f, b_, c in pairs:
             i, j = pid_idx[f], pid_idx[b_]
             wf = np.clip(0.5 + L[i] / 3.0, 0.0, 1.0) * float(c)
