@@ -311,9 +311,9 @@ def _head_in(inst, hc) -> bool:
 
 
 def _scores(pr, insts, hcs) -> np.ndarray:
-    """(people, instances) match scores. A person whose own face is seen (hcs[i] = its centre, else None) can only
-    be an instance that face is in, when there is one: the face is who the person is (its retouch goes by the
-    label), the body joints of two people tight together are often on the wrong one."""
+    """(people, instances) match scores. A person whose own face is seen (hcs[i] = its centre, else None) prefers
+    an instance that face is in: the face is who the person is (its retouch goes by the label), the body joints of
+    two people tight together are often on the wrong one."""
     S_ = np.zeros((len(pr), len(insts)), np.float32)
     for i, (p, bx, pos, neg) in enumerate(pr):
         for k, ins in enumerate(insts):
@@ -321,8 +321,8 @@ def _scores(pr, insts, hcs) -> np.ndarray:
         if hcs and hcs[i] is not None:
             inside = np.array([_head_in(ins, hcs[i]) for ins in insts], bool)
             if inside.any():
-                S_[i, ~inside] = -1.0
-                S_[i, inside] = np.maximum(S_[i, inside], MATCH_MIN) + 0.2
+                S_[i, ~inside] -= 0.25
+                S_[i, inside] = np.maximum(S_[i, inside], MATCH_MIN) + 0.25
     return S_
 
 
@@ -408,7 +408,7 @@ def decode_frame(seg, rgb, st, t: int, sx: float, sy: float, W: int, H: int, mw:
                 for k, ins in enumerate(cins):
                     sc = _match_score(bx, pos, ins)
                     if any(hin):
-                        sc = -1.0 if not hin[k] else max(sc, MATCH_MIN) + 0.2
+                        sc = sc - 0.25 if not hin[k] else max(sc, MATCH_MIN) + 0.25
                     if i in assigned:                      # the same person the whole frame gave this track
                         sc *= 0.5 + 0.5 * min(1.0, _box_iou(ins["box"], insts[assigned[i]]["box"]) / 0.5)
                     if sc > best:
