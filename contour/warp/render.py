@@ -124,6 +124,12 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
     cm = manager()
     in_cs = cut.input_cs or PASSTHROUGH
     convert_cs = bool(out.output_cs) and in_cs != PASSTHROUGH and out.output_cs != in_cs
+    # log footage: the retouch runs on the display picture the operator sees, its change is carried back into the log
+    disp_ = None
+    if in_cs != PASSTHROUGH:
+        _v = _vs_for(cut)
+        _v.exposure = 0.0
+        disp_ = (cm, _v, cut.info.color_range)
 
     # ---------------- writers
     writer = None
@@ -253,7 +259,7 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
             rf_ = RE.prepare(cut, tracker, t_)
             fi_ = F.build_input(cut, tracker, t_)
         if rf_ is not None:
-            planes_ = RE.apply_planes(planes_, subs, maxv, pf, rf_, 1.0)
+            planes_ = RE.apply_planes(planes_, subs, maxv, pf, rf_, 1.0, disp_)
         fr_ = F.compute_field(fi_, W, H, grid_step)
         if not warper[1] and not fr_.empty():
             with prep_lock:
@@ -334,7 +340,7 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
                 break
             rf = RE.prepare(cut, tracker, t)
             if rf is not None:
-                planes = RE.apply_planes(planes, subs, maxv, pf, rf, 1.0)
+                planes = RE.apply_planes(planes, subs, maxv, pf, rf, 1.0, disp_)
             fi = F.build_input(cut, tracker, t)
             fr = F.compute_field(fi, W, H, grid_step)
             alpha_out = None

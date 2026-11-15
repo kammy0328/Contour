@@ -2573,8 +2573,13 @@ def _grain(shape, size_px: float, seed: int) -> np.ndarray:
 
 
 def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame, y_per_src: float,
-                linear_light: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Y 0..1, Cb/Cr centred on 0 (any resolution each). y_per_src: Y-plane px per source px."""
+                linear_light: bool = False, src: Optional[dict] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Y 0..1, Cb/Cr centred on 0 (any resolution each). y_per_src: Y-plane px per source px.
+
+    src (log footage, retouch.logwrap): Y/Cb/Cr are then the display picture (the Rec.709 view), used to find
+    what to hold and where. The skin texture itself is thinned on the source luma src["Y"] (the original code values),
+    its change goes to src["dY"], and the view follows through src["Jy"/"Jcb"/"Jcr"] (what a unit change of the source
+    luma does to the view) so the steps after it see the same picture they would on a display-referred file."""
     hY, wY = Y.shape
     hC, wC = Cb.shape
     cs = wC / wY                                   # chroma px per luma px
@@ -2666,7 +2671,18 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
             if hasattr(SK, "_TLS"):
                 SK._TLS.wf = float(wf)                 # the face width without rounding (band widths follow it smoothly)
                 SK._TLS.sq = float(getattr(job, "sharp_q", 1.0))   # the footage's sharpness against its surroundings
-            Y = SK.smooth_channel(Y, mY, job.skin.strength, job.keep, r, relative=True)
+            if src is not None and src["Y"].shape == Y.shape:
+                Ys0 = src["Y"]
+                Ys1 = SK.smooth_channel(Ys0, mY, job.skin.strength, job.keep, r, relative=True)
+                dS = Ys1 - Ys0
+                src["Y"] = Ys1
+                src["dY"] += dS
+                Y = Y + src["Jy"] * dS
+                if Cb.shape == dS.shape:
+                    Cb = Cb + src["Jcb"] * dS
+                    Cr = Cr + src["Jcr"] * dS
+            else:
+                Y = SK.smooth_channel(Y, mY, job.skin.strength, job.keep, r, relative=True)
             rc = max(1, int(round(r * cs)))
             Cb = SK.smooth_channel(Cb, mC, job.skin.strength * SKIN_CHROMA, 0.0, rc, eps=0.0004)
             Cr = SK.smooth_channel(Cr, mC, job.skin.strength * SKIN_CHROMA, 0.0, rc, eps=0.0004)
@@ -2918,11 +2934,18 @@ def apply_rgb(img: np.ndarray, rf: Optional[RetouchFrame], y_per_src: float) -> 
 
 
 def apply_planes(planes: List[np.ndarray], subsample, max_value: float, pix_fmt: str,
-                 rf: Optional[RetouchFrame], y_per_src: float = 1.0) -> List[np.ndarray]:
+                 rf: Optional[RetouchFrame], y_per_src: float = 1.0, disp=None) -> List[np.ndarray]:
     """Render: native planes. YUV planes stay YUV (chroma at its own resolution); float RGB goes through
-    Y/Cb/Cr and back."""
+    Y/Cb/Cr and back. disp = (ColourManager, ViewSettings, range) for footage that is not display-referred
+    (log): the finding of what to hold is done on the Rec.709 view, the skin texture is thinned on the original
+    code values (retouch.logwrap)."""
     if rf is None or rf.empty():
         return planes
+    if disp is not None:
+        from . import logwrap as LW
+        if LW.wanted(disp[0], disp[1]):
+            return LW.apply_planes_display(planes, subsample, max_value, pix_fmt, rf, y_per_src,
+                                           disp[0], disp[1], disp[2] if len(disp) > 2 else "tv")
     if pix_fmt.startswith("yuv"):
         Y = planes[0].astype(np.float32) / max_value
         Cb = planes[1].astype(np.float32) / max_value - 0.5
