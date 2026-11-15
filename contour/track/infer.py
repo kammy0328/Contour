@@ -396,6 +396,7 @@ class Segmenter31:
     (data/sam31_encoder_gpu.onnx, same weights file), which runs on the GPU (about 0.4 s)."""
 
     SIZE = 1008
+    PICK = "best"            # "first": mask 0 (the export's rule for a box or several clicks); "best": by score and prompts
 
     def __init__(self, key: str = "seg_sam31"):
         d = M.ensure_model(key)
@@ -445,6 +446,10 @@ class Segmenter31:
             return None, 0.0
         masks = masks.reshape(-1, masks.shape[-2], masks.shape[-1])
         iou = iou.reshape(-1)
+        if self.PICK == "first":
+            # the export's own rule: with a box or several clicks the first mask is the answer (the other three are
+            # the readings of ONE ambiguous click: part, whole, group)
+            return masks[0].astype(np.float32), float(iou[0]) if len(iou) else 0.0
         best, bi = -1e9, 0
         for k in range(masks.shape[0]):
             m = masks[k]
