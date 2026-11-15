@@ -258,19 +258,48 @@ def _box_iou(a, b) -> float:
     return ix * iy / ua
 
 
+def _inside(pos, inst) -> float:
+    """Share of a person's visible joints that fall in a finder instance's mask."""
+    if len(pos) == 0:
+        return 0.0
+    x0, y0, x1, y1 = inst["rect"]
+    lg = inst["lg"]
+    gx = ((pos[:, 0] - x0) / max(x1 - x0, 1e-6) * lg.shape[1]).astype(int)
+    gy = ((pos[:, 1] - y0) / max(y1 - y0, 1e-6) * lg.shape[0]).astype(int)
+    ok = (gx >= 0) & (gx < lg.shape[1]) & (gy >= 0) & (gy < lg.shape[0])
+    return float((lg[gy[ok], gx[ok]] > 0).sum()) / len(pos)
+
+
 def _match_score(bx, pos, inst) -> float:
     """How well a finder instance is this tracked person: the share of the person's visible joints inside the
     instance's mask, and the overlap of the two boxes."""
     biou = _box_iou(bx, inst["box"])
     if len(pos) == 0:
         return 0.7 * biou
-    x0, y0, x1, y1 = inst["rect"]
-    lg = inst["lg"]
-    gx = ((pos[:, 0] - x0) / max(x1 - x0, 1e-6) * lg.shape[1]).astype(int)
-    gy = ((pos[:, 1] - y0) / max(y1 - y0, 1e-6) * lg.shape[0]).astype(int)
-    ok = (gx >= 0) & (gx < lg.shape[1]) & (gy >= 0) & (gy < lg.shape[0])
-    inside = float((lg[gy[ok], gx[ok]] > 0).sum()) / len(pos)
-    return 0.6 * inside + 0.4 * biou
+    return 0.6 * _inside(pos, inst) + 0.4 * biou
+
+
+def _merged(pr, insts) -> dict:
+    """instance index -> [indices in pr] for an instance that holds two or more tracked people (the finder took a
+    tight pair for one person): each of them has most visible joints inside it, has no better instance of their own,
+    and is clearly smaller than it. Such an instance cannot say who is who: its people are told apart by clicks,
+    inside it."""
+    if len(pr) < 2 or not insts:
+        return {}
+    best = []
+    for p, bx, pos, neg in pr:
+        sc = [_match_score(bx, pos, ins) for ins in insts]
+        best.append(int(np.argmax(sc)))
+    out = {}
+    for k, ins in enumerate(insts):
+        b_ = ins["box"]
+        area = max(1e-6, float((b_[2] - b_[0]) * (b_[3] - b_[1])))
+        who = [i for i, (p, bx, pos, neg) in enumerate(pr)
+               if best[i] == k and len(pos) >= 3 and _inside(pos, ins) >= 0.6
+               and float((bx[2] - bx[0]) * (bx[3] - bx[1])) < 0.75 * area]
+        if len(who) >= 2:
+            out[k] = who
+    return out
 
 
 def _assign(pr, insts) -> dict:
@@ -320,10 +349,17 @@ def decode_frame(seg, rgb, st, t: int, sx: float, sy: float, W: int, H: int, mw:
             insts = finder.find(full, FIND_MIN)
         except Exception:
             insts = []
-    assigned = _assign(pr, insts)
+    merged = _merged(pr, insts)
+    shared = {i: k for k, who in merged.items() for i in who}        # person -> the instance they share
+    if merged:
+        keep = [k for k in range(len(insts)) if k not in merged]
+        sub = _assign(pr, [insts[k] for k in keep])
+        assigned = {i: keep[k] for i, k in sub.items() if i not in shared}
+    else:
+        assigned = _assign(pr, insts)
     small = sorted([i for i, x in enumerate(pr) if (x[1][3] - x[1][1]) < SMALL_PERSON * H],
                    key=lambda i: pr[i][1][3] - pr[i][1][1])[:MAX_CLOSEUPS]
-    taken = set(assigned.values())
+    taken = set(assigned.values()) | set(merged)
     inst_cv = [None] * len(insts)
 
     def icv(k):
@@ -358,12 +394,14 @@ def decode_frame(seg, rgb, st, t: int, sx: float, sy: float, W: int, H: int, mw:
             if lg is None:
                 continue
             cv, src = _canvas(lg, enc["rect"], W, H, mw, mh), "click"
+            if cv is not None and i in shared and icv(shared[i]) is not None:
+                cv, src = np.minimum(cv, icv(shared[i]) + 2.0), "pair"      # told apart by clicks, inside the pair's mask
         if cv is None:
             continue
         dec[pid] = dict(p=p, bx=bx, pos=pos, neg=neg, canvas=cv, src=src)
     if insts:
         # a click mask never over a found person (someone else's, or one nobody tracks)
-        found = [d["canvas"] for d in dec.values() if d["src"] == "find"]
+        found = [d["canvas"] for d in dec.values() if d["src"] in ("find", "pair")]
         for k, ins in enumerate(insts):
             if k not in taken and ins["score"] >= FIND_SURE and icv(k) is not None:
                 extra.append(icv(k))
