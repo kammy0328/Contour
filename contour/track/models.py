@@ -2,8 +2,8 @@
 
 Pose/detector weights are the OpenMMLab RTMPose / RTMW / YOLOX ONNX exports
 (Apache-2.0). The matte model is Robust Video Matting (GPL-3.0, fine for
-in-house use). Face detection uses OpenCV YuNet (MIT). Person segmentation uses SAM 2.1 (Meta,
-Apache-2.0) in the onnx-community ONNX export.
+in-house use). Face detection uses OpenCV YuNet (MIT). Person segmentation uses SAM 3.1 (Meta, SAM License; smile-forge ONNX export), SAM 2.1
+(Apache-2.0, onnx-community export) as the fallback.
 """
 from __future__ import annotations
 
@@ -26,6 +26,8 @@ HF_MIRROR = "https://huggingface.co/Tau-J/RTMPose/resolve/main/"
 HF_SAM2 = "https://huggingface.co/onnx-community/sam2.1-hiera-{m}-ONNX/resolve/main/onnx/"
 SAM2_FILES = ["vision_encoder.onnx", "vision_encoder.onnx_data",
               "prompt_encoder_mask_decoder.onnx", "prompt_encoder_mask_decoder.onnx_data"]
+HF_SAM31 = "https://huggingface.co/smile-forge/sam3.1-onnx/resolve/main/"
+SAM31_FILES = ["image-encoder/image-encoder.onnx", "image-encoder/image-encoder.onnx.data", "click-decoder/click-decoder.onnx"]
 HF_SAM2V = "https://huggingface.co/square-zero-labs/sam2.1-tiny-video-onnx/resolve/main/"
 SAM2V_FILES = ["onnx/vision_encoder.onnx", "onnx/mask_decoder.onnx", "onnx/memory_encoder.onnx",
                "onnx/memory_attention.onnx", "onnx/pointer_tpos.onnx", "constants.json"]
@@ -61,6 +63,11 @@ MODELS: Dict[str, dict] = {
                        files=[HF_SAM2.format(m="small") + f for f in SAM2_FILES]),
     "seg_sam2_b": dict(kind="seg", label="SAM 2.1 base+ 인물 분할", input=(1024, 1024), size_mb=330,
                        files=[HF_SAM2.format(m="base-plus") + f for f in SAM2_FILES]),
+    # SAM 3.1 (Meta, SAM License), ONNX export by smile-forge: image encoder + click decoder. The encoder's opset 23
+    # Attention operator has no CUDA kernel, so a copy of its graph with MatMul/Softmax (track/data) is put next to it.
+    "seg_sam31": dict(kind="seg", label="SAM 3.1 인물 분할", input=(1008, 1008), size_mb=940,
+                      files=[HF_SAM31 + f for f in SAM31_FILES],
+                      bundle={"sam31_encoder_gpu.onnx": "image-encoder-gpu.onnx"}),
     # SAM 2.1 tiny video tracker (Meta, Apache-2.0), ONNX export with the memory modules by square-zero-labs
     # (Apache-2.0): follows each dancer by their own pixels through crossings (group-dance identities)
     "track_sam2v": dict(kind="track", label="SAM 2.1 비디오 추적 (tiny)", input=(1024, 1024), size_mb=190,
@@ -94,7 +101,8 @@ def is_downloaded(key: str) -> bool:
     p = model_path(key)
     files = MODELS.get(key, {}).get("files")
     if files:
-        return all(_usable(p / Path(u).name) for u in files)
+        return all(_usable(p / Path(u).name) for u in files) and \
+            all((p / n).is_file() for n in (MODELS[key].get("bundle") or {}).values())
     return _usable(p)
 
 
@@ -163,6 +171,10 @@ def ensure_model(key: str, progress: Optional[Callable[[float, str], None]] = No
                 if progress:
                     progress((i + f) / len(files), msg)
             _download(url, dst, prog, spec["label"])
+        for src_name, dst_name in (spec.get("bundle") or {}).items():
+            src, dst = Path(__file__).parent / "data" / src_name, out / dst_name
+            if src.is_file() and (not dst.is_file() or dst.stat().st_size != src.stat().st_size):
+                shutil.copyfile(src, dst)
         return out
     if _usable(out):
         return out

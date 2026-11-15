@@ -386,3 +386,78 @@ class Segmenter:
             if sc > best:
                 best, bi = sc, k
         return masks[bi].astype(np.float32), float(iou[bi])
+
+
+class Segmenter31:
+    """SAM 3.1 image predictor (ONNX export by smile-forge, SAM License): same contract as Segmenter.
+
+    The exported encoder uses the opset 23 `Attention` operator, which onnxruntime runs on the CPU only (206 s a picture).
+    models.ensure_model puts next to it a copy of the graph with that operator written as MatMul/Softmax/MatMul
+    (data/sam31_encoder_gpu.onnx, same weights file), which runs on the GPU (about 0.4 s)."""
+
+    SIZE = 1008
+
+    def __init__(self, key: str = "seg_sam31"):
+        d = M.ensure_model(key)
+        enc_path = d / "image-encoder-gpu.onnx"
+        self.enc = M.session(enc_path if enc_path.is_file() else d / "image-encoder.onnx")
+        self.dec = M.session(d / "click-decoder.onnx")
+        self.enc_in = self.enc.get_inputs()[0]
+        self.enc_out = [o.name for o in self.enc.get_outputs()]
+        self.dec_in = [i.name for i in self.dec.get_inputs()]
+
+    def encode(self, rgb: np.ndarray, region: Optional[Tuple[float, float, float, float]] = None) -> dict:
+        H, W = rgb.shape[:2]
+        if region is None:
+            x0, y0, x1, y1 = 0.0, 0.0, float(W), float(H)
+            img = rgb
+        else:
+            x0, y0, x1, y1 = [float(v) for v in region]
+            img = rgb[int(y0):int(np.ceil(y1)), int(x0):int(np.ceil(x1))]
+            x1, y1 = x0 + img.shape[1], y0 + img.shape[0]
+        interp = cv2.INTER_AREA if max(img.shape[:2]) > self.SIZE else cv2.INTER_LINEAR
+        x = cv2.resize(img, (self.SIZE, self.SIZE), interpolation=interp).astype(np.float32) / 255.0 * 2.0 - 1.0
+        x = x.transpose(2, 0, 1)[None]
+        x = x.astype(np.float16) if "float16" in self.enc_in.type else x.astype(np.float32)
+        outs = self.enc.run(None, {self.enc_in.name: x})
+        return dict(emb=dict(zip(self.enc_out, outs)), rect=(x0, y0, x1, y1))
+
+    def segment(self, enc: dict, box, pos: np.ndarray, neg: np.ndarray) -> Tuple[Optional[np.ndarray], float]:
+        """Prompts: box corners (labels 2 and 3), joints (1), other people's joints (0), in 1008 px of the encoded area."""
+        x0, y0, x1, y1 = enc["rect"]
+        kx, ky = self.SIZE / max(x1 - x0, 1e-6), self.SIZE / max(y1 - y0, 1e-6)
+
+        def tr(pts):
+            pts = np.asarray(pts, np.float32).reshape(-1, 2)
+            return np.column_stack([(pts[:, 0] - x0) * kx, (pts[:, 1] - y0) * ky]).astype(np.float32)
+
+        pos, neg = tr(pos), tr(neg)
+        neg = neg[(neg[:, 0] >= 0) & (neg[:, 0] < self.SIZE) & (neg[:, 1] >= 0) & (neg[:, 1] < self.SIZE)]
+        bx = tr(np.asarray(box, np.float32).reshape(2, 2))
+        pts = np.concatenate([bx, pos, neg], 0)
+        lab = np.concatenate([[2, 3], np.ones(len(pos)), np.zeros(len(neg))]).astype(np.float32)
+        feed = {"points": pts[None].astype(np.float32), "labels": lab[None]}
+        for k in self.dec_in:
+            if k in enc["emb"]:
+                feed[k] = enc["emb"][k]
+        masks, iou, obj = self.dec.run(None, feed)
+        if float(obj.reshape(-1)[0]) < 0:
+            return None, 0.0
+        masks = masks.reshape(-1, masks.shape[-2], masks.shape[-1])
+        iou = iou.reshape(-1)
+        best, bi = -1e9, 0
+        for k in range(masks.shape[0]):
+            m = masks[k]
+            sc = float(iou[k]) if k < len(iou) else 0.0
+            for P, want in ((pos, 1.0), (neg, -1.0)):
+                if len(P):
+                    gx = np.clip((P[:, 0] / self.SIZE * m.shape[1]).astype(int), 0, m.shape[1] - 1)
+                    gy = np.clip((P[:, 1] / self.SIZE * m.shape[0]).astype(int), 0, m.shape[0] - 1)
+                    sc += 0.35 * want * float((m[gy, gx] > 0).mean())
+            if sc > best:
+                best, bi = sc, k
+        return masks[bi].astype(np.float32), float(iou[bi]) if bi < len(iou) else 0.0
+
+
+def make_segmenter(key: str):
+    return Segmenter31(key) if key == "seg_sam31" else Segmenter(key)
