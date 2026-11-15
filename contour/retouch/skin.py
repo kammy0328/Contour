@@ -860,6 +860,7 @@ FS_GRAIN_PX = 2.0          # only bands up to this Gaussian width in pixels carr
 # small face (user 2026-11-15): on a face only a few hundred pixels wide the pores are as fine as the grain, so the wide
 # grain range kept the pores too and the retouch came out weaker than v3. The range narrows with the face width, without
 # a step: FS_GRAIN_PX_SMALL px up to FS_GRAIN_WF[0] face width, FS_GRAIN_PX from FS_GRAIN_WF[1] on
+DBG_SN = None              # a list: the grain level of each band is appended (diagnosis only)
 FS_GRAIN_PX_SMALL = 1.0
 FS_GRAIN_WF = (350.0, 480.0)
 # follow the sharpness (user 2026-11-15, cut 069 56:07..56:12: the source goes soft and sharp again and the retouch showed it).
@@ -884,6 +885,56 @@ def guided_self(I: np.ndarray, r: int, eps: float) -> np.ndarray:
     a = var / (var + eps)
     b = m - a * m
     return _box(a, r) * I + _box(b, r)
+
+
+# lines lying on the skin (face paint, a tattoo, a hair strand): the retouch took the contrast out of them (cut 053, the
+# paint on the cheek; cut 018, the fringe over the forehead). Found by the picture's own second derivative at a few
+# pixels' width: one direction strongly curved (the line's cross section), the other not (along it). A pore, a pit or a
+# scar's blob is curved both ways and is not held. The band scaling is held back on them for the bands from FS_LINE_BAND on
+FS_LINE = False   # off: by luma alone it also held skin pits and scars (the 069 reference went from 0.60 to 0.63 at best) and barely helped paint or fair hair
+FS_LINE_CON = (0.10, 0.18)    # peak contrast of the line over the skin's level: from where it counts .. fully a line
+FS_LINE_ANI = (0.55, 0.80)      # 1 - (curvature along) / (curvature across)
+FS_LINE_LEN = 0.08              # of the face width: shorter than this is no line
+FS_LINE_BAND = 1                # index of the first band that is held
+FS_LINE_KEEP = 0.85             # share of the band's change taken away at a full line
+
+
+def _line_hold(roi: np.ndarray, wf: float) -> Optional[np.ndarray]:
+    try:
+        sg = max(1.2, 0.0040 * wf)
+        g = cv2.GaussianBlur(roi, (0, 0), sg)
+        gxx = cv2.Sobel(g, cv2.CV_32F, 2, 0, ksize=3)
+        gyy = cv2.Sobel(g, cv2.CV_32F, 0, 2, ksize=3)
+        gxy = cv2.Sobel(g, cv2.CV_32F, 1, 1, ksize=3) / 4.0
+        tr = 0.5 * (gxx + gyy)
+        dt = np.sqrt(0.25 * (gxx - gyy) ** 2 + gxy ** 2)
+        l1, l2 = tr + dt, tr - dt                       # l1 >= l2
+        bright = -l2 > l1                               # a bright line is a ridge: l2 strongly negative
+        pm = np.where(bright, -l2, l1) * (sg * sg)
+        other = np.where(bright, np.maximum(0.0, -l1), np.maximum(0.0, l2)) * (sg * sg)
+        ani = 1.0 - np.clip(other / np.maximum(pm, 1e-6), 0.0, 1.0)
+        lvl = cv2.GaussianBlur(roi, (0, 0), max(2.0, 0.06 * wf)) + 0.03
+        rel = pm / lvl
+        t = _sstep(FS_LINE_CON[0], FS_LINE_CON[1], rel) * _sstep(FS_LINE_ANI[0], FS_LINE_ANI[1], ani)
+        n_, lab_, st_, _ = cv2.connectedComponentsWithStats((t > 0.3).astype(np.uint8), connectivity=8)
+        if n_ <= 1:
+            return None
+        ln_ = np.hypot(st_[:, cv2.CC_STAT_WIDTH], st_[:, cv2.CC_STAT_HEIGHT])
+        keep_ = ln_ >= FS_LINE_LEN * wf
+        keep_[0] = False
+        t = (t * keep_[lab_]).astype(np.float32)
+        if not t.any():
+            return None
+        kd = max(3, int(round(0.012 * wf)) | 1)
+        t = cv2.dilate(t, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kd, kd)))
+        return np.clip(cv2.GaussianBlur(t, (0, 0), max(1.0, 0.005 * wf)) * 1.3, 0.0, 1.0)
+    except Exception:
+        return None
+
+
+def _sstep(e0: float, e1: float, x: np.ndarray) -> np.ndarray:
+    t = np.clip((x - e0) / max(e1 - e0, 1e-9), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
 
 
 def smooth_channel(I: np.ndarray, mask: np.ndarray, strength: float, keep: float, r: int,
@@ -927,6 +978,7 @@ def smooth_channel(I: np.ndarray, mask: np.ndarray, strength: float, keep: float
         sq_ = 1.0 + np.sign(sq_ - 1.0) * max(d_ - FS_SQ_DEAD, 0.0)
         gpx_ = FS_GRAIN_PX_SMALL + (FS_GRAIN_PX - FS_GRAIN_PX_SMALL) * float(
             np.clip((wf_ - FS_GRAIN_WF[0]) / (FS_GRAIN_WF[1] - FS_GRAIN_WF[0]), 0.0, 1.0))
+        lh_ = _line_hold(roi, wf_) if FS_LINE else None
         prev = roi
         ps = 0.0
         acc = np.zeros_like(roi)
@@ -951,9 +1003,13 @@ def smooth_channel(I: np.ndarray, mask: np.ndarray, strength: float, keep: float
                 ab_ = np.abs(b_[sel_]) if sel_.any() else np.abs(b_).ravel()
                 if ab_.size > 400:
                     sn_ = float(np.percentile(ab_[:: max(1, ab_.size // 200000)], 25)) / 0.3186
+                    if DBG_SN is not None:
+                        DBG_SN.append((i_, sn_))
                     lim_ = FS_GRAIN * sn_
                     if lim_ > 0:
                         b_ = b_ - b_ * np.minimum(1.0, lim_ / np.maximum(np.abs(b_), 1e-9))   # the part above the grain
+            if lh_ is not None and i_ >= FS_LINE_BAND:
+                b_ = b_ * (1.0 - FS_LINE_KEEP * lh_)
             if shp is not None and FS_SHAPE[i_] < 1.0:
                 acc += f_ * (FS_SHAPE[i_] + (1.0 - FS_SHAPE[i_]) * shp) * b_
             else:

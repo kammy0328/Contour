@@ -934,6 +934,7 @@ def _focus_zone(rgb_u8: np.ndarray, lm: np.ndarray) -> Optional[np.ndarray]:
 SHARP_ADAPT = True     # the retouch follows the footage's own sharpness (see skin.FS_SQ)
 SHARP_WIN = 12         # frames each side that make "the sharpness round it"
 SHARP_BAND = (0.0016, 0.0064)   # the measured band, of the face width (Gaussian sigma)
+SHARP_MAD_MAX = 0.30   # spread (median absolute deviation over the median) of the frames round it above which it is not followed
 SHARP_MIN_WF = 60.0    # face width in proxy px below which the measure is not trusted
 
 
@@ -1014,7 +1015,15 @@ def _sharp_q(tracker, st, p: int, t: int, px) -> float:
         if len(ref) < 5:
             return 1.0
         r = float(np.median(ref))
-        return float(cur / r) if r > 1e-6 else 1.0
+        if r <= 1e-6:
+            return 1.0
+        # the frames round it must agree on what "sharp" is (a cut that goes from a dark blur to a lit face, a zoom, a
+        # flash: the measure then says more about the light than the focus): otherwise no following (cut 018: 3.25)
+        mad = float(np.median(np.abs(np.asarray(ref) - r))) / r
+        q = float(cur / r)
+        if mad > SHARP_MAD_MAX or not (0.45 <= q <= 1.8):
+            return 1.0
+        return q
     except Exception:
         return 1.0
 
@@ -2058,7 +2067,7 @@ def jaw_hold(lm: Optional[np.ndarray], shape, scale: float, wf: float) -> Option
 
 
 GLINT_LO, GLINT_HI = 0.22, 0.38   # a thin bright thing on the skin (a light hair, a chain's glint)
-THING_MIN_LEN = 0.10        # of the face width: shorter than this is no "thing" lying on the skin
+THING_MIN_LEN = 0.07        # of the face width: shorter than this is no "thing" lying on the skin
 PAINT_DC = (0.018, 0.03)     # chroma off the skin's own (0..1 YCbCr units) at which a thin line is paint
 
 
@@ -2102,7 +2111,9 @@ def _things(Y: np.ndarray, m: np.ndarray, wf: float, Cb: Optional[np.ndarray] = 
     try:
         dc = _chroma_off(Cb, Cr, Y.shape, r, wf)
         if dc is not None:
-            t = np.maximum(t, _ss(*PAINT_DC, dc) * _ss(0.02, 0.05, dk))
+            # also bright ones (light hair over a pale cheek is a thin line whose brightness is the skin's but whose
+            # colour is not; light paint): the tophat counts like the blackhat
+            t = np.maximum(t, _ss(*PAINT_DC, dc) * np.maximum(_ss(0.02, 0.05, dk), _ss(0.02, 0.05, gl)))
     except Exception:
         pass
     if THING_MIN_LEN > 0:
