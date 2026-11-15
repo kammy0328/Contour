@@ -468,25 +468,40 @@ def make_segmenter(key: str):
     return Segmenter31(key) if key == "seg_sam31" else Segmenter(key)
 
 
-class DepthEstimator:
-    """Depth Anything V2 Small (ONNX): relative inverse depth of a picture, larger = nearer the camera."""
 
-    MEAN = np.array([0.485, 0.456, 0.406], np.float32)
-    STD = np.array([0.229, 0.224, 0.225], np.float32)
-    LONG = 518
+class Finder31:
+    """SAM 3.1's finder with the phrase "person": every person in the picture as a mask of their own (up to 200),
+    with a score and a box. It tells overlapping people apart by itself, which point prompts do not.
 
-    def __init__(self, key: str = "depth_dav2_s"):
-        self.sess = M.session(M.ensure_model(key))
-        self.inp = self.sess.get_inputs()[0].name
+    The phrase's encoding is fixed, so it is shipped (data/sam31_text_person.npz: the text encoder's output for
+    "person", SAM License) and the 700 MB text encoder is never downloaded."""
 
-    def __call__(self, rgb: np.ndarray, out_wh: Optional[Tuple[int, int]] = None) -> np.ndarray:
-        """rgb uint8 (H,W,3) -> float32 (H,W) (or out_wh), larger = nearer. Arbitrary scale and offset per picture."""
-        H, W = rgb.shape[:2]
-        k = self.LONG / max(H, W)
-        h, w = max(14, int(round(H * k / 14)) * 14), max(14, int(round(W * k / 14)) * 14)
-        x = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
-        x = ((x - self.MEAN) / self.STD).transpose(2, 0, 1)[None].astype(np.float32)
-        d = self.sess.run(None, {self.inp: x})[0]
-        d = np.asarray(d, np.float32).reshape(d.shape[-2], d.shape[-1])
-        ow, oh = out_wh if out_wh else (W, H)
-        return cv2.resize(d, (ow, oh), interpolation=cv2.INTER_LINEAR)
+    def __init__(self, key: str = "seg_sam31_find"):
+        from pathlib import Path
+        d = M.ensure_model(key)
+        self.sess = M.session(d / "finder-gpu.onnx")
+        txt = np.load(str(Path(__file__).parent / "data" / "sam31_text_person.npz"))
+        self.const = {"text": txt["text"].astype(np.float32), "text_pad": txt["text_pad"],
+                      "box_tokens": np.zeros((0, 1, 256), np.float32)}
+        self.names = [i.name for i in self.sess.get_inputs()]
+
+    def find(self, enc: dict, min_score: float = 0.5) -> list:
+        """enc from Segmenter31.encode. -> [dict(score, box (x0,y0,x1,y1) in rgb px, lg (288x288 mask logits over
+        enc['rect']), rect)] by falling score."""
+        feed = {}
+        for n in self.names:
+            feed[n] = enc["emb"][n] if n in enc["emb"] else self.const[n]
+        logits, presence, boxes, masks = self.sess.run(None, feed)
+        sig = lambda v: 1.0 / (1.0 + np.exp(-np.asarray(v, np.float32)))
+        sc = sig(logits[0]) * float(sig(presence.reshape(-1)[0]))
+        x0, y0, x1, y1 = enc["rect"]
+        w, h = x1 - x0, y1 - y0
+        out = []
+        for k in np.argsort(-sc):
+            if sc[k] < min_score:
+                break
+            cx, cy, bw, bh = [float(v) for v in boxes[0, k]]
+            out.append(dict(score=float(sc[k]), rect=enc["rect"], lg=masks[0, k].astype(np.float32),
+                            box=np.array([x0 + (cx - bw / 2) * w, y0 + (cy - bh / 2) * h,
+                                          x0 + (cx + bw / 2) * w, y0 + (cy + bh / 2) * h], np.float32)))
+        return out
