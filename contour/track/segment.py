@@ -17,7 +17,6 @@ import numpy as np
 from .exposure import analysis_view
 
 from . import skeleton as S
-from . import layers as LY
 
 POS_TORSO = [S.NOSE, S.L_SH, S.R_SH, S.L_HIP, S.R_HIP]
 POS_LIMBS = [S.L_EL, S.R_EL, S.L_KN, S.R_KN]
@@ -176,80 +175,101 @@ def head_priors(st, t: int, mw: int, mh: int, W: int, H: int, sx: float, sy: flo
     return out
 
 
-ORDER_PULL = 8.0            # logit units: the person in front over the one behind, where the front mask is on
-CORE_LOGIT = 1.5            # a pixel this far inside a mask counts as that person's solid body
-
-
 DEPTH_PULL = 8.0            # logit units taken from a person whose own depth does not fit the pixel
 DEPTH_TAU = 0.10            # depth misfit (share of the people's depth range) at which the pull is full
-DEPTH_SIGMA = 0.12          # of sqrt(mask area): how far a person's own depth is carried into an overlap
+DEPTH_SIGMA = 0.12          # of sqrt(mask area): how far a person's own depth is carried
+CORE_LOGIT = 1.5            # a pixel this far inside a mask counts as that person's solid body
+SUPPORT_LOGIT = 1.0         # what a person's skeleton is worth on a pixel another person's mask took
+SUPPORT_LIMB = 0.045        # half width of a limb, of the person's height
+OWN_CLIP = 6.0              # mask logits are capped at this when owners are compared
 
 
-def depth_fit(L: np.ndarray, depth: np.ndarray) -> Optional[np.ndarray]:
-    """(n,h,w) misfit 0..1 of every person's own depth to the picture's depth, on the pixels two or more masks claim.
+def skeleton_support(kp: np.ndarray, height: float, shape) -> np.ndarray:
+    """Where a person's body is by their own VISIBLE joints (kp (17,3) in matte px, confidence 0 = not visible):
+    limbs as thick lines, the torso as a polygon, the head as a disc. Deliberately thinner than the body."""
+    h, w = shape
+    img = np.zeros((h, w), np.uint8)
+    ok = np.isfinite(kp[:, :2]).all(1) & (np.nan_to_num(kp[:, 2]) >= 0.35)
+    th = max(2, int(round(2 * SUPPORT_LIMB * height)))
+    P = kp[:, :2]
+    pt = lambda j: (int(round(float(P[j, 0]))), int(round(float(P[j, 1]))))
+    for a, b in S.LIMB_BONES:
+        if ok[a] and ok[b]:
+            cv2.line(img, pt(a), pt(b), 255, th)
+    tors = [j for j in (S.L_SH, S.R_SH, S.R_HIP, S.L_HIP) if ok[j]]
+    if len(tors) >= 3:
+        cv2.fillConvexPoly(img, np.round(P[tors]).astype(np.int32), 255)
+    hd = [j for j in (S.NOSE, S.L_EYE, S.R_EYE) if ok[j]]
+    if hd:
+        c = P[hd].mean(0)
+        cv2.circle(img, (int(round(float(c[0]))), int(round(float(c[1])))), max(2, int(round(0.05 * height))), 255, -1)
+    return img > 0
 
-    A person's own depth near a pixel = the depth of the pixels only that person claims, carried over by a normalised
-    blur. An overlapped pixel whose depth is the front person's belongs to the front person, wherever the masks leak:
-    a back mask that takes in the occluder, a front mask that spills on the body behind, an arm in front of a torso
-    that is itself behind. People at the same depth (side by side, touching) get the same fit: nothing changes."""
+
+def depth_fit(L: np.ndarray, depth: np.ndarray, cand: np.ndarray, support: Optional[List[Optional[np.ndarray]]] = None
+              ) -> Optional[np.ndarray]:
+    """(n,h,w) misfit 0..1 of every person's own depth to the picture's depth, on the pixels two or more people
+    can own (`cand`).
+
+    A person's own depth near a pixel = the depth of that person's sure pixels (well inside the mask, no other mask
+    stronger, and on the person's own skeleton where one is known), carried over by a normalised blur. A pixel whose
+    depth is the front person's belongs to the front person, wherever the masks leak: a back mask that takes in the
+    occluder, a front mask that spills on the body behind, an arm in front of a torso that is itself behind. People at
+    the same depth (side by side, touching) get the same fit: nothing changes."""
     n, h, w = L.shape
-    M = L > 0
-    cnt = M.sum(0)
-    over = cnt >= 2
+    over = cand.sum(0) >= 2
     if n < 2 or not over.any():
         return None
-    union = cnt >= 1
+    union = (L > 0).any(0)
+    if union.sum() < 32:
+        return None
     lo, hi = np.percentile(depth[union], [5, 95])
     rng = float(max(hi - lo, 1e-6))
+    Lmax = L.max(0)
     fit = np.zeros((n, h, w), np.float32)
-    known = np.zeros((n, h, w), bool)
     for i in range(n):
-        ex = (M[i] & (cnt == 1)).astype(np.float32)
-        area = float(M[i].sum())
-        if ex.sum() < 16:
+        sure = (L[i] > CORE_LOGIT) & (L[i] >= Lmax)
+        if support is not None and support[i] is not None and int((sure & support[i]).sum()) >= 16:
+            sure &= support[i]
+        if int(sure.sum()) < 16:
+            fit[i] = 0.5                         # nothing sure of this person: says nothing
             continue
+        ex = sure.astype(np.float32)
+        area = float((L[i] > 0).sum())
         sig = float(np.clip(DEPTH_SIGMA * np.sqrt(area), 3.0, 0.08 * max(h, w)))
         den = cv2.GaussianBlur(ex, (0, 0), sig)
         num = cv2.GaussianBlur(ex * depth, (0, 0), sig)
         ok = den > 0.02
-        dexp = np.where(ok, num / np.maximum(den, 1e-6), 0.0)
-        # further from the person's exclusive pixels than the blur reaches: the person's overall depth
-        far = ~ok
-        if far.any():
-            dexp = np.where(far, float(np.median(depth[ex > 0])), dexp)
+        dexp = np.where(ok, num / np.maximum(den, 1e-6), float(np.median(depth[sure])))
         fit[i] = np.clip(np.abs(depth - dexp) / rng / DEPTH_TAU, 0.0, 1.0)
-        known[i] = True
-    # a person with no pixels of their own (wholly inside other masks) says nothing: neutral
-    for i in range(n):
-        if not known[i].any():
-            fit[i] = 0.5
     fit[:, ~over] = 0.0
     return fit
 
 
 def combine(logits: List[Tuple[int, np.ndarray]], rvm: Optional[np.ndarray], shape,
-            heads: Optional[dict] = None, order: Optional[List[Tuple[int, int, float]]] = None,
-            depth: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
+            heads: Optional[dict] = None, depth: Optional[np.ndarray] = None,
+            skel: Optional[dict] = None) -> Tuple[np.ndarray, np.ndarray]:
     """Per person mask logits at matte size -> (alpha uint8, labels uint8 = pid + 1).
 
-    Where two people's masks overlap the owner is, in this order of say: the person who is in front (`order`, from
-    layers.depth_order: (front pid, back pid, confidence)), unless the back person's own face is visible there, and
-    otherwise the larger logit. Two near-equal logits used to split a face into stripes of both owners (the decoder's
-    texture), and a mask that took in the face of the person in front won it outright on some frames, so that face
-    lost its retouch on those frames. Logits are smoothed a little, and around each visible face its own person is
-    pulled up and everyone else down. Only a person whose mask covers the pixel (or whose visible face is there)
-    can own it."""
+    Who owns a person pixel:
+      * a person whose mask covers it, or whose visible face is there, or (with `depth`) whose own skeleton
+        (`skel`: pid -> (kp (17,3) matte px with confidence 0 for joints that are not visible, height px)) runs
+        through it, can own it;
+      * with `depth` (matte size, larger = nearer) the person whose own depth fits the pixel is preferred: the
+        person in front gets what is in front, pixel by pixel (depth_fit);
+      * around each visible face its own person is pulled up and everyone else down;
+      * otherwise the larger (slightly smoothed) logit.
+    Two near-equal logits used to split a face into stripes of both owners (the decoder's texture), and a mask that
+    took in the face of the person in front won it outright on some frames, so that face lost its retouch."""
     h, w = shape
     alpha = np.zeros((h, w), np.float32)
     lab = np.zeros((h, w), np.uint8)
     if logits:
         sig = max(1.0, 0.002 * max(h, w))
         L = np.stack([cv2.GaussianBlur(l, (0, 0), sig) for _, l in logits])
-        La = L                                  # for who owns a pixel; L alone says whether it is a person
+        n = len(logits)
         bumps = {}
-        pid_idx = {pid: i for i, (pid, _l) in enumerate(logits)}
-        yy = xx = None
-        if heads and len(logits) > 1:
+        if heads and n > 1:
             yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
             for pid, (cx, cy, r, wg) in heads.items():
                 x0, x1 = int(max(0, cx - 3 * r)), int(min(w, cx + 3 * r + 1))
@@ -259,12 +279,26 @@ def combine(logits: List[Tuple[int, np.ndarray]], rvm: Optional[np.ndarray], sha
                 b = np.zeros((h, w), np.float32)
                 b[y0:y1, x0:x1] = wg * np.exp(-((xx[y0:y1, x0:x1] - cx) ** 2 + (yy[y0:y1, x0:x1] - cy) ** 2) / (2 * r * r))
                 bumps[pid] = b
-        pairs = [(f, b_, c) for f, b_, c in (order or []) if f in pid_idx and b_ in pid_idx]
-        dfit = depth_fit(L, depth) if depth is not None and len(logits) > 1 else None
-        if bumps or pairs or dfit is not None:
-            La = L.copy()
-        if dfit is not None:
-            La = La - DEPTH_PULL * dfit
+        Lmax = L.max(0)
+        hard = Lmax > 0
+        cand = L > 0
+        La = np.clip(L, -OWN_CLIP, OWN_CLIP) if n > 1 else L
+        support = None
+        if depth is not None and n > 1:
+            if skel:
+                support = []
+                for i, (pid, _l) in enumerate(logits):
+                    sp = None
+                    if pid in skel and skel[pid][0] is not None:
+                        sp = skeleton_support(skel[pid][0], float(skel[pid][1]), (h, w))
+                        claim = sp & hard & (L[i] <= 0)          # on a pixel another person's mask took
+                        if claim.any():
+                            cand[i] |= claim
+                            La[i] = np.where(claim, SUPPORT_LOGIT, La[i])
+                    support.append(sp)
+            dfit = depth_fit(L, depth, cand, support)
+            if dfit is not None:
+                La = La - DEPTH_PULL * dfit
         if bumps:
             tot = sum(bumps.values())
             for i, (pid, _l) in enumerate(logits):
@@ -274,20 +308,10 @@ def combine(logits: List[Tuple[int, np.ndarray]], rvm: Optional[np.ndarray], sha
                 inplay = L[i] > -6
                 adj = HEAD_PULL * ((own if own is not None else 0.0) - np.clip(others, 0, 1))
                 La[i] = La[i] + np.where(inplay, adj, 0.0)
-        for f, b_, c in pairs:
-            i, j = pid_idx[f], pid_idx[b_]
-            wf = np.clip(0.5 + L[i] / 3.0, 0.0, 1.0) * float(c)
-            fb = np.clip(bumps[b_], 0.0, 1.0) if b_ in bumps else 0.0      # the back person's own visible face stays theirs
-            La[j] = La[j] - ORDER_PULL * wf * (1.0 - fb)
-        Lmax = L.max(0)
-        cand = L > 0
-        for i, (pid, _l) in enumerate(logits):
-            if pid in bumps:
-                cand[i] |= (L[i] > -6) & (bumps[pid] > 0.3)
-        arg_all = La.argmax(0)
-        arg = np.where(cand.any(0), np.where(cand, La, -1e9).argmax(0), arg_all)
+                if own is not None:
+                    cand[i] |= inplay & (own > 0.3)
+        arg = np.where(cand.any(0), np.where(cand, La, -1e9).argmax(0), La.argmax(0))
         pids = np.array([pid for pid, _ in logits])
-        hard = Lmax > 0
         solid = _fill_small_holes(hard)
         a = np.clip(0.5 + Lmax / 3.0, 0.0, 1.0)
         inner = cv2.erode(solid.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=2).astype(bool)
@@ -304,6 +328,27 @@ def combine(logits: List[Tuple[int, np.ndarray]], rvm: Optional[np.ndarray], sha
     return np.clip(alpha * 255 + 0.5, 0, 255).astype(np.uint8), lab
 
 
+def skeletons(st, t: int, mw: int, mh: int, W: int, H: int, sx: float, sy: float, use_final: bool) -> dict:
+    """pid -> (kp (17,3) in matte px, confidence 0 where the joint is not visible; person height in matte px)."""
+    out = {}
+    kx, ky = sx * mw / W, sy * mh / H
+    for p in np.nonzero(st.present[:, t])[0]:
+        kp = _kp_for(st, p, t, use_final)
+        if kp is None:
+            continue
+        kp = kp.copy()
+        kp[:, 0] *= kx
+        kp[:, 1] *= ky
+        box = st.boxes[p, t]
+        hgt = float((box[3] - box[1]) * ky) if np.isfinite(box).all() else float("nan")
+        sc = S.person_scale(kp)
+        if np.isfinite(sc):
+            hgt = max(sc, 0.0) if not np.isfinite(hgt) else max(hgt, sc)
+        if np.isfinite(hgt) and hgt > 4:
+            out[int(st.pids[p])] = (kp, hgt)
+    return out
+
+
 def _canvas(lg: np.ndarray, rect, W: int, H: int, mw: int, mh: int) -> Optional[np.ndarray]:
     x0, y0, x1, y1 = rect
     canvas = np.full((mh, mw), -20.0, np.float32)
@@ -313,78 +358,6 @@ def _canvas(lg: np.ndarray, rect, W: int, H: int, mw: int, mh: int) -> Optional[
         return None
     canvas[my0:my1, mx0:mx1] = cv2.resize(lg, (mx1 - mx0, my1 - my0), interpolation=cv2.INTER_LINEAR)
     return canvas
-
-
-def _interior_points(core: np.ndarray, box_m, k: int, sep: float) -> List[Tuple[float, float]]:
-    """Up to k points deep inside `core` (bool, matte px) and inside the box (matte px), spread apart."""
-    x0, y0, x1, y1 = [int(round(v)) for v in box_m]
-    x0, y0 = max(0, x0), max(0, y0)
-    x1, y1 = min(core.shape[1], x1), min(core.shape[0], y1)
-    if x1 - x0 < 3 or y1 - y0 < 3:
-        return []
-    reg = core[y0:y1, x0:x1].astype(np.uint8)
-    d = cv2.distanceTransform(reg, cv2.DIST_L2, 3)
-    pts = []
-    for _ in range(k):
-        i = int(np.argmax(d))
-        yy, xx = divmod(i, d.shape[1])
-        if d[yy, xx] < 3.0:
-            break
-        pts.append((x0 + xx + 0.5, y0 + yy + 0.5))
-        cv2.circle(d, (xx, yy), int(max(sep, 0.8 * d[yy, xx])), 0, -1)
-    return pts
-
-
-def _in_core(core: np.ndarray, pt, kx: float, ky: float) -> bool:
-    x, y = int(pt[0] * kx), int(pt[1] * ky)
-    return 0 <= x < core.shape[1] and 0 <= y < core.shape[0] and bool(core[y, x])
-
-
-def refine_for_order(seg, dec: dict, order_t, W: int, H: int, mw: int, mh: int) -> None:
-    """Second decode for the people an occlusion touches. dec: pid -> dict(p, bx, pos, neg, enc, canvas).
-
-    Behind someone: the joints that lie on the person in front are not this person's visible body (they are dropped
-    as positives) and points deep inside the front person's mask are given as negatives, so the mask stops at the
-    edge of whoever is in front. In front: a negative point that fell on this person's own solid body (another
-    person's joint seen through the overlap) is dropped. Changed people are decoded again, nothing else is."""
-    kx, ky = mw / W, mh / H
-    cores = {}
-    for pid, d in dec.items():
-        cores[pid] = cv2.erode((d["canvas"] > CORE_LOGIT).astype(np.uint8), np.ones((3, 3), np.uint8), iterations=2).astype(bool)
-    changed = {}
-    for f, b_, c in order_t:
-        if f not in dec or b_ not in dec:
-            continue
-        df, db = dec[f], dec[b_]
-        ovl = (df["canvas"] > 0) & (db["canvas"] > 0)
-        nb = int((db["canvas"] > 0).sum())
-        if nb == 0 or int(ovl.sum()) < 0.02 * nb:
-            continue
-        ch = changed.setdefault(b_, dict(pos=list(map(tuple, db["pos"])), neg=list(map(tuple, db["neg"]))))
-        keep = [q for q in ch["pos"] if not _in_core(cores[f], q, kx, ky)]
-        if len(keep) != len(ch["pos"]):
-            ch["pos"] = keep
-        bm = np.array([db["bx"][0] * kx, db["bx"][1] * ky, db["bx"][2] * kx, db["bx"][3] * ky])
-        for (px_, py_) in _interior_points(cores[f], bm, 4, 0.03 * mh):
-            ch["neg"].append((px_ / kx, py_ / ky))
-        ch["touched"] = True
-        cf = changed.setdefault(f, dict(pos=list(map(tuple, df["pos"])), neg=list(map(tuple, df["neg"]))))
-        keepn = [q for q in cf["neg"] if not _in_core(cores[f], q, kx, ky)]
-        if len(keepn) != len(cf["neg"]):
-            cf["neg"] = keepn
-            cf["touched"] = True
-    for pid, ch in changed.items():
-        if not ch.get("touched"):
-            continue
-        d = dec[pid]
-        pos = np.array(ch["pos"], np.float32).reshape(-1, 2)
-        neg = np.array(ch["neg"], np.float32).reshape(-1, 2)
-        lg, q = seg.segment(d["enc"], d["bx"], pos, neg)
-        if lg is None:
-            continue
-        cv = _canvas(lg, d["enc"]["rect"], W, H, mw, mh)
-        if cv is not None:
-            d["canvas"] = cv
 
 
 def decode_frame(seg, rgb, st, t: int, sx: float, sy: float, W: int, H: int, mw: int, mh: int,
@@ -430,12 +403,14 @@ def run(st, proxy, matte, seglab, a: int, b: int, seg_key: str, use_final: bool,
     mw, mh = matte.w, matte.h
     W, H = proxy.w, proxy.h
     sx, sy = proxy.sx, proxy.sy
-    try:
-        order = LY.depth_order(st, a, b, (W / max(sx, 1e-6), H / max(sy, 1e-6)), use_final)
-    except Exception as e:                      # the order is a refinement: never stop the matte for it
-        import sys
-        sys.stderr.write(f"depth order failed: {str(e)[:200]}\n")
-        order = None
+    depth_net = None
+    if np.count_nonzero(st.present[:, a:b].sum(0) >= 2):
+        try:
+            from .infer import DepthEstimator
+            depth_net = DepthEstimator()
+        except Exception as e:                  # depth is a refinement: never stop the matte for it
+            import sys
+            sys.stderr.write(f"depth model could not be loaded ({str(e)[:200]}): owners by mask only\n")
     mm = matte.open_rw()
     lm = seglab.open_rw()
     if matter is not None:
@@ -453,11 +428,15 @@ def run(st, proxy, matte, seglab, a: int, b: int, seg_key: str, use_final: bool,
             if matter is not None:
                 rvm = matter(cv2.resize(rgb, (mw, mh), interpolation=cv2.INTER_AREA))
             dec = decode_frame(seg, rgb, st, t, sx, sy, W, H, mw, mh, use_final)
-            order_t = order.at(t) if order is not None else []
-            if order_t and len(dec) > 1:
-                refine_for_order(seg, dec, order_t, W, H, mw, mh)
             logits = [(pid, d["canvas"]) for pid, d in dec.items()]
-            al, lb = combine(logits, rvm, (mh, mw), head_priors(st, t, mw, mh, W, H, sx, sy, use_final), order_t)
+            depth = skel = None
+            if depth_net is not None and len(logits) > 1:
+                try:
+                    depth = depth_net(rgb, (mw, mh))
+                    skel = skeletons(st, t, mw, mh, W, H, sx, sy, use_final)
+                except Exception:
+                    depth = skel = None
+            al, lb = combine(logits, rvm, (mh, mw), head_priors(st, t, mw, mh, W, H, sx, sy, use_final), depth, skel)
             mm[t] = al
             lm[t] = lb
             if progress:
