@@ -622,7 +622,9 @@ class CutTracker:
         self._update_persons(tracklets, dets, pids)
         for q in self.cut.persons:
             if q.id in getattr(self, "_added_pids", set()) and q.id in getattr(self, "_new_pids", set()):
+                # found by the finder, not by the detector: kept out of the warp, not retouched until the user says
                 q.name = f"{q.name} (추가)"
+                q.role = "protect"
         p_w = step(0.96, 1.0)
         # keys from a previous analysis still apply (same person ids)
         if any(self.cut.joint_keys.get(pid) for pid in pids):
@@ -1283,6 +1285,26 @@ class CutTracker:
                 if res is not None:
                     poses_t[t] = (res, rec)
             if len(poses_t) < need:
+                continue
+            # what is a dancer to add and what is not: a sure pose (a blurred shoulder in the foreground gives a
+            # pose of sorts too), not a blob filling the frame or cut by two of its edges (out-of-focus foreground),
+            # and something that moves (a figure on a poster does not)
+            W_, H_ = float(self.proxy.w), float(self.proxy.h)
+            qs, big, mot = [], 0, []
+            for t, (res, rec) in poses_t.items():
+                kp_, sc_ = res.get("pose_rtmw_x", next(iter(res.values())))
+                qs.append(float(np.median(sc_[:S.K])))
+                x0_, y0_, x1_, y1_ = [float(v) for v in rec["box"]]
+                edges = (x0_ <= 2) + (y0_ <= 2) + (x1_ >= W_ - 2) + (y1_ >= H_ - 2)
+                if (x1_ - x0_) * (y1_ - y0_) > 0.35 * W_ * H_ or edges >= 2:
+                    big += 1
+            bxs = np.array([rec["box"] for t, (res, rec) in sorted(poses_t.items())], np.float32)
+            hh = float(np.median(bxs[:, 3] - bxs[:, 1]))
+            span = float(np.max(np.ptp(bxs, axis=0))) / max(hh, 1.0)
+            if np.median(qs) < 0.4 or big > 0.5 * len(poses_t) or span < 0.03:
+                import logging
+                logging.getLogger("contour").info("finder instance not added (pose %.2f, foreground %d/%d, motion %.3f)",
+                                                  float(np.median(qs)), big, len(poses_t), span)
                 continue
             existing = [q.id for q in self.cut.persons] + list(self.cut.removed) + list(st.removed) + list(st.pids)
             pid = max(existing + [-1]) + 1
