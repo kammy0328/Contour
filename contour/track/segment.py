@@ -330,6 +330,7 @@ DUP_DIST = 0.08             # two tracks whose joints sit this close (of the bod
 REPOSE_MIN = 0.40           # finder score an instance needs to be a body a borrowed skeleton is re-estimated on
 EXTRA_MIN_H = 0.07          # an untracked person this tall (share of the frame) can become a tracked one
 EXTRA_OVERLAP = 0.40        # ... unless this much of it is on tracked people's masks (a part of one of them)
+DEBUG: Optional[list] = None  # a list here collects why borrowed skeletons were (not) re-estimated (tests)
 FIND_MIN = 0.30             # a finder instance this sure can be a tracked person (tracking vouches for it)
 FIND_SURE = 0.50            # this sure, it is a person even when tracking does not follow it
 MATCH_MIN = 0.35            # joints inside + box overlap a person needs with an instance
@@ -482,9 +483,17 @@ def _borrowed(st, t, pr, insts, assigned, merged, sx, sy, use_final, W: int, H: 
         for j in range(i + 1, len(pr)):
             h = max(pr[i][1][3] - pr[i][1][1], pr[j][1][3] - pr[j][1][1])
             sh = _same_skeleton(kps[i], kps[j], h)
+            if DEBUG is not None and kps[i] is not None and kps[j] is not None:
+                ok_ = np.isfinite(kps[i][:, :2]).all(1) & np.isfinite(kps[j][:, :2]).all(1)
+                md = float(np.median(np.hypot(*(kps[i][ok_, :2] - kps[j][ok_, :2]).T))) if ok_.any() else -1
+                if md >= 0 and md < 0.25 * h:
+                    DEBUG.append(dict(t=t, pair=[int(st.pids[pr[i][0]]), int(st.pids[pr[j][0]])], median=round(md / h, 3),
+                                      same=sh is not None))
             if sh is None:
                 continue
             ins_sc = [_inside(sh, ins) for ins in insts]
+            if DEBUG is not None:
+                DEBUG[-1]["inside"] = [round(v, 2) for v in ins_sc]
             if not ins_sc or max(ins_sc) < 0.5:
                 continue
             kS = int(np.argmax(ins_sc))
@@ -510,6 +519,9 @@ def _borrowed(st, t, pr, insts, assigned, merged, sx, sy, use_final, W: int, H: 
                 if gk.any() and float((gk & gS).sum()) >= 0.5 * float(gk.sum()):
                     continue
                 best, kb = v, k
+            if DEBUG is not None:
+                DEBUG[-1].update(kS=kS, owner=int(st.pids[pr[owner][0]]), borrower=int(st.pids[pr[borrower][0]]), kb=kb,
+                                 cands=[(k, round(_box_iou(bbx, ins["box"]), 2), round(ins["score"], 2)) for k, ins in enumerate(insts)])
             if kb < 0:
                 continue
             assigned[borrower] = kb
@@ -587,6 +599,8 @@ def decode_frame(seg, rgb, st, t: int, sx: float, sy: float, W: int, H: int, mw:
                 except Exception:
                     import traceback
                     traceback.print_exc()
+            if DEBUG is not None:
+                DEBUG.append(dict(t=t, repose=int(st.pids[pr[i][0]]), inst=k, ok=ok))
             if ok:
                 reposed[i] = k
                 if info is not None:

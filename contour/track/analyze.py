@@ -85,7 +85,7 @@ def _identity(tr: dict, dets) -> tuple:
     return reid, [[round(float(v), 4) for v in fe] for fe in picked]
 
 
-def _masked_pose(rgb: np.ndarray, rec: dict, poses: Dict[str, object]) -> Optional[dict]:
+def _masked_pose(rgb: np.ndarray, rec: dict, poses: Dict[str, object], dbg: Optional[dict] = None) -> Optional[dict]:
     """Pose of the person a finder instance holds, with everybody else hidden (grey): a pose model given a box over
     two people takes the more visible one; here it can see only this one. -> model -> (kp (K,2) rgb px, sc (K,)),
     or None when fewer than 5 sure joints fall on the person or the body is upside down (a mirror image)."""
@@ -115,11 +115,12 @@ def _masked_pose(rgb: np.ndarray, rec: dict, poses: Dict[str, object]) -> Option
             x, y = int(kp[j, 0]) - cx0, int(kp[j, 1]) - cy0
             if 0 <= x < m.shape[1] and 0 <= y < m.shape[0] and m[y, x]:
                 good += 1
-    if good < 5:
-        return None
     head = [kp[j, 1] for j in (S.NOSE, S.L_EYE, S.R_EYE) if sc[j] >= 0.3]
     feet = [kp[j, 1] for j in (S.L_AN, S.R_AN) if sc[j] >= 0.3]
-    if head and feet and np.mean(head) > np.mean(feet):
+    upside = bool(head and feet and np.mean(head) > np.mean(feet))
+    if dbg is not None:
+        dbg.update(good=good, upside=upside, box=[cx0, cy0, cx1, cy1], img=img, kp=kp, sc=sc)
+    if good < 5 or upside:
         return None
     return out
 
