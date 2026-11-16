@@ -100,7 +100,50 @@ def still_pictures(st) -> set:
             res.append(float(np.median(np.linalg.norm(q - k[m, :2], axis=1)) / size))
         if len(res) + 1 >= STILL_FRAMES and float(np.quantile(res, 0.9)) < STILL_RES:
             out.add(int(pid))
+    if out:
+        out -= _live_peers(st, out)
     return out
+
+
+PEER_FACE = 1.33        # face width ratio of two people standing in one row
+PEER_TOP = 1.0          # head heights apart, in face widths
+
+
+def _live_peers(st, cand: set) -> set:
+    """Of the figures that kept still, those standing in a row with someone who moves: a face the same size, the
+    head at the same height, seen at the same time. Members posing still for a few seconds next to the others are
+    as rigid as a print (ILLIT 018II7RF: two of four members side by side were called pictures and dropped out of the
+    retouch), and taking a real person for a picture costs far more than retouching a face on a poster. Posters on
+    a wall are smaller or higher than the people in front of them (2611 cut 008)."""
+    geo = {}
+    for p, pid in enumerate(st.pids):
+        K = st.final[p, :, :17]
+        F = st.face[p, :, :, :2]
+        tops, wfs, ts = [], [], []
+        for t in np.nonzero(st.present[p])[0]:
+            k = K[t]
+            ok = np.isfinite(k[:, :2]).all(1) & (np.nan_to_num(k[:, 2]) > 0.5)
+            if ok.sum() < 4 or not np.isfinite(F[t]).all():
+                continue
+            tops.append(float(k[ok, 1].min()))
+            wfs.append(float(np.hypot(*(F[t, 16] - F[t, 0]))))
+            ts.append(int(t))
+        if len(ts) >= 3:
+            geo[int(pid)] = (float(np.median(tops)), float(np.median(wfs)), set(ts))
+    keep = set()
+    for c in cand:
+        if c not in geo:
+            continue
+        tc, wc, sc = geo[c]
+        for pid, (tp, wp, sp) in geo.items():
+            if pid in cand or wc <= 0 or wp <= 0:
+                continue
+            if len(sc & sp) < 3:
+                continue
+            if max(wc, wp) / min(wc, wp) <= PEER_FACE and abs(tc - tp) <= PEER_TOP * max(wc, wp):
+                keep.add(c)
+                break
+    return keep
 
 
 def face_widths(st, p: int) -> np.ndarray:
