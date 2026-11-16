@@ -460,12 +460,6 @@ class CutTracker:
                 added = self._add_found_people(st, tracklets, dets, pids, collect, poses, a, b, cancel)
                 if added:
                     P = len(st.pids)
-                    fr = [t for t in range(a, b) if st.present[[st.index(q) for q in added], t].any()]
-                    if fr:
-                        sub: dict = {}
-                        self._run_matte(min(fr), max(fr) + 1, step(0.49, 0.50), st=st, accuracy=accuracy, cancel=cancel,
-                                        collect=sub)
-                        collect.setdefault("src", {}).update(sub.get("src", {}))
                 from . import segment as SG
                 self._seg_stats = SG.stats_from(collect.get("src"))
             except Cancelled:
@@ -1129,12 +1123,22 @@ class CutTracker:
                     if not (cax >= 0.4 and cax >= 2.0 * cnt[va] + 0.1):
                         continue
                     kA0 = SG._kp_for(st, pa, t - 1, False)
-                    kA1 = SG._kp_for(st, pa, t, False)
                     kX1 = SG._kp_for(st, px_, t, False)
-                    dAA, dAX = _kp_dist(kA0, kA1), _kp_dist(kA0, kX1)
+                    kA1 = SG._kp_for(st, pa, t, False)
                     bx = st.boxes[pa, t - 1]
                     h = float(bx[3] - bx[1]) if np.isfinite(bx).all() else 0.0
-                    if dAA is None or dAX is None or h <= 0 or not (dAX < 0.6 * dAA and dAA > 0.15 * h):
+                    # the skeleton may take a frame or two to follow the box and face that went over: this frame
+                    # or one of the next two
+                    jump = False
+                    for k in range(3):
+                        if t + k >= b or not (st.present[pa, t + k] and st.present[px_, t + k]):
+                            break
+                        dAA = _kp_dist(kA0, SG._kp_for(st, pa, t + k, False))
+                        dAX = _kp_dist(kA0, SG._kp_for(st, px_, t + k, False))
+                        if dAA is not None and dAX is not None and h > 0 and dAX < 0.6 * dAA and dAA > 0.15 * h * (1 + 0.5 * k):
+                            jump = True
+                            break
+                    if not jump:
                         continue
                     vx = int(st.pids[px_]) + 1
                     if st.present[px_, t - 1]:
@@ -1192,6 +1196,34 @@ class CutTracker:
                     fr[idb] = sa
                 if sb is not None:
                     fr[ida] = sb
+        self._label_cache.clear()
+
+    def _label_new(self, pid: int, poses_t: dict, collect: dict) -> None:
+        """A person added from the finder's instances takes the pixels marked nobody's (255) inside their instance."""
+        from . import segment as SG
+        if not self.seglab.exists() or not 0 <= pid < 254:
+            return
+        mw, mh = self.seglab.w, self.seglab.h
+        kx, ky = mw / self.proxy.w, mh / self.proxy.h
+        mm = self.seglab.open_rw()
+        try:
+            for t, (res, rec) in poses_t.items():
+                (x0, y0, x1, y1), m = SG.record_mask(rec)
+                bx0, by0 = int(round(x0 * kx)), int(round(y0 * ky))
+                bx1, by1 = max(bx0 + 1, int(round(x1 * kx))), max(by0 + 1, int(round(y1 * ky)))
+                mk = cv2.resize(m.astype(np.uint8), (bx1 - bx0, by1 - by0), interpolation=cv2.INTER_NEAREST).astype(bool)
+                cx0, cy0, cx1, cy1 = max(0, bx0), max(0, by0), min(mw, bx1), min(mh, by1)
+                if cx1 <= cx0 or cy1 <= cy0:
+                    continue
+                mk = mk[cy0 - by0:cy1 - by0, cx0 - bx0:cx1 - bx0]
+                sub = np.array(mm[t, cy0:cy1, cx0:cx1])
+                sub[(sub == SG.UNTRACKED) & mk] = pid + 1
+                mm[t, cy0:cy1, cx0:cx1] = sub
+                collect.setdefault("src", {}).setdefault(t, {})[int(pid)] = "find"
+        finally:
+            mm.flush()
+            del mm
+            self.seglab.close()
         self._label_cache.clear()
 
     def _add_found_people(self, st: TrackStore, tracklets, dets, pids, collect: dict, poses, a: int, b: int,
@@ -1275,6 +1307,7 @@ class CutTracker:
             tracklets.append(tr)
             pids.append(pid)
             added.append(pid)
+            self._label_new(pid, poses_t, collect)
             import logging
             logging.getLogger("contour").info("person the finder saw added: %d (%d frames)", pid, len(poses_t))
         self._added_pids = set(added)
