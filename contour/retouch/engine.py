@@ -1155,13 +1155,18 @@ def _steady(cut, tracker, st, rf: RetouchFrame, cache) -> RetouchFrame:
         frames = [(1.0, own)]                       # (weight, masks on this frame's geometry)
         veto = getattr(j, "veto", None)
         vetos = [veto.astype(np.float32)] if veto is not None else []
+        def usable(s):
+            return 0 <= s < N and bool(st.present[j.p, s]) and st.connected(s, t) \
+                and bool(np.isfinite(st.face[j.p, s, :, :2]).all())
+
         for d in range(1, STEADY_R + 1):
             w = float(np.exp(-0.5 * (d / STEADY_SIGMA) ** 2))
+            # both sides or neither: on the first and last frames of a shot (or next to a frame the face is missing on)
+            # the frames of one side alone pulled the mask towards where the face was, and its cover dropped by a
+            # quarter on that frame only (lngshot cut 011, last frame: 0.97 raw, 0.72 steadied)
+            if not (usable(t - d) and usable(t + d)):
+                break
             for s in (t - d, t + d):
-                if not (0 <= s < N) or not st.present[j.p, s] or not st.connected(s, t):
-                    continue
-                if not np.isfinite(st.face[j.p, s, :, :2]).all():
-                    continue
                 rs = _raw_cached(cut, tracker, s, cache)
                 js = next((x for x in rs.jobs if x.pid == j.pid), None) if rs is not None else None
                 if js is None or js.face is None:
@@ -1267,6 +1272,53 @@ def _parse_now(rgb_u8: np.ndarray, lm: np.ndarray) -> Optional[dict]:
         return None
 
 
+DOUBLE_DIST = 0.3     # face centres closer than this share of the face width: one face held by two tracks
+
+
+def _double_faces(st, tracker, t: int) -> set:
+    """Tracks whose face on frame t is another track's face: one person taken for two (lngshot cut 005: a girl
+    holding a magazine up to her eyes became one track for her head and one for the magazine and her hands, both
+    with her face). Retouched twice, and the second one's mask spread over the magazine (the first track's pixels).
+    The face stays with the track the person matte gives it to (then the surer face); the other loses it."""
+    if st is None or not getattr(st, "has_face", False):
+        return set()
+    ids = [p for p in np.nonzero(st.present[:, t])[0] if np.isfinite(st.face[p, t, :, :2]).all()]
+    if len(ids) < 2:
+        return set()
+    geo = {}
+    for p in ids:
+        F = st.face[p, t, :, :2]
+        geo[p] = (F.mean(0), float(np.hypot(*(F[16] - F[0]))))
+    lab = None
+    try:
+        lab = tracker.labels(t)
+    except Exception:
+        lab = None
+
+    def owns(p):
+        if lab is None:
+            return 0
+        c_ = geo[p][0]
+        x = int(c_[0] * lab.shape[1] / max(1.0, float(tracker.cut.info.width)))
+        y = int(c_[1] * lab.shape[0] / max(1.0, float(tracker.cut.info.height)))
+        return int(0 <= x < lab.shape[1] and 0 <= y < lab.shape[0] and int(lab[y, x]) == p)
+
+    out = set()
+    for i, a in enumerate(ids):
+        for b in ids[i + 1:]:
+            if a in out or b in out:
+                continue
+            (ca, wa), (cb, wb) = geo[a], geo[b]
+            if min(wa, wb) <= 0 or max(wa, wb) / min(wa, wb) > 1.6:
+                continue
+            if float(np.hypot(*(ca - cb))) > DOUBLE_DIST * max(wa, wb):
+                continue
+            ka = (owns(a), float(st.face_vis[a, t]))
+            kb = (owns(b), float(st.face_vis[b, t]))
+            out.add(b if ka >= kb else a)
+    return out
+
+
 def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optional[int] = None) -> Optional[RetouchFrame]:
     """One frame's masks on their own (see prepare). only: just this person, skin shown even at 0."""
     st = tracker.store
@@ -1277,6 +1329,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
     rgb_u8 = None
     rgb_f = None
     people = cut.targets() if only is None else [q for q in cut.persons if q.id == only]
+    doubles = _double_faces(st, tracker, t)
     for person in people:
         if not st.has(person.id):
             continue
@@ -1292,7 +1345,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
         face = None
         fw = 0.0
         fw_doubt = False
-        if st.has_face and np.isfinite(st.face[p, t, :, :2]).all():
+        if st.has_face and np.isfinite(st.face[p, t, :, :2]).all() and p not in doubles:
             face = st.face[p, t]
             # face visibility as a strength: full strength once the face is reasonably sure, so the retouch does
             # not breathe with small confidence changes (a zoom, a turn); it still fades out where the face is
