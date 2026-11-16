@@ -1236,6 +1236,8 @@ class CutTracker:
     def _duplicate_of(self, st: TrackStore, poses_t: dict):
         """(pid, frames) of the tracked person whose skeleton the masked pose of a finder chain repeats, or None."""
         sx, sy = self.proxy.sx, self.proxy.sy
+        # the skeletons as the pose models gave them: final is only made from them after this step
+        refs = [st.raw[k] for k in ("pose_rtmw_x", "pose_rtmpose_x") if k in st.raw and st.raw[k].shape[2] >= S.K]
         hits = {}
         for t, (res, rec) in poses_t.items():
             kp_, sc_ = res.get("pose_rtmw_x", next(iter(res.values())))
@@ -1245,14 +1247,15 @@ class CutTracker:
             for q in range(len(st.pids)):
                 if not st.present[q, t]:
                     continue
-                kq = st.final[q, t, :S.K]
-                ok = np.isfinite(kq[:, :2]).all(1) & (np.nan_to_num(kq[:, 2]) > 0.3) & np.isfinite(k).all(1)
-                ok &= sc >= float(np.median(sc))          # the chain's surer half of the joints
-                if ok.sum() < 5:
-                    continue
-                d = float(np.median(np.linalg.norm(k[ok] - kq[ok, :2], axis=1)))
-                if d < self.DUP_DIST * bh:
-                    hits.setdefault(int(st.pids[q]), []).append(t)
+                for kq in [r[q, t, :S.K] for r in refs] + [st.final[q, t, :S.K]]:
+                    ok = np.isfinite(kq[:, :2]).all(1) & np.isfinite(k).all(1)
+                    ok &= sc >= float(np.median(sc))          # the chain's surer half of the joints
+                    if ok.sum() < 5:
+                        continue
+                    d = float(np.median(np.linalg.norm(k[ok] - kq[ok, :2], axis=1)))
+                    if d < self.DUP_DIST * bh:
+                        hits.setdefault(int(st.pids[q]), []).append(t)
+                        break
         if not hits:
             return None
         q_pid, fr = max(hits.items(), key=lambda kv: len(kv[1]))
