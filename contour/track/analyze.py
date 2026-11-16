@@ -85,6 +85,56 @@ def _identity(tr: dict, dets) -> tuple:
     return reid, [[round(float(v), 4) for v in fe] for fe in picked]
 
 
+def _masked_pose(rgb: np.ndarray, rec: dict, poses: Dict[str, object]) -> Optional[dict]:
+    """Pose of the person a finder instance holds, with everybody else hidden (grey): a pose model given a box over
+    two people takes the more visible one; here it can see only this one. -> model -> (kp (K,2) rgb px, sc (K,)),
+    or None when fewer than 5 sure joints fall on the person or the body is upside down (a mirror image)."""
+    from . import segment as SG
+    (x0, y0, x1, y1), m = SG.record_mask(rec)
+    H, W = rgb.shape[:2]
+    cx0, cy0, cx1, cy1 = max(0, x0), max(0, y0), min(W, x1), min(H, y1)
+    if cx1 - cx0 < 4 or cy1 - cy0 < 4:
+        return None
+    m = m[cy0 - y0:cy1 - y0, cx0 - x0:cx1 - x0]
+    r = max(2, int(0.02 * (cy1 - cy0)))
+    m = cv2.dilate(m.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))).astype(bool)
+    img = np.full_like(rgb, 114)
+    sub, src = img[cy0:cy1, cx0:cx1], rgb[cy0:cy1, cx0:cx1]
+    sub[m] = src[m]
+    box = np.array([[cx0, cy0, cx1, cy1]], np.float32)
+    out = {}
+    for k, pe in poses.items():
+        kp, sc = pe(img, box)
+        out[k] = (np.asarray(kp[0], np.float32), np.asarray(sc[0], np.float32))
+    if not out:
+        return None
+    kp, sc = out.get("pose_rtmw_x", next(iter(out.values())))
+    good = 0
+    for j in range(S.K):
+        if sc[j] >= 0.3:
+            x, y = int(kp[j, 0]) - cx0, int(kp[j, 1]) - cy0
+            if 0 <= x < m.shape[1] and 0 <= y < m.shape[0] and m[y, x]:
+                good += 1
+    if good < 5:
+        return None
+    head = [kp[j, 1] for j in (S.NOSE, S.L_EYE, S.R_EYE) if sc[j] >= 0.3]
+    feet = [kp[j, 1] for j in (S.L_AN, S.R_AN) if sc[j] >= 0.3]
+    if head and feet and np.mean(head) > np.mean(feet):
+        return None
+    return out
+
+
+def _kp_dist(k0: Optional[np.ndarray], k1: Optional[np.ndarray]) -> Optional[float]:
+    """Median distance of the sure joints two skeletons share (>= 4), else None."""
+    if k0 is None or k1 is None:
+        return None
+    ok = np.isfinite(k0[:, :2]).all(1) & np.isfinite(k1[:, :2]).all(1) & (np.nan_to_num(k0[:, 2]) >= 0.3) \
+        & (np.nan_to_num(k1[:, 2]) >= 0.3)
+    if ok.sum() < 4:
+        return None
+    return float(np.median(np.hypot(*(k0[ok, :2] - k1[ok, :2]).T)))
+
+
 def _save_identity_samples(project, cut, tracklets, dets, pids) -> None:
     """For linking people across cuts and for identity self-learning: per person up to 12 body re-ID and
     12 face features from different moments, and which people were on screen at the same time (never the
@@ -385,9 +435,43 @@ class CutTracker:
         del raw1
 
         # ---------------- matte (needed to tell visible joints from guessed ones)
-        p_m = step(0.42, 0.50)
+        p_m = step(0.42, 0.48)
         self._label_cache.clear()
-        self._run_matte(a, b, p_m, st=st, accuracy=accuracy, cancel=cancel)
+        collect: dict = {}
+
+        def repose(t, p, rgb, rec):
+            res = _masked_pose(rgb, rec, poses)
+            if res is None:
+                return False
+            self._write_pose(st, p, t, res, rec["box"])
+            return True
+
+        self._run_matte(a, b, p_m, st=st, accuracy=accuracy, cancel=cancel, repose=repose, collect=collect)
+        # ---------------- what the person finder says about the tracking: identities that jumped to someone else,
+        # people nobody follows
+        self._added_pids = set()
+        if collect.get("src"):
+            p_fx = step(0.48, 0.50)
+            try:
+                p_fx(0.0, "인물 정체 확인")
+                self._fix_swaps(st, tracklets, collect, a, b)
+                p_fx(0.3, "놓친 인물 찾는 중")
+                added = self._add_found_people(st, tracklets, dets, pids, collect, poses, a, b, cancel)
+                if added:
+                    P = len(st.pids)
+                    fr = [t for t in range(a, b) if st.present[[st.index(q) for q in added], t].any()]
+                    if fr:
+                        sub: dict = {}
+                        self._run_matte(min(fr), max(fr) + 1, step(0.49, 0.50), st=st, accuracy=accuracy, cancel=cancel,
+                                        collect=sub)
+                        collect.setdefault("src", {}).update(sub.get("src", {}))
+                from . import segment as SG
+                self._seg_stats = SG.stats_from(collect.get("src"))
+            except Cancelled:
+                raise
+            except Exception:
+                import traceback
+                traceback.print_exc()
 
         # ---------------- blur + faces
         p_bf = step(0.50, 0.55)
@@ -539,6 +623,9 @@ class CutTracker:
 
         # ---------------- persons in the project
         self._update_persons(tracklets, dets, pids)
+        for q in self.cut.persons:
+            if q.id in getattr(self, "_added_pids", set()) and q.id in getattr(self, "_new_pids", set()):
+                q.name = f"{q.name} (추가)"
         p_w = step(0.96, 1.0)
         # keys from a previous analysis still apply (same person ids)
         if any(self.cut.joint_keys.get(pid) for pid in pids):
@@ -990,6 +1077,209 @@ class CutTracker:
         keep = set(pids)
         self.cut.joint_keys = {k: v for k, v in self.cut.joint_keys.items() if k in keep}
 
+    # ------------------------------------------------------------------ fixes from the person finder (analysis)
+    def _write_pose(self, st: TrackStore, p: int, t: int, res: dict, box_proxy) -> None:
+        """A pose estimated again (on the person's own instance) replaces what the pose models gave this track."""
+        sx, sy = self.proxy.sx, self.proxy.sy
+        for k, (kp, sc) in res.items():
+            if k in st.raw and st.raw[k].shape[2] == S.K:
+                st.raw[k][p, t, :, :2] = kp[:S.K] / [sx, sy]
+                st.raw[k][p, t, :, 2] = sc[:S.K]
+            if k == "pose_rtmw_x":
+                if "face_rtmw" in st.raw:
+                    st.raw["face_rtmw"][p, t] = np.nan
+                self._face_from_rtmw(st, p, t, kp / [sx, sy], sc)
+                self._hand42(st, p, t, kp / [sx, sy], sc)
+        st.boxes[p, t] = np.asarray(box_proxy, np.float32) / [sx, sy, sx, sy]
+
+    def _fix_swaps(self, st: TrackStore, tracklets, collect: dict, a: int, b: int) -> list:
+        """A track that went over to someone else between two frames (the tracker's identity switch): the finder's
+        masks say the person a track had is now under another track, and the skeletons say the same (this track's
+        joints jump, the other's continue where this one was). From that frame on the two exchange everything.
+        Both signs are needed: a person stepping in front of another moves the masks only, a fast move the joints
+        only."""
+        from . import segment as SG
+        if not self.seglab.exists():
+            return []
+        mw, mh = self.seglab.w, self.seglab.h
+        min_area = 0.002 * mw * mh
+        sx, sy = self.proxy.sx, self.proxy.sy
+        swaps = []
+        prev = None
+        for t in range(a, b):
+            g = self.seglab.get(t)
+            cur = None if g is None else np.array(g, np.uint8)
+            if prev is not None and cur is not None:
+                pres0 = [p for p in range(len(st.pids)) if st.present[p, t - 1]]
+                pres1 = [p for p in range(len(st.pids)) if st.present[p, t]]
+                for pa in [p for p in pres0 if p in pres1]:
+                    va = int(st.pids[pa]) + 1
+                    if va >= 255:
+                        continue
+                    A0 = prev == va
+                    na = int(A0.sum())
+                    if na < min_area:
+                        continue
+                    cnt = np.bincount(cur[A0], minlength=256).astype(np.float64) / na
+                    cands = [(cnt[int(st.pids[q]) + 1], q) for q in pres1 if q != pa and int(st.pids[q]) + 1 < 255]
+                    if not cands:
+                        continue
+                    cax, px_ = max(cands)
+                    if not (cax >= 0.4 and cax >= 2.0 * cnt[va] + 0.1):
+                        continue
+                    kA0 = SG._kp_for(st, pa, t - 1, False)
+                    kA1 = SG._kp_for(st, pa, t, False)
+                    kX1 = SG._kp_for(st, px_, t, False)
+                    dAA, dAX = _kp_dist(kA0, kA1), _kp_dist(kA0, kX1)
+                    bx = st.boxes[pa, t - 1]
+                    h = float(bx[3] - bx[1]) if np.isfinite(bx).all() else 0.0
+                    if dAA is None or dAX is None or h <= 0 or not (dAX < 0.6 * dAA and dAA > 0.15 * h):
+                        continue
+                    vx = int(st.pids[px_]) + 1
+                    if st.present[px_, t - 1]:
+                        X0 = prev == vx
+                        nx = int(X0.sum())
+                        if nx >= min_area:
+                            cx = np.bincount(cur[X0], minlength=256)
+                            if cx[va] < cx[vx]:
+                                continue
+                        kX0 = SG._kp_for(st, px_, t - 1, False)
+                        dXX, dXA = _kp_dist(kX0, kX1), _kp_dist(kX0, kA1)
+                        if dXX is not None and dXA is not None and not dXA < dXX:
+                            continue
+                    pid_a, pid_x = int(st.pids[pa]), int(st.pids[px_])
+                    self._swap_local(st, tracklets, collect, pa, px_, t, b)
+                    lut = np.arange(256, dtype=np.uint8)
+                    lut[va], lut[vx] = vx, va
+                    cur = lut[cur]
+                    swaps.append((pid_a, pid_x, t))
+                    import logging
+                    logging.getLogger("contour").info("identity switch fixed: %d <-> %d from frame %d", pid_a, pid_x, t)
+                    break
+            prev = cur
+        self._swaps_fixed = swaps
+        return swaps
+
+    def _swap_local(self, st: TrackStore, tracklets, collect: dict, pa: int, pb: int, t0: int, t1: int) -> None:
+        """Exchange two tracks over t0..t1-1 during analysis: the store, the labels, the tracklets, the sources."""
+        va, vb = int(st.pids[pa]) + 1, int(st.pids[pb]) + 1
+        st.swap_persons(int(st.pids[pa]), int(st.pids[pb]), t0, t1)
+        lut = np.arange(256, dtype=np.uint8)
+        lut[va], lut[vb] = vb, va
+        mm = self.seglab.open_rw()
+        try:
+            for t in range(t0, t1):
+                mm[t] = lut[np.asarray(mm[t])]
+        finally:
+            mm.flush()
+            del mm
+            self.seglab.close()
+        ta, tb = tracklets[pa], tracklets[pb]
+        ma = {f: i for f, i in ta.items() if t0 <= f < t1}
+        mb = {f: i for f, i in tb.items() if t0 <= f < t1}
+        for f in ma:
+            del ta[f]
+        for f in mb:
+            del tb[f]
+        ta.update(mb)
+        tb.update(ma)
+        ida, idb = int(st.pids[pa]), int(st.pids[pb])
+        for t, fr in (collect.get("src") or {}).items():
+            if t0 <= t < t1:
+                sa, sb = fr.pop(ida, None), fr.pop(idb, None)
+                if sa is not None:
+                    fr[idb] = sa
+                if sb is not None:
+                    fr[ida] = sb
+        self._label_cache.clear()
+
+    def _add_found_people(self, st: TrackStore, tracklets, dets, pids, collect: dict, poses, a: int, b: int,
+                          cancel=None) -> list:
+        """People the finder sees on many frames whom tracking never followed (a dancer behind another: the pose
+        model, given her box, took the dancer in front, and the double was dropped). Their instances are linked
+        from frame to frame, their pose estimated with everybody else hidden, and they become tracked people."""
+        from .assoc import appearance
+        from .people import MAX_PEOPLE
+        ex = collect.get("extras") or {}
+        if not ex:
+            return []
+        chains = []
+        for t in sorted(ex):
+            recs = ex[t]
+            used = set()
+            pairs = []
+            for ci, c in enumerate(chains):
+                if t - c["last"] > 3:
+                    continue
+                for ri, r in enumerate(recs):
+                    v = iou(c["box"], r["box"])
+                    if v >= 0.3:
+                        pairs.append((v, ci, ri))
+            pairs.sort(reverse=True)
+            done_c = set()
+            for v, ci, ri in pairs:
+                if ci in done_c or ri in used:
+                    continue
+                c = chains[ci]
+                c["recs"][t] = recs[ri]
+                c["last"], c["box"] = t, recs[ri]["box"]
+                done_c.add(ci)
+                used.add(ri)
+            for ri, r in enumerate(recs):
+                if ri not in used:
+                    chains.append(dict(recs={t: r}, last=t, box=r["box"]))
+        need = max(6, int(0.15 * (b - a)))
+        chains = [c for c in chains if len(c["recs"]) >= need
+                  and len(c["recs"]) >= 0.5 * (max(c["recs"]) - min(c["recs"]) + 1)]
+        chains.sort(key=lambda c: -len(c["recs"]))
+        sx, sy = self.proxy.sx, self.proxy.sy
+        added = []
+        frames = {}
+        for c in chains:
+            if len(st.pids) >= MAX_PEOPLE + 4:
+                break
+            poses_t = {}
+            for t, rec in sorted(c["recs"].items()):
+                if cancel and cancel():
+                    raise Cancelled()
+                if t not in frames:
+                    frames[t] = analysis_view(np.asarray(self.proxy.frame(t)))
+                res = _masked_pose(frames[t], rec, poses)
+                if res is not None:
+                    poses_t[t] = (res, rec)
+            if len(poses_t) < need:
+                continue
+            existing = [q.id for q in self.cut.persons] + list(self.cut.removed) + list(st.removed) + list(st.pids)
+            pid = max(existing + [-1]) + 1
+            st.add_person(pid)
+            p = len(st.pids) - 1
+            tr = {}
+            for t, (res, rec) in poses_t.items():
+                self._write_pose(st, p, t, res, rec["box"])
+                st.present[p, t] = True
+                kp, sc = res.get("pose_rtmw_x", next(iter(res.values())))
+                avg = np.column_stack([kp[:S.K], sc[:S.K]]).astype(np.float32)
+                d = dict(box=np.asarray(rec["box"], np.float32), kp=avg, score=float(rec["score"]),
+                         app=appearance(frames[t], avg, rec["box"]), reid=None, face=None)
+                d["i"] = len(dets[t])
+                dets[t].append(d)
+                tr[t] = d["i"]
+            fr = sorted(poses_t)
+            for f0, f1 in zip(fr, fr[1:]):
+                if 1 < f1 - f0 <= 4:
+                    for f in range(f0 + 1, f1):
+                        w_ = (f - f0) / (f1 - f0)
+                        st.present[p, f] = True
+                        st.boxes[p, f] = (1 - w_) * st.boxes[p, f0] + w_ * st.boxes[p, f1]
+            tracklets.append(tr)
+            pids.append(pid)
+            added.append(pid)
+            import logging
+            logging.getLogger("contour").info("person the finder saw added: %d (%d frames)", pid, len(poses_t))
+        self._added_pids = set(added)
+        st.invalidate_cache()
+        return added
+
     def _refiner_extra(self, st: TrackStore):
         try:
             from ..learn.refiner import active_runtime, refine_measurements
@@ -1004,7 +1294,7 @@ class CutTracker:
             return None
 
     def _run_matte(self, a: int, b: int, progress, st=None, accuracy: str = "high", use_final: bool = False,
-                   cancel=None) -> None:
+                   cancel=None, repose=None, collect: Optional[dict] = None) -> None:
         from .infer import Matter
         try:
             matter = Matter()
@@ -1017,7 +1307,7 @@ class CutTracker:
                     self.matte.create()
                     self.matte.close()
                 self._seg_stats = SG.run(st, self.proxy, self.matte, self.seglab, a, b, SG.model_for(accuracy),
-                                         use_final, progress, cancel, matter)
+                                         use_final, progress, cancel, matter, repose=repose, collect=collect)
                 self._label_cache.clear()
                 return
             except Exception as e:          # no model / no memory: the RVM matte still works

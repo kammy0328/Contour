@@ -175,8 +175,79 @@ def head_priors(st, t: int, mw: int, mh: int, W: int, H: int, sx: float, sy: flo
     return out
 
 
+HAIR = True                 # hair edges of the matte follow the picture (guided filter, RVM's strands when it holds)
+HAIR_REACH = 4.0            # head radii around a visible head that count as hair
+HAIR_OUT = 0.7              # head radii outside the mask a strand may reach
+HAIR_IN = 0.25              # head radii inside the mask the edge may move in
+RVM_TRUST = 0.75            # RVM's alpha this high on the person's sure body: its strands are used
+
+
+def _guided(I: np.ndarray, p: np.ndarray, r: int, eps: float) -> np.ndarray:
+    """He's guided filter, grey guide: p's edges moved onto I's."""
+    k = (2 * r + 1, 2 * r + 1)
+    m = lambda x: cv2.boxFilter(x, -1, k, normalize=True, borderType=cv2.BORDER_REFLECT)
+    mI, mp = m(I), m(p)
+    a = (m(I * p) - mI * mp) / (m(I * I) - mI * mI + eps)
+    b = mp - a * mI
+    return m(a) * I + m(b)
+
+
+def refine_hair(alpha: np.ndarray, lab: np.ndarray, solid: np.ndarray, guide: np.ndarray,
+                rvm: Optional[np.ndarray], heads: dict) -> Tuple[np.ndarray, np.ndarray]:
+    """Around each visible head, in a band along the mask edge, the matte follows the picture: SAM's mask is 288 px
+    over the frame, so loose strands are missing outside it and the background between strands is inside it.
+    RVM's alpha (made on the frame at matte size, good at hair) is taken where it holds this person's body; then a
+    guided filter on the frame puts the edge on the picture's own edges. Only the band moves: the body inside and
+    the background outside stay as they were. Strands outside the mask take the label of the head's person."""
+    h, w = alpha.shape
+    out, lab = alpha.copy(), lab.copy()
+    I = guide.astype(np.float32)
+    for pid, (cx, cy, r, wg) in heads.items():
+        if wg < 0.4 or r < 3:
+            continue
+        R = HAIR_REACH * r
+        x0, x1 = int(max(0, cx - R)), int(min(w, cx + R + 1))
+        y0, y1 = int(max(0, cy - R)), int(min(h, cy + R + 1))
+        if x1 - x0 < 8 or y1 - y0 < 8:
+            continue
+        own = lab[y0:y1, x0:x1] == pid + 1
+        if own.sum() < 20:
+            continue
+        sl = (slice(y0, y1), slice(x0, x1))
+        ro, ri = max(2, int(HAIR_OUT * r)), max(1, int(HAIR_IN * r))
+        se = lambda q: cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * q + 1, 2 * q + 1))
+        own8 = own.astype(np.uint8)
+        outer = cv2.dilate(own8, se(ro)).astype(bool)
+        inner = cv2.erode(own8, se(ri)).astype(bool)
+        # nobody else's pixels are touched
+        others = (lab[sl] != 0) & ~own
+        band = outer & ~inner & ~others
+        yy, xx = np.mgrid[y0:y1, x0:x1].astype(np.float32)
+        near = np.clip(1.5 - np.hypot(xx - cx, yy - cy) / R * 1.5, 0.0, 1.0)     # fades out towards R
+        band &= near > 0
+        if not band.any():
+            continue
+        a0 = out[sl]
+        target = a0.copy()
+        if rvm is not None:
+            rv = rvm[sl]
+            core = cv2.erode(own8, se(max(2, int(0.5 * r)))).astype(bool)
+            if core.sum() >= 20 and float(np.mean(rv[core])) >= RVM_TRUST:
+                target = np.where(band, rv, a0)
+        rr = max(2, int(round(r / 6)))
+        g = np.clip(_guided(I[sl], target.astype(np.float32), rr, 1e-3), 0.0, 1.0)
+        # outside the mask only what RVM (or the mask's own soft edge) holds there: strands, never new blobs
+        g = np.where(own, g, np.minimum(g, target))
+        wgt = (band * near).astype(np.float32)
+        out[sl] = a0 * (1.0 - wgt) + g * wgt
+        add = band & ~own & (out[sl] >= 0.25) & (lab[sl] == 0)
+        lab[sl][add] = np.uint8(pid + 1)
+    return out, lab
+
+
 def combine(logits: List[Tuple[int, np.ndarray]], rvm: Optional[np.ndarray], shape,
-            heads: Optional[dict] = None, extra: Optional[List[np.ndarray]] = None) -> Tuple[np.ndarray, np.ndarray]:
+            heads: Optional[dict] = None, extra: Optional[List[np.ndarray]] = None,
+            guide: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
     """Per person mask logits at matte size -> (alpha uint8, labels uint8 = pid + 1).
 
     Where two people's masks overlap the owner is the larger logit. Two near-equal logits used to split a face
@@ -221,6 +292,12 @@ def combine(logits: List[Tuple[int, np.ndarray]], rvm: Optional[np.ndarray], sha
         a = np.where(inner | (solid & ~hard), 1.0, a)
         alpha = a.astype(np.float32)
         lab = np.where(solid, pids[arg] + 1, 0).astype(np.uint8)
+        if HAIR and guide is not None and heads:
+            try:
+                alpha, lab = refine_hair(alpha, lab, solid, guide, rvm, heads)
+            except Exception:
+                import traceback
+                traceback.print_exc()
         if rvm is not None:
             r = max(3, int(0.025 * max(h, w)))
             near = cv2.dilate(solid.astype(np.uint8) * 255, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1)))
@@ -249,6 +326,10 @@ def _canvas(lg: np.ndarray, rect, W: int, H: int, mw: int, mh: int) -> Optional[
 
 
 UNTRACKED = 255             # label of a person the finder saw that tracking does not follow
+DUP_DIST = 0.08             # two tracks whose joints sit this close (of the body height) carry one skeleton
+REPOSE_MIN = 0.40           # finder score an instance needs to be a body a borrowed skeleton is re-estimated on
+EXTRA_MIN_H = 0.07          # an untracked person this tall (share of the frame) can become a tracked one
+EXTRA_OVERLAP = 0.40        # ... unless this much of it is on tracked people's masks (a part of one of them)
 FIND_MIN = 0.30             # a finder instance this sure can be a tracked person (tracking vouches for it)
 FIND_SURE = 0.50            # this sure, it is a person even when tracking does not follow it
 MATCH_MIN = 0.35            # joints inside + box overlap a person needs with an instance
@@ -332,8 +413,116 @@ def _assign(pr, insts) -> dict:
     return out
 
 
+def record(inst, W: int, H: int, side: int = 128) -> Optional[dict]:
+    """A compact copy of a finder instance: box (proxy px), score, mask over the box (bool, long side <= side)."""
+    x0, y0, x1, y1 = [float(v) for v in inst["box"]]
+    x0, y0, x1, y1 = max(0.0, x0), max(0.0, y0), min(float(W), x1), min(float(H), y1)
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return None
+    rx0, ry0, rx1, ry1 = inst["rect"]
+    lg = inst["lg"]
+    k = side / max(x1 - x0, y1 - y0)
+    cw, ch = max(4, int(round((x1 - x0) * k))), max(4, int(round((y1 - y0) * k)))
+    xs = ((x0 + (np.arange(cw) + 0.5) * (x1 - x0) / cw) - rx0) / max(rx1 - rx0, 1e-6) * lg.shape[1] - 0.5
+    ys = ((y0 + (np.arange(ch) + 0.5) * (y1 - y0) / ch) - ry0) / max(ry1 - ry0, 1e-6) * lg.shape[0] - 0.5
+    mx, my = np.meshgrid(xs.astype(np.float32), ys.astype(np.float32))
+    m = cv2.remap(lg.astype(np.float32), mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=-20.0) > 0
+    if not m.any():
+        return None
+    return dict(box=np.array([x0, y0, x1, y1], np.float32), score=float(inst["score"]), mask=m)
+
+
+def record_mask(rec: dict) -> Tuple[Tuple[int, int, int, int], np.ndarray]:
+    """(x0, y0, x1, y1) int proxy px and the bool mask at that box's size."""
+    x0, y0, x1, y1 = [int(round(float(v))) for v in rec["box"]]
+    x1, y1 = max(x1, x0 + 2), max(y1, y0 + 2)
+    m = cv2.resize(rec["mask"].astype(np.uint8), (x1 - x0, y1 - y0), interpolation=cv2.INTER_LINEAR) > 0
+    return (x0, y0, x1, y1), m
+
+
+def _kp_proxy(st, p: int, t: int, sx: float, sy: float, use_final: bool) -> Optional[np.ndarray]:
+    kp = _kp_for(st, p, t, use_final)
+    if kp is None:
+        return None
+    kp = kp.copy()
+    kp[:, 0] *= sx
+    kp[:, 1] *= sy
+    return kp
+
+
+def _same_skeleton(ka, kb, h: float) -> Optional[np.ndarray]:
+    """The joints two tracks share when they carry one skeleton (>= 4 sure joints within DUP_DIST of the body
+    height), else None."""
+    if ka is None or kb is None or h <= 0:
+        return None
+    ok = np.isfinite(ka[:, :2]).all(1) & np.isfinite(kb[:, :2]).all(1) & (np.nan_to_num(ka[:, 2]) >= 0.3) \
+        & (np.nan_to_num(kb[:, 2]) >= 0.3)
+    if ok.sum() < 4:
+        return None
+    d = np.hypot(*(ka[ok, :2] - kb[ok, :2]).T)
+    if float(np.median(d)) >= DUP_DIST * h:
+        return None
+    return 0.5 * (ka[ok, :2] + kb[ok, :2])
+
+
+def _grid(ins, W: int, H: int, gw: int = 160) -> np.ndarray:
+    """An instance's mask on a coarse grid over the whole frame (for overlaps between instances)."""
+    gh = max(4, int(round(gw * H / W)))
+    cv = _canvas(ins["lg"], ins["rect"], W, H, gw, gh)
+    return np.zeros((gh, gw), bool) if cv is None else cv > 0
+
+
+def _borrowed(st, t, pr, insts, assigned, merged, sx, sy, use_final, W: int, H: int) -> List[Tuple[int, int]]:
+    """Tracks that carry another track's skeleton (a face found behind someone, given that someone's body by the
+    pose model): [(index in pr, instance index)] with the instance the borrower's own box is on. `assigned` is
+    updated: the borrower takes that instance, the owner the one the skeleton is in."""
+    out = []
+    kps = [_kp_proxy(st, p, t, sx, sy, use_final) for p, bx, pos, neg in pr]
+    for i in range(len(pr)):
+        for j in range(i + 1, len(pr)):
+            h = max(pr[i][1][3] - pr[i][1][1], pr[j][1][3] - pr[j][1][1])
+            sh = _same_skeleton(kps[i], kps[j], h)
+            if sh is None:
+                continue
+            ins_sc = [_inside(sh, ins) for ins in insts]
+            if not ins_sc or max(ins_sc) < 0.5:
+                continue
+            kS = int(np.argmax(ins_sc))
+            ii = [_box_iou(pr[q][1], insts[kS]["box"]) for q in (i, j)]
+            owner, borrower = (i, j) if ii[0] >= ii[1] else (j, i)
+            if any(borrower == q for q, _k in out):
+                continue
+            bbx = pr[borrower][1]
+            used = set(assigned.values()) | set(merged) | {kS}
+            cur = assigned.get(borrower)
+            best, kb = 0.25, -1
+            gS = None
+            for k, ins in enumerate(insts):
+                if k == kS or ins["score"] < REPOSE_MIN or (k in used and k != cur):
+                    continue
+                v = _box_iou(bbx, ins["box"])
+                if v <= best:
+                    continue
+                # a part of the person the skeleton is on (an arm, the hair) is not somebody else
+                if gS is None:
+                    gS = _grid(insts[kS], W, H)
+                gk = _grid(ins, W, H)
+                if gk.any() and float((gk & gS).sum()) >= 0.5 * float(gk.sum()):
+                    continue
+                best, kb = v, k
+            if kb < 0:
+                continue
+            assigned[borrower] = kb
+            holders = {v for q, v in assigned.items() if q != owner}
+            if assigned.get(owner) is None and kS not in holders:
+                assigned[owner] = kS
+            out.append((borrower, kb))
+    return out
+
+
 def decode_frame(seg, rgb, st, t: int, sx: float, sy: float, W: int, H: int, mw: int, mh: int,
-                 use_final: bool, finder=None, heads: Optional[dict] = None) -> Tuple[dict, List[np.ndarray]]:
+                 use_final: bool, finder=None, heads: Optional[dict] = None, info: Optional[dict] = None,
+                 repose: Optional[Callable] = None) -> Tuple[dict, List[np.ndarray]]:
     """Everybody on frame t: (pid -> dict(p, bx, pos, neg, canvas (matte size mask logits), src), extra).
 
     With `finder` (SAM 3.1's "person" finder): the frame is first split into the people in it, each a mask of their
@@ -341,7 +530,11 @@ def decode_frame(seg, rgb, st, t: int, sx: float, sy: float, W: int, H: int, mw:
     takes the instance their visible joints and box fall in (src "find"); people small in the frame take theirs from
     a close-up. Only a tracked person the finder has nothing for is decoded from clicks as before (src "click"), and
     then never over a found person; one that is left with next to nothing (a track sitting on someone else) is
-    dropped. extra: the people the finder is sure of that tracking does not follow."""
+    dropped. extra: the people the finder is sure of that tracking does not follow.
+
+    info (a dict, filled when given): "repose": [(pid, p, record)] tracks that carried someone else's skeleton and
+    now have the instance their own box is on (the caller re-estimates their pose there); "extras": [record] the
+    people nobody tracks, tall enough and not a part of a tracked person."""
     pr = prompts(st, t, sx, sy, W, H, use_final)
     dec, extra = {}, []
     if not pr:
@@ -382,7 +575,37 @@ def decode_frame(seg, rgb, st, t: int, sx: float, sy: float, W: int, H: int, mw:
             if best is not None:
                 assigned[i] = best
                 free.remove(best)
-    small = sorted([i for i, x in enumerate(pr) if (x[1][3] - x[1][1]) < SMALL_PERSON * H],
+    reposed = {}
+    if repose is not None and insts and len(pr) > 1:
+        before = dict(assigned)
+        for i, k in _borrowed(st, t, pr, insts, assigned, merged, sx, sy, use_final, W, H):
+            rec = record(insts[k], W, H)
+            ok = False
+            if rec is not None:
+                try:
+                    ok = bool(repose(t, int(pr[i][0]), rgb, rec))
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+            if ok:
+                reposed[i] = k
+                if info is not None:
+                    info.setdefault("repose", []).append((int(st.pids[pr[i][0]]), int(pr[i][0]), rec))
+            else:                                   # no pose of its own there: as before
+                if before.get(i) is None:
+                    assigned.pop(i, None)
+                else:
+                    assigned[i] = before[i]
+        if reposed:
+            # the owners keep what the skeleton is in; drop any instance given twice by the steps above
+            seen = {}
+            for i in sorted(assigned, key=lambda q: (q not in reposed, q)):
+                k = assigned[i]
+                if k in seen:
+                    assigned.pop(i)
+                else:
+                    seen[k] = i
+    small = sorted([i for i, x in enumerate(pr) if (x[1][3] - x[1][1]) < SMALL_PERSON * H and i not in reposed],
                    key=lambda i: pr[i][1][3] - pr[i][1][1])[:MAX_CLOSEUPS]
     taken = set(assigned.values()) | set(merged)
     inst_cv = [None] * len(insts)
@@ -427,9 +650,19 @@ def decode_frame(seg, rgb, st, t: int, sx: float, sy: float, W: int, H: int, mw:
     if insts:
         # a click mask never over a found person (someone else's, or one nobody tracks)
         found = [d["canvas"] for d in dec.values() if d["src"] in ("find", "pair")]
+        fmask = np.max(np.stack(found), 0) > 0 if found else None
         for k, ins in enumerate(insts):
             if k not in taken and ins["score"] >= FIND_SURE and icv(k) is not None:
                 extra.append(icv(k))
+                tracked = any(_box_iou(bx, ins["box"]) >= 0.5 or (len(pos) >= 3 and _inside(pos, ins) >= 0.6)
+                              for p_, bx, pos, neg in pr)
+                if info is not None and not tracked and (ins["box"][3] - ins["box"][1]) >= EXTRA_MIN_H * H:
+                    m = icv(k) > 0
+                    n_ = int(m.sum())
+                    if n_ and (fmask is None or float((m & fmask).sum()) <= EXTRA_OVERLAP * n_):
+                        rec = record(ins, W, H)
+                        if rec is not None:
+                            info.setdefault("extras", []).append(rec)
         others = found + extra
         if others:
             omax = np.max(np.stack(others), 0)
@@ -455,10 +688,14 @@ def decode_frame(seg, rgb, st, t: int, sx: float, sy: float, W: int, H: int, mw:
 
 def run(st, proxy, matte, seglab, a: int, b: int, seg_key: str, use_final: bool,
         progress: Optional[Callable[[float, str], None]] = None, cancel: Optional[Callable[[], bool]] = None,
-        matter=None) -> dict:
+        matter=None, repose: Optional[Callable] = None, collect: Optional[dict] = None) -> dict:
     """Fill the matte (and the person labels) for frames a..b. Returns pid -> {"find", "pair", "click", "none"}:
     on how many frames the person's mask came from the finder, from clicks inside a pair, from clicks alone, or was
-    left out (a track the finder has nobody for is not a person: a shadow, a reflection)."""
+    left out (a track the finder has nobody for is not a person: a shadow, a reflection).
+
+    repose(t, p, rgb, record) -> bool: called for a track that carried someone else's skeleton, to estimate its
+    pose again on the instance it now has (analysis only). collect: filled with "src" {t: {pid: source}} and
+    "extras" {t: [record]} (the people nobody tracks) for the caller's fixes after the matte."""
     stats: dict = {}
     from .infer import make_segmenter
     try:
@@ -494,17 +731,31 @@ def run(st, proxy, matte, seglab, a: int, b: int, seg_key: str, use_final: bool,
             # dark or colour-lit frames: what SAM and RVM see only (never the output)
             rgb = analysis_view(np.asarray(proxy.frame(t)))
             rvm = None
+            small = cv2.resize(rgb, (mw, mh), interpolation=cv2.INTER_AREA)
             if matter is not None:
-                rvm = matter(cv2.resize(rgb, (mw, mh), interpolation=cv2.INTER_AREA))
+                rvm = matter(small)
+            guide = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
             heads = head_priors(st, t, mw, mh, W, H, sx, sy, use_final)
-            dec, extra = decode_frame(seg, rgb, st, t, sx, sy, W, H, mw, mh, use_final, finder, heads)
+            info = {} if (finder is not None and (repose is not None or collect is not None)) else None
+            dec, extra = decode_frame(seg, rgb, st, t, sx, sy, W, H, mw, mh, use_final, finder, heads, info,
+                                      repose if finder is not None else None)
+            if info and info.get("repose"):
+                heads = head_priors(st, t, mw, mh, W, H, sx, sy, use_final)
+                if collect is not None:
+                    collect.setdefault("reposed", []).extend((t, pid) for pid, p, rec in info["repose"])
             logits = [(pid, d["canvas"]) for pid, d in dec.items()]
             if finder is not None:
+                fr = {}
                 for p in np.nonzero(st.present[:, t])[0]:
                     pid = int(st.pids[p])
                     s_ = stats.setdefault(pid, {"find": 0, "pair": 0, "click": 0, "none": 0})
-                    s_[dec[pid]["src"] if pid in dec else "none"] += 1
-            al, lb = combine(logits, rvm, (mh, mw), heads, extra)
+                    src = dec[pid]["src"] if pid in dec else "none"
+                    s_[src] += 1
+                    fr[pid] = src
+                if collect is not None:
+                    collect.setdefault("src", {})[t] = fr
+                    collect.setdefault("extras", {})[t] = list((info or {}).get("extras", []))
+            al, lb = combine(logits, rvm, (mh, mw), heads, extra, guide)
             mm[t] = al
             lm[t] = lb
             if progress:
@@ -516,6 +767,16 @@ def run(st, proxy, matte, seglab, a: int, b: int, seg_key: str, use_final: bool,
         matte.close()
         seglab.close()
     return stats
+
+
+def stats_from(src: dict) -> dict:
+    """pid -> counts per mask source, from per-frame sources {t: {pid: source}}."""
+    out: dict = {}
+    for fr in (src or {}).values():
+        for pid, s_ in fr.items():
+            c = out.setdefault(int(pid), {"find": 0, "pair": 0, "click": 0, "none": 0})
+            c[s_] = c.get(s_, 0) + 1
+    return out
 
 
 def unconfirmed(stats: dict, min_frames: int = 8, share: float = 0.2) -> set:
