@@ -438,7 +438,11 @@ class FrameReader:
         if target_rgb and info.chroma not in ("rgb", "gray"):
             scale_opts += [f"in_color_matrix={swscale_matrix(info)}", f"in_range={info.color_range}", "out_range=pc"]
         if scale_opts:
-            flags = "area" if size else "bicubic"
+            # "area" only where the picture is made smaller: with no resize, ffmpeg 9's swscale converts 8-bit
+            # 4:2:0 to rgb48 with its colours wrong under "area" (green near nothing: a 1920x1080 H.264 source read
+            # at its own size, lngshot v3); "bicubic" there does nothing but pick the right converter
+            resize = bool(size) and (w, h) != (info.width, info.height)
+            flags = "area" if resize else "bicubic"
             vf.append("scale=" + ":".join(scale_opts) + f":flags={flags}+accurate_rnd+full_chroma_int+full_chroma_inp")
         cmd = [ffmpeg_bin(), "-hide_banner", "-v", "error", "-nostdin"]
         cmd += _input_args(info, start)
