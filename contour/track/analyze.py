@@ -1301,10 +1301,18 @@ class CutTracker:
             bxs = np.array([rec["box"] for t, (res, rec) in sorted(poses_t.items())], np.float32)
             hh = float(np.median(bxs[:, 3] - bxs[:, 1]))
             span = float(np.max(np.ptp(bxs, axis=0))) / max(hh, 1.0)
-            if np.median(qs) < 0.4 or big > 0.5 * len(poses_t) or span < 0.03:
+            # pose scores are not 0..1 (they depend on the model): against the tracked people of this shot
+            ref = st.raw.get("pose_rtmw_x")
+            if ref is not None:
+                rr = ref[:len(st.pids), a:b, :, 2]
+                rr = rr[np.isfinite(rr)]
+                ref_q = float(np.median(rr)) if rr.size else 0.0
+            else:
+                ref_q = 0.0
+            if np.median(qs) < 0.6 * ref_q or big > 0.5 * len(poses_t) or span < 0.03:
                 import logging
-                logging.getLogger("contour").info("finder instance not added (pose %.2f, foreground %d/%d, motion %.3f)",
-                                                  float(np.median(qs)), big, len(poses_t), span)
+                logging.getLogger("contour").info("finder instance not added (pose %.2f of %.2f, foreground %d/%d, motion %.3f)",
+                                                  float(np.median(qs)), ref_q, big, len(poses_t), span)
                 continue
             existing = [q.id for q in self.cut.persons] + list(self.cut.removed) + list(st.removed) + list(st.pids)
             pid = max(existing + [-1]) + 1
