@@ -227,7 +227,8 @@ class CutTracker:
                 lab = lut[seg]
                 al = self.matte.get(t)
                 if al is not None:
-                    miss = (lab < 0) & (al >= 128)
+                    # 255: a person nobody tracks (an extra): stays nobody's
+                    miss = (lab < 0) & (al >= 128) & (np.asarray(seg) != 255)
                     if miss.any():
                         kps = [self.store.kp(pid, t) for pid in self.store.pids]
                         sk = B.label_map(kps, (self.matte.h, self.matte.w),

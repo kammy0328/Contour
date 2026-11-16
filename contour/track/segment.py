@@ -228,9 +228,12 @@ def combine(logits: List[Tuple[int, np.ndarray]], rvm: Optional[np.ndarray], sha
             alpha = np.maximum(alpha, rvm * (1.0 - np.clip(near, 0, 1)))
     elif rvm is not None:
         alpha = rvm
-    # people the finder saw that tracking does not follow (extras, a figure on a poster): in the matte, nobody's
+    # people the finder saw that tracking does not follow (extras): in the matte, and marked UNTRACKED in the labels
+    # so that nobody's retouch takes them (the label lookup gives an unlabelled matte pixel to the nearest skeleton)
     for e in (extra or []):
-        alpha = np.maximum(alpha, np.where(lab == 0, np.clip(0.5 + e / 3.0, 0.0, 1.0), 0.0))
+        ea = np.clip(0.5 + e / 3.0, 0.0, 1.0)
+        alpha = np.maximum(alpha, np.where(lab == 0, ea, 0.0))
+        lab = np.where((lab == 0) & (e > 0), np.uint8(UNTRACKED), lab).astype(np.uint8)
     return np.clip(alpha * 255 + 0.5, 0, 255).astype(np.uint8), lab
 
 
@@ -245,6 +248,7 @@ def _canvas(lg: np.ndarray, rect, W: int, H: int, mw: int, mh: int) -> Optional[
     return canvas
 
 
+UNTRACKED = 255             # label of a person the finder saw that tracking does not follow
 FIND_MIN = 0.30             # a finder instance this sure can be a tracked person (tracking vouches for it)
 FIND_SURE = 0.50            # this sure, it is a person even when tracking does not follow it
 MATCH_MIN = 0.35            # joints inside + box overlap a person needs with an instance
