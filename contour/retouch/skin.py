@@ -195,7 +195,11 @@ def build_skin_model(rgb_frames: List[np.ndarray], faces: List[np.ndarray]) -> O
     X = X[:, 1:3]
     med = np.median(X, 0)
     d = np.linalg.norm(X - med, axis=1)
-    X = X[d < np.percentile(d, 85)]
+    keep = d <= np.percentile(d, 85)          # <=: flat chroma (clipped or one-colour grade) keeps its pixels
+    if keep.sum() >= 20:
+        X = X[keep]
+    if len(X) < 20:
+        return None
     mean = X.mean(0)
     # never tighter than a few code values: graded footage (one coloured light on everything) has very little
     # chroma spread, and a tight model turns 8-bit steps into a blotchy mask
