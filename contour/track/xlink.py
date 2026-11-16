@@ -345,6 +345,7 @@ def copy_settings(project, src_cut_id: str, pid: int, scope: str = "beauty") -> 
                 dst.amounts[k] = _copy.deepcopy(cv)
                 dst.amounts[k].keys = {}           # frame keys belong to the source cut's frames
         dst.skin_detail = src.skin_detail
+        dst.skin_basic = dict(getattr(src, "skin_basic", {}) or {})
         c2.person(int(p2)).role = q.role if q.role == "target" else c2.person(int(p2)).role
         n += 1
     return n

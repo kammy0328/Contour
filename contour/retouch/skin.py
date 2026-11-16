@@ -210,20 +210,36 @@ def build_skin_model(rgb_frames: List[np.ndarray], faces: List[np.ndarray]) -> O
 DEFAULT_MODEL = (np.array([150.0, 112.0]), np.linalg.inv(np.diag([90.0, 70.0])))
 
 
-def skin_probability(rgb_u8: np.ndarray, model) -> np.ndarray:
-    m = model if model is not None else DEFAULT_MODEL
-    mean, icov = m[0], m[1]
-    yref = m[2] if len(m) > 2 else None
+import threading as _thr_planes
+_PLANE_TLS = _thr_planes.local()    # each thread keeps the planes of the frame it is on
+
+
+def _chroma_planes(rgb_u8: np.ndarray):
+    """Luma and the smoothed Cr, Cb of a frame, as float32. A crowd frame asks for them once per person (the colour
+    model is per person, the planes are not): kept for the frame the thread is working on, the same values as before."""
+    key = (rgb_u8.__array_interface__["data"][0], rgb_u8.shape, hash(rgb_u8[::7, ::11].tobytes()))
+    ent = getattr(_PLANE_TLS, "planes", None)
+    if ent is not None and ent[0] == key:
+        return ent[1]
     ycc = _ycrcb(rgb_u8).astype(np.float32)
     # chroma a little smoothed: 8-bit chroma steps must not turn into a blotchy mask
     sig = max(0.8, 0.0012 * rgb_u8.shape[0])
     cr = cv2.GaussianBlur(ycc[..., 1], (0, 0), sig)
     cb = cv2.GaussianBlur(ycc[..., 2], (0, 0), sig)
+    out = (np.ascontiguousarray(ycc[..., 0]), cr, cb)
+    _PLANE_TLS.planes = (key, out)
+    return out
+
+
+def skin_probability(rgb_u8: np.ndarray, model) -> np.ndarray:
+    m = model if model is not None else DEFAULT_MODEL
+    mean, icov = m[0], m[1]
+    yref = m[2] if len(m) > 2 else None
+    y, cr, cb = _chroma_planes(rgb_u8)
     d0, d1 = cr - mean[0], cb - mean[1]
     m2 = icov[0, 0] * d0 * d0 + 2 * icov[0, 1] * d0 * d1 + icov[1, 1] * d1 * d1
     md = np.sqrt(np.maximum(m2, 0))
     prob = np.exp(-0.5 * np.maximum(md - 1.6, 0) ** 2)
-    y = ycc[..., 0]
     if yref is not None and yref > 8:
         # deep shadows, pupils, dark hair: dark against this face's own skin (dark grades stay skin)
         prob *= np.clip((y - 0.30 * yref) / (0.25 * yref), 0, 1)
@@ -727,8 +743,9 @@ def _neck_lines_back(out: np.ndarray, rgb_u8: np.ndarray, lm: np.ndarray, Wf: fl
 
 def skin_mask(job: SkinJob, rgb_proxy: np.ndarray, sx: float, sy: float, person_alpha: Optional[np.ndarray],
               model, parse: Optional[dict] = None, body_region: Optional[np.ndarray] = None,
-              cover: Optional[np.ndarray] = None) -> np.ndarray:
-    """float32 0..1 at proxy resolution. body_region: the chosen body regions (neck, shoulders, arms, hands,
+              cover: Optional[np.ndarray] = None, prob0: Optional[np.ndarray] = None) -> np.ndarray:
+    """float32 0..1 at proxy resolution. prob0: the face's skin probability the caller already has for this very
+    face, model and parse (the engine's frame state): not computed a second time. body_region: the chosen body regions (neck, shoulders, arms, hands,
     legs) of this person, 0..1, added to the face. cover: an arm, leg or hand in front of the face (taken out)."""
     h, w = rgb_proxy.shape[:2]
     lm = None
@@ -736,8 +753,8 @@ def skin_mask(job: SkinJob, rgb_proxy: np.ndarray, sx: float, sy: float, person_
         lm = job.face.copy()
         lm[:, 0] *= sx
         lm[:, 1] *= sy
-    prob = face_skin_probability(rgb_proxy, model, lm if job.face_w > 0.3 else None,
-                                 parse if job.face_w > 0.3 else None)
+    prob = prob0 if prob0 is not None else face_skin_probability(rgb_proxy, model, lm if job.face_w > 0.3 else None,
+                                                                 parse if job.face_w > 0.3 else None)
     if cover is not None:
         prob = prob * (1.0 - cover)
     from ..core.project import scope_set

@@ -133,6 +133,9 @@ class PartParams:
     # which side a body point edit means: 'person' (1.4: the person's own side, stays put when she turns
     # around) or 'measured' (1.3 projects: the side as measured in the picture, kept as it was made)
     body_sides: str = "person"
+    # the skin tab's basic adjustment the detail sliders were last set from: {"level": light|std|strong,
+    # "remove": [mouth, naso, acne]}; empty once any skin or colour value is changed by hand (shown unselected)
+    skin_basic: Dict[str, object] = field(default_factory=dict)
 
     def feather_factor(self) -> float:
         """0..100 -> 0.5..2.5 (50 = 1.5)."""
@@ -173,7 +176,9 @@ class PartParams:
                 "strength": self.strength.to_dict(), "skin_detail": self.skin_detail, "skin_scope": self.skin_scope,
                 "grain_size": self.grain_size, "feather": self.feather, "blemish_size": self.blemish_size, "cloth": self.cloth,
                 "sculpt": {str(k): list(v) for k, v in self.sculpt.items()},
-                "body_sculpt": dict(self.body_sculpt), "body_sides": self.body_sides}
+                "body_sculpt": dict(self.body_sculpt), "body_sides": self.body_sides,
+                **({"skin_basic": {"level": self.skin_basic.get("level", "std"),
+                                   "remove": list(self.skin_basic.get("remove", []))}} if self.skin_basic else {})}
 
     @classmethod
     def from_dict(cls, d) -> "PartParams":
@@ -206,6 +211,9 @@ class PartParams:
         p.sculpt = {int(k): [float(v[0]), float(v[1])] for k, v in (d.get("sculpt") or {}).items()}
         p.body_sculpt = {str(k): float(v) for k, v in (d.get("body_sculpt") or {}).items()}
         p.body_sides = d.get("body_sides") or ("measured" if p.body_sculpt else "person")
+        sb = d.get("skin_basic") or {}
+        if isinstance(sb, dict) and sb.get("level") in ("light", "std", "strong"):
+            p.skin_basic = {"level": sb["level"], "remove": [str(x) for x in (sb.get("remove") or [])]}
         return p
 
     def copy_static(self, frame: float) -> "PartParams":
@@ -225,6 +233,8 @@ class PartParams:
         p.sculpt = {k: list(v) for k, v in self.sculpt.items()}
         p.body_sculpt = dict(self.body_sculpt)
         p.body_sides = self.body_sides
+        p.skin_basic = {"level": self.skin_basic["level"], "remove": list(self.skin_basic.get("remove", []))} \
+            if self.skin_basic else {}
         return p
 
 

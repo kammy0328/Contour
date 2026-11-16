@@ -1,4 +1,4 @@
-"""Right panel: 보정 · 추적 · 보호 · QC · 출력."""
+"""Right panel: 피부 · 몸매 · 추적 · 보호 · 출력."""
 from __future__ import annotations
 
 import time
@@ -44,11 +44,16 @@ class _Tab(QWidget):
 # =========================================================================== 보정
 
 class ReshapeTab(_Tab):
-    _expanded = {"skin": True}          # remembered while the app runs
+    """피부 (part="skin": basic and detail adjustment of the skin and colour retouch) or 몸매 (part="body": every
+    shape change). Both start with the people of the cut and the selected person's role and presets."""
+    _expanded = {"skin": True, "color": False}  # remembered while the app runs
+    _view = "basic"                             # skin tab: basic or detail, remembered while the app runs
+    SKIN_GROUPS = ("skin", "color")
 
-    def __init__(self, ctl):
+    def __init__(self, ctl, part: str = "body"):
         super().__init__(ctl)
         from ..core.params import GROUPS, PARAMS, WIDTH_KEYS, PARAM
+        self.part = part
         self.chips_box = QWidget()
         self.chips = Wd.FlowLayout(self.chips_box)
         self.add(Wd.Section("인물"))
@@ -77,30 +82,55 @@ class ReshapeTab(_Tab):
         pw = QWidget()
         pw.setLayout(pr)
         pl.addWidget(pw)
-        self.add(Wd.Section("방식"))
-        self.mode = Wd.Segmented([("warp", "워프"), ("separate", "분리 + 배경 복원")])
-        self.mode.changed.connect(self.ctl.set_mode)
-        self.mode.setToolTip("워프: 주변 배경까지 자연스럽게 함께 변형 (기본)\n분리: 인물만 변형하고 드러난 배경은 이웃 프레임에서 복원")
-        self.add(self.mode)
-        # overall strength
-        self.strength = Wd.ParamRow("strength", "전체 강도", 0, 150, 1, "pct", 100)
-        self.strength.name.setToolTip("몸·얼굴·머리 모양 변화 전체에 곱해지는 강도 (피부·색 보정은 제외)")
-        self.strength.changed.connect(lambda k, v: self.ctl.param_changed("__strength__", v, False))
-        self.strength.committed.connect(lambda k, v: self.ctl.param_changed("__strength__", v, True))
-        self.strength.keyToggled.connect(lambda k: self.ctl.toggle_param_key("__strength__"))
-        self.add(self.strength)
-        self.feather = Wd.ParamRow("feather", "경계 부드러움", 0, 100, 1, "pct", 50)
-        self.feather.name.setToolTip("모양 보정이 주변으로 사라지는 폭. 높을수록 경계가 부드럽고 넓게 퍼지며, "
-                                     "낮을수록 보정한 부위에만 좁게 들어갑니다 (얼굴·머리·몸·피부 영역 모두)")
-        self.feather.changed.connect(lambda k, v: self.ctl.set_feather(v, False))
-        self.feather.committed.connect(lambda k, v: self.ctl.set_feather(v, True))
-        self.add(self.feather)
-        self.lay.addSpacing(6)
+        # widgets only one of the two tabs has
+        self.mode = self.strength = self.feather = None
+        self.skin_detail = self.grain_size = self.blemish_size = self.skin_scope = None
+        self.sculpt_btn = self.sculpt_clear = self.body_btn = self.body_clear = None
+        self.face_note = self.parts_btn = self.parts_info = self.cloth_keep = None
+        self.level = None
+        self.switches: Dict[str, Wd.Segmented] = {}
+        self.wrows: Dict[str, Wd.ParamRow] = {}
+        add = self.add
+        if part == "body":
+            self.add(Wd.Section("방식"))
+            self.mode = Wd.Segmented([("warp", "워프"), ("separate", "분리 + 배경 복원")])
+            self.mode.changed.connect(self.ctl.set_mode)
+            self.mode.setToolTip("워프: 주변 배경까지 자연스럽게 함께 변형 (기본)\n분리: 인물만 변형하고 드러난 배경은 이웃 프레임에서 복원")
+            self.add(self.mode)
+            # overall strength
+            self.strength = Wd.ParamRow("strength", "전체 강도", 0, 150, 1, "pct", 100)
+            self.strength.name.setToolTip("몸·얼굴·머리 모양 변화 전체에 곱해지는 강도 (피부·색 보정은 제외)")
+            self.strength.changed.connect(lambda k, v: self.ctl.param_changed("__strength__", v, False))
+            self.strength.committed.connect(lambda k, v: self.ctl.param_changed("__strength__", v, True))
+            self.strength.keyToggled.connect(lambda k: self.ctl.toggle_param_key("__strength__"))
+            self.add(self.strength)
+            self.feather = Wd.ParamRow("feather", "경계 부드러움", 0, 100, 1, "pct", 50)
+            self.feather.name.setToolTip("모양 보정이 주변으로 사라지는 폭. 높을수록 경계가 부드럽고 넓게 퍼지며, "
+                                         "낮을수록 보정한 부위에만 좁게 들어갑니다 (얼굴·머리·몸·피부 영역 모두)")
+            self.feather.changed.connect(lambda k, v: self.ctl.set_feather(v, False))
+            self.feather.committed.connect(lambda k, v: self.ctl.set_feather(v, True))
+            self.add(self.feather)
+            self.lay.addSpacing(6)
+        else:
+            self.add(Wd.Section("피부 보정"))
+            self.view = Wd.Segmented([("basic", "기본 조정"), ("detail", "세부 조정")], current=self._view)
+            self.view.changed.connect(self._show_view)
+            self.add(self.view)
+            self.basic_box = self._basic_box()
+            self.add(self.basic_box)
+            self.detail_box = QWidget()
+            dl = QVBoxLayout(self.detail_box)
+            dl.setContentsMargins(0, 6, 0, 0)
+            dl.setSpacing(4)
+            self.add(self.detail_box)
+            add = dl.addWidget
         # groups
         self.rows: Dict[str, Wd.ParamRow] = {}
         self.groups: Dict[str, tuple] = {}
         unit_map = {"%": "%", "pct": "pct", "deg": "deg"}
         for gkey, title, hint in GROUPS:
+            if (gkey in self.SKIN_GROUPS) != (part == "skin"):
+                continue
             head = Wd.GroupHeader(title, hint, expanded=self._expanded.get(gkey, False))
             box = QWidget()
             bl = QVBoxLayout(box)
@@ -133,11 +163,12 @@ class ReshapeTab(_Tab):
             box.setVisible(head.isChecked())
             head.toggled.connect(lambda on, b=box, k=gkey: (b.setVisible(on), self._expanded.__setitem__(k, on)))
             self.groups[gkey] = (head, box)
-            self.add(head)
-            self.add(box)
+            add(head)
+            add(box)
         btns = QHBoxLayout()
-        reset = Wd.button("초기화", "ghost", "refresh-cw")
-        reset.clicked.connect(self.ctl.reset_params)
+        reset = Wd.button("초기화", "ghost", "refresh-cw",
+                          "이 인물의 피부·색 보정 값을 처음으로" if part == "skin" else "이 인물의 몸매·얼굴형 값을 처음으로")
+        reset.clicked.connect(lambda: self.ctl.reset_params(part))
         copy = Wd.button("다른 컷에 복사", "", "copy")
         copy.clicked.connect(self.ctl.copy_settings_dialog)
         btns.addWidget(reset)
@@ -152,9 +183,71 @@ class ReshapeTab(_Tab):
         # colour grain only means something once there is grain
         if "grain" in self.rows and "grain_color" in self.rows:
             self.rows["grain"].changed.connect(lambda k, v: self._grain_gate(v))
-        self.strength.name.setFixedWidth(64)
-        self.feather.name.setFixedWidth(64)
-        self._retain(self.feather)
+        if self.strength is not None:
+            self.strength.name.setFixedWidth(64)
+        if self.feather is not None:
+            self.feather.name.setFixedWidth(64)
+            self._retain(self.feather)
+        if part == "skin":
+            self._show_view(self._view)
+
+    # ---- skin: basic adjustment
+    def _basic_box(self):
+        from ..core.params import SKIN_LEVELS, SKIN_REMOVE
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 8, 0, 4)
+        v.setSpacing(6)
+        v.addWidget(Wd.label("보정 강도", "", 12))
+        self.level = Wd.Segmented(SKIN_LEVELS)
+        self.level.set_current("")
+        self.level.setToolTip("피부결과 번들거림·다크서클·홍조·목주름·목 닭살을 한 번에.\n"
+                              "표준은 엔진의 기준 보정 정도입니다")
+        self.level.changed.connect(lambda k: self.ctl.apply_skin_basic(level=k))
+        v.addWidget(self.level)
+        self.level_info = Wd.label("", "Faint", 11)
+        self.level_info.setWordWrap(True)
+        v.addWidget(self.level_info)
+        v.addSpacing(4)
+        tips = {"mouth": "입꼬리 옆 주름", "naso": "코 옆에서 입가로 내려오는 주름",
+                "acne": "여드름·트러블·점처럼 주변보다 어둡거나 붉은 작은 점 (세부 조정의 잡티)"}
+        for sw, key, lab in SKIN_REMOVE:
+            seg = Wd.Segmented([("keep", "보호"), ("remove", "제거")], compact=True)
+            seg.set_current("")
+            seg.setFixedWidth(132)
+            seg.changed.connect(lambda k, sw=sw: self.ctl.apply_skin_basic(switch=(sw, k == "remove")))
+            v.addWidget(Wd.FieldRow(lab, seg, tips.get(sw, "")))
+            self.switches[sw] = seg
+        self.basic_note = Wd.label("고른 값은 세부 조정 슬라이더에 그대로 들어갑니다. 세부 조정에서 값을 바꾸면 "
+                                   "여기 선택이 해제됩니다.", "Faint", 11)
+        self.basic_note.setWordWrap(True)
+        v.addSpacing(2)
+        v.addWidget(self.basic_note)
+        return w
+
+    def _show_view(self, key: str):
+        ReshapeTab._view = key
+        self.view.set_current(key)
+        self.basic_box.setVisible(key == "basic")
+        self.detail_box.setVisible(key == "detail")
+
+    def _fill_basic(self, pp, enabled: bool):
+        from ..core.params import skin_basic_values, PARAM
+        sb = (getattr(pp, "skin_basic", None) or {}) if pp is not None else {}
+        self.level.set_current(sb.get("level", "") if sb else "")
+        rm = set(sb.get("remove", [])) if sb else set()
+        for sw, seg in self.switches.items():
+            seg.set_current(("remove" if sw in rm else "keep") if sb else "")
+        for w_ in [self.level] + list(self.switches.values()):
+            w_.setEnabled(enabled)
+        if sb:
+            vals = skin_basic_values(sb["level"], sb.get("remove", []))
+            self.level_info.setText(" · ".join(f"{PARAM[k].label} {v:.0f}" for k, v in vals.items() if v > 0))
+        elif pp is not None and pp.retouch_active():
+            self.level_info.setText("세부 조정에서 직접 맞춘 값입니다")
+        else:
+            self.level_info.setText("")
+        self.level_info.setVisible(bool(self.level_info.text()))
 
     # ---- group extras
     def _retain(self, r):
@@ -433,12 +526,13 @@ class ReshapeTab(_Tab):
         enabled = person is not None and person.role == "target"
         if person is not None:
             self.role.set_current("protect" if person.role == "ignore" else person.role)
-        if cut:
+        if cut and self.mode is not None:
             self.mode.set_current(cut.mode)
-        for w in list(self.rows.values()) + [self.strength, self.feather, self.skin_detail, self.grain_size,
-                                             self.blemish_size, self.skin_scope,
-                                             self.sculpt_btn, self.sculpt_clear, self.body_btn, self.body_clear] + \
-                list(self.wrows.values()):
+        ws = list(self.rows.values()) + list(self.wrows.values()) + \
+            [w_ for w_ in (self.strength, self.feather, self.skin_detail, self.grain_size, self.blemish_size,
+                           self.skin_scope, self.sculpt_btn, self.sculpt_clear, self.body_btn, self.body_clear)
+             if w_ is not None]
+        for w in ws:
             w.setEnabled(enabled)
         pp = cut.params_for(person.id) if person is not None else None
         for k, r in self.rows.items():
@@ -449,59 +543,72 @@ class ReshapeTab(_Tab):
             else:
                 r.set_value(0)
                 r.set_key_state("none")
+        if self.part == "skin":
+            self._fill_basic(pp, enabled)
         if pp is not None:
-            self.strength.set_value(pp.strength.value(t))
-            self.strength.set_key_state("key" if pp.strength.has_key(t) else ("animated" if pp.strength.is_animated() else "none"))
-            self.skin_detail.set_value(pp.skin_detail)
-            self.feather.set_value(pp.feather)
-            self.grain_size.set_value(pp.grain_size)
-            self.blemish_size.set_value(pp.blemish_size)
-            self._fill_cloth(pp, person, s)
-            head_on = any(pp._active(k) for k in ("head", "crown", "hair_volume"))
-            pinfo = ""
-            ready = False
-            if s.tracker is not None and s.tracker.store is not None:
-                from ..track import parts as PT
-                ready = PT.covers(s.tracker, person.id)
-                if ready:
-                    pinfo = "머리 부위 인식됨: 헤어 볼륨은 머리카락에만, 얼굴과 귀는 그대로"
-                elif head_on:
-                    pinfo = "머리 부위를 인식하면 헤어 볼륨이 머리카락에만 들어갑니다"
-            self.parts_info.setText(pinfo)
-            self.parts_btn.setText("다시 인식" if ready else "머리 부위 인식")
-            self.parts_btn.setVisible(head_on or ready)
-            self.parts_info.setVisible(bool(pinfo))
-            self._set_scope(pp.skin_scope)
+            if self.strength is not None:
+                self.strength.set_value(pp.strength.value(t))
+                self.strength.set_key_state("key" if pp.strength.has_key(t) else
+                                            ("animated" if pp.strength.is_animated() else "none"))
+            if self.feather is not None:
+                self.feather.set_value(pp.feather)
+            if self.skin_detail is not None:
+                self.skin_detail.set_value(pp.skin_detail)
+                self.grain_size.set_value(pp.grain_size)
+                self.blemish_size.set_value(pp.blemish_size)
+                self._set_scope(pp.skin_scope)
+            if self.cloth_keep is not None:
+                self._fill_cloth(pp, person, s)
+            if self.parts_btn is not None:
+                head_on = any(pp._active(k) for k in ("head", "crown", "hair_volume"))
+                pinfo = ""
+                ready = False
+                if s.tracker is not None and s.tracker.store is not None:
+                    from ..track import parts as PT
+                    ready = PT.covers(s.tracker, person.id)
+                    if ready:
+                        pinfo = "머리 부위 인식됨: 헤어 볼륨은 머리카락에만, 얼굴과 귀는 그대로"
+                    elif head_on:
+                        pinfo = "머리 부위를 인식하면 헤어 볼륨이 머리카락에만 들어갑니다"
+                self.parts_info.setText(pinfo)
+                self.parts_btn.setText("다시 인식" if ready else "머리 부위 인식")
+                self.parts_btn.setVisible(head_on or ready)
+                self.parts_info.setVisible(bool(pinfo))
             for k, r in self.wrows.items():
                 r.set_value(pp.widths.get(k, 1.0))
-            n = len(pp.sculpt)
-            self.sculpt_info.setText(f"옮긴 점 {n}개" if n else "")
-            n = len(pp.body_sculpt)
-            self.body_info.setText(f"옮긴 점 {n}개" if n else "")
+            if self.sculpt_btn is not None:
+                n = len(pp.sculpt)
+                self.sculpt_info.setText(f"옮긴 점 {n}개" if n else "")
+            if self.body_btn is not None:
+                n = len(pp.body_sculpt)
+                self.body_info.setText(f"옮긴 점 {n}개" if n else "")
             for gkey, (head, box) in self.groups.items():
                 head.set_active(any(pp._active(d.key) for d in PARAMS if d.group == gkey))
-            if "grain" in pp.amounts:
+            if "grain" in pp.amounts and "grain" in self.rows:
                 self._grain_gate(pp.amounts["grain"].value(t))
         else:
             for head, box in self.groups.values():
                 head.set_active(False)
-        self.sculpt_btn.blockSignals(True)
-        self.sculpt_btn.setChecked(self.ctl.viewer.tool == "sculpt")
-        self.sculpt_btn.blockSignals(False)
-        self.body_btn.blockSignals(True)
-        self.body_btn.setChecked(self.ctl.viewer.tool == "bodypts")
-        self.body_btn.blockSignals(False)
-        # face landmarks are needed for the face, head and skin tools
-        st_ = s.tracker.store if s.tracker else None
-        note = ""
-        if cut and cut.analyzed and st_ is not None and not st_.has_face:
-            note = "얼굴·머리·피부 보정은 얼굴 랜드마크가 필요합니다. 추적 탭에서 다시 분석하세요."
-        elif person is not None and st_ is not None and st_.has(person.id):
-            p_ = st_.index(person.id)
-            if st_.present[p_, t] and st_.face_vis[p_, t] < 0.15:
-                note = "이 프레임에서는 얼굴이 잘 보이지 않아 얼굴 보정이 약해집니다."
-        self.face_note.setText(note)
-        self.face_note.setVisible(bool(note))
+        if self.sculpt_btn is not None:
+            self.sculpt_btn.blockSignals(True)
+            self.sculpt_btn.setChecked(self.ctl.viewer.tool == "sculpt")
+            self.sculpt_btn.blockSignals(False)
+        if self.body_btn is not None:
+            self.body_btn.blockSignals(True)
+            self.body_btn.setChecked(self.ctl.viewer.tool == "bodypts")
+            self.body_btn.blockSignals(False)
+        if self.face_note is not None:
+            # face landmarks are needed for the face, head and skin tools
+            st_ = s.tracker.store if s.tracker else None
+            note = ""
+            if cut and cut.analyzed and st_ is not None and not st_.has_face:
+                note = "얼굴·머리·피부 보정은 얼굴 랜드마크가 필요합니다. 추적 탭에서 다시 분석하세요."
+            elif person is not None and st_ is not None and st_.has(person.id):
+                p_ = st_.index(person.id)
+                if st_.present[p_, t] and st_.face_vis[p_, t] < 0.15:
+                    note = "이 프레임에서는 얼굴이 잘 보이지 않아 얼굴 보정이 약해집니다."
+            self.face_note.setText(note)
+            self.face_note.setVisible(bool(note))
 
 
 # =========================================================================== 추적
@@ -952,7 +1059,7 @@ class Inspector(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 10, 0, 0)
         lay.setSpacing(0)
-        self.tabs = Wd.Segmented([("reshape", "보정"), ("track", "추적"), ("protect", "보호"),
+        self.tabs = Wd.Segmented([("skin", "피부"), ("body", "몸매"), ("track", "추적"), ("protect", "보호"),
                                   ("output", "출력")], compact=True)
         wrap = QWidget()
         wl = QHBoxLayout(wrap)
@@ -962,9 +1069,10 @@ class Inspector(QWidget):
         lay.addWidget(Wd.hline())
         self.stack = QStackedWidget()
         self.pages = {
-            "reshape": ReshapeTab(ctl), "track": TrackTab(ctl), "protect": ProtectTab(ctl),
-            "output": OutputTab(ctl),
+            "skin": ReshapeTab(ctl, "skin"), "body": ReshapeTab(ctl, "body"), "track": TrackTab(ctl),
+            "protect": ProtectTab(ctl), "output": OutputTab(ctl),
         }
+        self._edit_tab = "skin"            # "reshape" (from the window) means the last used of 피부 and 몸매
         for k, pg in self.pages.items():
             self.stack.addWidget(_scroll(pg))
         lay.addWidget(self.stack, 1)
@@ -974,13 +1082,19 @@ class Inspector(QWidget):
 
     def show_tab(self, key: str):
         keys = list(self.pages)
+        if key == "reshape":
+            key = self._edit_tab
         if key not in self.pages:
             return
+        if key in ("skin", "body"):
+            self._edit_tab = key
         self.tabs.set_current(key)
         self.stack.setCurrentIndex(keys.index(key))
         self.pages[key].refresh()
 
     def refresh(self, which: Optional[str] = None):
         cur = self.tabs.current
+        if which == "reshape" and cur in ("skin", "body"):
+            which = cur
         if which is None or which == cur:
             self.pages[cur].refresh()

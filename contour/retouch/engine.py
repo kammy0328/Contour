@@ -1389,6 +1389,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 state["model"] = SK.frame_model_for(tracker, p, t, state["rgb"], lm, centre)
                 state["prob"] = SK.face_skin_probability(state["rgb"], state["model"], lm if fw > 0.3 else None,
                                                          fmaps if fw > 0.3 else None)
+                state["prob0"] = state["prob"]      # before the cover and the focus zone: what the skin mask starts from too
                 if lm is not None:
                     # an arm, a leg or a hand in front of the face: skin coloured, but not this face's skin
                     try:
@@ -1542,7 +1543,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             def mk_skin():
                 b = base()
                 m_ = SK.skin_mask(sj, b["rgb"], px.sx, px.sy, b["alpha"], b["model"], b.get("parse"), body(),
-                                  b.get("cover"))
+                                  b.get("cover"), prob0=b.get("prob0"))
                 ap_ = armpit()
                 if ap_ is not None:
                     m_ = np.maximum(m_, ap_)

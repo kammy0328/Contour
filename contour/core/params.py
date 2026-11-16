@@ -143,3 +143,30 @@ def default(key: str) -> float:
 
 def is_neutral(key: str, v: float) -> bool:
     return abs(v - default(key)) < 1e-6
+
+
+# --------------------------------------------------------------------------- skin: basic adjustment (a preset of the detail sliders)
+# 표준 is the engine's reference: skin 70 takes the texture down as much as the hand retouch the engine was fitted
+# to (cut 069, skin.FS_REF); 약하게 is about two thirds of it, 강하게 stops at 90 (at 100 the pores are nearly gone).
+# The wrinkles and spots each have their own 보호 (0) / 제거 (the level's value) switch.
+SKIN_LEVELS: List[Tuple[str, str]] = [("light", "약하게"), ("std", "표준"), ("strong", "강하게")]
+SKIN_LEVEL_VALUES: Dict[str, Dict[str, float]] = {
+    "light": {"skin": 45, "shine": 0, "dark_circle": 15, "redness": 0, "neck_lines": 15, "neck_bumps": 0},
+    "std": {"skin": 70, "shine": 15, "dark_circle": 30, "redness": 15, "neck_lines": 30, "neck_bumps": 20},
+    "strong": {"skin": 90, "shine": 30, "dark_circle": 50, "redness": 30, "neck_lines": 50, "neck_bumps": 40},
+}
+# switch -> (detail slider, label, value at light / std / strong when 제거)
+SKIN_REMOVE: List[Tuple[str, str, str]] = [("mouth", "mouth_lines", "입가주름"), ("naso", "nasolabial", "팔자주름"),
+                                           ("acne", "blemish", "여드름")]
+SKIN_REMOVE_VALUES: Dict[str, float] = {"light": 25, "std": 40, "strong": 60}
+SKIN_BASIC_KEYS: List[str] = list(SKIN_LEVEL_VALUES["std"]) + [k for _, k, _ in SKIN_REMOVE]
+
+
+def skin_basic_values(level: str, remove) -> Dict[str, float]:
+    """The detail slider values of a basic adjustment: level (light | std | strong) and the switches set to 제거."""
+    level = level if level in SKIN_LEVEL_VALUES else "std"
+    out = {k: float(v) for k, v in SKIN_LEVEL_VALUES[level].items()}
+    rm = set(remove or ())
+    for sw, key, _ in SKIN_REMOVE:
+        out[key] = float(SKIN_REMOVE_VALUES[level]) if sw in rm else 0.0
+    return out
