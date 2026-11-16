@@ -992,7 +992,12 @@ class CutTracker:
         box = np.array([c[0] - size, c[1] - size, c[0] + size, c[1] + size])
         faces = face.detect(rgb, box)
         if not len(faces):
-            return
+            # a second look at a head the first pass found nothing in: a wider crop, enlarged more, a lower
+            # threshold (turned, blurred or small faces); the same distance test below keeps it to this head
+            r2 = 1.35 * size
+            faces = face.detect(rgb, np.array([c[0] - r2, c[1] - r2, c[0] + r2, c[1] + r2]), target=416, score=0.4)
+            if not len(faces):
+                return
         centers = faces[:, 0:2] + faces[:, 2:4] / 2
         k = int(np.argmin(np.linalg.norm(centers - c, axis=1)))
         fc = faces[k]

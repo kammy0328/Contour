@@ -240,11 +240,14 @@ class FaceDetector:
 
     def __init__(self, key: str = "face_yunet", score_thr: float = 0.6):
         self.path = str(M.ensure_model(key))
+        self.score_thr = score_thr
         self.det = cv2.FaceDetectorYN.create(self.path, "", (320, 320), score_thr, 0.3, 50)
         self._size = (320, 320)
 
-    def detect(self, rgb: np.ndarray, box: Optional[np.ndarray] = None, target: int = 256) -> np.ndarray:
-        """Detect faces inside `box` (xyxy) of the RGB image. Output (N,15) in image px."""
+    def detect(self, rgb: np.ndarray, box: Optional[np.ndarray] = None, target: int = 256,
+               score: Optional[float] = None) -> np.ndarray:
+        """Detect faces inside `box` (xyxy) of the RGB image. Output (N,15) in image px. `score` lowers the
+        detector's threshold for this call (a second look at a head the first pass found nothing in)."""
         H, W = rgb.shape[:2]
         if box is None:
             box = np.array([0, 0, W, H], np.float32)
@@ -264,7 +267,13 @@ class FaceDetector:
         if size != self._size:
             self.det.setInputSize(size)
             self._size = size
-        _, faces = self.det.detect(np.ascontiguousarray(crop))
+        if score is not None:
+            self.det.setScoreThreshold(float(score))
+        try:
+            _, faces = self.det.detect(np.ascontiguousarray(crop))
+        finally:
+            if score is not None:
+                self.det.setScoreThreshold(self.score_thr)
         if faces is None or len(faces) == 0:
             return np.zeros((0, 15), np.float32)
         f = faces.astype(np.float32).copy()
