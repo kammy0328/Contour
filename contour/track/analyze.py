@@ -624,7 +624,7 @@ class CutTracker:
             if q.id in getattr(self, "_added_pids", set()) and q.id in getattr(self, "_new_pids", set()):
                 # found by the finder, not by the detector: kept out of the warp, not retouched until the user says
                 q.name = f"{q.name} (추가)"
-                q.role = "protect"
+                q.role, q.hold = "protect", "added"
         p_w = step(0.96, 1.0)
         # keys from a previous analysis still apply (same person ids)
         if any(self.cut.joint_keys.get(pid) for pid in pids):
@@ -651,7 +651,7 @@ class CutTracker:
             new = getattr(self, "_new_pids", set())
             for q in self.cut.persons:
                 if q.id in new and q.id in SG.unconfirmed(getattr(self, "_seg_stats", None)) and not getattr(q, "still", False):
-                    q.role = "protect"
+                    q.role, q.hold = "protect", "unconfirmed"
                     q.name = f"{q.name} (확인)"
         except Exception:
             import traceback
@@ -1230,6 +1230,36 @@ class CutTracker:
             self.seglab.close()
         self._label_cache.clear()
 
+    DUP_DIST = 0.15      # median joint distance, share of the box height, of a skeleton drawn again on a tracked person
+    DUP_SHARE = 0.3      # share of the frames that makes the finder's instance part of that person
+
+    def _duplicate_of(self, st: TrackStore, poses_t: dict):
+        """(pid, frames) of the tracked person whose skeleton the masked pose of a finder chain repeats, or None."""
+        sx, sy = self.proxy.sx, self.proxy.sy
+        hits = {}
+        for t, (res, rec) in poses_t.items():
+            kp_, sc_ = res.get("pose_rtmw_x", next(iter(res.values())))
+            k = np.asarray(kp_, np.float32)[:S.K, :2] / [sx, sy]
+            sc = np.asarray(sc_, np.float32)[:S.K]
+            bh = max(float(rec["box"][3] - rec["box"][1]) / sy, 1.0)
+            for q in range(len(st.pids)):
+                if not st.present[q, t]:
+                    continue
+                kq = st.final[q, t, :S.K]
+                ok = np.isfinite(kq[:, :2]).all(1) & (np.nan_to_num(kq[:, 2]) > 0.3) & np.isfinite(k).all(1)
+                ok &= sc >= float(np.median(sc))          # the chain's surer half of the joints
+                if ok.sum() < 5:
+                    continue
+                d = float(np.median(np.linalg.norm(k[ok] - kq[ok, :2], axis=1)))
+                if d < self.DUP_DIST * bh:
+                    hits.setdefault(int(st.pids[q]), []).append(t)
+        if not hits:
+            return None
+        q_pid, fr = max(hits.items(), key=lambda kv: len(kv[1]))
+        if len(fr) < self.DUP_SHARE * len(poses_t):
+            return None
+        return q_pid, sorted(fr)
+
     def _add_found_people(self, st: TrackStore, tracklets, dets, pids, collect: dict, poses, a: int, b: int,
                           cancel=None) -> list:
         """People the finder sees on many frames whom tracking never followed (a dancer behind another: the pose
@@ -1285,6 +1315,17 @@ class CutTracker:
                 if res is not None:
                     poses_t[t] = (res, rec)
             if len(poses_t) < need:
+                continue
+            # someone already tracked: the finder split a person in two (the head of a dancer behind two others
+            # apart from her body, ILLIT 213ZQ6YQ) and the pose model, shown only that part, drew her whole skeleton
+            # again where her track already has it. Not a new person: the part's pixels nobody had are hers
+            dup = self._duplicate_of(st, poses_t)
+            if dup is not None:
+                q_pid, q_frames = dup
+                self._label_new(q_pid, {t: (None, c["recs"][t]) for t in q_frames}, collect)
+                import logging
+                logging.getLogger("contour").info("finder instance is part of person %d (%d frames): not added",
+                                                  q_pid, len(q_frames))
                 continue
             # what is a dancer to add and what is not: a sure pose (a blurred shoulder in the foreground gives a
             # pose of sorts too), not a blob filling the frame or cut by two of its edges (out-of-focus foreground),

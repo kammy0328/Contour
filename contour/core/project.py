@@ -244,6 +244,8 @@ class Person:
     member: str = ""                 # who this is across the edited timeline (Project.members id)
     member_conf: float = 0.0         # how sure the automatic link is (0..1); user links are 1
     still: bool = False              # a poster, photo or screen on the set (found by analysis; protected)
+    hold: str = ""                   # "added" (found by the person finder only) or "unconfirmed" (the finder never
+                                     # confirmed the track): kept out of the automatic targets until the user says
 
     def to_dict(self):
         return asdict(self)

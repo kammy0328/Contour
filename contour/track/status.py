@@ -223,7 +223,10 @@ def evaluate(cut, tracker, make_targets: bool = False) -> dict:
             if make_targets:
                 ids = {r["pid"] for r in main}
                 for q in cut.persons:
-                    if q.id in ids and q.role != "ignore" and not getattr(q, "still", False):
+                    # pictures, people only the finder saw and tracks it never confirmed stay as analysis left
+                    # them (protected) until the user makes them targets
+                    if q.id in ids and q.role != "ignore" and not getattr(q, "still", False) \
+                            and not getattr(q, "hold", ""):
                         q.role = "target"
             tg = {q.id for q in cut.persons if q.role == "target"}
             judged = [r for r in main if r["pid"] in tg] or main
