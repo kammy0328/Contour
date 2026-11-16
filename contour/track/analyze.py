@@ -1307,7 +1307,8 @@ class CutTracker:
             tracklets.append(tr)
             pids.append(pid)
             added.append(pid)
-            self._label_new(pid, poses_t, collect)
+            # every frame the finder had this person on (also where the masked pose was unsure)
+            self._label_new(pid, {t: (None, rec) for t, rec in c["recs"].items()}, collect)
             import logging
             logging.getLogger("contour").info("person the finder saw added: %d (%d frames)", pid, len(poses_t))
         self._added_pids = set(added)
