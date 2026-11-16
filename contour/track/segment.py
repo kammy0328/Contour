@@ -451,7 +451,7 @@ def _borrowed(st, t, pr, insts, assigned, merged, sx, sy, use_final, W: int, H: 
     for kS in range(len(insts)):
         if kS in merged:
             continue
-        holders = [i for i in range(len(pr)) if inside[i, kS] >= 0.6]
+        holders = [i for i in range(len(pr)) if inside[i, kS] >= 0.5]
         if len(holders) < 2:
             continue
         fit = {i: _box_iou(pr[i][1], insts[kS]["box"]) for i in holders}

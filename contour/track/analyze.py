@@ -85,10 +85,12 @@ def _identity(tr: dict, dets) -> tuple:
     return reid, [[round(float(v), 4) for v in fe] for fe in picked]
 
 
-def _masked_pose(rgb: np.ndarray, rec: dict, poses: Dict[str, object], dbg: Optional[dict] = None) -> Optional[dict]:
+def _masked_pose(rgb: np.ndarray, rec: dict, poses: Dict[str, object], dbg: Optional[dict] = None,
+                 upright: bool = False) -> Optional[dict]:
     """Pose of the person a finder instance holds, with everybody else hidden (grey): a pose model given a box over
     two people takes the more visible one; here it can see only this one. -> model -> (kp (K,2) rgb px, sc (K,)),
-    or None when fewer than 5 sure joints fall on the person or the body is upside down (a mirror image)."""
+    or None when fewer than 5 sure joints fall on the person, or (upright) when the head is below the feet (a mirror
+    image on a glossy floor: only asked for people who are not tracked yet; a dancer bending back is not one)."""
     from . import segment as SG
     (x0, y0, x1, y1), m = SG.record_mask(rec)
     H, W = rgb.shape[:2]
@@ -120,7 +122,7 @@ def _masked_pose(rgb: np.ndarray, rec: dict, poses: Dict[str, object], dbg: Opti
     upside = bool(head and feet and np.mean(head) > np.mean(feet))
     if dbg is not None:
         dbg.update(good=good, upside=upside, box=[cx0, cy0, cx1, cy1], img=img, kp=kp, sc=sc)
-    if good < 5 or upside:
+    if good < 5 or (upright and upside):
         return None
     return out
 
@@ -1277,7 +1279,7 @@ class CutTracker:
                     raise Cancelled()
                 if t not in frames:
                     frames[t] = analysis_view(np.asarray(self.proxy.frame(t)))
-                res = _masked_pose(frames[t], rec, poses)
+                res = _masked_pose(frames[t], rec, poses, upright=True)
                 if res is not None:
                     poses_t[t] = (res, rec)
             if len(poses_t) < need:
