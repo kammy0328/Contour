@@ -407,6 +407,33 @@ def join_planes(planes: Sequence[np.ndarray], layout: PlaneLayout) -> bytes:
 
 # --------------------------------------------------------------------------- reading
 
+_VSTART: dict = {}
+
+
+def video_start(path: str) -> float:
+    """Seconds by which the first video frame comes after the file's start. H.264 in MP4 with B-frames often starts
+    its picture a frame late (lngshot v3: video 0.041 s, audio and the file 0): ffmpeg's -ss counts from the file's
+    start, so a seek to a frame without this landed one frame early, and every cut of the bake began on the last
+    frame of the shot before."""
+    key = str(path)
+    if key in _VSTART:
+        return _VSTART[key]
+    v = 0.0
+    try:
+        r = _run([ffprobe_bin(), "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=start_time:format=start_time",
+                  "-of", "json", key])
+        d = json.loads(r.stdout.decode("utf-8", errors="replace") or "{}")
+        vs = float((d.get("streams") or [{}])[0].get("start_time") or 0.0)
+        fs = float((d.get("format") or {}).get("start_time") or 0.0)
+        v = vs - fs
+        if not np.isfinite(v) or abs(v) > 5.0:
+            v = 0.0
+    except Exception:
+        v = 0.0
+    _VSTART[key] = v
+    return v
+
+
 def _input_args(info: MediaInfo, start: int) -> List[str]:
     start = int(start) + int(getattr(info, "offset", 0) or 0)
     if info.kind == "sequence":
@@ -415,7 +442,7 @@ def _input_args(info: MediaInfo, start: int) -> List[str]:
     args = []
     if start > 0:
         # Seek half a frame early; `-frames:v` + accurate seek keeps the first frame exact.
-        t = (start - 0.5) * info.fps_den / info.fps_num
+        t = video_start(info.path) + (start - 0.5) * info.fps_den / info.fps_num
         args += ["-ss", f"{max(0.0, t):.6f}"]
     return args + ["-i", info.path]
 

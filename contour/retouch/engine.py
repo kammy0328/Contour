@@ -1155,13 +1155,18 @@ def _steady(cut, tracker, st, rf: RetouchFrame, cache) -> RetouchFrame:
         frames = [(1.0, own)]                       # (weight, masks on this frame's geometry)
         veto = getattr(j, "veto", None)
         vetos = [veto.astype(np.float32)] if veto is not None else []
+        def usable(s):
+            return 0 <= s < N and bool(st.present[j.p, s]) and st.connected(s, t) \
+                and bool(np.isfinite(st.face[j.p, s, :, :2]).all())
+
         for d in range(1, STEADY_R + 1):
             w = float(np.exp(-0.5 * (d / STEADY_SIGMA) ** 2))
+            # both sides or neither: on the first and last frames of a shot (or next to a frame the face is missing on)
+            # the frames of one side alone pulled the mask towards where the face was, and its cover dropped by a
+            # quarter on that frame only (lngshot cut 011, last frame: 0.97 raw, 0.72 steadied)
+            if not (usable(t - d) and usable(t + d)):
+                break
             for s in (t - d, t + d):
-                if not (0 <= s < N) or not st.present[j.p, s] or not st.connected(s, t):
-                    continue
-                if not np.isfinite(st.face[j.p, s, :, :2]).all():
-                    continue
                 rs = _raw_cached(cut, tracker, s, cache)
                 js = next((x for x in rs.jobs if x.pid == j.pid), None) if rs is not None else None
                 if js is None or js.face is None:
