@@ -137,6 +137,7 @@ def apply_copy(src: Cut, dst: Cut, mapping: Dict[int, Optional[int]], frame: int
                 d_params.sculpt = s_params.sculpt
                 d_params.body_sculpt = s_params.body_sculpt
                 d_params.body_sides = s_params.body_sides
+                d_params.skin_basic = s_params.skin_basic
             if opt.widths:
                 d_params.widths = dict(s_params.widths)
     if opt.mode:

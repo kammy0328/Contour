@@ -93,6 +93,9 @@ def make(pp: PartParams, frame: float, name: str, groups: List[str], points: boo
     if "skin" in groups:
         d["skin"] = dict(detail=pp.skin_detail, scope=pp.skin_scope, grain_size=pp.grain_size,
                          blemish_size=getattr(pp, "blemish_size", 50.0))
+        if getattr(pp, "skin_basic", None):
+            d["skin"]["basic"] = {"level": pp.skin_basic.get("level", "std"),
+                                  "remove": list(pp.skin_basic.get("remove", []))}
     if points:
         if pp.sculpt:
             d["sculpt"] = {str(k): list(v) for k, v in pp.sculpt.items()}
@@ -140,6 +143,9 @@ def apply(pp: PartParams, d: dict) -> None:
             pp.skin_scope = norm_scope(sk["scope"])
         pp.grain_size = float(sk.get("grain_size", pp.grain_size))
         pp.blemish_size = float(sk.get("blemish_size", getattr(pp, "blemish_size", 50.0)))
+        b = sk.get("basic") or {}
+        pp.skin_basic = {"level": b["level"], "remove": list(b.get("remove") or [])} \
+            if isinstance(b, dict) and b.get("level") in ("light", "std", "strong") else {}
     if "sculpt" in d:
         pp.sculpt = {int(k): [float(v[0]), float(v[1])] for k, v in d["sculpt"].items()}
     if "body_sculpt" in d:

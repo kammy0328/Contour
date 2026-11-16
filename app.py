@@ -61,9 +61,22 @@ def main():
     from contour.ui import gatedlg
     if not gatedlg.ask():
         sys.exit(0)
-    from contour.ui.main_window import MainWindow
-    w = MainWindow()
+    from contour.core.settings import APP_VERSION
+    from contour.ui.splash import Splash
+    splash = Splash(APP_VERSION)
+    splash.show()
+    app.processEvents()
+    try:
+        splash.wait_imports(app)
+        splash.set_message("화면 준비 중")
+        app.processEvents()
+        from contour.ui.main_window import MainWindow
+        w = MainWindow()
+    except Exception:
+        splash.close()
+        raise
     w.show()
+    splash.finish(w)
     sys.exit(app.exec())
 
 

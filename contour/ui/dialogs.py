@@ -127,6 +127,11 @@ class SettingsDialog(QDialog):
         self.as_min.setEnabled(self.autosave.isChecked())
         self.as_keep.setEnabled(self.autosave.isChecked())
         form.addRow("자동 저장", asw)
+        self.upd = QCheckBox("시작할 때 새 버전 확인")
+        self.upd.setChecked(bool(getattr(s, "auto_update_check", True)))
+        self.upd.setToolTip("새 버전이 있으면 시작할 때 알려 줍니다. 설치는 '지금 업데이트'를 눌러야만 합니다.\n"
+                            "끄더라도 프로젝트 메뉴 > 업데이트 확인으로 언제든 확인할 수 있습니다.")
+        form.addRow("업데이트", self.upd)
         self.gpu = QComboBox()
         for v, t in (("auto", "자동"), ("cuda", "CUDA (NVIDIA)"), ("dml", "DirectML"), ("cpu", "CPU")):
             self.gpu.addItem(t, v)
@@ -138,7 +143,7 @@ class SettingsDialog(QDialog):
         rep.setWordWrap(True)
         lay.addWidget(rep)
         note = Wd.label("데이터 폴더에는 모델, 학습 데이터, 프리셋이 저장됩니다. 업데이트해도 그대로 유지됩니다. "
-                        "자동 저장본은 각 프로젝트 폴더의 autosave에 저장됩니다.", "Faint", 11)
+                        "자동 저장은 복구용으로 각 프로젝트 폴더의 autosave에 저장되고, 프로젝트 파일은 저장할 때만 바뀝니다.", "Faint", 11)
         note.setWordWrap(True)
         lay.addWidget(note)
         from ..core.settings import APP_NAME, APP_VERSION
@@ -188,6 +193,7 @@ class SettingsDialog(QDialog):
         s.autosave = self.autosave.isChecked()
         s.autosave_minutes = int(self.as_min.value())
         s.autosave_keep = int(self.as_keep.value())
+        s.auto_update_check = self.upd.isChecked()
         if s.gpu != self.gpu.currentData():
             s.gpu = self.gpu.currentData()
             from ..track.models import reset_providers

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
-from PySide6.QtCore import QEvent, QObject, QSize, Qt, QThread, QTimer, QUrl
+from PySide6.QtCore import QEvent, QObject, QSize, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
                                QPushButton, QSplitter, QStackedWidget, QToolButton, QVBoxLayout, QWidget)
@@ -53,6 +53,47 @@ class _ActivityFilter(QObject):
                 if obj.objectName() == "ParamVal" or not obj.isModified():
                     return True
         return False
+
+
+def _load_project(path: str, long_side: int, progress) -> tuple:
+    """The project and a thumbnail per cut (numpy RGB), read off the main thread."""
+    from ..core.proxy import Proxy
+    from ..core.tlimport import load_thumb
+    prj = Project.load(path)
+    thumbs = {}
+    n = len(prj.cuts)
+    progress(0.0, f"프로젝트 읽음 · 컷 {n}개")
+    for i, c in enumerate(prj.cuts):
+        try:
+            px = Proxy(prj.cache_dir(c), c.info, long_side)
+            if px.has_frames():
+                thumbs[c.id] = px.thumbnail(c.info.frames // 2, 192)
+                px.close()
+            elif c.tl:
+                th = load_thumb(prj, c.id)
+                if th is not None:
+                    thumbs[c.id] = th
+        except Exception:
+            pass
+        progress((i + 1) / max(1, n), f"컷 미리보기 {i + 1}/{n}")
+    return prj, thumbs
+
+
+class _ProjectOpen(QThread):
+    progressed = Signal(float, str)
+    loaded = Signal(object, object)
+    failed = Signal(str)
+
+    def __init__(self, parent, path: str, long_side: int):
+        super().__init__(parent)
+        self.path, self.long_side = path, long_side
+
+    def run(self):
+        try:
+            prj, thumbs = _load_project(self.path, self.long_side, lambda f, m: self.progressed.emit(f, m))
+            self.loaded.emit(prj, thumbs)
+        except Exception as e:
+            self.failed.emit(f"{e}\n{traceback.format_exc()}")
 
 
 class MainWindow(QMainWindow):
@@ -477,14 +518,57 @@ class MainWindow(QMainWindow):
             return
         self.close_project()
         prj = Project.create(d, name)
-        self.open_project(prj.path)
+        self.open_project(prj.path, wait=True)
 
-    def open_project(self, path: str):
-        try:
-            prj = Project.load(path)
-        except Exception as e:
-            self.show_error("프로젝트를 열 수 없습니다", f"{e}\n{traceback.format_exc()}")
+    def open_project(self, path: str, wait: bool = False):
+        """Reads the project and the cut thumbnails on a thread (the window keeps turning) and then opens it.
+        wait: in one go on this thread (a project just made, which callers go on to fill)."""
+        if getattr(self, "_opening", None) is not None:
             return
+        if self.job is not None:
+            self.toast("진행 중인 작업이 끝난 뒤 프로젝트를 열 수 있습니다.", kind="warn")
+            return
+        self._offer_recovery(path)
+        if wait:
+            try:
+                prj, thumbs = _load_project(path, settings().proxy_long_side, lambda f, m: None)
+            except Exception as e:
+                self.show_error("프로젝트를 열 수 없습니다", f"{e}\n{traceback.format_exc()}")
+                return
+            self._project_loaded(prj, thumbs)
+            return
+        self._set_loading(True)
+        th = _ProjectOpen(self, path, settings().proxy_long_side)
+        th.progressed.connect(self.busy.progress)
+        th.loaded.connect(self._project_opened)
+        th.failed.connect(self._project_failed)
+        self._opening = th
+        th.start()
+
+    def _set_loading(self, on: bool, hide: bool = True):
+        for w_ in (self.cutlist, self.inspector, self.tlstrip, self.timeline, self.proj_btn):
+            w_.setEnabled(not on)
+        if on:
+            self.busy.start("프로젝트 여는 중", cancellable=False)
+            self.busy.progress(0.0, "프로젝트 읽는 중")
+        elif hide:
+            self.busy.hide()
+
+    def _project_failed(self, err: str):
+        self._opening = None
+        self._set_loading(False)
+        self.show_error("프로젝트를 열 수 없습니다", err)
+
+    def _project_opened(self, prj, thumbs):
+        self.busy.progress(1.0, "첫 컷 여는 중")
+        QApplication.processEvents()
+        try:
+            self._project_loaded(prj, thumbs)
+        finally:
+            self._opening = None
+            self._set_loading(False, hide=self.job is None)     # a job the cut started keeps the overlay
+
+    def _project_loaded(self, prj, thumbs: dict):
         self.close_project()
         self.session.project = prj
         s = settings()
@@ -493,19 +577,11 @@ class MainWindow(QMainWindow):
         self.proj_btn.setText(prj.name)
         self.viewer.message = ""
         self.cutlist.refresh()
-        for c in prj.cuts:
-            px = self.session.make_proxy(c)
-            if px.has_frames():
-                try:
-                    self.cutlist.set_thumb(c.id, px.thumbnail(c.info.frames // 2, 192))
-                except Exception:
-                    pass
-                px.close()
-            elif c.tl:
-                from ..core.tlimport import load_thumb
-                th = load_thumb(prj, c.id)
-                if th is not None:
-                    self.cutlist.set_thumb(c.id, th)
+        for cid, th in thumbs.items():
+            try:
+                self.cutlist.set_thumb(cid, th)
+            except Exception:
+                pass
         self.tlstrip.thumbs.clear()
         self.tlstrip.refresh()
         first = self._first_listed(prj)
@@ -515,6 +591,68 @@ class MainWindow(QMainWindow):
         else:
             self._refresh_all()
             self.viewer.update()
+
+    # ---- recovery: the autosave writes a recovery copy; project.json changes only when saved
+    @staticmethod
+    def _recovery_paths(folder: Path):
+        folder = Path(folder)
+        return folder / "autosave" / "recovery.json", list((folder / "cuts").glob("*/tracks.recovery.npz"))
+
+    def _clear_recovery(self, folder) -> None:
+        rec, trs = self._recovery_paths(folder)
+        for f in [rec] + trs:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+    def _offer_recovery(self, path: str) -> None:
+        """Work that was autosaved but never saved (the app ended without saving): offered back once."""
+        p = Path(path)
+        if p.is_file():
+            p = p.parent
+        rec, _ = self._recovery_paths(p)
+        if not rec.exists():
+            return
+        try:
+            d = json.loads(rec.read_text(encoding="utf-8"))
+            t = float(d.get("meta", {}).get("time", 0))
+            data = d["project"]
+        except Exception:
+            self._clear_recovery(p)
+            return
+        pj = p / "project.json"
+        if pj.exists() and pj.stat().st_mtime >= t:
+            self._clear_recovery(p)                 # saved after the recovery copy was made
+            return
+        m = QMessageBox(self)
+        m.setWindowTitle("DIAP")
+        m.setIcon(QMessageBox.Question)
+        m.setText("저장하지 않고 끝난 작업이 있습니다.")
+        m.setInformativeText(f"{time.strftime('%m월 %d일 %H:%M', time.localtime(t))}에 자동 저장된 복구본으로 "
+                             "되돌릴까요? 버리면 마지막으로 저장한 상태로 엽니다.")
+        b_rec = m.addButton("복구", QMessageBox.AcceptRole)
+        m.addButton("버리기", QMessageBox.DestructiveRole)
+        m.setDefaultButton(b_rec)
+        m.exec()
+        if m.clickedButton() is b_rec:
+            try:
+                if pj.exists():
+                    (p / "project.before_recovery.json").write_bytes(pj.read_bytes())
+                tmp = pj.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+                tmp.replace(pj)
+                cid = d.get("meta", {}).get("cut")
+                if cid:
+                    tr = p / "cuts" / str(cid) / "tracks.recovery.npz"
+                    if tr.exists():
+                        dst = tr.with_name("tracks.npz")
+                        if dst.exists():
+                            dst.replace(tr.with_name("tracks.before_recovery.npz"))
+                        tr.replace(dst)
+            except OSError as e:
+                self.show_error("복구하지 못했습니다", str(e))
+        self._clear_recovery(p)
 
     def close_project(self):
         if self.session.project is not None:
@@ -535,6 +673,7 @@ class MainWindow(QMainWindow):
         self.activity.flush()
         try:
             self.session.save()
+            self._clear_recovery(Path(self.session.project.path))
             self._collect_learning()
             self.saved_lbl.done(f"저장됨 {time.strftime('%H:%M')}")
         except Exception as e:
@@ -549,23 +688,33 @@ class MainWindow(QMainWindow):
             self.autosave.stop()
 
     def _autosave(self):
-        """Saves the project and keeps the last N saved states in <project>/autosave (to step back to)."""
+        """A recovery copy of unsaved work in <project>/autosave (recovery.json, the open cut's tracks next to its
+        own) and the last N of them as project_<time>.json. project.json itself changes only when the project is
+        saved, so closing without saving really leaves it as it was saved."""
         if not (self.session.dirty and self.job is None and self.session.project is not None):
             return
         prj = self.session.project
+        cut = self.session.cut
         try:
             d = Path(prj.path) / "autosave"
             d.mkdir(exist_ok=True)
-            f = Path(prj.path) / "project.json"
-            if f.exists():
-                (d / f"project_{time.strftime('%Y%m%d_%H%M%S')}.json").write_bytes(f.read_bytes())
+            data = {"meta": {"time": time.time(), "cut": cut.id if cut is not None else None, "version": APP_VERSION},
+                    "project": prj.to_dict()}
+            tmp = d / "recovery.json.tmp"
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(d / "recovery.json")
+            (d / f"project_{time.strftime('%Y%m%d_%H%M%S')}.json").write_text(
+                json.dumps(data["project"], ensure_ascii=False, indent=1), encoding="utf-8")
             keep = max(1, int(getattr(settings(), "autosave_keep", 10)))
             old = sorted(d.glob("project_*.json"))
             for x in old[:-keep]:
                 x.unlink()
-        except OSError:
+            tr = self.session.tracker
+            if tr is not None and tr.store is not None and cut is not None:
+                tr.store.save(prj.cut_dir(cut) / "tracks.recovery.npz")
+            self.saved_lbl.done(f"복구본 자동 저장 {time.strftime('%H:%M')}")
+        except Exception:
             pass
-        self.save(quiet=True)
 
     def _emergency_save(self, *_):
         try:
@@ -1007,6 +1156,9 @@ class MainWindow(QMainWindow):
                             dp.strength = sp.strength
                         elif hasattr(sp, k):
                             setattr(dp, k, getattr(sp, k))
+                    from ..core.params import RETOUCH_KEYS, SKIN_BASIC_KEYS
+                    if any(k in RETOUCH_KEYS for k in keys):
+                        dp.skin_basic = dict(sp.skin_basic) if set(SKIN_BASIC_KEYS) <= set(keys) else {}
             n_people += len(mapping)
             if not dst.analyzed:
                 dst.pending_copy = dict(src=src.id, frame=cp[1], keys=sorted(keys) if keys else None)
@@ -1579,6 +1731,7 @@ class MainWindow(QMainWindow):
                             if k in SL.LEARNED_KEYS:
                                 pp.amounts[k].base = float(sample["values"].get(k, 0.0))
                         pp.skin_detail = float(sample.get("detail", pp.skin_detail))
+                        pp.skin_basic = {}
                 if s.cut is cut:
                     s.touch()
                     self._refresh_all()
@@ -2351,6 +2504,8 @@ class MainWindow(QMainWindow):
         c.set_at(self.frame, v)
         for op in self._others():
             (op.strength if part == "__strength__" else op.amounts[part]).set_at(self.frame, v)
+        if part != "__strength__" and self._kind_of(part) == "ret":
+            self._skin_hand_set(pp)
         self.session.interactive = not committed
         self.session.touch(self._kind_of(part))
         self.viewer.update()
@@ -2368,6 +2523,8 @@ class MainWindow(QMainWindow):
             c.remove_key(self.frame)
         else:
             c.add_key(self.frame)
+        if part != "__strength__" and self._kind_of(part) == "ret":
+            self._skin_hand_set(pp)
         self.session.touch(self._kind_of(part))
         self._refresh_all()
 
@@ -2401,6 +2558,7 @@ class MainWindow(QMainWindow):
             return
         if committed:
             self.push_undo(coalesce=f"skin:{self.sel_pid}:{what}")
+        self._skin_hand_set(pp)
         for q in [pp] + self._others():
             if what == "detail":
                 q.skin_detail = float(v)
@@ -2450,15 +2608,85 @@ class MainWindow(QMainWindow):
             self.session.touch(self._kind_of(k))
         self._refresh_all()
 
-    def reset_params(self):
+    def reset_params(self, part: str = "all"):
+        """part: skin (skin and colour retouch), body (every shape change) or all."""
         pp = self._params()
         if pp is None:
             return
         self.push_undo()
         from ..core.project import PartParams
-        self.session.cut.params[self.sel_pid] = PartParams()
-        self.session.touch()
+        from ..core.params import RETOUCH_KEYS
+        fresh = PartParams()
+        if part == "skin":
+            for k in RETOUCH_KEYS:
+                pp.amounts[k] = fresh.amounts[k]
+            pp.skin_detail, pp.skin_scope = fresh.skin_detail, fresh.skin_scope
+            pp.grain_size, pp.blemish_size = fresh.grain_size, fresh.blemish_size
+            pp.skin_basic = {}
+            self.session.touch("ret")
+        elif part == "body":
+            for k in RETOUCH_KEYS:
+                fresh.amounts[k] = pp.amounts[k]
+            fresh.skin_detail, fresh.skin_scope = pp.skin_detail, pp.skin_scope
+            fresh.grain_size, fresh.blemish_size = pp.grain_size, pp.blemish_size
+            fresh.skin_basic = pp.skin_basic
+            self.session.cut.params[self.sel_pid] = fresh
+            self.session.touch("geo")
+        else:
+            self.session.cut.params[self.sel_pid] = fresh
+            self.session.touch()
         self._refresh_all()
+
+    # ---- skin: basic adjustment (a preset of the detail sliders)
+    def _skin_hand_set(self, pp):
+        """A skin or colour value changed by hand: the basic adjustment no longer describes the sliders."""
+        for q in [pp] + self._others():
+            if getattr(q, "skin_basic", None):
+                q.skin_basic = {}
+
+    def apply_skin_basic(self, level: str = "", switch=None):
+        """Sets the detail sliders from the basic adjustment (level light | std | strong, switch (name, remove)).
+        With no basic adjustment chosen yet, a switch starts from 표준 with every switch on 보호."""
+        pp = self._params()
+        if pp is None:
+            self.inspector.refresh("reshape")
+            return
+        from ..core.params import skin_basic_values
+        from ..core.project import Curve
+        cur = dict(pp.skin_basic) if pp.skin_basic else {"level": "std", "remove": []}
+        started = not pp.skin_basic
+        if level:
+            cur["level"] = level
+        rm = set(cur.get("remove", []))
+        if switch is not None:
+            (rm.add if switch[1] else rm.discard)(switch[0])
+        cur["remove"] = sorted(rm)
+        vals = skin_basic_values(cur["level"], cur["remove"])
+        targets = [pp] + self._others()
+        if any(q.amounts[k].keys for q in targets for k in vals):
+            m = QMessageBox(self)
+            m.setWindowTitle("기본 조정")
+            m.setIcon(QMessageBox.Question)
+            m.setText("키프레임이 있는 피부 보정 항목이 있습니다.")
+            m.setInformativeText("키프레임을 지우고 컷 전체에 같은 값으로 적용할까요?")
+            b_ok = m.addButton("키프레임 지우고 적용", QMessageBox.AcceptRole)
+            m.addButton("취소", QMessageBox.RejectRole)
+            m.setDefaultButton(b_ok)
+            m.exec()
+            if m.clickedButton() is not b_ok:
+                self.inspector.refresh("reshape")
+                return
+        self.push_undo()
+        for q in targets:
+            for k, v in vals.items():
+                q.amounts[k] = Curve(base=float(v))
+            q.skin_basic = {"level": cur["level"], "remove": list(cur["remove"])}
+        self.session.touch("ret")
+        self.viewer.update()
+        self.timeline.update()
+        self.inspector.refresh("reshape")
+        if started and switch is not None and not level:
+            self.toast("강도는 표준으로 적용했습니다", "ok")
 
     def copy_settings_dialog(self):
         s = self.session
@@ -3008,6 +3236,7 @@ class MainWindow(QMainWindow):
             elif m.clickedButton() is b_no:
                 self.session.dirty = False
                 self._discard_on_close = True
+                self._clear_recovery(Path(self.session.project.path))
             else:
                 e.ignore()
                 return
@@ -3025,6 +3254,8 @@ class MainWindow(QMainWindow):
         if self.job is not None:
             self.job.cancel()
             self.job.wait(5000)
+        if getattr(self, "_opening", None) is not None:
+            self._opening.wait(15000)
         self.stop_play()
         if not getattr(self, "_discard_on_close", False):
             self.save(quiet=True)
