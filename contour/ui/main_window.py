@@ -317,7 +317,7 @@ class MainWindow(QMainWindow):
         fit = Wd.tool("maximize", "화면에 맞추기  Z")
         fit.clicked.connect(lambda: self.viewer.fit_view())
         h.addWidget(fit)
-        foc = Wd.tool("columns-2", "보정 탭과 미리보기만  Shift+F")
+        foc = Wd.tool("columns-2", "오른쪽 패널과 미리보기만  Shift+F")
         foc.clicked.connect(self.toggle_focus)
         h.addWidget(foc)
         full = Wd.tool("expand", "전체 화면  Ctrl+F")
