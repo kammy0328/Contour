@@ -62,24 +62,9 @@ def import_timeline(project: Project, edit_path: str, baked_path: str, progress:
                     ", ".join(str(x) for x in al["extra"][:8]) + (" …" if len(al["extra"]) > 8 else ""))
     if replace:
         project.cuts = [c for c in project.cuts if not c.tl]
-    # an edit point one or two frames off the picture change in the bake (the XML of a re-cut, frame rounding at
-    # 23.976): the cut then starts on the last frame of the shot before (lngshot v3 cuts 006 and 039), and that
-    # frame is tracked and retouched as if it were this shot. Each boundary goes to the change next to it
-    peaks = set(al.get("peaks") or [])
-    snapped = {}
-
-    def snap(x: int) -> int:
-        if x <= 0 or x >= n or x in peaks:
-            return x
-        for d in (1, -1, 2, -2):
-            if x + d in peaks:
-                snapped[x] = x + d
-                return x + d
-        return x
-
     shots = []
     for s in tl.shots:
-        a, b = snap(s.rec_in + off), snap(s.rec_out + off)
+        a, b = s.rec_in + off, s.rec_out + off
         a, b = max(0, a), min(n, b)
         if b - a >= 1:
             shots.append((a, b, s))
@@ -89,9 +74,6 @@ def import_timeline(project: Project, edit_path: str, baked_path: str, progress:
     if shots and shots[0][0] > 0:
         from .timeline import Shot
         shots.insert(0, (0, shots[0][0], Shot(-off, shots[0][0] - off, "gap", note="편집 파일 범위 밖")))
-    if snapped:
-        warn.append(f"편집 경계 {len(snapped)}곳을 영상의 실제 화면 전환에 맞춰 1~2프레임 옮겼습니다: " +
-                    ", ".join(f"{a}→{b}" for a, b in sorted(snapped.items())[:8]) + (" …" if len(snapped) > 8 else ""))
     if tl.duration + off > n:
         warn.append(f"영상이 편집보다 {tl.duration + off - n}프레임 짧습니다 (끝부분 컷 일부 없음)")
     made = []
