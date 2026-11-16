@@ -557,4 +557,5 @@ def align(tl: Timeline, diff: np.ndarray, baked_tc_frames: Optional[int] = None)
     for c in {v for sh in tl.shots for v in (sh.rec_in, sh.rec_out)}:
         xs.update(range(c + off - 2, c + off + 3))
     res["extra"] = [int(p) for p in peaks if p not in xs and diff[p] > 0.12]
+    res["peaks"] = [int(p) for p in peaks]
     return res
