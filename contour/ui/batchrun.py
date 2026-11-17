@@ -9,6 +9,72 @@ from typing import Callable, List, Optional
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 
 APP_DIR = Path(__file__).resolve().parents[2]
+CANCELLED = "__cancelled__"     # finishedCut error text of a cut stopped by kill()
+
+
+def _tree(pid: int) -> List[int]:
+    """The process and every process under it (the analysis may run ffmpeg)."""
+    if sys.platform != "win32":
+        try:
+            import subprocess
+            out = subprocess.run(["ps", "-e", "-o", "pid=,ppid="], capture_output=True, text=True).stdout
+            kids = {}
+            for ln in out.splitlines():
+                a, b = ln.split()
+                kids.setdefault(int(b), []).append(int(a))
+        except Exception:
+            return [pid]
+    else:
+        import ctypes
+        from ctypes import wintypes
+
+        class PE(ctypes.Structure):
+            _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                        ("th32DefaultHeapID", ctypes.c_void_p), ("th32ModuleID", wintypes.DWORD),
+                        ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD),
+                        ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_char * 260)]
+        k32 = ctypes.windll.kernel32
+        snap = k32.CreateToolhelp32Snapshot(0x2, 0)
+        kids = {}
+        try:
+            e = PE()
+            e.dwSize = ctypes.sizeof(PE)
+            ok = k32.Process32First(snap, ctypes.byref(e))
+            while ok:
+                kids.setdefault(int(e.th32ParentProcessID), []).append(int(e.th32ProcessID))
+                ok = k32.Process32Next(snap, ctypes.byref(e))
+        finally:
+            k32.CloseHandle(snap)
+    out, todo = [], [pid]
+    while todo:
+        q = todo.pop()
+        if q in out:
+            continue
+        out.append(q)
+        todo.extend(kids.get(q, []))
+    return out
+
+
+def _suspend(pid: int, on: bool) -> bool:
+    """Stops (on) or lets go on (off) a process and its children where they are."""
+    ok = False
+    for q in _tree(pid):
+        try:
+            if sys.platform == "win32":
+                import ctypes
+                h = ctypes.windll.kernel32.OpenProcess(0x0800, False, q)       # PROCESS_SUSPEND_RESUME
+                if h:
+                    f = ctypes.windll.ntdll.NtSuspendProcess if on else ctypes.windll.ntdll.NtResumeProcess
+                    ok = (f(h) == 0) or ok
+                    ctypes.windll.kernel32.CloseHandle(h)
+            else:
+                import os
+                import signal
+                os.kill(q, signal.SIGSTOP if on else signal.SIGCONT)
+                ok = True
+        except Exception:
+            pass
+    return ok
 
 
 class BatchRunner(QObject):
@@ -28,6 +94,7 @@ class BatchRunner(QObject):
         self.done = 0
         self.failed = 0
         self._stop = False
+        self.paused = False
         self.before_start: Optional[Callable[[str], bool]] = None   # may veto / prepare a cut (returns False: skip)
 
     @property
@@ -43,6 +110,7 @@ class BatchRunner(QObject):
         if self.proc is None:
             self.done = self.failed = 0
             self._stop = False
+            self._killed = False
             self._next()
 
     def stop(self):
@@ -51,9 +119,33 @@ class BatchRunner(QObject):
         self.queue.clear()
 
     def kill(self):
+        """Stops now: the running cut's half-done analysis is dropped (the cut stays as it was)."""
         self.queue.clear()
+        self._stop = True
+        if self.proc is None:
+            self.finishedAll.emit(self.done, self.failed)
+            return
         if self.proc is not None:
+            self._killed = True
+            if self.paused:
+                self.resume()
             self.proc.kill()
+
+    def pause(self) -> bool:
+        """Stops the running analysis where it is (the process keeps its memory); resume() goes on."""
+        if self.proc is None or self.paused:
+            return False
+        pid = int(self.proc.processId() or 0)
+        if pid and _suspend(pid, True):
+            self.paused = True
+        return self.paused
+
+    def resume(self) -> None:
+        if self.proc is not None and self.paused:
+            pid = int(self.proc.processId() or 0)
+            if pid:
+                _suspend(pid, False)
+        self.paused = False
 
     def _next(self):
         while self.queue and not self._stop:
@@ -126,6 +218,7 @@ class BatchRunner(QObject):
                 self._errline = t[6:]
 
     def _finished(self, code, _status):
+        self.paused = False
         cid = self.current
         err = ""
         try:
@@ -139,7 +232,11 @@ class BatchRunner(QObject):
         except OSError:
             pass
         ok = code == 0
-        if ok:
+        killed = getattr(self, "_killed", False)
+        self._killed = False
+        if killed:
+            ok, err, self._errline = False, "", CANCELLED
+        elif ok:
             self.done += 1
         else:
             self.failed += 1

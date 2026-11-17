@@ -181,6 +181,7 @@ class MainWindow(QMainWindow):
         self.viewer.shapeAdded.connect(self._shape_added)
         self.viewer.shapeEdited.connect(self._shape_edited)
         self.viewer.contextAction.connect(self._viewer_context)
+        self.viewer.personAction.connect(self._person_action)
         self.viewer.editStarted.connect(lambda: self.push_undo())
         self.viewer.sculptEdited.connect(self._sculpt_edit)
         self.viewer.bodyEdited.connect(self._body_edit)
@@ -217,6 +218,8 @@ class MainWindow(QMainWindow):
         self.batch.finishedCut.connect(self._batch_cut_done)
         self.batch.finishedAll.connect(self._batch_all_done)
         self._batch_preset = None
+        self._batch_dlg = None
+        self._batch_skin = None
         self._review_pos = -1
         self._last_export = {}
         split.addWidget(center)
@@ -1211,7 +1214,15 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self.viewer.fit_view)
 
     def _cut_action(self, action: str, cid: str):
+        if action == "analyze_all":
+            self.analyze_all()
+            return
+        if action == "skin_all":
+            self.skin_all()
+            return
         prj = self.session.project
+        if prj is None:
+            return
         cut = prj.cut(cid)
         if cut is None:
             return
@@ -1436,37 +1447,10 @@ class MainWindow(QMainWindow):
             return
         cuts = prj.timeline_cuts()
         sel = [c for c in cuts if c.id in set(ids)]
-        if action in ("analyze", "analyze_force"):
-            if action == "analyze":
-                todo = [c for c in (sel or cuts) if not c.analyzed and c.tl.get("kind") == "clip"
-                        and (c.status or {}).get("auto") != "none"]
-            else:
-                todo = [c for c in sel if c.tl.get("kind") == "clip"]
-            if not todo:
-                self.toast("분석할 컷이 없습니다 (이미 분석했거나 인물 없음)")
-                return
-            self.save()
-            # the bake's shared proxy first (one decode), then every shot's analysis reads from it
-            from ..core.tlimport import bake_proxy, build_bake_proxy, link_bake_proxy
-            tlm = prj.timeline or {}
-            if tlm.get("baked") and Path(tlm["baked"]).exists() and bake_proxy(prj) is None and self.job is None:
-                if not self._ask_proxy_size():
-                    return
-                cm = manager()
-                vs = self.session.view_settings(todo[0])
-
-                def work(progress, cancelled):
-                    from ..track.analyze import Cancelled
-                    if not build_bake_proxy(prj, cm, vs, progress, cancelled):
-                        raise Cancelled()
-
-                self.run_job("편집 타임라인 프록시 만드는 중 (한 번만)", work,
-                             lambda _: self._tl_action("analyze_force", [c.id for c in todo]))
-                return
-            link_bake_proxy(prj)
-            run = {c.id: -1.0 for c in todo}
-            self.tlstrip.set_running(run, f"분석 대기 {len(todo)}컷")
-            self.batch.start(prj.path, [c.id for c in todo], self.accuracy, True)
+        if action == "analyze":
+            self.analyze_all(ids)
+        elif action == "analyze_force":
+            self._start_batch([c for c in (prj.cut(i) for i in ids) if c is not None])
         elif action == "stop":
             self.batch.stop()
             self.toast("지금 분석 중인 컷이 끝나면 멈춥니다")
@@ -1585,6 +1569,163 @@ class MainWindow(QMainWindow):
                 lines += [f"· {w}" for w in tl["warnings"]]
             QMessageBox.information(self, "편집 타임라인", "\n".join(lines))
 
+    # ================================================================== whole project: 전체 분석 / 전체 피부 보정
+    @staticmethod
+    def _clip_cuts(prj, ids=None) -> list:
+        cuts = [c for c in prj.cuts if c.tl.get("kind", "clip") == "clip"]
+        if ids:
+            sel = [c for c in cuts if c.id in set(ids)]
+            return sel or cuts
+        return cuts
+
+    def _busy_with(self) -> str:
+        if self.job is not None:
+            return "진행 중인 작업이 끝난 뒤 할 수 있습니다."
+        if self.batch.busy:
+            return "일괄 분석이 진행 중입니다."
+        if getattr(self, "_opening", None) is not None:
+            return "프로젝트를 여는 중입니다."
+        return ""
+
+    def analyze_all(self, ids=None):
+        """Every cut not analysed yet (or the cuts selected in the cut list / timeline), one after another, with
+        the app covered by the progress window (pause, go on, cancel)."""
+        prj = self.session.project
+        if prj is None:
+            self.toast("먼저 프로젝트를 여세요", "warn")
+            return
+        why = self._busy_with()
+        if why:
+            self.toast(why, "warn")
+            return
+        if ids is None:
+            ids = [i for i in self.cutlist.selected_ids()] if len(self.cutlist.selected_ids()) > 1 else []
+        pool = self._clip_cuts(prj, ids)
+        todo = [c for c in pool if not c.analyzed and (c.status or {}).get("auto") != "none"]
+        if not todo:
+            self.toast("분석할 컷이 없습니다 (모두 분석했거나 인물 없음)")
+            return
+        from .batchdlg import AnalyzeAllDialog
+        frames = sum(int(c.info.frames) for c in todo)
+        dlg = AnalyzeAllDialog(self, len(todo), frames, sum(1 for c in pool if c.analyzed),
+                               float(getattr(settings(), "analysis_spf", 0.0) or 0.0))
+        if dlg.exec() != QDialog.Accepted:
+            return
+        self._batch_skin = dlg.skin()
+        self._batch_preset = None
+        self._batch_dlg = None
+        self._batch_skin = None
+        self._start_batch(todo)
+
+    def _start_batch(self, todo: list):
+        prj = self.session.project
+        if prj is None or not todo:
+            return
+        self.save()
+        # the bake's shared proxy first (one decode), then every shot's analysis reads from it
+        from ..core.tlimport import bake_proxy, build_bake_proxy, link_bake_proxy
+        tlm = prj.timeline or {}
+        if tlm.get("baked") and Path(tlm["baked"]).exists() and bake_proxy(prj) is None and self.job is None:
+            if not self._ask_proxy_size():
+                return
+            cm = manager()
+            vs = self.session.view_settings(todo[0])
+
+            def work(progress, cancelled):
+                from ..track.analyze import Cancelled
+                if not build_bake_proxy(prj, cm, vs, progress, cancelled):
+                    raise Cancelled()
+
+            self.run_job("편집 타임라인 프록시 만드는 중 (한 번만)", work,
+                         lambda _: self._start_batch(todo))
+            return
+        link_bake_proxy(prj)
+        from .batchdlg import BatchProgress
+        run = {c.id: -1.0 for c in todo}
+        self.tlstrip.set_running(run, f"분석 대기 {len(todo)}컷")
+        dlg = BatchProgress(self, "전체 분석", [c.id for c in todo], {c.id: c.name for c in todo},
+                            {c.id: int(c.info.frames) for c in todo},
+                            float(getattr(settings(), "analysis_spf", 0.0) or 0.0))
+        dlg.pauseToggled.connect(self._batch_pause)
+        dlg.cancelNow.connect(self.batch.kill)
+        dlg.cancelAfter.connect(self.batch.stop)
+        self._batch_dlg = dlg
+        dlg.open()
+        self.batch.start(prj.path, [c.id for c in todo], self.accuracy, True)
+
+    def _batch_pause(self, on: bool):
+        dlg = getattr(self, "_batch_dlg", None)
+        if on:
+            if not self.batch.pause() and dlg is not None:
+                dlg.set_paused(False)
+                self.toast("지금은 멈출 수 없습니다 (컷이 시작되는 중). 잠시 뒤 다시 누르세요.", "warn")
+        else:
+            self.batch.resume()
+
+    def skin_all(self):
+        """The skin basic adjustment on the targets of every analysed cut."""
+        prj = self.session.project
+        if prj is None:
+            self.toast("먼저 프로젝트를 여세요", "warn")
+            return
+        why = self._busy_with()
+        if why:
+            self.toast(why, "warn")
+            return
+        cuts = self._clip_cuts(prj)
+        done = [c for c in cuts if c.analyzed]
+        if not done:
+            self.toast("분석된 컷이 없습니다. 먼저 전체 분석을 하세요.", "warn")
+            return
+
+        def hand(pp) -> bool:
+            return bool(pp.retouch_active()) and not pp.skin_basic
+
+        people = [(c, q) for c in done for q in c.targets()]
+        n_hand = sum(1 for c, q in people if hand(c.params_for(q.id)))
+        from .batchdlg import SkinAllDialog, BatchProgress
+        dlg = SkinAllDialog(self, len(done), len(people), n_hand, len(cuts) - len(done))
+        if dlg.exec() != QDialog.Accepted:
+            return
+        level, remove, skip_hand = dlg.values()
+        from ..core.params import skin_basic_values
+        from ..core.project import Curve
+        vals = skin_basic_values(level, remove)
+        self.save()
+        cur = self.session.cut
+        if cur is not None and cur in done:
+            self.push_undo()
+        pg = BatchProgress(self, "전체 피부 보정", [c.id for c in done], {c.id: c.name for c in done},
+                           {c.id: 1 for c in done}, 0.01, can_pause=False)
+        stop = {"now": False}
+        pg.cancelNow.connect(lambda: stop.__setitem__("now", True))
+        pg.cancelAfter.connect(lambda: stop.__setitem__("now", True))
+        pg.open()
+        n = skipped = 0
+        for c in done:
+            if stop["now"]:
+                break
+            pg.started(c.id)
+            QApplication.processEvents()
+            for q in c.targets():
+                pp = c.params_for(q.id)
+                if skip_hand and hand(pp):
+                    skipped += 1
+                    continue
+                for k, v in vals.items():
+                    pp.amounts[k] = Curve(base=float(v))
+                pp.skin_basic = {"level": level, "remove": list(remove)}
+                n += 1
+            pg.cut_done(c.id, False)
+        pg.finish()
+        self.session.dirty = True
+        self.save()
+        if cur is not None:
+            self.session.touch("ret")
+        self._refresh_all()
+        self.viewer.update()
+        self.toast(f"전체 피부 보정: {n}명 적용" + (f" · 손으로 조정한 {skipped}명 건너뜀" if skipped else ""), "ok")
+
     def _batch_before(self, cid: str) -> bool:
         prj = self.session.project
         cut = prj.cut(cid) if prj else None
@@ -1607,6 +1748,9 @@ class MainWindow(QMainWindow):
         left = sum(1 for v in run.values() if v < 0)
         cut = self.session.project.cut(cid) if self.session.project else None
         self.tlstrip.set_running(run, f"분석 중 {cut.name if cut else ''} {f * 100:.0f}% · {msg} · 대기 {left}")
+        dlg = getattr(self, "_batch_dlg", None)
+        if dlg is not None:
+            dlg.progress(cid, f, msg)
 
     def _batch_cut_done(self, cid: str, ok: bool, err: str):
         from ..core.project import Cut
@@ -1618,10 +1762,26 @@ class MainWindow(QMainWindow):
         cut = prj.cut(cid) if prj else None
         if cut is None:
             return
+        dlg = getattr(self, "_batch_dlg", None)
+        from .batchrun import CANCELLED
+        if err == CANCELLED:
+            # stopped in the middle: the half-done analysis is dropped, the cut stays as it was
+            try:
+                result_path(prj, cut).unlink()
+            except OSError:
+                pass
+            if dlg is not None:
+                dlg.drop(cid)
+            if getattr(self, "_reopen_after", None) == cid:
+                self._reopen_after = None
+                self.open_cut(cid)
+            return
         f = result_path(prj, cut)
+        if dlg is not None and (not ok or not f.exists()):
+            dlg.cut_done(cid, False)
         if not ok or not f.exists():
             s = dict(cut.status or {})
-            s.update(auto="bad", reason=f"분석 실패: {err or '알 수 없는 오류'}"[:120])
+            s.update(auto="bad", reason=f"분석 실패: {err or '알 수 없는 오류'}"[:120], failed=True)
             cut.status = s
             self.session.dirty = True
             self.tlstrip.update_counts()
@@ -1630,7 +1790,11 @@ class MainWindow(QMainWindow):
             import json as _json
             d = _json.loads(f.read_text(encoding="utf-8"))
             new = Cut.from_dict(d["cut"])
+            if dlg is not None:
+                dlg.cut_done(cid, bool(d.get("analyzed")))
         except Exception as e:
+            if dlg is not None:
+                dlg.cut_done(cid, False)
             self.toast(f"{cut.name}: 분석 결과를 읽지 못했습니다 ({e})", "error")
             return
         # the user may have changed status or review marks meanwhile: keep those
@@ -1638,10 +1802,21 @@ class MainWindow(QMainWindow):
         new.status = dict(new.status or {}, **keep)
         i = prj.cuts.index(cut)
         prj.cuts[i] = new
+        new.status.pop("failed", None)
         if self._batch_preset:
             from ..core import presets as P
             for q in new.targets():
                 P.apply(new.params_for(q.id), self._batch_preset)
+        if getattr(self, "_batch_skin", None) and d.get("analyzed"):
+            from ..core.params import skin_basic_values
+            from ..core.project import Curve
+            lv, rm = self._batch_skin
+            vals = skin_basic_values(lv, rm)
+            for q in new.targets():
+                pp = new.params_for(q.id)
+                for k, v in vals.items():
+                    pp.amounts[k] = Curve(base=float(v))
+                pp.skin_basic = {"level": lv, "remove": list(rm)}
         try:
             f.unlink()
         except OSError:
@@ -1680,6 +1855,17 @@ class MainWindow(QMainWindow):
         return r
 
     def _batch_all_done(self, done: int, failed: int):
+        dlg = getattr(self, "_batch_dlg", None)
+        self._batch_dlg = None
+        self._batch_skin = None
+        if dlg is not None:
+            if dlg.meas_frames >= 24 and dlg.meas_sec > 0:
+                st = settings()
+                spf = dlg.meas_sec / dlg.meas_frames
+                st.analysis_spf = round(spf if not st.analysis_spf else 0.5 * st.analysis_spf + 0.5 * spf, 3)
+                st.save()
+            dlg.finish()
+        self.cutlist.refresh(self.session.cut.id if self.session.cut else None)
         self.tlstrip.set_running({}, "")
         self.tlstrip.update_counts()
         self.toast(f"일괄 분석 끝: {done}컷" + (f" · 실패 {failed}컷" if failed else ""), "ok" if not failed else "warn")
@@ -2804,6 +2990,63 @@ class MainWindow(QMainWindow):
             t = self.frame
             self.edit_worker.submit(("resolve", pid), lambda: s.resolve_local(pid, t))
             self.toast(f"{S.JOINT_NAMES_KO[j]} 키를 지웠습니다.")
+
+    def _person_action(self, action: str, pid: int):
+        """Right click on a person in the preview: rename, 보정/보호, delete."""
+        cut = self.session.cut
+        q = cut.person(pid) if cut else None
+        if q is None:
+            return
+        self.select_person(pid)
+        if action == "role":
+            self.set_role("protect" if q.role == "target" else "target")
+        elif action == "delete":
+            self.sel_pids = set()
+            self.delete_person()
+        elif action == "rename":
+            prj = self.session.project
+            mid = q.member if (q.member and prj is not None and q.member in prj.members) else ""
+            ncuts = len({c for c, _ in prj.members[mid]["people"]}) if mid else 1
+            dlg = QDialog(self)
+            dlg.setWindowTitle("이름 변경")
+            v = QVBoxLayout(dlg)
+            v.setContentsMargins(18, 16, 18, 14)
+            ed = QLineEdit(q.name)
+            ed.selectAll()
+            v.addWidget(QLabel("이름"))
+            v.addWidget(ed)
+            from PySide6.QtWidgets import QRadioButton
+            r_all = QRadioButton(f"같은 사람으로 연결된 모든 컷 ({ncuts}컷)")
+            r_one = QRadioButton("이 컷만")
+            (r_all if mid and ncuts > 1 else r_one).setChecked(True)
+            r_all.setEnabled(bool(mid) and ncuts > 1)
+            if not mid:
+                r_all.setToolTip("다른 컷의 같은 사람과 아직 연결되지 않았습니다 (인물 버튼에서 연결)")
+            v.addWidget(r_all)
+            v.addWidget(r_one)
+            h = QHBoxLayout()
+            h.addStretch(1)
+            b_no = QPushButton("취소")
+            b_ok = QPushButton("변경")
+            b_ok.setDefault(True)
+            b_no.clicked.connect(dlg.reject)
+            b_ok.clicked.connect(dlg.accept)
+            h.addWidget(b_no)
+            h.addWidget(b_ok)
+            v.addLayout(h)
+            if dlg.exec() != QDialog.Accepted or not ed.text().strip():
+                return
+            name = ed.text().strip()
+            if r_all.isChecked() and mid:
+                from ..track import xlink as XL
+                XL.rename(prj, mid, name)
+                self.session.dirty = True
+                self.cutlist.refresh(cut.id)
+                self.tlstrip.refresh()
+                self._refresh_all()
+            else:
+                self.rename_person(name)
+        self.viewer.update()
 
     def _viewer_context(self, action, pid, j):
         s = self.session
