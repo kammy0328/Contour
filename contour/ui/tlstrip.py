@@ -31,12 +31,37 @@ def badge_rect(tr: QRectF, ver: str) -> QRectF:
     return QRectF(tr.right() - w - 4, tr.top() + 4, w, 17)
 
 
+def _state_text(cut) -> str:
+    ws = WS.state(cut)
+    return WS.LABEL[ws] + (" · 추적 확인" if ST.effective(cut) == "bad" and ws not in ("skip", "done") else "")
+
+
 class _List(QListWidget):
     """The thumbnail row; a click on a version badge opens the version list instead of selecting the cut."""
     badgeClicked = Signal(object, QPoint)
+    stateClicked = Signal(object, QPoint)
+
+    @staticmethod
+    def _label_rect(r: QRectF, tr: QRectF, cut) -> QRectF:
+        from PySide6.QtGui import QFontMetrics
+        w = QFontMetrics(font(10, 600)).horizontalAdvance(_state_text(cut)) + 18
+        return QRectF(r.left() + 2, tr.bottom() + 2, min(w, TW), 17)
+
+    def _label_hit(self, pos):
+        it = self.itemAt(pos.toPoint())
+        if it is None:
+            return None
+        cut = it.data(Qt.UserRole)
+        r = QRectF(self.visualItemRect(it)).adjusted(4, 3, -4, -3)
+        tr = QRectF(r.left() + 4, r.top() + 4, TW, TH)
+        return cut if cut is not None and self._label_rect(r, tr, cut).contains(pos) else None
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
+            lc = self._label_hit(e.position())
+            if lc is not None:
+                self.stateClicked.emit(lc, self.viewport().mapToGlobal(e.position().toPoint()))
+                return
             it = self.itemAt(e.position().toPoint())
             if it is not None:
                 cut = it.data(Qt.UserRole)
@@ -56,7 +81,8 @@ class _List(QListWidget):
             cut = it.data(Qt.UserRole)
             r = QRectF(self.visualItemRect(it)).adjusted(4, 3, -4, -3)
             tr = QRectF(r.left() + 4, r.top() + 4, TW, TH)
-            hand = badge_rect(tr, f"v{int(getattr(cut, 'version', 1) or 1)}").contains(e.position())
+            hand = badge_rect(tr, f"v{int(getattr(cut, 'version', 1) or 1)}").contains(e.position()) \
+                or self._label_hit(e.position()) is not None
         self.viewport().setCursor(Qt.PointingHandCursor if hand else Qt.ArrowCursor)
         super().mouseMoveEvent(e)
 
@@ -95,6 +121,9 @@ class _Delegate(QStyledItemDelegate):
         st = ST.effective(cut)
         ws = WS.state(cut)
         col = QColor(WS.COLOR[ws])
+        if ws == "skip":
+            p.setBrush(QColor(0, 0, 0, 120))
+            p.drawRoundedRect(tr, 4, 4)             # nothing to do here: dimmed
         # status bar under the picture, user override drawn solid, automatic drawn lighter
         bar = QRectF(tr.left(), tr.bottom() - 3, tr.width(), 3)
         p.setBrush(col)
@@ -139,14 +168,13 @@ class _Delegate(QStyledItemDelegate):
             p.setPen(QPen(qc("accent"), 2))
             p.setBrush(Qt.NoBrush)
             p.drawRoundedRect(tr.adjusted(-1, -1, 1, 1), 5, 5)
-        # label
-        p.setPen(Qt.NoPen)
-        p.setBrush(col)
-        p.drawEllipse(QRectF(r.left() + 6, tr.bottom() + 8, 6, 6))
-        p.setPen(qc("text2") if not sel else qc("text"))
+        # label (click it to change the state)
+        from .cutlist import draw_state_icon
+        tc = QColor("#8C8C8C") if ws == "skip" else (col if ws in ("todo", "doing", "done") else qc("text2"))
+        draw_state_icon(p, r.left() + 10, tr.bottom() + 10.5, ws, tc)
+        p.setPen(tc)
         p.setFont(font(10, 600))
-        lab = WS.LABEL[ws] + (" · 추적 확인" if st == "bad" and ws not in ("skip", "done") else "")
-        p.drawText(QRectF(r.left() + 16, tr.bottom() + 3, TW - 10, 15), Qt.AlignLeft | Qt.AlignVCenter, lab)
+        p.drawText(QRectF(r.left() + 19, tr.bottom() + 3, TW - 13, 15), Qt.AlignLeft | Qt.AlignVCenter, _state_text(cut))
         p.setPen(qc("text3"))
         p.setFont(font(9, 400, tabular=True))
         n = cut.info.frames
@@ -162,6 +190,7 @@ class TimelineStrip(QWidget):
     action = Signal(str, list)          # action, cut ids
     menuRequested = Signal(list, QPoint)
     versionPicked = Signal(str, int)     # cut id, version
+    stateRequested = Signal(list, QPoint)    # cut ids, global position: a status label was clicked
 
     def __init__(self, session, parent=None):
         super().__init__(parent)
@@ -220,6 +249,7 @@ class TimelineStrip(QWidget):
         lay.addLayout(head)
         self.list = _List()
         self.list.badgeClicked.connect(self._badge_menu)
+        self.list.stateClicked.connect(self._state_click)
         self.list.setViewMode(QListView.IconMode)
         self.list.setFlow(QListView.LeftToRight)
         self.list.setWrapping(False)
@@ -323,6 +353,10 @@ class TimelineStrip(QWidget):
         return ids[j] if 0 <= j < len(ids) else None
 
     # ------------------------------------------------------------------ interaction
+    def _state_click(self, cut, gpos):
+        ids = self.selected_ids()
+        self.stateRequested.emit(ids if cut.id in ids and len(ids) > 1 else [cut.id], gpos)
+
     def _badge_menu(self, cut, gpos):
         vs = WS.all_versions(cut)
         m = QMenu(self)

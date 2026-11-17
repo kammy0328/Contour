@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QHBoxLayout, QLabel
                                QStyle, QStyledItemDelegate, QVBoxLayout, QWidget)
 
 from . import widgets as Wd
+from ..core import workstate as WS
 from .theme import C, font, qc
 from .viewer import np_to_qimage
 
@@ -71,6 +72,11 @@ class _Delegate(QStyledItemDelegate):
             dw, dh = iw * s, ih * s
             p.drawImage(QRectF(tr.center().x() - dw / 2, tr.center().y() - dh / 2, dw, dh), th)
             p.restore()
+        from ..core import workstate as WS0
+        if WS0.state(cut) == "skip":
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(0, 0, 0, 120))
+            p.drawRoundedRect(tr, 5, 5)             # nothing to do here: dimmed
         draw_analysed(p, tr, cut)
         x = tr.right() + 10
         p.setFont(font(12, 600))
@@ -97,17 +103,9 @@ class _Delegate(QStyledItemDelegate):
         p.drawText(QRectF(x, r.top() + 27, r.right() - x, 16), Qt.AlignLeft | Qt.AlignVCenter, meta)
         # status pill
         status, col = self.panel.status_of(cut)
-        p.setFont(font(10, 600))
-        fm = p.fontMetrics()
-        w = fm.horizontalAdvance(status) + 14
-        pr = QRectF(x, r.top() + 46, w, 18)
-        c = QColor(col)
-        bg = QColor(c.red(), c.green(), c.blue(), 40)
-        p.setPen(Qt.NoPen)
-        p.setBrush(bg)
-        p.drawRoundedRect(pr, 9, 9)
-        p.setPen(c)
-        p.drawText(pr, Qt.AlignCenter, status)
+        ws = WS0.state(cut)
+        pr = QRectF(x, r.top() + 46, pill_width(status), 18)
+        draw_pill(p, pr, ws, status)
         # tracking needs a look (automatic check): a small amber note after the pill
         from ..core import workstate as WS
         from ..track import status as ST
@@ -125,11 +123,68 @@ class _Delegate(QStyledItemDelegate):
         p.restore()
 
 
+def pill_width(label: str) -> float:
+    return QFontMetrics(font(10, 600)).horizontalAdvance(label) + 14 + 13
+
+
+def draw_state_icon(p: QPainter, cx: float, cy: float, ws: str, col: QColor) -> None:
+    """Small mark in front of a work state: 분석 전 ring, 작업 전 dot, 작업 중 play, 완료 check, 불필요 dash."""
+    p.save()
+    p.setRenderHint(QPainter.Antialiasing)
+    pen = QPen(col, 1.6)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    if ws == "pre":
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawEllipse(QPointF(cx, cy), 3.0, 3.0)
+    elif ws == "todo":
+        p.setPen(Qt.NoPen)
+        p.setBrush(col)
+        p.drawEllipse(QPointF(cx, cy), 3.2, 3.2)
+    elif ws == "doing":
+        p.setPen(Qt.NoPen)
+        p.setBrush(col)
+        from PySide6.QtGui import QPolygonF
+        p.drawPolygon(QPolygonF([QPointF(cx - 2.6, cy - 3.6), QPointF(cx + 3.6, cy), QPointF(cx - 2.6, cy + 3.6)]))
+    elif ws == "done":
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawPolyline([QPointF(cx - 3.2, cy + 0.2), QPointF(cx - 0.9, cy + 2.6), QPointF(cx + 3.4, cy - 2.4)])
+    else:                                   # skip
+        p.setPen(pen)
+        p.drawLine(QPointF(cx - 3.2, cy), QPointF(cx + 3.2, cy))
+    p.restore()
+
+
+def draw_pill(p: QPainter, pr: QRectF, ws: str, label: str) -> None:
+    """The work state of a cut. 작업 전 is filled and warm (it needs work), 작업 중 blue, 작업 불필요 only an
+    outline in grey (nothing to do), so the two are told apart at a glance."""
+    p.save()
+    p.setRenderHint(QPainter.Antialiasing)
+    c = QColor(WS.COLOR[ws])
+    if ws == "skip":
+        p.setPen(QPen(QColor(c.red(), c.green(), c.blue(), 200), 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(pr.adjusted(0.5, 0.5, -0.5, -0.5), 9, 9)
+        tc = QColor("#8C8C8C")
+    else:
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(c.red(), c.green(), c.blue(), 75 if ws in ("todo", "doing") else 40))
+        p.drawRoundedRect(pr, 9, 9)
+        tc = c
+    draw_state_icon(p, pr.left() + 9, pr.center().y(), ws, tc)
+    p.setPen(tc)
+    p.setFont(font(10, 600))
+    p.drawText(QRectF(pr.left() + 17, pr.top(), pr.width() - 19, pr.height()), Qt.AlignLeft | Qt.AlignVCenter, label)
+    p.restore()
+
+
 def draw_analysed(p: QPainter, tr: QRectF, cut, left: bool = False) -> None:
-    """On a cut's thumbnail: a green check once analysed, a red ! when the last analysis failed."""
+    """On a cut's thumbnail: a red ! when the last analysis failed. (Analysed is told by the work state label.)"""
     st = cut.status or {}
     if cut.analyzed:
-        col, mark = QColor("#30A46C"), "check"
+        return
     elif st.get("failed"):
         col, mark = QColor("#E5484D"), "fail"
     else:
@@ -154,7 +209,38 @@ def draw_analysed(p: QPainter, tr: QRectF, cut, left: bool = False) -> None:
     p.restore()
 
 
+class _List(QListWidget):
+    """A click on the status pill opens the status menu instead of selecting the cut."""
+    stateClicked = Signal(object, QPoint)
+
+    def _pill_hit(self, pos):
+        it = self.itemAt(pos.toPoint())
+        if it is None:
+            return None
+        cut = it.data(Qt.UserRole)
+        if cut is None:
+            return None
+        r = QRectF(self.visualItemRect(it)).adjusted(6, 3, -6, -3)
+        x = r.left() + 6 + 96 + 10
+        label = WS.LABEL[WS.state(cut)]
+        pr = QRectF(x, r.top() + 46, pill_width(label), 18).adjusted(-2, -3, 2, 3)
+        return cut if pr.contains(pos) else None
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            cut = self._pill_hit(e.position())
+            if cut is not None:
+                self.stateClicked.emit(cut, self.viewport().mapToGlobal(e.position().toPoint()))
+                return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        self.viewport().setCursor(Qt.PointingHandCursor if self._pill_hit(e.position()) is not None else Qt.ArrowCursor)
+        super().mouseMoveEvent(e)
+
+
 class CutList(QWidget):
+    stateRequested = Signal(list, QPoint)    # cut ids, global position: the status label was clicked
     cutSelected = Signal(str)
     addRequested = Signal()
     action = Signal(str, str)        # action, cut id
@@ -202,7 +288,8 @@ class CutList(QWidget):
         self.filter.addItem("분석 실패", "failed")
         self.filter.currentIndexChanged.connect(lambda _: self.refresh(self._current_id()))
         lay.addWidget(self.filter)
-        self.list = QListWidget()
+        self.list = _List()
+        self.list.stateClicked.connect(self._state_click)
         self.list.setItemDelegate(_Delegate(self))
         self.list.setStyleSheet("QListWidget { background: transparent; border: none; } QListWidget::item { border: none; }")
         self.list.setMouseTracking(True)
@@ -273,6 +360,10 @@ class CutList(QWidget):
         if QApplication.keyboardModifiers() & (Qt.ShiftModifier | Qt.ControlModifier) and len(self.list.selectedItems()) > 1:
             return                       # building a multi-selection: stay on the open cut
         self.cutSelected.emit(cur.data(Qt.UserRole).id)
+
+    def _state_click(self, cut, gpos):
+        ids = self.selected_ids()
+        self.stateRequested.emit(ids if cut.id in ids and len(ids) > 1 else [cut.id], gpos)
 
     def _menu(self, pos):
         it = self.list.itemAt(pos)

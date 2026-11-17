@@ -126,6 +126,36 @@ class Viewer(QWidget):
             rects.append(r)
         return rects
 
+    def _cells(self) -> List[QRectF]:
+        """The viewer areas the panes live in (images are clipped to them: a zoomed image must not run over the
+        neighbouring pane)."""
+        W, H = self.width(), self.height()
+        n = 2 if self.mode == "side" else 1
+        pane_w = (W - 24 - (12 if n == 2 else 0)) / n
+        return [QRectF(12 + (pane_w + 12) * i, 12, pane_w, H - 24) for i in range(n)]
+
+    def _wipe_x(self) -> float:
+        """Wipe divider: fixed on the screen (zooming or panning moves the picture under it, not the line)."""
+        c = self._cells()[0]
+        return c.left() + c.width() * self.wipe
+
+    def _limit_pan(self):
+        """The picture can be pushed around but never out of sight."""
+        panes, cells = self._panes(), self._cells()
+        r, c = panes[0], cells[0]
+        keep = 60.0
+        dx = dy = 0.0
+        if r.right() < c.left() + keep:
+            dx = c.left() + keep - r.right()
+        elif r.left() > c.right() - keep:
+            dx = c.right() - keep - r.left()
+        if r.bottom() < c.top() + keep:
+            dy = c.top() + keep - r.bottom()
+        elif r.top() > c.bottom() - keep:
+            dy = c.bottom() - keep - r.top()
+        if dx or dy:
+            self.pan = QPointF(self.pan.x() + dx, self.pan.y() + dy)
+
     def _edit_rect(self) -> QRectF:
         ps = self._panes()
         return ps[-1]
@@ -423,43 +453,52 @@ class Viewer(QWidget):
         mode = self.mode
         if mode in ("result", "orig") and self.ab_flip:
             mode = "orig" if mode == "result" else "result"
+        cells = self._cells()
         if mode == "side":
-            for r, which, lab in zip(panes, ("orig", "result"), ("원본", "결과")):
+            for r, cell, which, lab in zip(panes, cells, ("orig", "result"), ("원본", "결과")):
                 img = self._qimg(which)
+                p.save()
+                p.setClipRect(cell)
                 if img is not None:
                     p.drawImage(r, img)
-                self._tag(p, r, lab)
+                p.restore()
+                self._tag(p, cell, lab)
             r = panes[1]
         elif mode == "wipe":
             r = panes[0]
+            cell = cells[0]
             a, b = self._qimg("orig"), self._qimg("result")
             if b is not None:
                 p.drawImage(r, b)
+            x = self._wipe_x()
             if a is not None:
-                x = r.left() + r.width() * self.wipe
                 p.save()
-                p.setClipRect(QRectF(r.left(), r.top(), x - r.left(), r.height()))
+                p.setClipRect(QRectF(cell.left(), cell.top(), x - cell.left(), cell.height()))
                 p.drawImage(r, a)
                 p.restore()
                 p.setPen(QPen(QColor(255, 255, 255, 200), 1.2))
-                p.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()))
+                p.drawLine(QPointF(x, cell.top()), QPointF(x, cell.bottom()))
                 p.setBrush(qc("bg3"))
                 p.setPen(QPen(qc("line2"), 1))
-                p.drawEllipse(QPointF(x, r.center().y()), 9, 9)
-            self._tag(p, r, "원본", left=True)
-            self._tag(p, r, "결과")
+                p.drawEllipse(QPointF(x, cell.center().y()), 9, 9)
+            self._tag(p, cell, "원본", left=True)
+            self._tag(p, cell, "결과")
         else:
             r = panes[0]
             img = self._qimg("orig" if mode == "orig" else "result")
             if img is not None:
                 p.drawImage(r, img)
             if mode == "orig":
-                self._tag(p, r, "원본")
-        # overlays on the edit pane (in wipe mode only on the result side)
+                self._tag(p, cells[0], "원본")
+        # overlays on the edit pane (in wipe mode only on the result side, in side mode inside its pane)
+        clipped = mode in ("wipe", "side")
         if mode == "wipe":
             p.save()
-            xw = r.left() + r.width() * self.wipe
-            p.setClipRect(QRectF(xw, r.top(), r.right() - xw, r.height()))
+            xw = self._wipe_x()
+            p.setClipRect(QRectF(xw, cells[0].top(), cells[0].right() - xw, cells[0].height()))
+        elif mode == "side":
+            p.save()
+            p.setClipRect(cells[1])
         if self.show_matte:
             mi = self._matte_img()
             if mi is not None:
@@ -468,8 +507,11 @@ class Viewer(QWidget):
             si = self._skin_img()
             if si is not None:
                 p.drawImage(r, si)
-        if mode == "wipe":
+        if clipped:
             p.restore()
+        if mode == "side":
+            p.save()
+            p.setClipRect(cells[1])
         if self._hover_pid is not None and self.tool == "edit" and self._drag is None:
             self._paint_hover(p, r, self._hover_pid)
         if self.show_protect:
@@ -482,6 +524,8 @@ class Viewer(QWidget):
             self._paint_body(p, r)
         if self._draw is not None:
             self._paint_draft(p)
+        if mode == "side":
+            p.restore()
         if self.message:
             self._tag(p, QRectF(self.rect()).adjusted(12, 12, -12, -12), self.message, left=True, bottom=True)
         # the "not computed yet" tag only after several original frames in a row, and it stays a moment:
@@ -492,7 +536,7 @@ class Viewer(QWidget):
                 self._raw_shown_until = self._paint_n + 12
         self._paint_n = getattr(self, "_paint_n", 0) + 1
         if self.playing and getattr(self, "_raw_shown_until", -1) > self._paint_n:
-            self._tag(p, r, "미리 계산 전 · 원본")
+            self._tag(p, cells[-1], "미리 계산 전 · 원본")
 
     def _tag(self, p: QPainter, r: QRectF, text: str, left: bool = False, bottom: bool = False):
         p.save()
@@ -1004,8 +1048,7 @@ class Viewer(QWidget):
         if e.button() != Qt.LeftButton:
             return
         if self.mode == "wipe":
-            r = self._panes()[0]
-            x = r.left() + r.width() * self.wipe
+            x = self._wipe_x()
             if abs(pos.x() - x) < 10:
                 self._wipe_drag = True
                 return
@@ -1048,11 +1091,12 @@ class Viewer(QWidget):
             start, pan0 = self._panning
             self.fit = False
             self.pan = pan0 + (pos - start)
+            self._limit_pan()
             self.update()
             return
         if self._wipe_drag:
-            r = self._panes()[0]
-            self.wipe = float(np.clip((pos.x() - r.left()) / max(1, r.width()), 0, 1))
+            c = self._cells()[0]
+            self.wipe = float(np.clip((pos.x() - c.left()) / max(1, c.width()), 0, 1))
             self.update()
             return
         if self._draw is not None:
@@ -1104,7 +1148,7 @@ class Viewer(QWidget):
                 self.update()
             if hv is not None or ph is not None or gh is not None or hp is not None:
                 self.setCursor(Qt.PointingHandCursor)
-            elif self.mode == "wipe" and abs(pos.x() - (self._panes()[0].left() + self._panes()[0].width() * self.wipe)) < 10:
+            elif self.mode == "wipe" and abs(pos.x() - self._wipe_x()) < 10:
                 self.setCursor(Qt.SplitHCursor)
             else:
                 self.setCursor(Qt.ArrowCursor)
@@ -1258,6 +1302,12 @@ class Viewer(QWidget):
         r2 = self._panes()[k]
         q = self.img_to_w(ix, iy, r2)
         self.pan += pos - q
+        c0 = self._cells()[0]
+        iw, ih = self._img_size()
+        if self.zoom <= min(c0.width() / iw, c0.height() / ih) * 1.001:
+            self.fit_view()                 # zoomed out to the whole picture: back to the fitted, centred view
+            return
+        self._limit_pan()
         self.update()
 
     def fit_view(self):
