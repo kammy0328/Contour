@@ -155,8 +155,12 @@ def launch_installer(setup: Path) -> None:
     if sys.platform != "win32":
         subprocess.Popen(args, close_fds=True)
         return
-    # a few seconds' wait first: this app's Python must have exited before its files are replaced
-    # 'start' goes through ShellExecute: the installer (Program Files, needs admin) gets its UAC prompt
-    cmd = "ping -n 5 127.0.0.1 >nul & start \"\" " + subprocess.list2cmdline(args)
-    flags = 0x00000008 | 0x00000200 | 0x08000000      # DETACHED_PROCESS | NEW_PROCESS_GROUP | NO_WINDOW
-    subprocess.Popen(["cmd", "/c", cmd], close_fds=True, creationflags=flags)
+    # a few seconds' wait first: this app's Python must have exited before its files are replaced.
+    # 'start' goes through ShellExecute: the installer (Program Files, needs admin) gets its UAC prompt.
+    # The command line is given to cmd as one string (cmd /s /c "...") so its quotes reach cmd as they are:
+    # passed as a list, Python escapes them as \" which cmd does not read (1.9.0: Windows said '\\' not found).
+    # CREATE_NO_WINDOW without DETACHED_PROCESS: cmd and its ping share one hidden console, nothing shows.
+    inner = 'ping -n 5 127.0.0.1 >nul & start "" ' + " ".join(f'"{a}"' for a in args)
+    line = f'cmd.exe /d /s /c "{inner}"'
+    flags = 0x00000200 | 0x08000000                   # CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+    subprocess.Popen(line, close_fds=True, creationflags=flags)
