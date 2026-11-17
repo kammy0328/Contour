@@ -5,7 +5,7 @@ import time
 from typing import Dict, List, Optional
 
 from PySide6.QtCore import QSize, Qt, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QFontMetrics
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem, QMenu, QPushButton, QScrollArea,
                                QSizePolicy, QStackedWidget, QToolButton, QVBoxLayout, QWidget)
@@ -627,41 +627,8 @@ class TrackTab(_Tab):
         self.analyze_btn = Wd.button("분석 시작", "primary", "scan")
         self.analyze_btn.clicked.connect(self.ctl.run_analysis)
         self.add(self.analyze_btn)
-        self.add(Wd.Section("정확도"))
-        self.t_face = Wd.Toggle()
-        self.t_flow = Wd.Toggle()
-        self.t_pass2 = Wd.Toggle()
-        self.t_m = Wd.Toggle()
-        self.t_detail = Wd.Toggle()
-        self.t_flip = Wd.Toggle()
-        self.t_reid = Wd.Toggle()
-        self.t_vt = Wd.Toggle()
-        self.t_vt.toggled.connect(lambda v: self.ctl.set_tracking("video_track", "auto" if v else "off"))
-        self.add(Wd.FieldRow("비디오 추적 (SAM 2, 실험)", self.t_vt,
-                             "실험 기능. 사람마다 SAM 2 비디오 메모리로 자기 픽셀을 기억해 프레임마다 다시 찾습니다. "
-                             "같은 의상의 군무에서 엇갈림 뒤 번호가 덜 바뀌는 대신, 얼굴만 크게 나오는 클로즈업에서는 "
-                             "기존 방식이 더 안정적일 수 있습니다. GPU(CUDA·DirectML)가 있을 때만 쓰고, 처음 한 번 "
-                             "모델(약 190MB)을 받습니다"))
-        for text, tg, attr, tip in (
-                ("사람 재인식 (군무)", self.t_reid, "reid",
-                 "몸 재인식(OSNet)과 얼굴 인식(SFace)으로 사람마다 생김새를 기억해, 교차·대형 변경·화면 이탈 뒤에도 "
-                 "같은 사람에게 같은 번호를 붙입니다. 다른 컷으로 설정을 복사할 때 멤버 매칭에도 씁니다"),
-                ("얼굴 트래킹 융합", self.t_face, "face", "얼굴 랜드마크로 머리·목 관절을 보정합니다"),
-                ("얼굴·손 정밀 모델", self.t_detail, "detail",
-                 "얼굴 106점, 손 21점 전용 모델을 얼굴·손 크롭에 따로 돌려 세부 위치를 잡습니다"),
-                ("포인트 트래커 결합", self.t_flow, "point_tracker", "광류 추적과 포즈 추정을 양방향으로 융합합니다"),
-                ("2차 정밀 추정", self.t_pass2, "second_pass", "1차 결과로 인물 영역을 다시 잡아 한 번 더 추정합니다"),
-                ("좌우 반전 추정", self.t_flip, "flip_tta",
-                 "모든 모델을 좌우 반전한 영상에도 돌려 평균합니다. 분석 시간 약 2배, 관절 떨림이 줄어듭니다 (최고 정밀은 항상 켜짐)"),
-                ("보조 모델 추가 (RTMPose-m)", self.t_m, "model_m", "앙상블에 해상도가 다른 모델을 더해 튀는 프레임을 줄입니다")):
-            tg.toggled.connect(lambda v, a=attr: self.ctl.set_tracking(a, v))
-            self.add(Wd.FieldRow(text, tg, tip))
-        # person matte
-        self.t_sam = Wd.Toggle()
-        self.t_sam.toggled.connect(lambda v: self.ctl.set_tracking("seg", "sam2" if v else "rvm"))
-        self.add(Wd.FieldRow("SAM 2 인물 분할", self.t_sam,
-                             "추적한 인물마다 SAM 2로 정확한 실루엣을 따로 만듭니다. 몸 윤곽 점, 다른 인물 보호, "
-                             "분리 모드, 머리 윤곽이 모두 이 매트를 씁니다. 빠르게 모드에서는 RVM만 씁니다"))
+        # accuracy is decided by the app (always the most precise analysis); nothing to switch here
+        self.add(Wd.Section("인물 매트"))
         self.seg_info = Wd.label("", "Faint", 11)
         self.seg_info.setWordWrap(True)
         self.add(self.seg_info)
@@ -670,12 +637,6 @@ class TrackTab(_Tab):
                                  "다시 분석할 필요가 없습니다")
         self.rematte.clicked.connect(self.ctl.rebuild_matte)
         self.add(self.rematte)
-        self.smooth = Wd.ParamRow("smooth", "스무딩", 0, 100, 1, "", 0)
-        self.smooth.keyb.hide()
-        self.smooth.name.setFixedWidth(64)
-        self.smooth.committed.connect(lambda k, v: self.ctl.set_tracking("smoothing", v / 100.0))
-        self.smooth.setToolTip("카메라 흔들림은 그대로 따라가고, 몸 기준의 떨림만 줄입니다")
-        self.add(self.smooth)
         # learning (clip adaptation, cumulative model, re-solving from corrections) is always on and automatic
         # ranges
         self.add(Wd.Section("구간 (타임라인에서 Shift+드래그로 선택)"))
@@ -740,24 +701,10 @@ class TrackTab(_Tab):
             self.analyze_btn.setIcon(I.icon("scan", 15, "#FFFFFF", "#FFFFFF"))
         self.analyze_btn.style().unpolish(self.analyze_btn)
         self.analyze_btn.style().polish(self.analyze_btn)
-        for tg, v in ((self.t_reid, getattr(ts, "reid", True)), (self.t_face, ts.face), (self.t_detail, ts.detail),
-                      (self.t_flip, ts.flip_tta),
-                      (self.t_flow, ts.point_tracker), (self.t_pass2, ts.second_pass),
-                      (self.t_m, "pose_rtmpose_m" in ts.models)):
-            tg.blockSignals(True)
-            tg.setChecked(bool(v))
-            tg.blockSignals(False)
-        self.t_vt.blockSignals(True)
-        self.t_vt.setChecked(getattr(ts, "video_track", "off") != "off")
-        self.t_vt.blockSignals(False)
-        self.t_sam.blockSignals(True)
-        self.t_sam.setChecked(getattr(ts, "seg", "sam2") == "sam2")
-        self.t_sam.blockSignals(False)
         has_seg = bool(s.tracker is not None and s.tracker.has_seg())
         self.seg_info.setText("이 컷의 매트: SAM 2" if has_seg else
                               ("이 컷의 매트: RVM (SAM 2로 바꾸려면 아래 버튼)" if cut.analyzed else ""))
         self.rematte.setEnabled(bool(cut.analyzed and st is not None))
-        self.smooth.set_value(ts.smoothing * 100)
         sel = self.ctl.selection
         self.sel_label.setText(f"선택: {sel[0]}~{sel[1]} 프레임 ({sel[1] - sel[0] + 1}f)" if sel else "선택된 구간 없음")
 
@@ -941,10 +888,9 @@ class OutputTab(_Tab):
         self.src.setWordWrap(True)
         self.add(self.src)
         self.cs = QComboBox()
-        self.cs.setMinimumWidth(180)
         self.cs.currentIndexChanged.connect(self._cs)
         self.add(Wd.FieldRow("입력 색공간", self.cs, "뷰어와 분석에 쓰는 표시 변환입니다. 렌더 결과의 픽셀 값은 바꾸지 않습니다."))
-        self.lut = Wd.button("뷰 LUT 없음", "ghost")
+        self.lut = Wd.button("뷰 LUT 없음", "", "file-video")
         self.lut.clicked.connect(self.ctl.choose_lut)
         self.add(Wd.FieldRow("뷰 LUT", self.lut))
         self.range_lbl = Wd.label("", "Faint", 11)
@@ -958,16 +904,16 @@ class OutputTab(_Tab):
         self.ocs = QComboBox()
         self.ocs.currentIndexChanged.connect(lambda i: self.ctl.set_output("output_cs", self.ocs.itemData(i) or ""))
         self.add(Wd.FieldRow("색공간", self.ocs, "원본 유지: 보정된 부분 외에는 원본과 같은 코드값으로 저장합니다 (권장)"))
-        self.dir = Wd.button("", "ghost", "folder")
+        self.dir = Wd.button("", "", "folder")
         self.dir.clicked.connect(self.ctl.browse_output_dir)
         self.add(Wd.FieldRow("폴더", self.dir))
         self.name = QLineEdit()
-        self.name.setMinimumWidth(170)
         self.name.editingFinished.connect(lambda: self.ctl.set_output("name_pattern", self.name.text()))
         self.add(Wd.FieldRow("파일 이름", self.name, "{cut} 컷 이름 · {project} 프로젝트 · {date} 날짜. 같은 이름이 있으면 _v02처럼 번호가 붙습니다"))
         self.t_audio = Wd.Toggle()
         self.t_audio.toggled.connect(lambda v: self.ctl.set_output("include_audio", v))
-        self.add(Wd.FieldRow("오디오 포함", self.t_audio))
+        self.audio_row = Wd.FieldRow("오디오 포함", self.t_audio)
+        self.add(self.audio_row)
         self.add(Wd.Section("매트 출력"))
         self.t_mp = Wd.Toggle()
         self.t_mp.toggled.connect(lambda v: self.ctl.set_output("matte_person", v))
@@ -979,6 +925,11 @@ class OutputTab(_Tab):
         self.go = Wd.button("렌더에 추가", "primary", "list-video")
         self.go.clicked.connect(self.ctl.enqueue_render)
         self.add(self.go)
+        # one width for every control in the right column, so the page reads as one column
+        for w_ in (self.cs, self.lut, self.fmt, self.ocs, self.dir, self.name):
+            w_.setFixedWidth(196)
+        for b_ in (self.lut, self.dir):
+            b_.setStyleSheet("QPushButton { text-align: left; padding-left: 8px; }")
         # edited timeline: how the whole timeline (or the chosen shots) is written out
         self.tl_box = QWidget()
         tv = QVBoxLayout(self.tl_box)
@@ -987,15 +938,12 @@ class OutputTab(_Tab):
         tv.addWidget(Wd.Section("타임라인 출력"))
         tv.addWidget(Wd.label("전체 길이 한 파일 · 컷별 개별 파일 · 리터칭 컷만 + 교체용 XML 중에서 고릅니다. "
                               "작업 불필요 컷과 추적 확인 컷을 넣을지도 여기서 정합니다.", "Faint", 11))
-        row = QHBoxLayout()
         b_all = Wd.button("타임라인 내보내기…", "", "download")
         b_all.clicked.connect(lambda: self.ctl._tl_action("export", []))
-        b_sel = Wd.button("선택한 컷만…", "ghost", "download", "컷 리스트나 타임라인에서 고른 컷만 내보냅니다")
+        b_sel = Wd.button("선택한 컷만 내보내기…", "", "download", "컷 리스트나 타임라인에서 고른 컷만 내보냅니다")
         b_sel.clicked.connect(lambda: self.ctl._tl_action("export_sel", self.ctl._sel_cut_ids()))
-        row.addWidget(b_all)
-        row.addWidget(b_sel)
-        row.addStretch(1)
-        tv.addLayout(row)
+        tv.addWidget(b_all)
+        tv.addWidget(b_sel)
         self.add(self.tl_box)
         self.note = Wd.label("", "Faint", 11)
         self.note.setWordWrap(True)
@@ -1037,13 +985,15 @@ class OutputTab(_Tab):
         self.fmt.setCurrentIndex(max(0, self.fmt.findData(o.format)))
         self.ocs.setCurrentIndex(max(0, self.ocs.findData(o.output_cs or "")))
         self.ocs.setEnabled(bool(cut.input_cs))
-        self.dir.setText(o.out_dir or "프로젝트 옆 DIAP_Renders")
+        d = o.out_dir or ""
+        self.dir.setText(QFontMetrics(self.dir.font()).elidedText(d or "프로젝트 옆 DIAP_Renders", Qt.ElideMiddle, 160))
+        self.dir.setToolTip(d or "프로젝트 폴더 옆 DIAP_Renders")
         self.name.setText(o.name_pattern)
         for tg, v in ((self.t_audio, o.include_audio), (self.t_mp, o.matte_person), (self.t_mw, o.matte_warp)):
             tg.blockSignals(True)
             tg.setChecked(v)
             tg.blockSignals(False)
-        self.t_audio.setEnabled(info.has_audio)
+        self.audio_row.setVisible(bool(info.has_audio))     # no audio in the source: nothing to choose
         self.note.setText("렌더는 원본 해상도·비트뎁스·타임코드를 유지합니다. 파일 이름 끝에 컷 버전(_v1)이 붙습니다.")
         self.tl_box.setVisible(bool(s.project is not None and s.project.timeline_cuts()))
         self._filling = False

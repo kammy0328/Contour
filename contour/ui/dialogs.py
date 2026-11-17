@@ -74,22 +74,12 @@ class SettingsDialog(QDialog):
         form = QFormLayout()
         form.setHorizontalSpacing(16)
         form.setVerticalSpacing(10)
-        self.ff = QLineEdit(s.ffmpeg_dir)
-        self.ff.setPlaceholderText(r"자동 (PATH 또는 C:\ffmpeg\bin)")
-        ffb = Wd.button("찾기", "ghost")
-        ffb.clicked.connect(lambda: self._pick_dir(self.ff))
-        form.addRow("ffmpeg 폴더", self._row(self.ff, ffb))
         self.data = QLineEdit(s.data_dir)
         self.data.setPlaceholderText(str(default_data_dir()))
         db = Wd.button("찾기", "ghost")
         db.clicked.connect(lambda: self._pick_dir(self.data))
         form.addRow("데이터 폴더", self._row(self.data, db))
-        self.ocio = QLineEdit(s.ocio_config)
-        self.ocio.setPlaceholderText("내장 ACES Studio 설정 (카메라 로그 포함)")
-        ob = Wd.button("찾기", "ghost")
-        ob.clicked.connect(self._pick_ocio)
-        form.addRow("OCIO 설정", self._row(self.ocio, ob))
-        cm = manager(s.ocio_config)
+        cm = manager(BUILTIN_STUDIO)          # the built-in ACES Studio config (no choice of config file)
         self.display = QComboBox()
         self.view = QComboBox()
         for d in cm.displays():
@@ -192,18 +182,10 @@ class SettingsDialog(QDialog):
         if d:
             edit.setText(d)
 
-    def _pick_ocio(self):
-        f, _ = QFileDialog.getOpenFileName(self, "OCIO 설정 파일", "", "OCIO (*.ocio *.ocioz)")
-        if f:
-            self.ocio.setText(f)
-
     def apply(self) -> bool:
         s = settings()
-        changed_view = (s.display != self.display.currentText() or s.view != self.view.currentText()
-                        or s.ocio_config != self.ocio.text().strip())
-        s.ffmpeg_dir = self.ff.text().strip()
+        changed_view = s.display != self.display.currentText() or s.view != self.view.currentText()
         s.data_dir = self.data.text().strip()
-        s.ocio_config = self.ocio.text().strip()
         s.display = self.display.currentText()
         s.view = self.view.currentText()
         s.proxy_long_side = int(self.proxy.currentData())
@@ -218,8 +200,8 @@ class SettingsDialog(QDialog):
             from ..track.models import reset_providers
             reset_providers()
         s.save()
-        configure_ffmpeg(s.ffmpeg_dir or None)
-        manager(s.ocio_config or BUILTIN_STUDIO)
+        configure_ffmpeg()
+        manager(BUILTIN_STUDIO)
         return changed_view
 
 

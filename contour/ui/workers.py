@@ -149,7 +149,9 @@ class CacheWorker(QThread):
     def _busy(self) -> bool:
         import time
         s = self.s
-        return s.interactive or time.time() - s.last_touch < 0.8
+        now = time.time()
+        return (s.interactive or now - s.last_touch < 0.8 or now - getattr(s, "last_seek", 0.0) < 0.8
+                or getattr(s, "preview_wait", 0) > 0)
 
     def run(self):
         import time

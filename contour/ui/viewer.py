@@ -208,6 +208,7 @@ class Viewer(QWidget):
         rkey = self.s.result_key(self.t)
         key = ("result", rkey)
         self._play_raw = False
+        self._res_pending = False
         if key in self._img_cache:
             return self._img_cache[key]
         if not self.s.interactive:
@@ -226,11 +227,15 @@ class Viewer(QWidget):
         if a is None and self._last_res is not None and self._last_res[0] == self.t:
             # same frame, new settings: keep showing the last result while the new one renders
             self.preview.request((self.t, rkey))
+            self._res_pending = True
             return self._last_res[1]
         if a is None:
-            a = self.s.result(self.t)
-            if a is None:
-                return None
+            # never computed on the UI thread: a frame can take seconds (and the playback cache may hold the
+            # computation lock), which froze the window after it had been left alone. The original shows, marked,
+            # until the preview thread has the result.
+            self.preview.request((self.t, rkey))
+            self._res_pending = True
+            return self._qimg("orig")
         img = np_to_qimage(a)
         self._store_img(key, img)
         self._last_res = (self.t, img)
@@ -242,7 +247,11 @@ class Viewer(QWidget):
             return None
         cid = self.s.cut.id
         rk = self.s.result_key(t)
-        a = self.s.result(t)
+        self.s.preview_wait += 1             # the playback cache steps aside after the frame it is on
+        try:
+            a = self.s.result(t)
+        finally:
+            self.s.preview_wait -= 1
         return (t, rk, a, cid) if a is not None else None
 
     def _preview_ready(self, key, payload):
@@ -537,6 +546,8 @@ class Viewer(QWidget):
         self._paint_n = getattr(self, "_paint_n", 0) + 1
         if self.playing and getattr(self, "_raw_shown_until", -1) > self._paint_n:
             self._tag(p, cells[-1], "미리 계산 전 · 원본")
+        elif not self.playing and getattr(self, "_res_pending", False) and mode in ("result", "side", "wipe"):
+            self._tag(p, cells[-1], "보정 계산 중", bottom=True)
 
     def _tag(self, p: QPainter, r: QRectF, text: str, left: bool = False, bottom: bool = False):
         p.save()

@@ -449,8 +449,8 @@ class MainWindow(QMainWindow):
     # ================================================================== startup / project
     def _startup(self):
         s = settings()
-        M.configure_ffmpeg(s.ffmpeg_dir or None)
-        manager(s.ocio_config)
+        M.configure_ffmpeg()                 # the ffmpeg that ships with DIAP
+        manager()                            # the built-in ACES Studio config
         try:
             from ..track.models import device_label
             self.dev_lbl.setText(f"추론: {device_label()}")
@@ -2102,6 +2102,8 @@ class MainWindow(QMainWindow):
         if s.proxy is None:
             return
         t = int(np.clip(t, 0, s.proxy.n - 1))
+        if t != self.frame and not self.play_timer.isActive():
+            s.last_seek = time.time()
         self.frame = t
         self.viewer.set_frame(t)
         self.timeline.set_frame(t)

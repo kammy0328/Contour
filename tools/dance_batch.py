@@ -778,7 +778,7 @@ def menu(args) -> None:
 def main(argv=None):
     from contour.core.media import configure_ffmpeg
     from contour.core.settings import settings
-    configure_ffmpeg(settings().ffmpeg_dir or None)
+    configure_ffmpeg()
     ap = argparse.ArgumentParser(description="Contour 안무영상 도구")
     ap.add_argument("--out", default=None, help="결과 폴더 (기본: 문서\\Contour_Data\\dance)")
     ap.add_argument("--seg", type=float, default=20.0, help="구간 길이(초)")

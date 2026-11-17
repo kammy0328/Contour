@@ -4,7 +4,7 @@
 ; Installs for all users in Program Files\Diap (asks for admin rights once per install or update)
 ;   {app}\python   embeddable Python 3.12 + packages (pip, installed by tools\setup_env.py)
 ; {app}\app      DIAP itself (code package: contour) (replaced on every update)
-;   {app}\ffmpeg   ffmpeg, fetched once when none is found on the PC
+;   {app}\ffmpeg   ffmpeg and ffprobe, packed into the installer (never looked up elsewhere on the PC)
 ; Projects, learned data, presets and models stay in Documents\Contour_Data and are never touched.
 
 #ifndef AppVer
@@ -15,6 +15,9 @@
 #endif
 #ifndef Py
   #define Py "..\build\python"
+#endif
+#ifndef Ffm
+  #define Ffm "..\build\ffmpeg"
 #endif
 
 [Setup]
@@ -59,6 +62,7 @@ Name: "{app}\Cloud\data"; Permissions: users-modify
 [Files]
 Source: "{#Src}\cloud\*"; DestDir: "{app}\Cloud"; Excludes: "__pycache__,*.pyc"; Flags: ignoreversion
 Source: "{#Py}\*"; DestDir: "{app}\python"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#Ffm}\bin\*"; DestDir: "{app}\ffmpeg\bin"; Flags: ignoreversion
 Source: "{#Src}\app.py"; DestDir: "{app}\app"; Flags: ignoreversion
 Source: "{#Src}\requirements.txt"; DestDir: "{app}\app"; Flags: ignoreversion
 Source: "{#Src}\requirements-learn.txt"; DestDir: "{app}\app"; Flags: ignoreversion

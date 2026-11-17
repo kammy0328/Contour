@@ -34,16 +34,14 @@ _tool_paths = {"ffmpeg": None, "ffprobe": None}
 
 
 def configure_ffmpeg(path_hint: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
-    """Locate ffmpeg/ffprobe. `path_hint` may be a folder or the ffmpeg executable."""
+    """Locate ffmpeg/ffprobe: the copy that ships with DIAP ({app}\ffmpeg\bin), never one found elsewhere on the
+    PC. Only a development checkout (no installed python next to it) falls back to the one on PATH.
+    `path_hint` is ignored (kept for old callers)."""
     exe = ".exe" if sys.platform == "win32" else ""
-    dirs: List[str] = []
-    if path_hint:
-        p = Path(path_hint)
-        dirs.append(str(p.parent if p.is_file() else p))
     here = Path(__file__).resolve().parents[2]
-    # installed build: {app}\app is the code, {app}\ffmpeg\bin the ffmpeg the installer fetched
-    dirs += [str(here / "ffmpeg" / "bin"), str(here / "ffmpeg"), str(here.parent / "ffmpeg" / "bin"),
-             r"C:\ffmpeg\bin", r"C:\Program Files\ffmpeg\bin"]
+    # installed build: {app}\app is the code, {app}\ffmpeg\bin the ffmpeg packed into the installer
+    dirs: List[str] = [str(here.parent / "ffmpeg" / "bin"), str(here / "ffmpeg" / "bin")]
+    installed = (here.parent / "python").is_dir()
     found = {}
     for tool in ("ffmpeg", "ffprobe"):
         hit = None
@@ -52,7 +50,7 @@ def configure_ffmpeg(path_hint: Optional[str] = None) -> Tuple[Optional[str], Op
             if cand.is_file():
                 hit = str(cand)
                 break
-        if hit is None:
+        if hit is None and not installed:
             hit = shutil.which(tool)
         found[tool] = hit
     _tool_paths.update(found)
@@ -63,7 +61,7 @@ def ffmpeg_bin() -> str:
     if not _tool_paths["ffmpeg"]:
         configure_ffmpeg()
     if not _tool_paths["ffmpeg"]:
-        raise MediaError("ffmpeg를 찾을 수 없습니다. 설정에서 ffmpeg 폴더를 지정하세요.")
+        raise MediaError("ffmpeg를 찾을 수 없습니다. DIAP을 다시 설치하세요 (ffmpeg는 설치 파일에 들어 있습니다).")
     return _tool_paths["ffmpeg"]
 
 
@@ -71,7 +69,7 @@ def ffprobe_bin() -> str:
     if not _tool_paths["ffprobe"]:
         configure_ffmpeg()
     if not _tool_paths["ffprobe"]:
-        raise MediaError("ffprobe를 찾을 수 없습니다. 설정에서 ffmpeg 폴더를 지정하세요.")
+        raise MediaError("ffprobe를 찾을 수 없습니다. DIAP을 다시 설치하세요 (ffmpeg는 설치 파일에 들어 있습니다).")
     return _tool_paths["ffprobe"]
 
 
