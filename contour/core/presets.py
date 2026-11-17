@@ -117,8 +117,11 @@ def delete(name: str) -> None:
 def apply(pp: PartParams, d: dict) -> None:
     """Put a preset's groups onto one person (as static values: keyframes of those sliders are replaced)."""
     vals = d.get("values") or {}
+    keep = set(d.get("keep") or [])          # sliders the preset leaves as they are (학습된_스타일: 잡티)
     for g in d.get("groups") or []:
         for k in GROUP_KEYS.get(g, []):
+            if k in keep and k not in vals:
+                continue
             v = vals.get(k, param_default(k))
             pp.amounts[k] = Curve(base=float(v))
     if "strength" in d:

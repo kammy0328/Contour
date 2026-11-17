@@ -37,7 +37,6 @@ K = np.array([0.2126, 0.7152, 0.0722], np.float32)
 SEARCH: List[Tuple[str, List[float]]] = [
     ("skin", [0, 15, 30, 45, 60, 80]),
     ("_detail", [15, 25, 45, 65]),
-    ("blemish", [0, 20, 40, 70]),
     ("redness", [0, 25, 50]),
     ("dark_circle", [0, 25, 50]),
     ("nasolabial", [0, 25, 50]),
@@ -48,7 +47,15 @@ SEARCH: List[Tuple[str, List[float]]] = [
     ("skin", None),          # refine around the current value
     ("_detail", None),
 ]
-LEARNED_KEYS = ["skin", "blemish", "redness", "dark_circle", "nasolabial", "shine", "mouth_lines", "neck_lines", "grain"]
+# Acne and spots are DIAP's own (2026-11-18, the user: removing them ourselves can do better than the hand result).
+# They are not learned: during the fit they are removed at this level and left out of the comparison (the spots
+# the detector finds, and the few pixels where the result and the hand differ most), and the learned preset leaves
+# the user's own 잡티 slider as it is.
+NOT_LEARNED = ("blemish",)
+OWN_VALUES = {"blemish": 40.0}
+SPOT_MASK = 0.3          # detector score from which a pixel is a spot (left out of the comparison)
+TRIM_Q = 98.0            # the comparison leaves out the pixels above this percentile of the difference
+LEARNED_KEYS = ["skin", "redness", "dark_circle", "nasolabial", "shine", "mouth_lines", "neck_lines", "grain"]
 
 
 class StyleError(Exception):
@@ -329,6 +336,46 @@ def find_still_frame(cut, path: str, progress: Callable = None) -> Tuple[int, fl
     return best
 
 
+def _trimmed_rms(d: np.ndarray) -> float:
+    """RMS without the largest differences: a spot the hand removed and DIAP removes in its own way, a bit of
+    cleaning on the face, a stray hair, should not decide how smooth the skin is."""
+    d = np.abs(np.asarray(d, np.float32).ravel())
+    if d.size == 0:
+        return 0.0
+    q = float(np.percentile(d, TRIM_Q))
+    d = d[d <= q]
+    return float(np.sqrt((d ** 2).mean())) if d.size else 0.0
+
+
+def _spots(o: np.ndarray, lm: np.ndarray, m: np.ndarray) -> np.ndarray:
+    """Where DIAP's detector finds spots (dark, red, raised) on the plate: left out of the comparison."""
+    try:
+        from ..retouch import engine as RE, detect as DT
+        Y, Cb, Cr = RE.rgb_to_ycc(np.clip(o, 0, 1).astype(np.float32))
+        f = np.asarray(lm, np.float32)[:, :2]
+        wf = float(np.hypot(*(f[16] - f[0])))
+        if not np.isfinite(wf) or wf < 20:
+            return np.zeros(m.shape, bool)
+        d = DT.spots(Y, Cr, m.astype(np.float32), (0.012 + 0.05 * 0.5) * wf, shade=DT.fold_zone(f, Y.shape, wf))
+        sp = np.maximum(np.maximum(d["dark"], d["red"]), d["bump"]) > SPOT_MASK
+        r = max(1, int(round(0.012 * wf)))
+        return cv2.dilate(sp.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))) > 0
+    except Exception:
+        return np.zeros(m.shape, bool)
+
+
+def sample_key(cut) -> str:
+    """One sample per shot: a hand result of a whole timeline teaches every shot of it (it was keyed by the plate's
+    file, so every shot replaced the one before)."""
+    src = Path(str(getattr(cut, "source", "") or cut.name)).stem
+    off = int(getattr(cut.info, "offset", 0) or 0)
+    return _norm(src) + (f"#{off}" if (cut.tl or off) else "")
+
+
+def _skey(s: dict) -> str:
+    return s.get("key") or _norm(Path(s.get("source") or s.get("clip", "")).stem)
+
+
 def fit_pair(cut, tracker, after_path: str, progress: Callable = None, cancelled: Callable = None,
              at_frame: Optional[int] = None) -> dict:
     """after_path: the retoucher's result of this cut as a video, or one retouched still of it (then
@@ -421,6 +468,9 @@ def fit_pair(cut, tracker, after_path: str, progress: Callable = None, cancelled
             if float((np.abs(dd[m]) > 0.004).mean()) < 0.05:
                 continue
         ac, m, wpx = align_crop(apply_grade(G, oc), best[1][y0:y1, x0:x1], m)
+        m = np.asarray(m, bool) & ~_spots(oc, loc, np.asarray(m, bool))
+        if m.sum() < 500:
+            continue
         frames[(p, t)] = dict(planes=pl, o=oc, a=ac, box=(x0, y0, x1, y1), m=m, cache={}, G=G, warp=wpx)
         progress(0.02 + 0.1 * (i + 1) / len(picks), "프레임 읽는 중")
     if not frames:
@@ -445,7 +495,7 @@ def fit_pair(cut, tracker, after_path: str, progress: Callable = None, cancelled
                 pp.amounts[k].base = 0.0
                 pp.amounts[k].keys = {}
             pp.skin_detail = float(vals.get("_detail", 45.0))
-            for k, v in vals.items():
+            for k, v in dict(OWN_VALUES, **vals).items():
                 if not k.startswith("_") and k in pp.amounts:
                     pp.amounts[k].base = float(v)
             rf = RE.prepare(cut, tracker, t, cache=fr["cache"])
@@ -458,9 +508,9 @@ def fit_pair(cut, tracker, after_path: str, progress: Callable = None, cancelled
             b = apply_grade(fr["G"], deg(rgb(out)[y0:y1, x0:x1]))
             a, m = fr["a"], fr["m"]
             dl = cv2.GaussianBlur((b - a) @ K, (0, 0), 3)
-            E.append(float(np.sqrt((dl[m] ** 2).mean())) * 1000)
+            E.append(_trimmed_rms(dl[m]) * 1000)
             cr = lambda Z: cv2.GaussianBlur(Z[..., 0] - Z @ K, (0, 0), 3)
-            C.append(float(np.sqrt(((cr(b) - cr(a))[m] ** 2).mean())) * 1000)
+            C.append(_trimmed_rms((cr(b) - cr(a))[m]) * 1000)
             F.append(_fine((b @ K).astype(np.float32), m) / max(1e-6, _fine((a @ K).astype(np.float32), m)))
         return float(np.mean(E)), float(np.mean(C)), float(np.mean(F))
 
@@ -518,7 +568,8 @@ def fit_pair(cut, tracker, after_path: str, progress: Callable = None, cancelled
         band = lambda Y: (Y - cv2.GaussianBlur(Y, (0, 0), 3))[m].std()
         tex.append(float(band(a.astype(np.float32)) / max(1e-6, band(o.astype(np.float32)))))
     sample = dict(
-        clip=cut.name, source=str(getattr(cut, "source", "")), after=str(after_path),
+        clip=cut.name, source=str(getattr(cut, "source", "")), after=str(after_path), key=sample_key(cut),
+        not_learned=list(NOT_LEARNED),
         date=time.strftime("%Y-%m-%d %H:%M"), frames=[[int(st.pids[p]), int(t)] for (p, t) in frames],
         values={k: round(float(v), 1) for k, v in cur.items() if not k.startswith("_")},
         detail=round(float(cur.get("_detail", 45.0)), 1),
@@ -561,17 +612,25 @@ def aggregate(samples: List[dict]) -> Optional[dict]:
     ok = [s for s in samples if s.get("err_after", 1e9) < s.get("err_before", 0) - 1e-3]
     if not ok:
         return None
-    w = [max(0.05, (s["err_before"] - s["err_after"]) / max(1e-6, s["err_before"])) for s in ok]
-    vals = {k: round(_wmedian([float(s["values"].get(k, 0.0)) for s in ok], w)) for k in LEARNED_KEYS}
+    # every pair counts once however many shots it has (a timeline of 170 shots against one plate)
+    pair = lambda s: _norm(Path(s.get("after") or s.get("source") or s.get("clip", "")).stem)
+    per = {}
+    for s in ok:
+        per[pair(s)] = per.get(pair(s), 0) + 1
+    w = [max(0.05, (s["err_before"] - s["err_after"]) / max(1e-6, s["err_before"])) / per[pair(s)] for s in ok]
+    vals = {}
+    for k in LEARNED_KEYS:
+        have = [(float(s["values"].get(k, 0.0)), wi) for s, wi in zip(ok, w) if k not in s.get("not_learned", [])]
+        if have:
+            vals[k] = round(_wmedian([x for x, _ in have], [x for _, x in have]))
     detail = round(_wmedian([float(s.get("detail", 45.0)) for s in ok], w))
-    return dict(values=vals, detail=detail, n=len(ok))
+    return dict(values=vals, detail=detail, n=len(ok), pairs=len(per))
 
 
 def add_sample(sample: dict) -> Optional[dict]:
     """Stores the sample (one per plate: a re-learn of the same plate replaces it) and rewrites the preset."""
     from ..core import presets as PR
-    samples = [s for s in load_samples() if _norm(Path(s.get("source") or s.get("clip", "")).stem)
-               != _norm(Path(sample.get("source") or sample.get("clip", "")).stem)]
+    samples = [s for s in load_samples() if _skey(s) != _skey(sample)]
     samples.append(sample)
     f = _store_path()
     tmp = f.with_suffix(".tmp")
@@ -581,12 +640,13 @@ def add_sample(sample: dict) -> Optional[dict]:
     if agg is None:
         return None
     PR.save(dict(version=PR.VERSION, name=PRESET_NAME, created=time.strftime("%Y-%m-%d %H:%M"), groups=["skin"],
-                 values={k: float(v) for k, v in agg["values"].items()},
+                 values={k: float(v) for k, v in agg["values"].items()}, keep=list(NOT_LEARNED),
                  skin=dict(detail=float(agg["detail"]), scope="face"),
-                 note=f"수작업 리터칭 {agg['n']}개 영상에서 학습"))
+                 note=f"수작업 리터칭 {agg.get('pairs', agg['n'])}개 영상 {agg['n']}개 샷에서 학습 (잡티 제거는 DIAP 자체)"))
     return agg
 
 
 def forget(clip_key: str) -> None:
-    samples = [s for s in load_samples() if _norm(Path(s.get("source") or s.get("clip", "")).stem) != _norm(clip_key)]
+    samples = [s for s in load_samples() if _skey(s) != _norm(clip_key)
+               and not _skey(s).startswith(_norm(clip_key) + "#")]
     _store_path().write_text(json.dumps(dict(version=1, samples=samples), ensure_ascii=False, indent=1), encoding="utf-8")
