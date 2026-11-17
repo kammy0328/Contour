@@ -72,6 +72,7 @@ class Viewer(QWidget):
         self.show_matte = False
         self.show_protect = True
         self.show_skin = False
+        self.hover_pick = True                           # highlight the person under the mouse (edit tool)
         self.selection: Optional[Tuple[int, int]] = None   # timeline range (for joint menus)
         self._hover_ghost: Optional[Tuple[int, int]] = None
         self._hover_sculpt: Optional[int] = None
@@ -1219,7 +1220,7 @@ class Viewer(QWidget):
                 self._hover_ghost = gh
                 self.update()
             hp = None
-            if hv is None and gh is None and ph is None and self.s.cut is not None and not self.playing:
+            if self.hover_pick and hv is None and gh is None and ph is None and self.s.cut is not None and not self.playing:
                 hp = self.s.person_at(self.t, *self.w_to_src(pos))
             if hp != self._hover_pid:
                 self._hover_pid = hp

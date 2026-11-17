@@ -120,3 +120,23 @@ def test_hover_highlight_cleared_when_pointer_is_outside(qapp):
     v.hide()
     assert v._hover_pid is None
     _stop(v)
+
+
+def test_hover_pick_toggle(qapp, project):
+    from contour.core.settings import settings
+    settings().ask_proxy = False
+    from contour.ui.main_window import MainWindow
+    w = MainWindow()
+    try:
+        assert w.hover_btn.isCheckable() and w.viewer.hover_pick is True
+        w.hover_btn.setChecked(False)
+        assert w.viewer.hover_pick is False and settings().hover_pick is False
+        w.viewer._hover_pid = 2
+        w._hover_pick(False)
+        assert w.viewer._hover_pid is None
+        w.hover_btn.setChecked(True)
+        assert w.viewer.hover_pick is True
+    finally:
+        settings().hover_pick = True
+        _stop(w.viewer)
+        w.close()
