@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 APP_NAME = "DIAP"
-APP_VERSION = "1.19.0"
+APP_VERSION = "1.20.0"
 
 
 def default_data_dir() -> Path:

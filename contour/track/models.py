@@ -377,7 +377,31 @@ def reset_providers() -> None:
 
 
 # session settings (measured on the 4070 Ti, j2682); DIAP_ARENA / DIAP_SPIN / DIAP_THREADS override them
-ARENA = "default"           # "same": the CUDA memory pool grows by what is asked (kSameAsRequested)
+# j2730 (2026-11-18, cut 024 of 2611, 12 frames, RTX 4070 Ti 12 GB): with the default pools the SAM 3.1 encoder held
+# 8.4 GB after its first run, the GPU sat at 11.9 of 12 GB, the encoder took 9 s a call (median; 108 s mean) and the
+# whole computer stuttered (Chrome, the desktop). Pools that grow by what is asked and runs that give spare memory
+# back: 0.41 s a call, 1249 s -> 58 s for the analysis, 2.0 GB median and 9.8 GB peak, the matte identical (IoU 1.0,
+# mean difference 0). Both on by default.
+RUN_SHRINK = "1"            # "1": a model's run gives its arena's spare memory back (not the SAM models)
+SHARE_ARENA = "0"           # "1": every session takes its GPU memory from one shared pool
+_shared_arena = []
+
+
+def _share_cuda_arena(so) -> None:
+    """One CUDA memory pool for all sessions (each had its own, every one grown to its own peak)."""
+    try:
+        import onnxruntime as ort
+        if not _shared_arena:
+            mi = ort.OrtMemoryInfo("Cuda", ort.OrtAllocatorType.ORT_ARENA_ALLOCATOR, 0, ort.OrtMemType.DEFAULT)
+            cfg = ort.OrtArenaCfg(0, 1, -1, -1)           # no cap, grow by what is asked
+            ort.create_and_register_allocator(mi, cfg)
+            _shared_arena.append(1)
+        so.add_session_config_entry("session.use_env_allocators", "1")
+    except Exception as e:
+        sys.stderr.write(f"shared GPU pool not used: {str(e)[:200]}\n")
+
+
+ARENA = "same"              # "same": the CUDA memory pool grows by what is asked (kSameAsRequested); "default": doubling
 SPIN = "1"                  # "0": idle threads do not spin
 
 # ---------------------------------------------------------------------------------------------- GPU memory
@@ -430,11 +454,23 @@ class Session:
 
     RETRIES = 2
 
-    def __init__(self, sess, path):
+    def __init__(self, sess, path, shrink: bool = False):
         self._s = sess
         self._path = str(path)
+        self._ro = None
+        if shrink:
+            try:
+                import onnxruntime as ort
+                self._ro = ort.RunOptions()
+                # the arena gives back what a run needed above what it keeps: a small model's one big buffer was
+                # held for the rest of the analysis, in the memory the SAM encoder needs
+                self._ro.add_run_config_entry("memory.enable_memory_arena_shrinkage", "gpu:0")
+            except Exception:
+                self._ro = None
 
     def run(self, *a, **k):
+        if self._ro is not None and "run_options" not in k and len(a) < 3:
+            k["run_options"] = self._ro
         for attempt in range(self.RETRIES + 1):
             try:
                 return self._s.run(*a, **k)
@@ -498,11 +534,15 @@ def _session_raw(path: Path):
     prov = providers()
     on_gpu = any((p if isinstance(p, str) else p[0]) != "CPUExecutionProvider" for p in prov)
     err = None
+    shrink = on_gpu and os.environ.get("DIAP_RUN_SHRINK", RUN_SHRINK) == "1" and not Path(path).name.startswith(
+        ("image-encoder", "finder", "click-decoder"))
+    if on_gpu and os.environ.get("DIAP_SHARE_ARENA", SHARE_ARENA) == "1":
+        _share_cuda_arena(so)
     for attempt in range(2 if on_gpu else 1):
         try:
             sess = ort.InferenceSession(str(path), sess_options=so, providers=prov)
             _check_actual(sess, prov, path)
-            return Session(sess, path)
+            return Session(sess, path, shrink)
         except Exception as e:
             err = e
             if not (on_gpu and is_oom(e)) or attempt:

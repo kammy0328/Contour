@@ -218,7 +218,10 @@ class Viewer(QWidget):
     def _qimg(self, which: str) -> Optional[QImage]:
         cid = self.s.cut.id if self.s.cut is not None else ""
         if which == "orig":
-            key = ("orig", self.t, cid)
+            # the session's epoch too: the same cut opened again (another colour view, a LUT) is another picture, and
+            # a decode of the old one finishing late was taken for the new one (review c84dc81)
+            ep = getattr(self.s, "epoch", 0)
+            key = ("orig", self.t, cid, ep)
             if key in self._img_cache:
                 return self._img_cache[key]
             # never decoded here: only a frame already in memory (or a proxy's mapped file) is taken at once;
@@ -228,12 +231,12 @@ class Viewer(QWidget):
             if a is None:
                 ld = getattr(self, "orig_loader", None)
                 if ld is not None:
-                    ld.request((self.t, cid))
+                    ld.request((self.t, cid, ep))
                 lo = getattr(self, "_last_orig", None)
-                return lo[1] if lo is not None and lo[0] == cid else None
+                return lo[1] if lo is not None and lo[0] == (cid, ep) else None
             img = np_to_qimage(a)
             self._store_img(key, img)
-            self._last_orig = (cid, img)
+            self._last_orig = ((cid, ep), img)
             return img
         if self.s.cut is None:
             return None
@@ -273,30 +276,37 @@ class Viewer(QWidget):
         self._last_res = (self.t, img)
         return img
 
+    def _current(self, cid, ep) -> bool:
+        return self.s.cut is not None and self.s.cut.id == cid and getattr(self.s, "epoch", 0) == ep
+
     def _load_orig(self, key):
-        t, cid = key
-        if self.s.cut is None or self.s.cut.id != cid:
+        t, cid, ep = key
+        if not self._current(cid, ep):
             return None
         try:
             a = self.s.frame(t)
         except Exception as e:
-            return (t, cid, None, str(e))
-        return (t, cid, a, "")
+            a, err = None, str(e)
+        else:
+            err = ""
+        if not self._current(cid, ep):
+            return None                 # the cut was opened again while this was read: its picture, not this one
+        return (t, cid, ep, a, err)
 
     def _orig_ready(self, key, payload):
         if payload is None:
             return
-        t, cid, a, err = payload
-        if self.s.cut is None or cid != self.s.cut.id:
-            return                      # decoded for a cut that is no longer open
+        t, cid, ep, a, err = payload
+        if not self._current(cid, ep):
+            return                      # decoded for a cut (or an opening of it) that is no longer current
         if a is None:
             self.message = "원본을 읽지 못했습니다.\n" + err[:300]
             self.update()
             return
         img = np_to_qimage(a)
-        self._store_img(("orig", t, cid), img)
+        self._store_img(("orig", t, cid, ep), img)
         if t == self.t:
-            self._last_orig = (cid, img)
+            self._last_orig = ((cid, ep), img)
         self.update()
 
     def stop_workers(self, wait_ms: int = 3000) -> None:
@@ -534,6 +544,8 @@ class Viewer(QWidget):
                     on += ["dark", "red", "bump"]
                 if j.v.get("neck_lines", 0) > 1e-4:
                     on += ["line", "fold"]
+                if j.v.get("neck_bumps", 0) > 1e-4 and "bump" not in on:
+                    on += ["bump"]
                 pr = maps.get("protect")
                 for k in on:
                     sc = maps.get(k)

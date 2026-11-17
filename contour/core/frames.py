@@ -330,6 +330,7 @@ class SourceFrames:
 
 
 # ---------------------------------------------------------------------------------------------- pieces of the original
+CROP_READERS = 4            # piece readers kept open at once (faces of one cut)
 CROP_GRID = 96          # the piece decoded is the piece asked for, widened to this grid: a face moving a little
                         # keeps its piece (one reader going on) instead of a new reader every frame
 
@@ -350,20 +351,24 @@ class SourceCrops:
                      int(getattr(info, "seq_start", 0) or 0), _sig(info), int(getattr(info, "offset", 0) or 0),
                      self.n, vs.key(), _decode_key(info), "crop")
         self._lock = threading.RLock()
-        self._reader: Optional[FrameReader] = None
-        self._key = None            # (grid box, out size) of the open reader
-        self._next = -1
+        # one reader per region (several faces of one frame), the least recently used closed beyond CROP_READERS:
+        # with one reader for all of them it restarted at every face (review 6c3dcb3: 12 restarts for 6 frames x 2)
+        self._readers: "OrderedDict[tuple, list]" = OrderedDict()      # key -> [reader, next frame]
         self.decoded = 0
         self.seeks = 0
 
+    def _drop(self, key) -> None:
+        r = self._readers.pop(key, None)
+        if r is not None:
+            try:
+                r[0].close()
+            except Exception:
+                pass
+
     def close(self) -> None:
         with self._lock:
-            if self._reader is not None:
-                try:
-                    self._reader.close()
-                except Exception:
-                    pass
-            self._reader, self._key, self._next = None, None, -1
+            for k in list(self._readers):
+                self._drop(k)
 
     def _grid(self, box) -> Tuple[int, int, int, int]:
         W, H = int(self.info.width), int(self.info.height)
@@ -397,29 +402,34 @@ class SourceCrops:
         return np.array(a[max(0, ya):max(ya + 1, yb), max(0, xa):max(xa + 1, xb)])
 
     def _decode(self, i: int, gb, osz, key) -> np.ndarray:
-        if self._reader is None or self._key != key or not (self._next <= i <= self._next + 8):
-            self.close()
+        r = self._readers.get(key)
+        if r is None or not (r[1] <= i <= r[1] + 8):
+            self._drop(key)
             pf = "gbrpf32le" if self.info.is_float else "rgb48le"
             gw, gh = gb[2] - gb[0], gb[3] - gb[1]
-            self._reader = FrameReader(self.info, i, self.n - i, pf, size=osz if osz != (gw, gh) else None, prefetch=2,
-                                       crop=(gb[0], gb[1], gw, gh))
-            self._key, self._next = key, i
+            rd = FrameReader(self.info, i, self.n - i, pf, size=osz if osz != (gw, gh) else None, prefetch=2,
+                             crop=(gb[0], gb[1], gw, gh))
+            r = [rd, i]
+            self._readers[key] = r
             self.seeks += 1
+            while len(self._readers) > CROP_READERS:
+                self._drop(next(iter(self._readers)))
+        self._readers.move_to_end(key)
         got = None
         p = pool()
-        while self._next <= i:
-            planes = self._reader.read()
+        while r[1] <= i:
+            planes = r[0].read()
             if planes is None:
-                err = self._reader.error_text.strip()
-                at = self._next
-                self.close()
+                err = r[0].error_text.strip()
+                at = r[1]
+                self._drop(key)
                 raise FrameError(f"원본에서 프레임 {i}의 일부를 읽지 못했습니다 ({at}에서 끝남). {err[:300]}")
-            u8 = self.cm.to_display_u8(planes_to_rgb_float(planes, self._reader.layout), self.vs)
+            u8 = self.cm.to_display_u8(planes_to_rgb_float(planes, r[0].layout), self.vs)
             self.decoded += 1
-            p.put((key, self._next), u8)
-            if self._next == i:
+            p.put((key, r[1]), u8)
+            if r[1] == i:
                 got = u8
-            self._next += 1
+            r[1] += 1
         return got
 
 

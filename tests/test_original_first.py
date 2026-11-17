@@ -297,7 +297,7 @@ def test_viewer_original_frame_comes_from_loader_thread(qapp, project):
         img = None
         while img is None and time.time() - t0 < 10:
             _pump(qapp, 0.05)
-            img = v._img_cache.get(("orig", 3, project.cuts[0].id))
+            img = v._img_cache.get(("orig", 3, project.cuts[0].id, s.epoch))
         assert img is not None and v._qimg("orig") is img
     finally:
         v.stop_workers()

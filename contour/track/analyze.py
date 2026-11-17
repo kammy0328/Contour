@@ -336,6 +336,8 @@ class CutTracker:
         try:
             from . import sam2video as VT
             vt = VT.make_tracker(getattr(ts, "video_track", "off"), float(cut.info.fps or 30.0), p_load)
+        except Cancelled:
+            raise
         except Exception:
             import traceback
             traceback.print_exc()
@@ -1427,6 +1429,8 @@ class CutTracker:
                                          use_final, progress, cancel, matter, repose=repose, collect=collect)
                 self._label_cache.clear()
                 return
+            except Cancelled:
+                raise                       # cancel pressed: stop here (it was taken for a failure and the whole RVM matte followed)
             except Exception as e:          # no model / no memory: the RVM matte still works
                 import logging
                 logging.getLogger("contour").warning("SAM 2 matte failed, using RVM: %s", e)

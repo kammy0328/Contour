@@ -208,7 +208,10 @@ class NextCutPrep:
                 self.failed = True
                 stop.set()
             finally:
-                if stop.is_set():
+                with own["lock"]:
+                    own["exited"] = True
+                    gone = stop.is_set()          # cancelled (or failed) before or while it ran: it closes here
+                if gone:
                     _release(own)
 
         threading.Thread(target=run, name="diap-nextcut", daemon=True).start()
@@ -230,7 +233,13 @@ class NextCutPrep:
         self._stop.set()                 # the thread ends after the frame it is on and closes its session
         own = getattr(self, "_own", None)
         if own is not None:
-            _release(own)                # a run that already finished closes nothing itself
+            # a run still going closes its session itself when it stops (it sees the stop under the lock); only a run
+            # that has ended is closed here, and then no decode holds the reader. Closing a running one here made
+            # the UI wait for its decode (review c84dc81)
+            with own["lock"]:
+                ended = own.get("exited", False)
+            if ended:
+                _release(own)
         self.cut_id, self.session, self.ready, self.failed = None, None, False, False
 
 

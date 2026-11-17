@@ -104,7 +104,7 @@ def test_small_spot_found_on_the_original_piece(cut4k):
     finally:
         RE.DET_SRC = old
         px.close()
-    assert px.__dict__["_src_crops"]._reader is None, "the piece reader ends with the cut's frames"
+    assert not px.__dict__["_src_crops"]._readers, "the piece reader ends with the cut's frames"
 
 
 def test_no_original_falls_back_to_the_analysis_picture(cut4k, tmp_path):
