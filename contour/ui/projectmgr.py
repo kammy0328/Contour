@@ -124,7 +124,7 @@ class _CardDelegate(QStyledItemDelegate):
         if missing:
             line1 = "드라이브가 연결되지 않았거나 폴더가 옮겨졌습니다"
         else:
-            bits = [f"컷 {d.get('cuts', 0)}", f"분석 {d.get('analyzed', 0)}"]
+            bits = [f"컷 {d.get('cuts', 0)}"]
             if d.get("done"):
                 bits.append(f"완료 {d['done']}")
             if d.get("client"):
@@ -170,10 +170,15 @@ class ProjectsPage(QWidget):
         self.new_b.clicked.connect(self.main.new_project)
         self.open_b = Wd.button("폴더에서 열기", "", "folder-open", "프로젝트 폴더(.dpprj, 예전 .contour)를 골라 엽니다")
         self.open_b.clicked.connect(self._open_folder)
+        self.find_b = Wd.button("", "ghost", "search", "검색 (Ctrl+F)")
+        self.find_b.setCheckable(True)
+        self.find_b.toggled.connect(self._toggle_search)
+        head.addWidget(self.find_b)
         head.addWidget(self.new_b)
         head.addWidget(self.open_b)
         lay.addLayout(head)
-        sub = Wd.label("더블클릭으로 열고, 우클릭으로 이름 변경·삭제·프록시 캐시 정리를 할 수 있습니다.", "Faint", 12)
+        sub = Wd.label("더블클릭으로 열고, 우클릭으로 이름 변경·삭제·프록시 캐시 정리를 할 수 있습니다. "
+                       "프로젝트 폴더(.dpprj)를 끌어다 놓으면 목록에 추가됩니다.", "Faint", 12)
         lay.addWidget(sub)
         bar = QHBoxLayout()
         self.search = QLineEdit()
@@ -183,9 +188,14 @@ class ProjectsPage(QWidget):
         self.sort = QComboBox()
         for k, lab in (("modified", "최근 수정순"), ("name", "이름순"), ("created", "만든 날짜순")):
             self.sort.addItem(lab, k)
-        self.sort.currentIndexChanged.connect(self.refresh_list)
+        from ..core.settings import settings as _st
+        i_ = self.sort.findData(getattr(_st(), "pm_sort", "modified") or "modified")
+        self.sort.setCurrentIndex(max(0, i_))
+        self.sort.currentIndexChanged.connect(self._sort_changed)
         self.count = Wd.label("", "Faint", 12)
+        self.search.setVisible(False)
         bar.addWidget(self.search, 1)
+        bar.addStretch(1)
         bar.addWidget(self.sort)
         bar.addWidget(self.count)
         lay.addLayout(bar)
@@ -208,6 +218,30 @@ class ProjectsPage(QWidget):
                               "영상을 창에 끌어다 놓아도 됩니다.", "Faint", 13)
         self.empty.setWordWrap(True)
         lay.addWidget(self.empty)
+
+    def _toggle_search(self, on: bool):
+        self.search.setVisible(on)
+        if on:
+            self.search.setFocus()
+        else:
+            self.search.clear()
+
+    def keyPressEvent(self, e):
+        from PySide6.QtGui import QKeySequence
+        if e.matches(QKeySequence.Find):
+            self.find_b.setChecked(True)
+            return
+        if e.key() == Qt.Key_Escape and self.find_b.isChecked():
+            self.find_b.setChecked(False)
+            return
+        super().keyPressEvent(e)
+
+    def _sort_changed(self, *_):
+        from ..core.settings import settings as _st
+        s = _st()
+        s.pm_sort = self.sort.currentData() or "modified"
+        s.save()
+        self.refresh_list()
 
     # ------------------------------------------------------------------ data
     def current_path(self) -> str:
@@ -416,7 +450,7 @@ class ProjectsPage(QWidget):
         m.setWindowTitle("프로젝트 삭제")
         m.setIcon(QMessageBox.Warning)
         m.setText(f"'{d.get('name')}' 프로젝트를 삭제할까요?")
-        info = f"컷 {d.get('cuts', 0)}개 · 분석 {d.get('analyzed', 0)}개"
+        info = f"컷 {d.get('cuts', 0)}개"
         if sz:
             info += f" · 폴더 {PJ.human(sz['total'])}"
         m.setInformativeText(

@@ -281,6 +281,7 @@ class MainWindow(QMainWindow):
         gear = Wd.tool("settings", "설정")
         gear.clicked.connect(self.open_settings)
         h.addWidget(gear)
+        self._top_items = [self.proj_btn, self.page_tabs, self.saved_lbl, self.dev_lbl, gear]   # hidden on 프로젝트
         return bar
 
     def _viewer_bar(self) -> QWidget:
@@ -3379,6 +3380,8 @@ class MainWindow(QMainWindow):
             self.stop_play()
             self.save()
         self.pages.setCurrentIndex(idx)
+        for w_ in getattr(self, "_top_items", []):
+            w_.setVisible(key != "projects")
         if key == "projects":
             self.projects_page.reload()
         if key == "dash":
@@ -3431,6 +3434,20 @@ class MainWindow(QMainWindow):
 
     def dropEvent(self, e):
         paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
+        from ..core import projects as PJ
+        prjs = [PJ.norm(p) for p in paths if Path(p).is_dir() and PJ.is_project_dir(p)]
+        if prjs:
+            # project folders (.dpprj / .contour): into the project manager (opened when dropped on the editor)
+            for p in prjs:
+                PJ.remember(p)
+            if self.pages.currentIndex() == 4 or len(prjs) > 1:
+                self.show_page("projects")
+                self.toast(f"프로젝트 {len(prjs)}개를 목록에 추가했습니다", "ok")
+            else:
+                self.open_project(prjs[0])
+            paths = [p for p in paths if PJ.norm(p) not in prjs]
+            if not paths:
+                return
         xmls = [p for p in paths if p.lower().endswith((".xml", ".fcpxml", ".edl"))]
         paths = [p for p in paths if not p.lower().endswith((".xml", ".fcpxml", ".edl"))]
         if xmls and (len(paths) >= 1 or not xmls[0].lower().endswith(".xml")):
