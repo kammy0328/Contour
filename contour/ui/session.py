@@ -396,4 +396,8 @@ class EditSession:
         mx = int(np.clip(x_src * self.tracker.matte.w / self.cut.info.width, 0, self.tracker.matte.w - 1))
         my = int(np.clip(y_src * self.tracker.matte.h / self.cut.info.height, 0, self.tracker.matte.h - 1))
         p = int(lab[my, mx])
+        if p >= 0 and self.tracker.matte is not None:
+            al = self.tracker.matte.get(t)
+            if al is not None and al.shape == lab.shape and al[my, mx] < 128:
+                return None             # background near the body is nobody's
         return self.tracker.store.pids[p] if p >= 0 else None

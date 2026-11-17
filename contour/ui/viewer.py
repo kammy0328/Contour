@@ -257,9 +257,20 @@ class Viewer(QWidget):
         if lab is None:
             return None
         m = lab == tr.store.index(pid)
+        import cv2
+        # the skeleton fallback of the label map also covers background near the body: keep only what the person
+        # matte holds, and drop specks
+        al = tr.matte.get(self.t) if tr.matte is not None else None
+        if al is not None and al.shape == m.shape:
+            m = m & (np.asarray(al) >= 128)
+            if m.any():
+                n, cc, st, _ = cv2.connectedComponentsWithStats(m.astype(np.uint8), connectivity=8)
+                if n > 2:
+                    keep = np.zeros(n, bool)
+                    keep[1:] = st[1:, cv2.CC_STAT_AREA] >= max(30, 0.02 * st[1:, cv2.CC_STAT_AREA].max())
+                    m = keep[cc]
         if not m.any():
             return None
-        import cv2
         h, w = lab.shape
         p_ = self.s.cut.person(pid)
         col = QColor(p_.color if p_ is not None else "#FFFFFF")
