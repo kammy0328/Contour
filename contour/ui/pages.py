@@ -10,8 +10,8 @@ from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QPainter, QPainterPath, QPen
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QCursor, QDesktopServices, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
                                QHeaderView, QLabel, QMessageBox, QProgressBar, QPushButton, QScrollArea,
@@ -87,13 +87,68 @@ class QueueItem:
     seconds: float = 0.0
     kind: str = "cut"             # cut | timeline
     export: dict = field(default_factory=dict)   # timeline export settings (warp/tlrender.TimelineExport)
+    cut_no: str = ""              # timeline number (001) or the cut's place in the project
+    version: int = 0
+    src_cs: str = ""              # the source colour space as the cut reads it
 
 
 STATUS_TEXT = {"wait": "대기", "running": "렌더 중", "done": "완료", "failed": "실패", "cancelled": "취소됨"}
 
 
+def source_cs_label(prj, cut) -> str:
+    """The colour space the cut's source is read in: the input colour space set on the cut (or the project),
+    else what the file says."""
+    cs = (getattr(cut, "input_cs", "") or getattr(prj, "input_cs", "") or "").strip()
+    if cs and cs.lower() not in ("passthrough", "none"):
+        return cs
+    inf = cut.info
+    trc = (inf.color_trc or "").lower()
+    prim = (inf.color_primaries or "").lower()
+    if inf.is_float:
+        return "Linear (float)"
+    if trc == "smpte2084":
+        return "PQ (Rec.2100)"
+    if trc == "arib-std-b67":
+        return "HLG (Rec.2100)"
+    if "2020" in prim:
+        return "Rec.2020"
+    if "p3" in prim or "smpte43" in prim:
+        return "P3"
+    return "Rec.709"
+
+
+def cut_number(prj, cut) -> str:
+    if cut.tl and "index" in cut.tl:
+        return f"{int(cut.tl['index']) + 1:03d}"
+    try:
+        return f"{prj.cuts.index(cut) + 1:03d}"
+    except ValueError:
+        return ""
+
+
+class _QueueTable(QTableWidget):
+    """Clicks on 코덱 / 출력 경로 of a row that is part of a multi-row selection keep the selection
+    (Ctrl+A, then click a path: every selected row gets the folder)."""
+    cellAction = Signal(int, int)        # row, column
+
+    ACT_COLS = ()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton and not (e.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier)):
+            ix = self.indexAt(e.position().toPoint())
+            if ix.isValid() and ix.column() in self.ACT_COLS:
+                rows = {i.row() for i in self.selectionModel().selectedRows()}
+                if ix.row() not in rows:
+                    self.selectRow(ix.row())
+                self.cellAction.emit(ix.row(), ix.column())
+                return
+        super().mousePressEvent(e)
+
+
 class RenderQueuePage(QWidget):
     jobFinished = Signal(object, object)       # QueueItem, RenderReport | None
+    previewed = Signal(str, int, object)       # item id, frame, rgb (from the render thread)
+    C_THUMB, C_NO, C_CUT, C_VER, C_FMT, C_CS, C_PATH, C_STATE, C_PROG = range(9)
 
     def __init__(self, main, parent=None):
         super().__init__(parent)
@@ -101,10 +156,13 @@ class RenderQueuePage(QWidget):
         self.items: List[QueueItem] = []
         self.job: Optional[Job] = None
         self.current: Optional[QueueItem] = None
+        self._prj_cache: dict = {}
+        self._thumbs: dict = {}                 # item id -> QPixmap (source frame; the result while it renders)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(28, 24, 28, 24)
         lay.setSpacing(12)
-        lay.addWidget(_page_header("렌더 큐", "컷을 쌓아 두고 한 번에 렌더합니다. 앱을 다시 켜도 대기 중인 작업은 남아 있습니다."))
+        lay.addWidget(_page_header("렌더", "컷을 쌓아 두고 한 번에 렌더합니다. 앱을 다시 켜도 대기 중인 작업은 남아 있습니다. "
+                                   "코덱이나 출력 경로를 누르면 바꿀 수 있고, Ctrl+A로 모두 고른 뒤 누르면 한꺼번에 바뀝니다."))
         bar = QHBoxLayout()
         self.start = Wd.button("렌더 시작", "primary", "play")
         self.start.clicked.connect(self.start_queue)
@@ -123,7 +181,7 @@ class RenderQueuePage(QWidget):
         self.train_after = QCheckBox("큐가 끝나면 누적 모델 학습")
         self.train_after.setChecked(True)
         self.train_after.hide()                 # learning is automatic; no switch
-        self.add_sel = Wd.button("선택한 컷 추가", "", "list-video", "편집 화면의 컷 리스트·타임라인에서 고른 컷을 큐에 넣습니다")
+        self.add_sel = Wd.button("선택한 컷 추가", "", "list-video", "편집 화면의 컷 리스트·타임라인에서 고른 컷을 렌더 목록에 넣습니다")
         self.add_sel.clicked.connect(self._add_selected)
         self.bake_all = Wd.button("전체 컷 일괄 렌더 (베이크)", "", "film",
                                   "편집 타임라인 전체를 베이크 영상과 같은 길이의 한 파일로 출력합니다")
@@ -133,15 +191,181 @@ class RenderQueuePage(QWidget):
             bar.addWidget(w)
         bar.addStretch(1)
         lay.addLayout(bar)
-        self.table = _table(["컷", "프로젝트", "포맷", "프레임", "상태", "진행", "메시지"])
-        hh = self.table.horizontalHeader()
-        for i, w in enumerate((200, 160, 130, 70, 80, 160)):
-            self.table.setColumnWidth(i, w)
-        lay.addWidget(self.table, 1)
-        self.empty = Wd.label("렌더 큐가 비어 있습니다. 편집 화면의 출력 탭에서 '렌더 큐에 추가'를 누르세요.", "Faint")
+        lay.addWidget(self._now_panel())
+        self.table = _QueueTable(0, 9)
+        self.table.ACT_COLS = (self.C_FMT, self.C_PATH)
+        self.table.setHorizontalHeaderLabels(["", "번호", "컷", "버전", "코덱", "원본 색공간", "출력 경로", "상태", "진행"])
+        t = self.table
+        t.verticalHeader().setVisible(False)
+        t.setSelectionBehavior(QAbstractItemView.SelectRows)
+        t.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        t.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        t.setShowGrid(False)
+        t.setAlternatingRowColors(True)
+        t.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        t.horizontalHeader().setStretchLastSection(True)
+        t.verticalHeader().setDefaultSectionSize(52)
+        t.setIconSize(QSize(80, 45))
+        t.setWordWrap(False)
+        t.setFocusPolicy(Qt.StrongFocus)
+        t.setMouseTracking(True)
+        for i, w in enumerate((92, 52, 190, 50, 130, 150, 360, 70)):
+            t.setColumnWidth(i, w)
+        t.cellAction.connect(self._cell_action)
+        t.setContextMenuPolicy(Qt.CustomContextMenu)
+        t.customContextMenuRequested.connect(self._context)
+        lay.addWidget(t, 1)
+        self.empty = Wd.label("렌더 목록이 비어 있습니다. 편집 화면의 출력 탭에서 '렌더에 추가'를 누르세요.", "Faint")
         lay.addWidget(self.empty)
+        from PySide6.QtGui import QKeySequence, QShortcut
+        sc = QShortcut(QKeySequence.SelectAll, self)
+        sc.activated.connect(self.table.selectAll)
+        self.previewed.connect(self._on_preview)
         self.load()
         self.refresh()
+
+    # ------------------------------------------------------------------ now rendering
+    def _now_panel(self) -> QWidget:
+        f = QFrame()
+        f.setObjectName("Card")
+        f.setStyleSheet(f"QFrame#Card {{ background: {C['bg2']}; border: 1px solid {C['line']}; border-radius: 10px; }}")
+        h = QHBoxLayout(f)
+        h.setContentsMargins(14, 12, 14, 12)
+        h.setSpacing(16)
+        self.now_img = QLabel()
+        self.now_img.setFixedSize(320, 180)
+        self.now_img.setAlignment(Qt.AlignCenter)
+        self.now_img.setStyleSheet(f"background: {C['bg0'] if 'bg0' in C else '#000'}; border-radius: 6px;")
+        h.addWidget(self.now_img)
+        v = QVBoxLayout()
+        v.setSpacing(5)
+        self.now_title = QLabel("렌더 중인 작업 없음")
+        self.now_title.setFont(font(15, 600))
+        self.now_fmt = Wd.label("", "Faint", 12)
+        self.now_path = Wd.label("", "Faint", 12)
+        self.now_path.setWordWrap(True)
+        self.now_path.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.now_bar = QProgressBar()
+        self.now_bar.setRange(0, 1000)
+        self.now_bar.setTextVisible(False)
+        self.now_bar.setFixedHeight(8)
+        self.now_msg = Wd.label("", "Faint", 12)
+        for w in (self.now_title, self.now_fmt, self.now_path):
+            v.addWidget(w)
+        v.addStretch(1)
+        v.addWidget(self.now_bar)
+        v.addWidget(self.now_msg)
+        h.addLayout(v, 1)
+        return f
+
+    def _fill_now(self):
+        it = self.current
+        if it is None:
+            self.now_title.setText("렌더 중인 작업 없음")
+            n = sum(1 for i in self.items if i.status == "wait")
+            self.now_fmt.setText(f"대기 {n}개" if n else "")
+            self.now_path.setText("")
+            self.now_bar.setValue(0)
+            self.now_msg.setText("")
+            self.now_img.setPixmap(QPixmap())
+            return
+        no = f"{it.cut_no} · " if it.cut_no else ""
+        ver = f" · v{it.version}" if it.version else ""
+        self.now_title.setText(f"{no}{it.cut_name}{ver}")
+        self.now_fmt.setText(f"{it.fmt_label}  ·  원본 {it.src_cs or '-'}  ·  {it.frames}프레임  ·  {it.project_name}")
+        self.now_path.setText(self._out_label(it)[0])
+        self.now_bar.setValue(int(it.progress * 1000))
+        self.now_msg.setText(it.message)
+        pm = self._thumbs.get(it.id)
+        if pm is not None:
+            self.now_img.setPixmap(pm.scaled(320, 180, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def _on_preview(self, iid: str, frame: int, rgb):
+        from .viewer import np_to_qimage
+        try:
+            pm = QPixmap.fromImage(np_to_qimage(np.ascontiguousarray(rgb)))
+        except Exception:
+            return
+        self._thumbs[iid] = pm
+        if self.current is not None and self.current.id == iid:
+            self.now_img.setPixmap(pm.scaled(320, 180, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            r = self.items.index(self.current) if self.current in self.items else -1
+            if r >= 0:
+                it0 = self.table.item(r, self.C_THUMB)
+                if it0 is not None:
+                    it0.setIcon(QIcon(pm.scaled(80, 45, Qt.KeepAspectRatio, Qt.SmoothTransformation)))
+
+    # ------------------------------------------------------------------ project lookups (cached)
+    def _project(self, path: str):
+        from ..core.project import Project
+        try:
+            f = Path(path) / "project.json" if Path(path).is_dir() else Path(path)
+            mt = f.stat().st_mtime
+        except OSError:
+            return None
+        hit = self._prj_cache.get(path)
+        if hit and hit[0] == mt:
+            return hit[1]
+        try:
+            prj = Project.load(path)
+        except Exception:
+            return None
+        self._prj_cache[path] = (mt, prj)
+        return prj
+
+    def _fill_info(self, it: QueueItem):
+        """Number, version and source colour space for an item queued before they were kept."""
+        if it.kind != "cut" or (it.cut_no and it.version and it.src_cs):
+            return
+        prj = self._project(it.project_path)
+        cut = prj.cut(it.cut_id) if prj else None
+        if cut is None:
+            return
+        it.cut_no = it.cut_no or cut_number(prj, cut)
+        it.version = it.version or int(getattr(cut, "version", 1) or 1)
+        it.src_cs = it.src_cs or source_cs_label(prj, cut)
+
+    def _out_label(self, it: QueueItem):
+        """(the file the render writes, whether a file of that name is there already)"""
+        if it.out_path and it.status == "done":
+            return it.out_path, False
+        if it.kind == "timeline":
+            d = it.export.get("out_dir") or str(Path(it.project_path).parent / "DIAP_Renders")
+            return d, False
+        from ..core.project import OutputSettings
+        from ..warp.render import output_base
+        prj = self._project(it.project_path)
+        cut = prj.cut(it.cut_id) if prj else None
+        if cut is None:
+            return "(프로젝트에서 컷을 찾을 수 없음)", False
+        base = output_base(prj, cut, OutputSettings.from_dict(it.output))
+        if it.output.get("format") == "exr_half":
+            return str(base) + "\\ (EXR 시퀀스)", base.exists()
+        f = Path(str(base) + ".mov")
+        return str(f), f.exists()
+
+    def _thumb(self, it: QueueItem):
+        pm = self._thumbs.get(it.id)
+        if pm is not None or it.kind != "cut":
+            return pm
+        prj = self._project(it.project_path)
+        cut = prj.cut(it.cut_id) if prj else None
+        if cut is None:
+            return None
+        try:
+            from ..core.proxy import Proxy
+            from .viewer import np_to_qimage
+            px = Proxy(prj.cache_dir(cut), cut.info, settings().proxy_long_side)
+            if not px.has_frames():
+                return None
+            a, b = cut.work_range
+            th = px.thumbnail((a + b) // 2, 160)
+            px.close()
+            pm = QPixmap.fromImage(np_to_qimage(np.ascontiguousarray(th)))
+        except Exception:
+            return None
+        self._thumbs[it.id] = pm
+        return pm
 
     def _add_selected(self):
         prj = self.main.session.project
@@ -155,7 +379,7 @@ class RenderQueuePage(QWidget):
         self.main.save()
         for c in cuts:
             self.add(prj, c)
-        self.main.toast(f"{len(cuts)}컷을 렌더 큐에 추가했습니다", "ok")
+        self.main.toast(f"{len(cuts)}컷을 렌더 목록에 추가했습니다", "ok")
 
     # ------------------------------------------------------------------ persistence
     def _file(self) -> Path:
@@ -166,6 +390,7 @@ class RenderQueuePage(QWidget):
         if f.exists():
             try:
                 for d in json.loads(f.read_text(encoding="utf-8")):
+                    d = {k: v for k, v in d.items() if k in QueueItem.__dataclass_fields__}
                     it = QueueItem(**d)
                     if it.status == "running":
                         it.status = "wait"
@@ -187,7 +412,9 @@ class RenderQueuePage(QWidget):
         a, b = cut.work_range
         fmt = dict(OUTPUT_FORMATS).get(cut.output.format, cut.output.format)
         it = QueueItem(id=uuid.uuid4().hex[:8], project_path=project.path, project_name=project.name, cut_id=cut.id,
-                       cut_name=cut.name, output=cut.output.to_dict(), frames=b - a, fmt_label=fmt)
+                       cut_name=cut.name, output=cut.output.to_dict(), frames=b - a, fmt_label=fmt,
+                       cut_no=cut_number(project, cut), version=int(getattr(cut, "version", 1) or 1),
+                       src_cs=source_cs_label(project, cut))
         self.items.append(it)
         self.save()
         self.refresh()
@@ -210,6 +437,10 @@ class RenderQueuePage(QWidget):
         r = self.table.currentRow()
         return r if 0 <= r < len(self.items) else None
 
+    def _sel_rows(self) -> List[int]:
+        rows = sorted({i.row() for i in self.table.selectionModel().selectedRows()})
+        return [r for r in rows if 0 <= r < len(self.items)]
+
     def _move(self, d):
         r = self._sel()
         if r is None:
@@ -222,10 +453,12 @@ class RenderQueuePage(QWidget):
             self.table.selectRow(j)
 
     def _remove(self):
-        r = self._sel()
-        if r is None or self.items[r].status == "running":
+        rows = [r for r in self._sel_rows() if self.items[r].status != "running"]
+        if not rows:
             return
-        self.items.pop(r)
+        for r in reversed(rows):
+            self._thumbs.pop(self.items[r].id, None)
+            self.items.pop(r)
         self.save()
         self.refresh()
 
@@ -237,23 +470,139 @@ class RenderQueuePage(QWidget):
     def _open_dir(self):
         r = self._sel()
         path = None
-        if r is not None and self.items[r].out_path:
-            path = Path(self.items[r].out_path).parent
+        if r is not None:
+            p_, _ = self._out_label(self.items[r])
+            path = Path(p_.split(" (")[0].rstrip("\\")).parent
         elif self.items:
             o = self.items[-1].output.get("out_dir")
             path = Path(o) if o else Path(self.items[-1].project_path).parent / "DIAP_Renders"
         if path and path.exists():
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        elif path:
+            self.main.toast("아직 출력 폴더가 없습니다 (렌더할 때 만들어집니다)")
+
+    # ------------------------------------------------------------------ path / codec
+    def _editable(self, rows: List[int]):
+        ok = [self.items[r] for r in rows if self.items[r].status in ("wait", "failed", "cancelled")]
+        return ok, len(rows) - len(ok)
+
+    def _cell_action(self, row: int, col: int):
+        rows = self._sel_rows() or [row]
+        if row not in rows:
+            rows = [row]
+        if col == self.C_PATH:
+            self._change_path(rows)
+        elif col == self.C_FMT:
+            self._change_codec(rows)
+
+    def _change_path(self, rows: List[int]):
+        items, skipped = self._editable(rows)
+        if not items:
+            self.main.toast("렌더 중이거나 완료된 항목은 경로를 바꿀 수 없습니다", "warn")
+            return
+        first = items[0]
+        start = (first.export.get("out_dir") if first.kind == "timeline" else first.output.get("out_dir")) or \
+            str(Path(first.project_path).parent / "DIAP_Renders")
+        title = "출력 폴더" + (f" ({len(items)}개 항목)" if len(items) > 1 else "")
+        d = QFileDialog.getExistingDirectory(self, title, start)
+        if not d:
+            return
+        for it in items:
+            if it.kind == "timeline":
+                it.export["out_dir"] = d
+            else:
+                it.output["out_dir"] = d
+        self.save()
+        self.refresh()
+        msg = f"{len(items)}개 항목의 출력 폴더를 바꿨습니다 (파일 이름은 그대로)"
+        if skipped:
+            msg += f" · 렌더 중이거나 완료된 {skipped}개는 그대로"
+        self.main.toast(msg, "ok")
+
+    def _change_codec(self, rows: List[int]):
+        from PySide6.QtWidgets import QMenu
+        from ..core.project import OUTPUT_FORMATS
+        items, skipped = self._editable(rows)
+        items = [i for i in items if i.kind == "cut"]
+        if not items:
+            self.main.toast("렌더 중이거나 완료된 항목(또는 타임라인 출력)은 코덱을 바꿀 수 없습니다", "warn")
+            return
+        m = QMenu(self)
+        cur = items[0].output.get("format", "")
+        acts = {}
+        for k, lab in OUTPUT_FORMATS:
+            a = m.addAction(lab)
+            a.setCheckable(True)
+            a.setChecked(k == cur and len(items) == 1)
+            acts[a] = (k, lab)
+        act = m.exec(QCursor.pos())
+        if act is None:
+            return
+        k, lab = acts[act]
+        for it in items:
+            it.output["format"] = k
+            it.fmt_label = lab
+        self.save()
+        self.refresh()
+        msg = f"{len(items)}개 항목의 코덱을 {lab}(으)로 바꿨습니다"
+        if skipped:
+            msg += f" · 렌더 중이거나 완료된 {skipped}개는 그대로"
+        self.main.toast(msg, "ok")
+
+    def _context(self, pos):
+        from PySide6.QtWidgets import QMenu
+        ix = self.table.indexAt(pos)
+        if not ix.isValid():
+            return
+        rows = self._sel_rows()
+        if ix.row() not in rows:
+            self.table.selectRow(ix.row())
+            rows = [ix.row()]
+        m = QMenu(self)
+        a_path = m.addAction("출력 폴더 바꾸기…")
+        a_fmt = m.addAction("코덱 바꾸기…")
+        a_open = m.addAction("출력 폴더 열기")
+        m.addSeparator()
+        a_rm = m.addAction("목록에서 제거")
+        act = m.exec(self.table.viewport().mapToGlobal(pos))
+        if act == a_path:
+            self._change_path(rows)
+        elif act == a_fmt:
+            self._change_codec(rows)
+        elif act == a_open:
+            self._open_dir()
+        elif act == a_rm:
+            self._remove()
 
     def refresh(self):
+        sel = self._sel_rows() if self.table.rowCount() == len(self.items) else []
         self.table.setRowCount(len(self.items))
         for r, it in enumerate(self.items):
+            self._fill_info(it)
             col = {"done": C["ok"], "failed": C["error"], "running": C["accent"], "cancelled": C["text3"]}.get(it.status)
-            self.table.setItem(r, 0, _item(it.cut_name))
-            self.table.setItem(r, 1, _item(it.project_name, color=C["text2"]))
-            self.table.setItem(r, 2, _item(it.fmt_label, color=C["text2"]))
-            self.table.setItem(r, 3, _item(it.frames, Qt.AlignRight))
-            self.table.setItem(r, 4, _item(STATUS_TEXT[it.status], color=col))
+            ti = _item("")
+            pm = self._thumb(it)
+            if pm is not None:
+                ti.setIcon(QIcon(pm.scaled(80, 45, Qt.KeepAspectRatio, Qt.SmoothTransformation)))
+            self.table.setItem(r, self.C_THUMB, ti)
+            self.table.setItem(r, self.C_NO, _item(it.cut_no or ("TL" if it.kind == "timeline" else ""), color=C["text2"]))
+            name = _item(it.cut_name)
+            name.setToolTip(f"{it.cut_name}\n{it.project_name} · {it.frames}프레임")
+            self.table.setItem(r, self.C_CUT, name)
+            self.table.setItem(r, self.C_VER, _item(f"v{it.version}" if it.version else "", color=C["text2"]))
+            fmt = _item(it.fmt_label + "  ▾", color=C["text"])
+            fmt.setToolTip("눌러서 코덱 바꾸기 (여러 줄을 고른 상태면 모두)")
+            self.table.setItem(r, self.C_FMT, fmt)
+            self.table.setItem(r, self.C_CS, _item(it.src_cs or "-", color=C["text2"]))
+            path, exists = self._out_label(it)
+            pi = _item(("⚠ " if exists else "") + path, color=C["warn"] if exists else C["text2"])
+            pi.setToolTip(path + ("\n같은 이름의 파일이 이미 있어 이름 뒤에 번호가 붙어 저장됩니다" if exists else "")
+                          + "\n눌러서 출력 폴더 바꾸기 (파일 이름은 그대로)")
+            self.table.setItem(r, self.C_PATH, pi)
+            st = _item(STATUS_TEXT[it.status], color=col)
+            if it.message:
+                st.setToolTip(it.message)
+            self.table.setItem(r, self.C_STATE, st)
             pb = QProgressBar()
             pb.setRange(0, 1000)
             pb.setValue(int(it.progress * 1000))
@@ -262,25 +611,35 @@ class RenderQueuePage(QWidget):
             l = QHBoxLayout(w)
             l.setContentsMargins(8, 0, 8, 0)
             l.addWidget(pb)
-            self.table.setCellWidget(r, 5, w)
-            self.table.setItem(r, 6, _item(it.message or (Path(it.out_path).name if it.out_path else ""),
-                                           color=C["text2"]))
+            self.table.setCellWidget(r, self.C_PROG, w)
+        if sel:
+            from PySide6.QtCore import QItemSelectionModel
+            sm = self.table.selectionModel()
+            for r in sel:
+                if r < len(self.items):
+                    sm.select(self.table.model().index(r, 0), QItemSelectionModel.Select | QItemSelectionModel.Rows)
         busy = self.job is not None
         self.start.setEnabled(not busy and any(i.status == "wait" for i in self.items))
         self.stop.setEnabled(busy)
         self.empty.setVisible(not self.items)
+        self._fill_now()
         self.main.update_queue_badge(sum(1 for i in self.items if i.status in ("wait", "running")))
 
     def _update_row(self, it: QueueItem):
         r = self.items.index(it) if it in self.items else -1
         if r < 0:
             return
-        w = self.table.cellWidget(r, 5)
+        w = self.table.cellWidget(r, self.C_PROG)
         if w is not None:
             pb = w.findChild(QProgressBar)
             if pb:
                 pb.setValue(int(it.progress * 1000))
-        self.table.setItem(r, 6, _item(it.message, color=C["text2"]))
+        st = self.table.item(r, self.C_STATE)
+        if st is not None:
+            st.setToolTip(it.message)
+        if it is self.current:
+            self.now_bar.setValue(int(it.progress * 1000))
+            self.now_msg.setText(it.message)
 
     # ------------------------------------------------------------------ running
     def start_queue(self):
@@ -315,7 +674,8 @@ class RenderQueuePage(QWidget):
                 raise RuntimeError("프록시가 없습니다. 편집 화면에서 컷을 한 번 열어 주세요.")
             tr = CutTracker(prj, cut, px)
             out = OutputSettings.from_dict(nxt.output)
-            return render_cut(prj, cut, tr, out, progress, cancelled)
+            return render_cut(prj, cut, tr, out, progress, cancelled,
+                              preview=lambda t_, rgb: self.previewed.emit(nxt.id, t_, rgb))
 
         self.job = Job(work, self)
         self.job.progressed.connect(self._prog)

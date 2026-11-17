@@ -162,7 +162,7 @@ class TimelineExportDialog(QDialog):
         self.sum = QLabel("")
         self.sum.setObjectName("Faint")
         v.addWidget(self.sum)
-        v.addWidget(_bb(self, "렌더 큐에 추가"))
+        v.addWidget(_bb(self, "렌더에 추가"))
         for w in (self.fmt,):
             w.currentIndexChanged.connect(self._upd)
         for b in self.modes.buttons():

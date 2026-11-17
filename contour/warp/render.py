@@ -91,10 +91,33 @@ class _Lookahead:
                 break
 
 
+def preview_rgb(planes, pf: str, maxv: float, width: int = 480) -> np.ndarray:
+    """A small 8-bit RGB picture of output planes (as written, in the source encoding) for the render page."""
+    import cv2
+    if pf == "gbrpf32le":
+        g, b, r = planes[:3]
+        h, w = g.shape
+        tw, th = width, max(2, int(round(width * h / w)))
+        rgb = np.dstack([cv2.resize(np.asarray(x, np.float32), (tw, th), interpolation=cv2.INTER_AREA)
+                         for x in (r, g, b)])
+        return (np.clip(rgb, 0, 1) * 255 + 0.5).astype(np.uint8)
+    y = np.asarray(planes[0], np.float32)
+    h, w = y.shape
+    tw, th = width, max(2, int(round(width * h / w)))
+    sc = (float(maxv) + 1.0) / 256.0                 # code values in 8-bit steps
+    Y = (cv2.resize(y, (tw, th), interpolation=cv2.INTER_AREA) / sc - 16.0) / 219.0
+    U = (cv2.resize(np.asarray(planes[1], np.float32), (tw, th), interpolation=cv2.INTER_AREA) / sc - 128.0) / 224.0
+    V = (cv2.resize(np.asarray(planes[2], np.float32), (tw, th), interpolation=cv2.INTER_AREA) / sc - 128.0) / 224.0
+    rgb = np.dstack([Y + 1.5748 * V, Y - 0.1873 * U - 0.4681 * V, Y + 1.8556 * U])
+    return (np.clip(rgb, 0, 1) * 255 + 0.5).astype(np.uint8)
+
+
 def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progress: Progress = None,
-               cancel: Optional[Callable[[], bool]] = None, ext_writer=None) -> RenderReport:
+               cancel: Optional[Callable[[], bool]] = None, ext_writer=None,
+               preview: Optional[Callable[[int, np.ndarray], None]] = None) -> RenderReport:
     """ext_writer: write the frames into this (an edited timeline's output) instead of a file of its own;
-    it is neither closed nor aborted here, and no mattes are written."""
+    it is neither closed nor aborted here, and no mattes are written.
+    preview(frame, rgb): about once a second, a small picture of the frame just written."""
     rep = RenderReport()
     t_start = time.time()
     # the face layer (parsing, steady skin colour) for cuts analysed before it existed
@@ -270,12 +293,20 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
                     warper[1] = True
         return planes_, fr_, do_warp(planes_, fr_)
 
+    last_preview = [0.0]
+
     def write_frame(t_, outp_, fr_, alpha_out_=None):
         if convert_cs and pf == "gbrpf32le":
             g, b_, r = outp_
             rgb = cm.convert(np.dstack([r, g, b_]), in_cs, out.output_cs)
             outp_ = [rgb[..., 1].copy(), rgb[..., 2].copy(), rgb[..., 0].copy()]
         writer.write(outp_)
+        if preview is not None and time.time() - last_preview[0] >= 1.0:
+            last_preview[0] = time.time()
+            try:
+                preview(int(t_), preview_rgb(outp_, pf, maxv))
+            except Exception:
+                pass
         if "person" in matte_writers:
             am = alpha_out_ if alpha_out_ is not None else np.zeros((H, W), np.float32)
             _write_matte(matte_writers["person"], am, is_exr, seq_offset + t_)
