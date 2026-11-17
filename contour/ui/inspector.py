@@ -505,7 +505,8 @@ class ReshapeTab(_Tab):
             it = self.chips.takeAt(0)
             w = it.widget() if it is not None else None
             if w:
-                w.setParent(None)
+                # setParent(None) would leave a visible chip behind as a window of its own
+                w.hide()
                 w.deleteLater()
         self._chips.clear()
         persons = [p for p in (cut.persons if cut else [])]
