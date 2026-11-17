@@ -303,3 +303,18 @@ def test_viewer_original_frame_comes_from_loader_thread(qapp, project):
         v.stop_workers()
         s.open_cut(None)
 
+
+
+def test_auto_mode_wants_proxy_after_scrubbing(project):
+    """'auto': a cut read from its original gets a proxy once the user keeps jumping around it (each jump restarts
+    a decoder), not for a cut only played through."""
+    from contour.core import frames as FR
+    from contour.core.settings import settings
+    settings().proxy_mode = "auto"
+    fr = FR.frames_for(project, project.cuts[0])
+    assert not FR.wants_proxy(fr, 24.0)
+    fr.seeks = FR.SCRUB_SEEKS
+    assert FR.wants_proxy(fr, 24.0)
+    settings().proxy_mode = "off"
+    assert not FR.wants_proxy(fr, 24.0)
+    fr.close()

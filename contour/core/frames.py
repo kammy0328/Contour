@@ -39,6 +39,8 @@ BLOCK = 16              # frames decoded with one backwards step
 AHEAD = 48              # a request this far past a reader's position reads on instead of seeking
 READERS = 2             # open readers per source (playback and an analysis pass at once)
 DEFAULT_POOL_MB = 1536
+SCRUB_SEEKS = 10        # reader starts on one cut (the user jumping around it) after which 'auto' makes a proxy:
+                        # a jump in a long-GOP original takes ~0.2 s (measured, 1080p H.264), in a proxy ~2 ms
 
 
 class FrameError(RuntimeError):
@@ -407,5 +409,7 @@ def wants_proxy(fr, fps: float) -> bool:
     if m == "off":
         return False
     if m == "always":
+        return True
+    if fr.seeks >= SCRUB_SEEKS:
         return True
     return fr.decoded >= 24 and fr.decode_fps() < 0.9 * max(1.0, float(fps or 24.0))

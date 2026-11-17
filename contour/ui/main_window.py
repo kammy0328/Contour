@@ -32,6 +32,7 @@ from ..core import media as M
 from ..core.colour import manager
 from ..core.copyset import CopyOptions, apply_copy, suggest_mapping
 from ..core.project import PART_KEYS, PERSON_COLORS, Project, ProtectLine, ProtectShape, safe_name
+from ..core.frames import SCRUB_SEEKS
 from ..core.settings import APP_NAME, APP_VERSION, settings
 from ..stats.tracker import ActivityClock, log_event
 from ..track import skeleton as S
@@ -2283,6 +2284,8 @@ class MainWindow(QMainWindow):
         t = int(np.clip(t, 0, s.proxy.n - 1))
         if t != self.frame and not self.play_timer.isActive():
             s.last_seek = time.time()
+            if s.from_source() and getattr(s.proxy, "seeks", 0) >= SCRUB_SEEKS:
+                self._maybe_bg_proxy()          # jumping around a cut read from its original: a proxy helps
         self.frame = t
         self.viewer.set_frame(t)
         self.timeline.set_frame(t)
