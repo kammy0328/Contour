@@ -975,7 +975,7 @@ class OutputTab(_Tab):
         self.t_mw.toggled.connect(lambda v: self.ctl.set_output("matte_warp", v))
         self.add(Wd.FieldRow("변형 영역 마스크", self.t_mw, "픽셀이 움직인 곳 (Resolve·Nuke 후처리용)"))
         self.add(Wd.Section(""))
-        self.go = Wd.button("렌더 큐에 추가", "primary", "list-video")
+        self.go = Wd.button("렌더에 추가", "primary", "list-video")
         self.go.clicked.connect(self.ctl.enqueue_render)
         self.add(self.go)
         # edited timeline: how the whole timeline (or the chosen shots) is written out

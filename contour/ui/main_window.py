@@ -1022,7 +1022,7 @@ class MainWindow(QMainWindow):
         acts[a] = "paste_pick"
         m.addSeparator()
         acts[m.addAction("선택 컷 분석" + tag)] = "analyze"
-        acts[m.addAction("렌더 큐에 추가" + tag)] = "render"
+        acts[m.addAction("렌더에 추가" + tag)] = "render"
         if any(c.tl for c in cuts):
             acts[m.addAction("검수 완료 표시" + tag)] = "reviewed:1"
         if n == 1:
@@ -1075,7 +1075,7 @@ class MainWindow(QMainWindow):
             self.save()
             for c in cuts:
                 self.queue_page.add(prj, c)
-            self.toast(f"{n}컷을 렌더 큐에 추가했습니다.")
+            self.toast(f"{n}컷을 렌더 목록에 추가했습니다.")
         elif act.startswith("reviewed:"):
             self._tl_action(act, [c.id for c in cuts])
         else:
@@ -1239,7 +1239,7 @@ class MainWindow(QMainWindow):
         elif action == "render":
             self.save()
             self.queue_page.add(prj, cut)
-            self.toast(f"'{cut.name}'을(를) 렌더 큐에 추가했습니다.")
+            self.toast(f"'{cut.name}'을(를) 렌더 목록에 추가했습니다.")
         elif action == "reveal":
             p = Path(cut.source if cut.info.kind == "video" else cut.info.seq_pattern).parent
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
@@ -1550,7 +1550,7 @@ class MainWindow(QMainWindow):
             exp = dlg.export()
             self._last_export = exp.to_dict()
             self.queue_page.add_timeline(prj, exp)
-            self.toast("렌더 큐에 추가했습니다. 렌더 큐에서 시작하세요.", "ok")
+            self.toast("렌더 목록에 추가했습니다. 렌더 화면에서 시작하세요.", "ok")
         elif action == "info":
             tl = prj.timeline or {}
             al = tl.get("align", {})
@@ -3243,11 +3243,11 @@ class MainWindow(QMainWindow):
             if QMessageBox.question(self, "보정 없음", "보정값이 없어 원본과 같은 결과가 나옵니다. 그래도 추가할까요?") != QMessageBox.Yes:
                 return
         errs = [q for q in cut.qc if q.severity == "error" and q.status == "open"]
-        if errs and QMessageBox.question(self, "QC 오류", f"QC 오류 {len(errs)}개가 남아 있습니다. 그래도 렌더 큐에 추가할까요?") != QMessageBox.Yes:
+        if errs and QMessageBox.question(self, "QC 오류", f"QC 오류 {len(errs)}개가 남아 있습니다. 그래도 렌더 목록에 추가할까요?") != QMessageBox.Yes:
             return
         self.save()
         self.queue_page.add(s.project, cut)
-        self.toast("렌더 큐에 추가했습니다. 렌더 큐 화면에서 시작하세요.", kind="ok")
+        self.toast("렌더 목록에 추가했습니다. 렌더 화면에서 시작하세요.", kind="ok")
 
     def before_render(self, item):
         if self.session.project is not None and self.session.project.path == item.project_path:
@@ -3281,7 +3281,7 @@ class MainWindow(QMainWindow):
         self.toast(f"렌더 완료: {Path(rep.out_path).name}", kind="ok")
 
     def update_queue_badge(self, n: int):
-        self.page_tabs.options[1] = ("queue", f"렌더 큐 {n}" if n else "렌더 큐")
+        self.page_tabs.options[1] = ("queue", f"렌더 {n}" if n else "렌더")
         self.page_tabs.update()
 
     # ================================================================== undo
