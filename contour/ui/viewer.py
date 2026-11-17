@@ -5,7 +5,7 @@ from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (QBrush, QColor, QCursor, QFont, QImage, QPainter, QPainterPath, QPen, QPolygonF,
                            QTransform)
 from PySide6.QtWidgets import QMenu, QWidget
@@ -106,6 +106,10 @@ class Viewer(QWidget):
         self._spin_t.timeout.connect(self._spin_tick)
         self.message = ""
         self.setMouseTracking(True)
+        self._hover_timer = QTimer(self)                  # hover state follows the real pointer (see _pointer_inside)
+        self._hover_timer.setInterval(200)
+        self._hover_timer.timeout.connect(self._hover_check)
+        self._hover_timer.start()
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMinimumSize(320, 200)
         self.setAttribute(Qt.WA_OpaquePaintEvent, True)
@@ -559,7 +563,8 @@ class Viewer(QWidget):
         if mode == "side":
             p.save()
             p.setClipRect(cells[1])
-        if self._hover_pid is not None and self.tool == "edit" and self._drag is None and not self.playing:
+        if self._hover_pid is not None and self.tool == "edit" and self._drag is None and not self.playing \
+                and self._pointer_inside():
             self._paint_hover(p, r, self._hover_pid)
         if self.show_protect:
             self._paint_protect(p, r)
@@ -1228,11 +1233,37 @@ class Viewer(QWidget):
         else:
             self.setCursor(Qt.CrossCursor)
 
-    def leaveEvent(self, e):
-        if self._hover_pid is not None:
-            self._hover_pid = None
+    def _pointer_inside(self) -> bool:
+        """The real pointer, not the last mouse event: a leave event is lost when the pointer leaves fast, the window
+        goes inactive or another window opens, and the hover highlight then stayed on."""
+        try:
+            from PySide6.QtGui import QCursor
+            return self.isVisible() and self.rect().contains(self.mapFromGlobal(QCursor.pos())) \
+                and (self.window().isActiveWindow() or self.underMouse())
+        except Exception:
+            return True
+
+    def clear_hover(self) -> None:
+        if (self._hover_pid is not None or self._hover is not None or self._hover_ghost is not None
+                or self._hover_sculpt is not None or self._hover_body is not None):
+            self._hover_pid = self._hover = self._hover_ghost = self._hover_sculpt = self._hover_body = None
             self.update()
+
+    def _hover_check(self) -> None:
+        if not self._pointer_inside():
+            self.clear_hover()
+
+    def leaveEvent(self, e):
+        self.clear_hover()
         super().leaveEvent(e)
+
+    def hideEvent(self, e):
+        self.clear_hover()
+        super().hideEvent(e)
+
+    def focusOutEvent(self, e):
+        self.clear_hover()
+        super().focusOutEvent(e)
 
     def _drag_sculpt(self, pos, committed: bool):
         sp = self._sculpt_points()

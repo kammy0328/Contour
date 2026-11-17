@@ -99,3 +99,24 @@ def test_side_zoom_pixel_under_pointer_painted(qapp, project, side):
     c1 = v.grab().toImage().pixelColor(int(pos.x()), int(pos.y())).red()
     _stop(v)
     assert abs(c0 - c1) <= 12, f"colour under the pointer {c0} -> {c1} (zoom {v.zoom:.2f})"
+
+
+def test_hover_highlight_cleared_when_pointer_is_outside(qapp):
+    """A lost leave event left the person's matte highlighted with the pointer off the screen."""
+    from PySide6.QtGui import QCursor
+    from contour.ui.session import EditSession
+    from contour.ui.viewer import Viewer
+    s = EditSession()
+    s.proxy = _PX()
+    v = Viewer(s)
+    v.resize(600, 400)
+    v.show()
+    QCursor.setPos(v.mapToGlobal(v.rect().bottomRight()) + QPoint(300, 300))   # far outside (offscreen: any point)
+    v._hover_pid = 3
+    assert not v._pointer_inside()
+    v._hover_check()
+    assert v._hover_pid is None
+    v._hover_pid = 3
+    v.hide()
+    assert v._hover_pid is None
+    _stop(v)
