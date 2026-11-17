@@ -181,12 +181,10 @@ class RenderQueuePage(QWidget):
         self.train_after = QCheckBox("큐가 끝나면 누적 모델 학습")
         self.train_after.setChecked(True)
         self.train_after.hide()                 # learning is automatic; no switch
-        self.add_sel = Wd.button("선택한 컷 추가", "", "list-video", "편집 화면의 컷 리스트·타임라인에서 고른 컷을 렌더 목록에 넣습니다")
-        self.add_sel.clicked.connect(self._add_selected)
         self.bake_all = Wd.button("전체 컷 일괄 렌더 (베이크)", "", "film",
                                   "편집 타임라인 전체를 베이크 영상과 같은 길이의 한 파일로 출력합니다")
         self.bake_all.clicked.connect(lambda: self.main._tl_action("export_full", []))
-        for w in (self.start, self.stop, self.add_sel, self.bake_all, self.up, self.down, self.rm, self.clear_done,
+        for w in (self.start, self.stop, self.bake_all, self.up, self.down, self.rm, self.clear_done,
                   self.open_dir):
             bar.addWidget(w)
         bar.addStretch(1)
@@ -366,20 +364,6 @@ class RenderQueuePage(QWidget):
             return None
         self._thumbs[it.id] = pm
         return pm
-
-    def _add_selected(self):
-        prj = self.main.session.project
-        if prj is None:
-            return
-        ids = self.main._sel_cut_ids()
-        cuts = [c for c in (prj.cut(i) for i in ids) if c is not None and c.analyzed]
-        if not cuts:
-            self.main.toast("편집 화면에서 분석한 컷을 먼저 고르세요", "warn")
-            return
-        self.main.save()
-        for c in cuts:
-            self.add(prj, c)
-        self.main.toast(f"{len(cuts)}컷을 렌더 목록에 추가했습니다", "ok")
 
     # ------------------------------------------------------------------ persistence
     def _file(self) -> Path:

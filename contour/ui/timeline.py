@@ -236,10 +236,6 @@ class Timeline(QWidget):
                 p.setPen(qc("text3"))
                 p.drawText(QRectF(x + 3, 3, 120, 14), Qt.AlignLeft | Qt.AlignVCenter, info.tc_at(f) if info.timecode else str(f))
             f += step
-        # current frame number (counted from the first frame of this cut) in the label column
-        p.setFont(font(11, 600, tabular=True))
-        p.setPen(qc("text"))
-        p.drawText(QRectF(8, 2, LEFT - 12, RULER_H - 4), Qt.AlignVCenter | Qt.AlignLeft, f"프레임 {self.t}")
 
     def _paint_conf(self, p: QPainter, r: QRectF, st, person, thr: float, sel: bool):
         i = st.index(person.id)
