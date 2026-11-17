@@ -452,7 +452,8 @@ def fit_pair(cut, tracker, after_path: str, progress: Callable = None, cancelled
             if rf is None:
                 out = fr["planes"]
             else:
-                out = RE.apply_planes([x.copy() for x in fr["planes"]], layout.subsample, layout.max_value, pf, rf, 1.0)
+                out = RE.apply_planes([x.copy() for x in fr["planes"]], layout.subsample, layout.max_value, pf, rf, 1.0,
+                                      None, info.color_range)
             x0, y0, x1, y1 = fr["box"]
             b = apply_grade(fr["G"], deg(rgb(out)[y0:y1, x0:x1]))
             a, m = fr["a"], fr["m"]

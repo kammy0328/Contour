@@ -1261,8 +1261,23 @@ def person_masks(cut, tracker, t: int, pid: int) -> Optional[RetouchFrame]:
 PARSE_NOW = True          # a face the analysis kept no parser maps for is parsed when its frame is retouched
 PARSE_NOW_MIN = 60.0      # proxy px of face width from which that is done
 _FPARSER = [None]
+_FP_COOL = [0.0]          # out of GPU memory: no parse-now until then (time.time())
 import threading as _threading
+import time as _time
 _FPLOCK = _threading.Lock()
+
+
+def _drop_parser() -> None:
+    """GPU memory is short: the parser is made again the next time it is needed."""
+    if _FPARSER[0]:
+        _FPARSER[0] = None
+
+
+try:
+    from ..track import models as _M
+    _M.on_low_gpu_memory(_drop_parser)
+except Exception:
+    pass
 
 
 def _parse_now(rgb_u8: np.ndarray, lm: np.ndarray) -> Optional[dict]:
@@ -1273,6 +1288,8 @@ def _parse_now(rgb_u8: np.ndarray, lm: np.ndarray) -> Optional[dict]:
             return None
         from ..track import faceparse as FP
         from ..track import facelayer as FL
+        if _FP_COOL[0] > _time.time():
+            return None
         with _FPLOCK:                           # frames are prepared on several threads: one parser, one call at a time
             if _FPARSER[0] is None:
                 _FPARSER[0] = FP.FaceParser() if FP.ready() else False
@@ -1287,6 +1304,13 @@ def _parse_now(rgb_u8: np.ndarray, lm: np.ndarray) -> Optional[dict]:
         return dict(tex=None, skin=FP.to_image(r["skin"], r["M"], shape), neck=FP.to_image(r["neck"], r["M"], shape),
                     cover=cover, trust=float(np.clip((rel - 0.35) / 0.25, 0, 1)))
     except Exception as e_:
+        from ..track import models as M_
+        if M_.is_oom(e_):
+            # short of GPU memory (an analysis or another program): not for good, again in a while
+            print("parse-now paused (GPU memory):", repr(e_)[:200], flush=True)
+            _FPARSER[0] = None
+            _FP_COOL[0] = _time.time() + 30.0
+            return None
         if _FPARSER[0] is not False:
             print("parse-now off:", repr(e_)[:200], flush=True)
         _FPARSER[0] = False
@@ -3039,8 +3063,17 @@ def apply_rgb(img: np.ndarray, rf: Optional[RetouchFrame], y_per_src: float) -> 
     return np.clip(out * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
 
+def yuv_scale(max_value: float, rng: Optional[str]) -> Tuple[float, float, float, float]:
+    """(Y offset, Y span, chroma centre, chroma span) of a YUV plane's code values: the same convention as
+    media.yuv_to_rgb, so Y 0..1 and Cb/Cr here are exactly what the preview gets from the decoded RGB (BT.709)."""
+    s = (float(max_value) + 1.0) / 256.0
+    if (rng or "tv") == "tv":
+        return 16.0 * s, 219.0 * s, 128.0 * s, 224.0 * s
+    return 0.0, float(max_value), 128.0 * s, float(max_value)
+
+
 def apply_planes(planes: List[np.ndarray], subsample, max_value: float, pix_fmt: str,
-                 rf: Optional[RetouchFrame], y_per_src: float = 1.0, disp=None) -> List[np.ndarray]:
+                 rf: Optional[RetouchFrame], y_per_src: float = 1.0, disp=None, rng: Optional[str] = "tv") -> List[np.ndarray]:
     """Render: native planes. YUV planes stay YUV (chroma at its own resolution); float RGB goes through
     Y/Cb/Cr and back. disp = (ColourManager, ViewSettings, range) for footage that is not display-referred
     (log): the finding of what to hold is done on the Rec.709 view, the skin texture is thinned on the original
@@ -3053,14 +3086,17 @@ def apply_planes(planes: List[np.ndarray], subsample, max_value: float, pix_fmt:
             return LW.apply_planes_display(planes, subsample, max_value, pix_fmt, rf, y_per_src,
                                            disp[0], disp[1], disp[2] if len(disp) > 2 else "tv")
     if pix_fmt.startswith("yuv"):
-        Y = planes[0].astype(np.float32) / max_value
-        Cb = planes[1].astype(np.float32) / max_value - 0.5
-        Cr = planes[2].astype(np.float32) / max_value - 0.5
+        # the file's own range (limited: Y 64..940 in 10 bits): read as if full range, every retouch that depends on
+        # the brightness worked on other values than in the preview (grey 51 + skin brightness 50 %: 86 / 95)
+        y0, ys, c0, cs_ = yuv_scale(max_value, rng)
+        Y = (planes[0].astype(np.float32) - y0) / ys
+        Cb = (planes[1].astype(np.float32) - c0) / cs_
+        Cr = (planes[2].astype(np.float32) - c0) / cs_
         Y, Cb, Cr = process_ycc(Y, Cb, Cr, rf, y_per_src)
         out = []
-        for pl, val in zip(planes, (Y, Cb + 0.5, Cr + 0.5)):
+        for pl, val in zip(planes, (Y * ys + y0, Cb * cs_ + c0, Cr * cs_ + c0)):
             if np.issubdtype(pl.dtype, np.integer):
-                out.append(np.clip(np.rint(val * max_value), 0, max_value).astype(pl.dtype))
+                out.append(np.clip(np.rint(val), 0, max_value).astype(pl.dtype))
             else:
                 out.append(val.astype(pl.dtype))
         return out + list(planes[3:])

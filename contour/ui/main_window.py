@@ -65,7 +65,7 @@ def _load_project(path: str, long_side: int, progress) -> tuple:
     progress(0.0, f"프로젝트 읽음 · 컷 {n}개")
     for i, c in enumerate(prj.cuts):
         try:
-            px = Proxy(prj.cache_dir(c), c.info, long_side)
+            px = Proxy(prj.proxy_dir(c), c.info, long_side)
             if px.has_frames():
                 thumbs[c.id] = px.thumbnail(c.info.frames // 2, 192)
                 px.close()
@@ -116,6 +116,23 @@ class _ProjectOpen(QThread):
             self.failed.emit(f"{e}\n{traceback.format_exc()}")
 
 
+def resolve_task(session, pid: int, t: int = 0, frame_end: Optional[int] = None, every: bool = False):
+    """A joint re-solve for the edit worker, bound to the cut open now. If the user has gone to another cut by the
+    time it runs, it still re-solves (and saves) that cut's own tracker, never the one open then."""
+    tr = session.tracker
+
+    def run():
+        if tr is None or tr.store is None:
+            return None
+        rng = tr.resolve_all() if every else tr.resolve_local(pid, t, frame_end=frame_end)
+        if session.tracker is tr:
+            session.touch()
+        else:
+            tr.save()                       # its cut was saved and closed before this ran
+        return rng
+    return run
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -137,7 +154,10 @@ class MainWindow(QMainWindow):
         self._build()
         self._shortcuts()
         self.play_timer = QTimer(self)
+        self.play_timer.setTimerType(Qt.PreciseTimer)
         self.play_timer.timeout.connect(self._tick)
+        self._play_clock = (0.0, 0, 24.0)          # start time, frames shown since, fps
+        self._undo_by_cut: dict = {}               # cut id -> (undo, redo) of the cuts left during this session
         # results computed ahead for smooth playback
         from .workers import CacheWorker
         self.cache_worker = CacheWorker(self.session, self)
@@ -241,6 +261,7 @@ class MainWindow(QMainWindow):
         self.batch.progressed.connect(self._batch_progress)
         self.batch.finishedCut.connect(self._batch_cut_done)
         self.batch.finishedAll.connect(self._batch_all_done)
+        self.batch.warned.connect(self._batch_warned)
         self._batch_preset = None
         self._batch_dlg = None
         self._batch_skin = None
@@ -598,8 +619,12 @@ class MainWindow(QMainWindow):
             self._set_loading(False, hide=self.job is None)     # a job the cut started keeps the overlay
 
     def _project_loaded(self, prj, thumbs: dict):
-        self.close_project()
+        if not self.close_project():
+            self.toast("지금 프로젝트를 저장하지 못해 새 프로젝트를 열지 않았습니다", kind="error")
+            return
         self.session.project = prj
+        self._undo_by_cut.clear()
+        self.undo_stack, self.redo_stack = [], []
         s = settings()
         s.add_recent(prj.path)
         s.save()
@@ -683,31 +708,52 @@ class MainWindow(QMainWindow):
                 self.show_error("복구하지 못했습니다", str(e))
         self._clear_recovery(p)
 
-    def close_project(self):
-        if self.session.project is not None:
-            self.save()
+    def close_project(self) -> bool:
+        if self.session.project is not None and not self._save_or_ask("프로젝트를 닫기"):
+            return False
         self.activity.set_cut("", None)
         if self.batch.busy:
             self.batch.kill()
         self.session.project = None
+        self._undo_by_cut.clear()
         self.session.open_cut(None)
         self.tlstrip.refresh()
         self.proj_btn.setText("프로젝트 없음")
+        return True
 
-    def save(self, quiet: bool = False):
+    def save(self, quiet: bool = False) -> bool:
+        """False when the project could not be written: callers that would drop what is in memory (closing the
+        project, going to another cut, quitting) must stop then."""
         if self.session.project is None:
-            return
+            return True
         if not quiet:
             self.saved_lbl.start("저장 중")
         self.activity.flush()
+        # joint re-solves still queued are part of what is saved (and must not write the tracks while they are saved)
+        self.edit_worker.drain(30.0)
         try:
             self.session.save()
-            self._clear_recovery(Path(self.session.project.path))
-            self._collect_learning()
-            self.saved_lbl.done(f"저장됨 {time.strftime('%H:%M')}")
         except Exception as e:
             self.saved_lbl.done("저장 실패")
             self.show_error("저장 실패", f"{e}\n{traceback.format_exc()}")
+            return False
+        try:
+            self._clear_recovery(Path(self.session.project.path))
+            self._collect_learning()
+        except Exception:
+            traceback.print_exc()
+        self.saved_lbl.done(f"저장됨 {time.strftime('%H:%M')}")
+        return True
+
+    def _save_or_ask(self, what: str) -> bool:
+        """Saves; if that fails, asks whether to go on anyway (losing what was not saved). Default: no."""
+        if self.save():
+            return True
+        return QMessageBox.question(
+            self, "저장 실패",
+            f"프로젝트를 저장하지 못했습니다. 저장하지 않은 변경 사항을 버리고 {what}할까요?\n"
+            "(아니요: 그대로 두고 공간·권한·네트워크 연결을 확인한 뒤 다시 저장하세요)",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
 
     def apply_autosave_settings(self):
         s = settings()
@@ -868,10 +914,12 @@ class MainWindow(QMainWindow):
             self.toast("일괄 분석 중인 컷입니다. 분석이 끝나면 열 수 있습니다.", kind="warn")
             return
         self.stop_play()
-        if self.session.cut is not None:
-            self.save()
-        self.undo_stack.clear()
-        self.redo_stack.clear()
+        if self.session.cut is not None and not self.save():
+            # the open cut's tracks and edits are written with the project: never dropped unsaved
+            self.toast("저장하지 못해 컷을 바꾸지 않았습니다", kind="error")
+            self.cutlist.refresh(self.session.cut.id)
+            return
+        self._switch_undo(cut.id)
         self.session.open_cut(cut)
         self.viewer._img_cache.clear()            # cached pictures are per frame number, not per cut
         if hasattr(self.viewer, "_last_res"):
@@ -959,7 +1007,10 @@ class MainWindow(QMainWindow):
         vs = s.view_settings(cut)
         cm = manager()
         prj = s.project
-        bake = bool(cut.tl and (prj.timeline or {}).get("baked") and Path(prj.timeline["baked"]).exists())
+        # the bake's one proxy is in the colour view most shots share; a shot set to another colour space or LUT
+        # gets its own proxy (rebuilding the shared one in its view showed every other shot wrong)
+        from ..core.tlimport import shares_bake
+        bake = shares_bake(prj, cut)
 
         def work(progress, cancelled):
             from ..track.analyze import Cancelled
@@ -977,6 +1028,9 @@ class MainWindow(QMainWindow):
         def done(_):
             s.open_cut(cut)
             self._after_open()
+            if getattr(self, "_reanalyse_after_proxy", None) == cut.id:
+                self._reanalyse_after_proxy = None
+                QTimer.singleShot(0, self.run_analysis)
 
         self.run_job("편집 타임라인 프록시 만드는 중 (한 번만)" if bake else "프록시 만드는 중", work, done)
 
@@ -1333,10 +1387,16 @@ class MainWindow(QMainWindow):
                 done(res)
             except Exception as e:
                 self.show_error("오류", f"{e}\n{traceback.format_exc()}")
+            self._gpu_notes()
 
         def fail(err):
             self.job = None
             self.busy.hide()
+            self._gpu_notes()
+            if err != "__cancelled__" and ("GpuMemoryError" in str(err) or "out of memory" in str(err).lower()):
+                from ..track.models import GPU_OOM_TEXT
+                self.show_error(title + " 실패", GPU_OOM_TEXT + "\n\n" + str(err))
+                return
             if err == "__cancelled__":
                 self.toast("취소했습니다.")
                 if self.session.cut is not None and not self.session.proxy_ready():
@@ -1348,6 +1408,26 @@ class MainWindow(QMainWindow):
         self.job.succeeded.connect(ok)
         self.job.failed.connect(fail)
         self.job.start(QThread.LowPriority)       # the UI stays responsive while it works
+
+    def _batch_warned(self, cid: str, text: str):
+        seen = getattr(self, "_batch_warn_seen", set())
+        if text in seen:
+            return
+        seen.add(text)
+        self._batch_warn_seen = seen
+        self.toast(text, kind="warn")
+
+    def _gpu_notes(self):
+        """Models that went to the CPU because the GPU had no room: say so once (an analysis then takes far longer)."""
+        try:
+            from ..track.models import take_cpu_fallbacks
+            fb = take_cpu_fallbacks()
+        except Exception:
+            return
+        if fb:
+            names = ", ".join(sorted({n for n, _ in fb}))[:120]
+            why = "GPU 메모리가 부족해" if any(w == "GPU 메모리 부족" for _, w in fb) else "GPU에서 열지 못해"
+            self.toast(f"{why} 일부 모델을 CPU로 실행했습니다 ({names}). 많이 느려질 수 있습니다", kind="warn")
 
     def _cancel_job(self):
         if self.job:
@@ -1699,7 +1779,8 @@ class MainWindow(QMainWindow):
             if not self._ask_proxy_size():
                 return
             cm = manager()
-            vs = self.session.view_settings(todo[0])
+            from ..core.tlimport import bake_view_cut
+            vs = self.session.view_settings(bake_view_cut(prj) or todo[0])
 
             def work(progress, cancelled):
                 from ..track.analyze import Cancelled
@@ -1721,6 +1802,13 @@ class MainWindow(QMainWindow):
         dlg.cancelAfter.connect(self.batch.stop)
         self._batch_dlg = dlg
         dlg.open()
+        try:
+            # the analysis runs in its own process on the same GPU: what this window holds there (the preview's face
+            # parser) is let go, it comes back by itself when it is needed
+            from ..track.models import free_gpu_memory
+            free_gpu_memory()
+        except Exception:
+            pass
         self.batch.start(prj.path, [c.id for c in todo], self.accuracy, True)
 
     def _batch_pause(self, on: bool):
@@ -1829,6 +1917,7 @@ class MainWindow(QMainWindow):
         run = dict(self.tlstrip.running)
         run.pop(cid, None)
         self.tlstrip.set_running(run, self.tlstrip.run_lbl.text())
+        self.drop_undo(cid)
         cut = prj.cut(cid) if prj else None
         if cut is None:
             return
@@ -1967,7 +2056,7 @@ class MainWindow(QMainWindow):
         else:
             from ..core.proxy import Proxy
             from ..track.analyze import CutTracker
-            tr = CutTracker(prj, cut, Proxy(prj.cache_dir(cut), cut.info, settings().proxy_long_side))
+            tr = CutTracker(prj, cut, Proxy(prj.proxy_dir(cut), cut.info, settings().proxy_long_side))
 
         def work(progress, cancelled):
             sample = SL.fit_pair(cut, tr, after, progress, cancelled)
@@ -2145,9 +2234,27 @@ class MainWindow(QMainWindow):
             fps = self.session.cut.info.fps
             self.viewer.playing = True
             self.cache_worker.kick(self.frame)
-            self.play_timer.start(int(1000 / max(1, fps)))
+            self._clock_start(fps)
+            self.play_timer.start(max(1, int(round(1000 / max(1.0, float(fps or 24.0))))))
             self.play_btn.setIcon(I.icon("pause", 17))
             self._prep_next_cut()
+
+    def _clock_start(self, fps) -> None:
+        self._play_clock = (time.perf_counter(), 0, max(1.0, float(fps or 24.0)))
+
+    def _clock_next(self) -> None:
+        """The next frame on time: 23.976 fps is 41.7 ms a frame, a fixed whole-ms timer ran 2 % fast. A frame that
+        came late does not make the next ones hurry (no burst to catch up, the clock starts again)."""
+        t0, n, fps = self._play_clock
+        n += 1
+        now = time.perf_counter()
+        due = t0 + (n + 1) / fps
+        if due - now < -2.0 / fps:
+            t0, n = now, 0
+            due = now + 1.0 / fps
+        self._play_clock = (t0, n, fps)
+        if self.play_timer.isActive():
+            self.play_timer.setInterval(max(1, int(round((due - now) * 1000))))
 
     # ---- playback into the next cut
     def _loop_toggled(self, on: bool):
@@ -2195,10 +2302,10 @@ class MainWindow(QMainWindow):
                 return False
             return None
         prj = self.session.project
-        if self.session.dirty:
-            self.save()
-        self.undo_stack.clear()
-        self.redo_stack.clear()
+        if self.session.dirty and not self.save():
+            self.stop_play()                    # not into the next cut with this one unsaved
+            return True
+        self._switch_undo(nxt.id)
         self.session.adopt(sh)
         cut = self.session.cut
         self.viewer._img_cache.clear()
@@ -2216,7 +2323,8 @@ class MainWindow(QMainWindow):
         self.viewer.message = ""
         self.frame = cut.work_range[0]
         fps = max(1.0, float(cut.info.fps or 24.0))
-        self.play_timer.setInterval(int(1000 / fps))
+        self._clock_start(fps)
+        self.play_timer.setInterval(max(1, int(round(1000 / fps))))
         self._refresh_all(skip_inspector=True)
         QTimer.singleShot(250, lambda: self.inspector.refresh())     # the inspector after the first frames show
         self.cache_worker.kick(self.frame)
@@ -2236,6 +2344,9 @@ class MainWindow(QMainWindow):
         nf = self.frame + 1
         if nf >= b:
             if not self.loop_btn.isChecked():
+                if self._next_play_cut() is None:
+                    self.stop_play()            # the last cut, 구간 반복 off: playback ends here
+                    return
                 r = self._play_into_next()
                 if r:
                     return
@@ -2243,6 +2354,7 @@ class MainWindow(QMainWindow):
                     return                      # the next cut is still opening: stay on the last frame
             nf = a
         self.set_frame(nf)
+        self._clock_next()
 
     def set_in_out(self, which: str):
         cut = self.session.cut
@@ -3101,7 +3213,7 @@ class MainWindow(QMainWindow):
             s.tracker.set_hidden(pid, [j], t, t, False)     # placing a joint means it is visible here
         s.commit_joint(pid, j, self.frame, (x, y))
         s.tracker.store.flags[s.tracker.store.index(pid), t, j] |= S.FLAG_USER
-        self.edit_worker.submit(("resolve", pid), lambda: s.resolve_local(pid, t))
+        self.edit_worker.submit(("resolve", pid), resolve_task(s, pid, t))
         self.timeline.update()
         self.inspector.refresh("track")
 
@@ -3110,7 +3222,7 @@ class MainWindow(QMainWindow):
         self.push_undo()
         if s.delete_joint_key(pid, j, self.frame):
             t = self.frame
-            self.edit_worker.submit(("resolve", pid), lambda: s.resolve_local(pid, t))
+            self.edit_worker.submit(("resolve", pid), resolve_task(s, pid, t))
             self.toast(f"{S.JOINT_NAMES_KO[j]} 키를 지웠습니다.")
 
     def _person_action(self, action: str, pid: int):
@@ -3186,7 +3298,7 @@ class MainWindow(QMainWindow):
             s.cut.joint_keys.get(pid, {}).pop(j, None)
             s.touch()
             for f in frames[:1]:
-                self.edit_worker.submit(("resolve", pid), lambda f=f: s.tracker.resolve_all())
+                self.edit_worker.submit(("resolve", pid), resolve_task(s, pid, every=True))
 
     def _hide_joint(self, action: str, pid: int, j: int):
         s = self.session
@@ -3217,7 +3329,7 @@ class MainWindow(QMainWindow):
         rng = f"{a}" if a == b else f"{a}~{b}"
         self.toast(f"{names}: {rng} 프레임 " + ("안 보이는 관절로 지정" if hide else "자동 판단으로 되돌림"))
         s.touch()
-        self.edit_worker.submit(("resolve", pid), lambda: s.resolve_local(pid, a, frame_end=b))
+        self.edit_worker.submit(("resolve", pid), resolve_task(s, pid, a, frame_end=b))
         self.viewer.update()
 
     def _edit_done(self, tag, res):
@@ -3326,19 +3438,44 @@ class MainWindow(QMainWindow):
         if cut is None:
             return
         prj = self.session.project
+
+        def logish(x):
+            return "log" in (x or "").lower()
+
+        # tracking and mattes were made on the picture as it was shown then: from a log picture shown flat (or a
+        # normal one shown as log) they are less sure. Worth analysing again when log/not log changes.
+        def seen_as(c):
+            return c.cs_analysed if c.cs_analysed is not None else c.input_cs
+
+        stale = [c for c in (prj.cut(i) for i in self.cutlist.selected_ids()) if c is not None and c is not cut
+                 and c.analyzed and logish(seen_as(c)) != logish(cs)]
         others = [c for c in (prj.cut(i) for i in self.cutlist.selected_ids()) if c is not None and c is not cut]
         for c in others:
             c.input_cs, c.cs_auto = cs, ""        # their proxies follow when they are opened next
         if others:
-            self.toast(f"{len(others) + 1}컷의 색공간을 {manager().short_name(cs)}(으)로 바꿨습니다", "ok")
+            msg = f"{len(others) + 1}컷의 색공간을 {manager().short_name(cs)}(으)로 바꿨습니다"
+            if stale:
+                msg += f". 이미 분석된 {len(stale)}컷은 다시 분석하면 추적·매트가 더 정확합니다"
+            self.toast(msg, "ok")
         self.cutlist.update_rows()
         if cs == (cut.input_cs or ""):
             cut.cs_auto = ""
             self.session.project.save()
             self.inspector.refresh("output")
             return
+        was = seen_as(cut)
+        again = cut.analyzed and logish(was) != logish(cs)
         cut.input_cs, cut.cs_auto = cs, ""
         self.session.project.save()
+        self._reanalyse_after_proxy = None
+        if again and self.job is None:
+            r = QMessageBox.question(
+                self, "색공간 변경",
+                f"이 컷은 {'log' if logish(was) else 'log가 아닌'} 화면으로 분석되어 추적·인물 매트가 덜 정확할 수 있습니다.\n"
+                "바뀐 색공간으로 다시 분석할까요? (보정 값은 그대로 남습니다)",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if r == QMessageBox.Yes:
+                self._reanalyse_after_proxy = cut.id
         self.session.open_cut(cut)
         self.build_proxy()
 
@@ -3427,6 +3564,21 @@ class MainWindow(QMainWindow):
                     persons=[p.to_dict() for p in cut.persons], locked=copy.deepcopy(cut.locked),
                     confirmed=copy.deepcopy(cut.confirmed), hidden=copy.deepcopy(cut.hidden))
 
+    def _switch_undo(self, new_id: str) -> None:
+        """Each cut keeps its own undo history while the project is open (going to another cut, by hand or by
+        playing on into it, and back again keeps what can be undone there)."""
+        cur = self.session.cut
+        if cur is not None and cur.id != new_id and (self.undo_stack or self.redo_stack):
+            self._undo_by_cut[cur.id] = (self.undo_stack, self.redo_stack)
+            while len(self._undo_by_cut) > 30:
+                self._undo_by_cut.pop(next(iter(self._undo_by_cut)))
+        u, r = self._undo_by_cut.pop(new_id, ([], []))
+        self.undo_stack, self.redo_stack = list(u), list(r)
+
+    def drop_undo(self, cut_id: str) -> None:
+        """The cut's tracking was made again (analysis): its old snapshots no longer fit its people."""
+        self._undo_by_cut.pop(cut_id, None)
+
     def push_undo(self, coalesce: str = ""):
         if self.session.cut is None:
             return
@@ -3465,14 +3617,14 @@ class MainWindow(QMainWindow):
                 changed = a ^ b
                 changed |= {(j, f) for (j, f) in a & b if old_keys[pid][j][f] != cut.joint_keys[pid][j][f]}
                 for f in sorted({f for _, f in changed}):
-                    self.edit_worker.submit(("resolve", pid), lambda pid=pid, f=f: s.resolve_local(pid, f))
+                    self.edit_worker.submit(("resolve", pid), resolve_task(s, pid, f))
             for pid in set(old_hidden) | set(cut.hidden):
                 if old_hidden.get(pid) != cut.hidden.get(pid):
                     rs = [r for jd in (old_hidden.get(pid, {}), cut.hidden.get(pid, {})) for v in jd.values() for r in v]
                     if rs:
                         a0, b0 = min(r[0] for r in rs), max(r[1] for r in rs)
                         self.edit_worker.submit(("resolve_h", pid),
-                                                lambda pid=pid, a0=a0, b0=b0: s.resolve_local(pid, a0, frame_end=b0))
+                                                resolve_task(s, pid, a0, frame_end=b0))
         s.touch()
         self._refresh_all()
 
@@ -3624,6 +3776,7 @@ class MainWindow(QMainWindow):
             self.busy.setGeometry(self.center.rect())
 
     def closeEvent(self, e):
+        self._close_saved = False
         if self.session.project is not None and self.session.dirty and not getattr(self, "_close_decided", False):
             m = QMessageBox(self)
             m.setWindowTitle("DIAP")
@@ -3636,7 +3789,10 @@ class MainWindow(QMainWindow):
             m.setDefaultButton(b_save)
             m.exec()
             if m.clickedButton() is b_save:
-                self.save()
+                if not self.save():
+                    e.ignore()                  # not saved: the window stays open
+                    return
+                self._close_saved = True
             elif m.clickedButton() is b_no:
                 self.session.dirty = False
                 self._discard_on_close = True
@@ -3644,6 +3800,12 @@ class MainWindow(QMainWindow):
             else:
                 e.ignore()
                 return
+        if not getattr(self, "_discard_on_close", False) and not self._close_saved and self.job is None:
+            # saved before anything is stopped: a failed save leaves the window (and a running render) as they were
+            if not self._save_or_ask("종료"):
+                e.ignore()
+                return
+            self._close_saved = True
         if self.queue_page.job is not None:
             if QMessageBox.question(self, "렌더 중", "렌더가 진행 중입니다. 종료하면 현재 렌더는 취소됩니다. 종료할까요?") != QMessageBox.Yes:
                 e.ignore()
@@ -3662,8 +3824,10 @@ class MainWindow(QMainWindow):
             self._opening.wait(15000)
         self.projects_page.shutdown()
         self.stop_play()
-        if not getattr(self, "_discard_on_close", False):
-            self.save(quiet=True)
+        if not getattr(self, "_discard_on_close", False) and not self._close_saved \
+                and not self._save_or_ask("종료"):
+            e.ignore()
+            return
         self.activity.flush()
         self.edit_worker.stop()
         self.edit_worker.wait(3000)

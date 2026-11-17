@@ -47,11 +47,28 @@ class SerialWorker(QThread):
         super().__init__(parent)
         self.q: "queue.Queue" = queue.Queue()
         self._stop = False
+        import threading
+        self._idle = threading.Condition()
+        self._open = 0                  # tasks submitted and not finished
 
     def submit(self, tag, fn: Callable[[], Any]):
+        with self._idle:
+            self._open += 1
         self.q.put((tag, fn))
         if not self.isRunning():
             self.start()
+
+    def drain(self, timeout: float = 15.0) -> bool:
+        """Waits (this thread) until every submitted task has run. False when it took longer than timeout."""
+        import time as _t
+        end = _t.time() + timeout
+        with self._idle:
+            while self._open > 0:
+                left = end - _t.time()
+                if left <= 0 or not self.isRunning():
+                    return self._open == 0
+                self._idle.wait(min(left, 0.1))
+        return True
 
     def pending(self) -> int:
         return self.q.qsize()
@@ -72,6 +89,10 @@ class SerialWorker(QThread):
                 self.done.emit(tag, res)
             except Exception as e:
                 self.error.emit(f"{e}\n{traceback.format_exc()}")
+            finally:
+                with self._idle:
+                    self._open -= 1
+                    self._idle.notify_all()
             if self.q.empty():
                 self.busy.emit(False)
 
@@ -152,8 +173,8 @@ class NextCutPrep:
                         sh.proxy.close()
                     sh.proxy, sh.tracker = None, None
                     vs = sh.view_settings(cut)
-                    if cut.tl and (project.timeline or {}).get("baked"):
-                        from ..core.tlimport import build_bake_proxy
+                    from ..core.tlimport import build_bake_proxy, shares_bake
+                    if shares_bake(project, cut):
                         ok = build_bake_proxy(project, manager(), vs, None, stop.is_set)
                     else:
                         ok = sh.make_proxy(cut).build(manager(), vs, None, stop.is_set)

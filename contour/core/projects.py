@@ -77,12 +77,28 @@ def info(path: str) -> Dict:
     return d
 
 
+def local_cache(path: str) -> Optional[Path]:
+    """The project's folder in this computer's proxy cache (1.16), if there is one."""
+    try:
+        j = json.loads((Path(path) / "project.json").read_text(encoding="utf-8"))
+        key = f"{int(round(float(j.get('created', 0) or 0) * 1000))}"
+        from .settings import settings
+        root = settings().cache_path
+        return next((p for p in root.glob(key + "_*") if p.is_dir()), None)
+    except Exception:
+        return None
+
+
 def _proxy_files(path: str) -> List[Path]:
     root = Path(path)
     out = [p for p in root.glob("cuts/*/cache/proxy_*.u8")] + [p for p in root.glob("cuts/*/cache/proxy_meta.json")]
+    out += [p for p in root.glob("cuts/*/cache/proxy_shared.json")]
     bc = root / "bake_cache"
     if bc.exists():
         out += [p for p in bc.rglob("*") if p.is_file()]
+    lc = local_cache(path)
+    if lc is not None:
+        out += [p for p in lc.rglob("*") if p.is_file()]
     return out
 
 
@@ -117,6 +133,50 @@ def clear_proxies(path: str) -> int:
     bc = Path(path) / "bake_cache"
     if bc.exists():
         shutil.rmtree(bc, ignore_errors=True)
+    lc = local_cache(path)
+    if lc is not None:
+        shutil.rmtree(lc, ignore_errors=True)
+    return freed
+
+
+def cache_usage() -> Dict:
+    """This computer's proxy cache: folder, bytes used, free space on its drive, and the folders of projects that are
+    no longer in the project list."""
+    from .settings import settings
+    st = settings()
+    root = st.cache_path
+    used = 0
+    for dp, _, fs in os.walk(root):
+        for f in fs:
+            try:
+                used += os.path.getsize(os.path.join(dp, f))
+            except OSError:
+                pass
+    keys = set()
+    for p in list(st.known_projects) + list(st.recent_projects):
+        try:
+            j = json.loads((Path(p) / "project.json").read_text(encoding="utf-8"))
+            keys.add(f"{int(round(float(j.get('created', 0) or 0) * 1000))}")
+        except Exception:
+            pass
+    orphans = [d for d in root.iterdir() if d.is_dir() and d.name.split("_", 1)[0] not in keys] if root.exists() else []
+    try:
+        free = shutil.disk_usage(root).free
+    except OSError:
+        free = -1
+    return dict(root=str(root), used=used, free=free, orphans=orphans)
+
+
+def clear_orphans(dirs) -> int:
+    freed = 0
+    for d in dirs:
+        for dp, _, fs in os.walk(d):
+            for f in fs:
+                try:
+                    freed += os.path.getsize(os.path.join(dp, f))
+                except OSError:
+                    pass
+        shutil.rmtree(d, ignore_errors=True)
     return freed
 
 

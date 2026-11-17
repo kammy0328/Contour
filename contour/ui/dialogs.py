@@ -79,6 +79,26 @@ class SettingsDialog(QDialog):
         db = Wd.button("찾기", "ghost")
         db.clicked.connect(lambda: self._pick_dir(self.data))
         form.addRow("데이터 폴더", self._row(self.data, db))
+        # proxies: this computer's fast disk, not the (network) project folder
+        self.cache = QLineEdit(getattr(s, "cache_dir", "") or "")
+        self.cache.setPlaceholderText(str(s.data_path / "cache"))
+        self.cache.setToolTip("프록시(원본에서 언제든 다시 만들 수 있는 미리보기용 영상)를 두는 곳입니다. 빠른 로컬 SSD를 권장합니다.\n"
+                              "바꾸면 컷을 열 때 새 폴더에 프록시를 다시 만듭니다. 분석 결과와 매트는 프로젝트 폴더에 그대로 있습니다.")
+        cb_ = Wd.button("찾기", "ghost")
+        cb_.clicked.connect(lambda: self._pick_dir(self.cache))
+        form.addRow("캐시 폴더", self._row(self.cache, cb_))
+        self.cache_info = Wd.label("", "Faint", 11)
+        self.cache_info.setWordWrap(True)
+        self.orphan_btn = QPushButton("쓰지 않는 캐시 지우기")
+        self.orphan_btn.setToolTip("프로젝트 목록에 없는 프로젝트(지웠거나 목록에서 뺀 프로젝트)의 프록시를 지웁니다")
+        self.orphan_btn.clicked.connect(self._clear_orphans)
+        crow = QWidget()
+        cl_ = QHBoxLayout(crow)
+        cl_.setContentsMargins(0, 0, 0, 0)
+        cl_.addWidget(self.cache_info, 1)
+        cl_.addWidget(self.orphan_btn)
+        form.addRow("", crow)
+        self._cache_usage()
         cm = manager(BUILTIN_STUDIO)          # the built-in ACES Studio config (no choice of config file)
         self.display = QComboBox()
         self.view = QComboBox()
@@ -145,6 +165,16 @@ class SettingsDialog(QDialog):
             self.gpu.addItem(t, v)
         self.gpu.setCurrentIndex(max(0, self.gpu.findData(s.gpu)))
         form.addRow("추론 장치", self.gpu)
+        lg = QPushButton("로그 폴더 열기")
+        lg.setToolTip("문제가 생기면 이 폴더의 errors.log, freeze.log, output.log를 보내 주세요")
+        lg.clicked.connect(self._open_logs)
+        lrow = QWidget()
+        ll_ = QHBoxLayout(lrow)
+        ll_.setContentsMargins(0, 0, 0, 0)
+        ll_.addWidget(Wd.label("오류·멈춤 기록", "Faint", 11))
+        ll_.addStretch(1)
+        ll_.addWidget(lg)
+        form.addRow("로그", lrow)
         lay.addLayout(form)
         from ..track.models import gpu_report
         rep = Wd.label(gpu_report(), "Faint", 11)
@@ -159,6 +189,48 @@ class SettingsDialog(QDialog):
         lay.addWidget(ver)
         lay.addWidget(_buttons(self, "저장"))
         self.setMinimumWidth(560)
+
+    def _cache_usage(self):
+        from ..core import projects as PJ
+        try:
+            u = PJ.cache_usage()
+        except Exception:
+            self.cache_info.setText("")
+            self.orphan_btn.setVisible(False)
+            return
+        self._orphans = u["orphans"]
+        txt = f"사용 {PJ.human(u['used'])}"
+        if u["free"] >= 0:
+            txt += f" · 남은 공간 {PJ.human(u['free'])}"
+        try:
+            import ctypes
+            import os as _os
+            drv = _os.path.splitdrive(u["root"])[0] + "\\"
+            if drv.strip("\\") and ctypes.windll.kernel32.GetDriveTypeW(drv) == 4:
+                txt += " · 네트워크 드라이브라 재생과 분석이 느릴 수 있습니다"
+        except Exception:
+            pass
+        self.cache_info.setText(txt)
+        self.orphan_btn.setVisible(bool(self._orphans))
+
+    def _clear_orphans(self):
+        from ..core import projects as PJ
+        dirs = list(getattr(self, "_orphans", []) or [])
+        if not dirs:
+            return
+        if QMessageBox.question(self, "쓰지 않는 캐시 지우기",
+                                f"프로젝트 목록에 없는 프로젝트 {len(dirs)}개의 프록시를 지울까요?\n"
+                                "나중에 그 프로젝트를 다시 열면 프록시를 새로 만듭니다.") != QMessageBox.Yes:
+            return
+        freed = PJ.clear_orphans(dirs)
+        self._cache_usage()
+        QMessageBox.information(self, "쓰지 않는 캐시 지우기", f"{PJ.human(freed)}를 비웠습니다.")
+
+    def _open_logs(self):
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        from ..core import logs
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(logs.folder())))
 
     def _row(self, a, b):
         w = QWidget()
@@ -186,6 +258,8 @@ class SettingsDialog(QDialog):
         s = settings()
         changed_view = s.display != self.display.currentText() or s.view != self.view.currentText()
         s.data_dir = self.data.text().strip()
+        cd = self.cache.text().strip()
+        s.cache_dir = "" if cd and Path(cd) == s.data_path / "cache" else cd
         s.display = self.display.currentText()
         s.view = self.view.currentText()
         s.proxy_long_side = int(self.proxy.currentData())
