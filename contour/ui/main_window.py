@@ -1275,12 +1275,12 @@ class MainWindow(QMainWindow):
             self._refresh_all()
 
     # ================================================================== jobs
-    def run_job(self, title: str, fn, done, cancellable: bool = True):
+    def run_job(self, title: str, fn, done, cancellable: bool = True, est_s: float = 0.0):
         if self.job is not None:
             self.toast("다른 작업이 진행 중입니다.", kind="warn")
             return
         self.stop_play()
-        self.busy.start(title, cancellable)
+        self.busy.start(title, cancellable, est_s)
         self.job = Job(fn, self)
         self.job.progressed.connect(self.busy.progress)
 
@@ -1347,7 +1347,18 @@ class MainWindow(QMainWindow):
                 traceback.print_exc()
             return res
 
+        from .batchdlg import DEFAULT_SPF
+        a_, b_ = cut.work_range
+        nfr = max(1, b_ - a_)
+        t_start = time.time()
+        spf0 = float(getattr(settings(), "analysis_spf", 0.0) or 0.0)
+
         def done(_):
+            if nfr >= 24:                                   # learn this PC's pace for the next estimate
+                st = settings()
+                spf = (time.time() - t_start) / nfr
+                st.analysis_spf = round(spf if not st.analysis_spf else 0.5 * st.analysis_spf + 0.5 * spf, 3)
+                st.save()
             cut.stats.analysis_runs += 1
             ok = tr.auto_ok_rate(cut.tracking.conf_threshold)
             cut.stats.auto_ok_rate = ok
@@ -1376,7 +1387,7 @@ class MainWindow(QMainWindow):
                 log_event("self_learning", s.project.name, cut.name, fusion_gain=fr.get("gain"), cuts=fr.get("cuts"))
             QTimer.singleShot(4000, self.models_page.maybe_self_train)
 
-        self.run_job("분석 중", work, done)
+        self.run_job("분석 중", work, done, est_s=nfr * (spf0 or DEFAULT_SPF))
 
     # ================================================================== edited timeline
     @staticmethod
