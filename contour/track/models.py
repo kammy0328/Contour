@@ -377,7 +377,12 @@ def reset_providers() -> None:
 
 
 # session settings (measured on the 4070 Ti, j2682); DIAP_ARENA / DIAP_SPIN / DIAP_THREADS override them
-RUN_SHRINK = "0"            # "1": a model's run gives its arena's spare memory back (not the SAM models)
+# j2730 (2026-11-18, cut 024 of 2611, 12 frames, RTX 4070 Ti 12 GB): with the default pools the SAM 3.1 encoder held
+# 8.4 GB after its first run, the GPU sat at 11.9 of 12 GB, the encoder took 9 s a call (median; 108 s mean) and the
+# whole computer stuttered (Chrome, the desktop). Pools that grow by what is asked and runs that give spare memory
+# back: 0.41 s a call, 1249 s -> 58 s for the analysis, 2.0 GB median and 9.8 GB peak, the matte identical (IoU 1.0,
+# mean difference 0). Both on by default.
+RUN_SHRINK = "1"            # "1": a model's run gives its arena's spare memory back (not the SAM models)
 SHARE_ARENA = "0"           # "1": every session takes its GPU memory from one shared pool
 _shared_arena = []
 
@@ -396,7 +401,7 @@ def _share_cuda_arena(so) -> None:
         sys.stderr.write(f"shared GPU pool not used: {str(e)[:200]}\n")
 
 
-ARENA = "default"           # "same": the CUDA memory pool grows by what is asked (kSameAsRequested)
+ARENA = "same"              # "same": the CUDA memory pool grows by what is asked (kSameAsRequested); "default": doubling
 SPIN = "1"                  # "0": idle threads do not spin
 
 # ---------------------------------------------------------------------------------------------- GPU memory
