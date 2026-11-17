@@ -46,6 +46,10 @@ SMALL_GAIN = 1.35           # how many times further above the texture a 3 px sp
 BUMP_SIZE_MAX = 1.0         # share of the largest spot size up to which bumps are looked for
 LINE_LEN = 0.05             # of the face width: a neck line is at least this long (shorter marks are texture)
 FOLD_LEN = 0.12
+LINE_DOWN = (0.2, 0.45)      # |cos| between a line's normal and the neck's axis: below, the line runs down the neck
+LINE_DEEP = 0.2             # a valley this much darker than the skin anywhere along its run is a thing, not a skin line
+RUN_GAP = 0.01              # of the face width: gaps this long in a valley's run are bridged
+TWO_SIDED = (0.3, 0.65)      # share of a valley's depth it must also have against its darker side (a shadow's foot has none)
 BUMP_MAX = (0.16, 0.26)     # a bright dot this much over the skin (relative) is glitter, a glint, a drop: not a bump
 DARK_MAX = (0.45, 0.65)     # a dot this much darker than the skin is a thing (a stud, a painted dot), not a blemish
 
@@ -55,7 +59,21 @@ def _ss(e0: float, e1: float, x: np.ndarray) -> np.ndarray:
     return (t * t * (3 - 2 * t)).astype(np.float32)
 
 
+GM_WORK = 2.5               # a wide weighted mean is taken on a reduced picture: its Gaussian is this many pixels there
+
+
 def _gm(x: np.ndarray, w: np.ndarray, sig: float) -> np.ndarray:
+    """Mean of x weighted by w under a Gaussian. A wide one is smooth, so it is worked out on a reduced picture
+    (the same answer to within a rounding, at a fraction of the time: detection cost was mostly this)."""
+    f = sig / GM_WORK
+    if f >= 2.0 and min(x.shape[:2]) >= 4 * f:
+        h, ww = x.shape[:2]
+        sz = (max(4, int(round(ww / f))), max(4, int(round(h / f))))
+        num = cv2.GaussianBlur(cv2.resize(x * w, sz, interpolation=cv2.INTER_AREA), (0, 0), sig * sz[0] / ww)
+        den = cv2.GaussianBlur(cv2.resize(w, sz, interpolation=cv2.INTER_AREA), (0, 0), sig * sz[0] / ww)
+        plain = cv2.GaussianBlur(cv2.resize(x, sz, interpolation=cv2.INTER_AREA), (0, 0), sig * sz[0] / ww)
+        out = np.where(den > 1e-3, num / np.maximum(den, 1e-3), plain).astype(np.float32)
+        return cv2.resize(out, (ww, h), interpolation=cv2.INTER_LINEAR)
     num = cv2.GaussianBlur(x * w, (0, 0), sig)
     den = cv2.GaussianBlur(w, (0, 0), sig)
     return np.where(den > 1e-3, num / np.maximum(den, 1e-3), cv2.GaussianBlur(x, (0, 0), sig)).astype(np.float32)
@@ -264,6 +282,16 @@ def fold_zone(lm: Optional[np.ndarray], shape, wf: float) -> Optional[np.ndarray
         pts = np.round(np.stack([a, b, c])).astype(np.int32)
         cv2.polylines(m, [pts], False, 1, max(2, int(0.10 * wf)))
         cv2.circle(m, (int(b[0]), int(b[1])), max(2, int(0.10 * wf)), 1, -1)
+    # the hollow between the lower lip and the chin, and the hollows under the eyes (from the inner corner along
+    # the lower lid): round shade of the face's build, as large as a spot (lngshot 058: both were marked dark)
+    if np.isfinite(L[57]).all():
+        c = L[57] + down * 0.07 * wf
+        ang = float(np.degrees(np.arctan2(down[1], down[0]))) - 90.0
+        cv2.ellipse(m, (int(c[0]), int(c[1])), (max(2, int(0.15 * wf)), max(2, int(0.07 * wf))), ang, 0, 360, 1, -1)
+    for ids in ((39, 40, 41, 36), (42, 47, 46, 45)):
+        if np.isfinite(L[list(ids)]).all():
+            pts = np.round(L[list(ids)] + down * 0.06 * wf).astype(np.int32)
+            cv2.polylines(m, [pts], False, 1, max(2, int(0.07 * wf)))
     return cv2.GaussianBlur(m.astype(np.float32), (0, 0), max(1.0, 0.02 * wf))
 
 
@@ -284,6 +312,11 @@ def lines(Y: np.ndarray, neck: np.ndarray, wf: float, axis: Optional[Tuple[float
     if sel.sum() < 30:
         return out
     full = (roi, mm)
+    # how much darker than the skin beside it, at the picture's own sharpness (a chain a pixel wide is deep here
+    # and shallow on the pictures the wider lines are looked for on)
+    rq_ = cv2.GaussianBlur(roi, (0, 0), max(0.6, 0.003 * wf))
+    b0_ = _gm(rq_, wsk, max(3.0, 0.05 * wf))
+    deep_full = np.clip(b0_ - rq_, 0, 1) / np.maximum(b0_, 0.05)
     for kind, ws in (("line", widths), ("fold", folds)):
         acc = np.zeros(full[0].shape, np.float32)
         for f in ws:
@@ -313,16 +346,23 @@ def lines(Y: np.ndarray, neck: np.ndarray, wf: float, axis: Optional[Tuple[float
             # side of the neck, the jaw's shadow) is dark against one side only
             gy_, gx_ = np.mgrid[0:roi.shape[0], 0:roi.shape[1]].astype(np.float32)
             dx_, dy_ = np.cos(phi).astype(np.float32) * (2.5 * w), np.sin(phi).astype(np.float32) * (2.5 * w)
+            Yw = cv2.GaussianBlur(Ys, (0, 0), max(0.8, 1.0 * w))    # the sides: the skin's level there, not its grain
             side = []
             for sg_ in (1.0, -1.0):
                 mx_, my_ = gx_ + sg_ * dx_, gy_ + sg_ * dy_
-                side.append((cv2.remap(Ys, mx_, my_, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE),
+                side.append((cv2.remap(Yw, mx_, my_, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE),
                              cv2.remap(mm, mx_, my_, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)))
-            D = np.minimum(D, np.clip(np.minimum(side[0][0], side[1][0]) - Ys, 0, 0.25))
-            rel = D / np.maximum(base, 0.05)
+            two = np.clip(np.minimum(side[0][0], side[1][0]) - Ys, 0, 0.25)
+            # a gate, not the depth itself: the darker side's own grain must not thin a real line's score
+            line = line * _ss(TWO_SIDED[0], TWO_SIDED[1], two / np.maximum(D, 1e-4))
             line = line * _ss(0.4, 0.8, np.minimum(side[0][1], side[1][1]))
             if kind == "line":
                 sc = _ss(1.0, 2.4, D / texr) * _ss(0.006, 0.025, rel) * line
+                if axis is not None:
+                    # any direction but the neck's own: what runs down the neck is a hanging strand of hair, a cord,
+                    # a tendon's shade. A line tilted up to some 70 degrees from "across" still counts in full
+                    along = np.abs(np.cos(phi) * axis[0] + np.sin(phi) * axis[1])
+                    sc = sc * _ss(LINE_DOWN[0], LINE_DOWN[1], cv2.GaussianBlur(along.astype(np.float32), (0, 0), max(1.0, 0.5 * w)))
             else:
                 sc = _ss(0.8, 2.0, D / texr) * _ss(0.006, 0.03, rel) * line
                 if axis is not None:
@@ -343,6 +383,28 @@ def lines(Y: np.ndarray, neck: np.ndarray, wf: float, axis: Optional[Tuple[float
                 n_, lab_, st_, _c = cv2.connectedComponentsWithStats(cand, connectivity=8)
                 ok_ = np.hypot(st_[:, 2], st_[:, 3]) >= need
                 ok_[0] = False
+                if kind == "line" and ok_.any():
+                    # one thing along its whole length: a chain, a cord, a strand of hair is deep where it is in
+                    # focus and in the light and faint elsewhere. Its faint stretch alone reads as a neck line, so
+                    # a valley that is deep anywhere along its run is left alone everywhere
+                    run = ((line * _ss(0.003, 0.01, rel)) > 0.4).astype(np.uint8)
+                    rb_ = max(1, int(round(RUN_GAP * wf / red_)))        # grain breaks a faint run: short gaps are bridged
+                    run = cv2.dilate(run, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rb_ + 1, 2 * rb_ + 1)))
+                    nr_, labr_ = cv2.connectedComponents(run, connectivity=8)
+                    if nr_ > 1:
+                        dp_ = deep_full
+                        if red_ > 1.0:
+                            kd_ = int(np.ceil(red_)) | 1
+                            dp_ = cv2.resize(cv2.dilate(deep_full, np.ones((kd_, kd_), np.uint8)),
+                                             (sc.shape[1], sc.shape[0]), interpolation=cv2.INTER_AREA)
+                        dmax = np.zeros(nr_, np.float32)
+                        np.maximum.at(dmax, labr_.ravel(), np.maximum(rel, dp_).ravel())
+                        thing_ = dmax >= LINE_DEEP
+                        thing_[0] = False
+                        if thing_.any():
+                            bad_ = np.zeros(n_, bool)
+                            bad_[np.unique(lab_[thing_[labr_]])] = True
+                            ok_ &= ~bad_
                 if ok_.any():
                     keep = cv2.GaussianBlur(ok_[lab_].astype(np.float32), (0, 0), max(0.6, 0.5 * w))
             sc = sc * np.clip(keep * 1.5, 0, 1)

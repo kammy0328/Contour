@@ -1398,6 +1398,13 @@ def _double_faces(st, tracker, t: int) -> set:
     return out
 
 
+def _nbytes(m) -> int:
+    """Memory of a cached mask, or of a frame's score maps (a dict of them)."""
+    if isinstance(m, dict):
+        return int(sum(int(getattr(x, "nbytes", 0)) for x in m.get("maps", {}).values()) + int(getattr(m.get("thumb"), "nbytes", 0)))
+    return int(getattr(m, "nbytes", 0))
+
+
 def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optional[int] = None) -> Optional[RetouchFrame]:
     """One frame's masks on their own (see prepare). only: just this person, skin shown even at 0."""
     st = tracker.store
@@ -1531,10 +1538,10 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 cache[key] = m
                 # bounded by memory, not by count: at a 1920 proxy every mask is 8 MB, and 400 of them took
                 # over 3 GB in the preview
-                nb = cache.get("__bytes__", 0) + int(getattr(m, "nbytes", 0))
+                nb = cache.get("__bytes__", 0) + _nbytes(m)
                 while (len(cache) > 401 or nb > CACHE_BYTES) and len(cache) > 2:
                     k0 = next(k_ for k_ in cache if k_ != "__bytes__")
-                    nb -= int(getattr(cache.pop(k0), "nbytes", 0))
+                    nb -= _nbytes(cache.pop(k0))
                 cache["__bytes__"] = max(0, nb)
             return m
 
