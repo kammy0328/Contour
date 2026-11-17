@@ -827,6 +827,7 @@ class BusyOverlay(QWidget):
         import time
         self._t0 = time.time()
         self._est = max(0.0, float(est_s or 0.0))
+        self._cancelling = False
         self.title.setText(title)
         self.msg.setText("준비 중")
         self._eta_text(0.0)
@@ -862,7 +863,18 @@ class BusyOverlay(QWidget):
                          + (" (처음엔 예상치)" if f < 0.05 else ""))
         self._fit()
 
+    def cancelling(self):
+        """Cancel was pressed: from here on the panel says only that it is stopping. The worker keeps sending
+        progress until it notices (a frame of SAM takes seconds), which brought back "분석 중" and the time left."""
+        self._cancelling = True
+        self.cancel.setEnabled(False)
+        self.msg.setText("취소하는 중…")
+        self.eta.setText("")
+        self._fit()
+
     def progress(self, f: float, msg: str = ""):
+        if getattr(self, "_cancelling", False):
+            return
         self.bar.setValue(int(max(0, min(1, f)) * 1000))
         if msg:
             self.msg.setText(msg)

@@ -113,13 +113,7 @@ class _JobGuard(QObject):
         if ev.type() == QEvent.Wheel and getattr(w, "viewer", None) is not None and \
                 (obj is w.viewer or w.viewer.isAncestorOf(obj)):
             return False                    # looking around in the picture changes nothing
-        if ev.type() in (QEvent.MouseButtonPress, QEvent.KeyPress) and time.time() - self._told > 3.0:
-            self._told = time.time()
-            try:
-                w.toast("작업이 끝난 뒤 조작할 수 있습니다 (진행 창에서 취소 가능)", kind="warn")
-            except Exception:
-                pass
-        return True
+        return True                         # blocked without a message: the progress panel says what is going on
 
 
 class _CenterFilter(QObject):
@@ -1502,8 +1496,7 @@ class MainWindow(QMainWindow):
     def _cancel_job(self):
         if self.job:
             self.job.cancel()
-            self.busy.cancel.setEnabled(False)
-            self.busy.progress(self.busy.bar.value() / 1000, "취소하는 중…")
+            self.busy.cancelling()
 
     def set_accuracy(self, v: str):
         self.accuracy = v

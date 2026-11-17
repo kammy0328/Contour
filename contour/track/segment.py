@@ -490,7 +490,7 @@ def _borrowed(st, t, pr, insts, assigned, merged, sx, sy, use_final, W: int, H: 
 
 def decode_frame(seg, rgb, st, t: int, sx: float, sy: float, W: int, H: int, mw: int, mh: int,
                  use_final: bool, finder=None, heads: Optional[dict] = None, info: Optional[dict] = None,
-                 repose: Optional[Callable] = None) -> Tuple[dict, List[np.ndarray]]:
+                 repose: Optional[Callable] = None, cancel_check: Optional[Callable] = None) -> Tuple[dict, List[np.ndarray]]:
     """Everybody on frame t: (pid -> dict(p, bx, pos, neg, canvas (matte size mask logits), src), extra).
 
     With `finder` (SAM 3.1's "person" finder): the frame is first split into the people in it, each a mask of their
@@ -507,7 +507,10 @@ def decode_frame(seg, rgb, st, t: int, sx: float, sy: float, W: int, H: int, mw:
     dec, extra = {}, []
     if not pr:
         return dec, extra
+    _check = cancel_check or (lambda: None)
+    _check()
     full = seg.encode(rgb)
+    _check()
     insts = []
     if finder is not None:
         try:
@@ -589,6 +592,7 @@ def decode_frame(seg, rgb, st, t: int, sx: float, sy: float, W: int, H: int, mw:
         pid = int(st.pids[p])
         cv, src = None, None
         enc = full
+        _check()                            # a close-up is another encoder run: cancel does not wait for the whole frame
         if i in small:
             enc = seg.encode(rgb, _closeup_rect(bx, W, H))
             if finder is not None:
@@ -699,7 +703,8 @@ def run(st, proxy, matte, seglab, a: int, b: int, seg_key: str, use_final: bool,
     try:
         for t in range(a, b):
             if cancel and cancel():
-                break
+                from .analyze import Cancelled
+                raise Cancelled()           # not "break": the caller went on with the rest of the analysis
             # dark or colour-lit frames: what SAM and RVM see only (never the output)
             rgb = analysis_view(np.asarray(proxy.frame(t)))
             rvm = None
@@ -708,8 +713,12 @@ def run(st, proxy, matte, seglab, a: int, b: int, seg_key: str, use_final: bool,
                 rvm = matter(small)
             heads = head_priors(st, t, mw, mh, W, H, sx, sy, use_final)
             info = {} if (finder is not None and (repose is not None or collect is not None)) else None
+            def _chk():
+                if cancel and cancel():
+                    from .analyze import Cancelled
+                    raise Cancelled()
             dec, extra = decode_frame(seg, rgb, st, t, sx, sy, W, H, mw, mh, use_final, finder, heads, info,
-                                      repose if finder is not None else None)
+                                      repose if finder is not None else None, cancel_check=_chk)
             if info and info.get("repose"):
                 heads = head_priors(st, t, mw, mh, W, H, sx, sy, use_final)
                 if collect is not None:
