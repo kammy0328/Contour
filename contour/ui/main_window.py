@@ -565,7 +565,8 @@ class MainWindow(QMainWindow):
         d = QFileDialog.getExistingDirectory(self, "프로젝트를 만들 폴더", str(Path.home()))
         if not d:
             return
-        self.close_project()
+        if not self.close_project():
+            return
         prj = Project.create(d, name)
         self.open_project(prj.path, wait=True)
         self.show_page("edit")
@@ -729,8 +730,13 @@ class MainWindow(QMainWindow):
         if not quiet:
             self.saved_lbl.start("저장 중")
         self.activity.flush()
-        # joint re-solves still queued are part of what is saved (and must not write the tracks while they are saved)
-        self.edit_worker.drain(30.0)
+        # joint re-solves still queued are part of what is saved (and must not write the tracks while they are saved):
+        # one that has not finished means no save now (callers that would drop unsaved work stop on False)
+        if not self.edit_worker.drain(30.0):
+            self.saved_lbl.done("저장 보류")
+            self.show_error("저장하지 않았습니다", "관절 다시 계산이 30초 안에 끝나지 않아 저장하지 않았습니다. "
+                            "계산이 끝난 뒤(아래 '다시 계산 중' 표시가 사라지면) 다시 저장하세요.")
+            return False
         try:
             self.session.save()
         except Exception as e:
@@ -1537,7 +1543,8 @@ class MainWindow(QMainWindow):
         plain = [c for c in prj.cuts if not c.tl and c.info.kind == "video" and same(c.source, baked)
                  and not c.analyzed]
         if self.session.cut is not None and ((self.session.cut.tl and replace) or self.session.cut in plain):
-            self.save()
+            if not self.save():
+                return
             self.session.open_cut(None)
 
         def work(progress, cancelled):
@@ -1771,7 +1778,8 @@ class MainWindow(QMainWindow):
         prj = self.session.project
         if prj is None or not todo:
             return
-        self.save()
+        if not self.save():                     # the analysis process reads the project from disk
+            return
         # the bake's shared proxy first (one decode), then every shot's analysis reads from it
         from ..core.tlimport import bake_proxy, build_bake_proxy, link_bake_proxy
         tlm = prj.timeline or {}
@@ -1889,15 +1897,23 @@ class MainWindow(QMainWindow):
         cut = prj.cut(cid) if prj else None
         if cut is None:
             return False
+        # the batch process reads the project from disk and writes its result over the cut: unsaved work first
+        if not self.save():
+            try:
+                self.batch.stop()               # no more cuts (each would fail the same way, one error box each)
+            except Exception:
+                pass
+            try:
+                self.toast("저장하지 못해 일괄 분석을 멈췄습니다", kind="error")
+            except Exception:
+                pass
+            return False
         if self.session.cut is not None and self.session.cut.id == cid:
             # the open cut holds its proxy files: the batch process could not rewrite them
-            self.save()
             self.session.open_cut(None)
             self._reopen_after = cid
             self.viewer.message = "일괄 분석 중인 컷입니다"
             self.viewer.update()
-        else:
-            self.save()
         return True
 
     def _batch_progress(self, cid: str, f: float, msg: str):
@@ -2472,7 +2488,8 @@ class MainWindow(QMainWindow):
         c = prj.cut(cut_id) if prj else None
         if c is None or int(v) == int(c.version):
             return
-        self.save()
+        if not self.save():                     # the version being left keeps what was not written
+            return
         WS.version_switch(c, v)
         self.session.dirty = True
         if self.session.cut is c:
@@ -3521,9 +3538,12 @@ class MainWindow(QMainWindow):
         self.queue_page.add(s.project, cut)
         self.toast("렌더 목록에 추가했습니다. 렌더 화면에서 시작하세요.", kind="ok")
 
-    def before_render(self, item):
+    def before_render(self, item) -> bool:
+        """The render reads the project from disk: False when the open project could not be saved (the render would
+        use an older state than the one on screen)."""
         if self.session.project is not None and self.session.project.path == item.project_path:
-            self.save()
+            return self.save()
+        return True
 
     def _render_finished(self, item, rep):
         if rep is None or getattr(rep, "cancelled", True):

@@ -137,7 +137,7 @@ class EditSession:
         if kind in ("retouch", "ret_img"):
             return key[2:4] == (v["ret"], v["trk"]) and key[-1] == self.epoch
         if kind == "res":
-            return key[2:5] == (v["geo"], v["ret"], v["trk"])
+            return key[2:5] == (v["geo"], v["ret"], v["trk"]) and key[-1] == self.epoch
         return False
 
     # ------------------------------------------------------------------ preview
@@ -246,8 +246,10 @@ class EditSession:
 
     def result_key(self, t: int, final: bool = False) -> tuple:
         # the cut is part of the key: a result computed for the previous cut must never show on this one
+        # and the epoch: the same cut opened again (or its proxy made again) while an old computation was running
+        # must not get that computation's picture
         return ("res", t, self.vers["geo"], self.vers["ret"], self.vers["trk"], False if final else self.interactive,
-                self.cut.mode if self.cut else "", self.cut.id if self.cut else "")
+                self.cut.mode if self.cut else "", self.cut.id if self.cut else "", self.epoch)
 
     def cached_result(self, t: int) -> Optional[np.ndarray]:
         with self._lock:

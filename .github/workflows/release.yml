@@ -22,7 +22,13 @@ env:
   GITHUB_TOKEN: ${{ github.token }}
 
 jobs:
+  tests:
+    # the regression tests first: no installer is built from a commit that fails them
+    if: github.event_name != 'push' || github.ref_type == 'tag' || contains(github.event.head_commit.message, '[release]')
+    uses: ./.github/workflows/tests.yml
+
   build:
+    needs: tests
     # a push to main builds only when its commit message has [release]
     if: github.event_name != 'push' || github.ref_type == 'tag' || contains(github.event.head_commit.message, '[release]')
     runs-on: windows-latest

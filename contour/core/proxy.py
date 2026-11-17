@@ -115,13 +115,23 @@ class Proxy:
 
     def is_valid(self, view_key: str) -> bool:
         m = self.meta()
-        return (self.path.exists() and m.get("complete") and m.get("view") == view_key
+        return (self.has_frames() and m.get("view") == view_key
                 and m.get("w") == self.w and m.get("h") == self.h and m.get("n") == self.n_file
                 and m.get("sig") == self._source_sig())
 
     def has_frames(self) -> bool:
+        """Every frame is in the file: a build that was cancelled, failed or decoded too few frames is not (its frames
+        past that point are black). Used before analysis, render and export."""
         m = self.meta()
-        return self.path.exists() and m.get("w") == self.w and m.get("h") == self.h and m.get("n") == self.n_file
+        if not (self.path.exists() and m.get("complete") and m.get("w") == self.w and m.get("h") == self.h
+                and m.get("n") == self.n_file):
+            return False
+        if int(m.get("n_decoded", self.n_file) or 0) < self.n_file:
+            return False                    # made by 1.15 or older from a file that ended early: a black tail
+        try:
+            return self.path.stat().st_size >= self.n_file * self.w * self.h * 3
+        except OSError:
+            return False
 
     @property
     def shared(self) -> bool:

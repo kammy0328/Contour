@@ -1,9 +1,10 @@
 name: tests
-# Regression tests that need no GPU and no model (tests/): run on every push to a branch and on pull requests.
+# Regression tests that need no GPU and no model (tests/): every push (main too), pull requests, and before every
+# release build (release.yml calls this workflow and builds only when it passes).
 on:
   push:
-    branches-ignore: [main]
   pull_request:
+  workflow_call:
 
 jobs:
   pytest:
@@ -22,4 +23,6 @@ jobs:
       - name: Tests
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python -m pytest -q tests
+        run: |
+          ffmpeg -version | head -1
+          python -m pytest -q tests

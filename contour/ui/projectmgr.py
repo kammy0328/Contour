@@ -385,8 +385,8 @@ class ProjectsPage(QWidget):
         r = QMessageBox.question(self, what, "지금 열려 있는 프로젝트입니다. 저장하고 닫은 뒤 진행할까요?")
         if r != QMessageBox.Yes:
             return False
-        self.main.close_project()
-        return True
+        # a failed save keeps the project open: renaming or deleting its folder now would lose what was not written
+        return bool(self.main.close_project())
 
     def _rename(self, d: Dict):
         from .dialogs import TextPrompt

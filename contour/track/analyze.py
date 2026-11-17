@@ -674,6 +674,11 @@ class CutTracker:
         self.cut.analyzed = True
         self.cut.analysis_version += 1
         self.cut.cs_analysed = self.cut.input_cs or ""
+        try:
+            from . import models as _M
+            self.cut.models_used = _M.fingerprints()
+        except Exception:
+            pass
         self.save()
         return st
 
