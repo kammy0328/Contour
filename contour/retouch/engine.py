@@ -2058,6 +2058,7 @@ def _blemish(Y, Cb, Cr, mY, mC, k: float, size: float, cs: float):
 
 
 # ----------------------------------------------------------------------------- flaws found by detect.py (1.19)
+FOLD_ZONE_OLD = True     # with 팔자주름·입가주름 on, the pre-1.19 spot finder still works along those folds
 DET_ON = True              # False: every correction looks for its flaw itself, on the frame, at one size (before 1.19)
 DET_SURE = (0.45, 0.85)        # score from which a flaw is sure enough for the grain band inside it to be given up .. in full
 DET_FINE = (0.04, 0.5, 1.2)    # what is finer than this stays inside a filled spot (share of the spot size, px floor and cap):
@@ -3167,12 +3168,33 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
             for nm_ in ("skinx", "neck"):
                 if nm_ in job.masks:
                     reg = M(job.masks[nm_], (hY, wY)) if reg is None else np.maximum(reg, M(job.masks[nm_], (hY, wY)))
-            S_ = np.maximum(det["dark"], det["bump"])
+            dk_ = det["dark"]
+            S_ = np.maximum(dk_, det["bump"])
             R_ = det["red"]
             if prot_ is not None:
                 S_ = S_ * (1.0 - prot_)
                 R_ = R_ * (1.0 - prot_)
+            Yin_, Cbin_, Crin_ = Y, Cb, Cr
             Y, Cb, Cr = _spot_fill(Y, Cb, Cr, reg, S_, R_, k, size, cs)
+            # the dips along the folds beside the mouth are the face's own shade, so the detector leaves them. But
+            # when the user asked for those folds to go (팔자주름, 입가주름) they are to go too: there the spot finder
+            # of before 1.19 still runs, as it did (2611 cut 011, j2721: the hollow at the mouth's corner was left
+            # darker than 1.18 left it). Lightening only, inside the fold zone only
+            wfold_ = float(np.clip(max(v.get("nasolabial", 0), v.get("mouth_lines", 0)) / 0.3, 0, 1))
+            if FOLD_ZONE_OLD and wfold_ > 1e-3 and "skinx" in job.masks and job.face is not None:
+                try:
+                    zone_ = DT.fold_zone(np.asarray(job.face, np.float32)[:, :2] * y_per_src, (hY, wY), wf, "folds")
+                    if zone_ is not None and zone_.max() > 0.02:
+                        Yb_, Cbb_, Crb_ = _blemish(Yin_, Cbin_, Crin_, M(job.masks["skinx"], (hY, wY)),
+                                                   M(job.masks["skinx"], (hC, wC)), k, max(2.0, size), cs)
+                        zw_ = zone_ * wfold_
+                        Y = Y + np.clip(Yb_ - Y, 0, None) * zw_
+                        zc_ = zw_ if (hC, wC) == (hY, wY) else cv2.resize(zw_, (wC, hC), interpolation=cv2.INTER_AREA)
+                        take_ = (cv2.resize(np.clip(Yb_ - Yin_, 0, None), (wC, hC), interpolation=cv2.INTER_AREA) > 1e-4) * zc_
+                        Cb = Cb + (Cbb_ - Cb) * take_
+                        Cr = Cr + (Crb_ - Cr) * take_
+                except Exception:
+                    pass
         elif "skinx" in job.masks and v.get("blemish", 0) > 1e-4:
             k = float(np.clip(v["blemish"], 0, 1))
             size = (0.012 + 0.05 * job.blemish_size) * wf

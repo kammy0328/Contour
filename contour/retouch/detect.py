@@ -43,6 +43,7 @@ WORK_LINE = 2.5             # the same for a line's Gaussian width
 GLOBAL_TEX_Q = 30.0         # percentile of the local texture over the skin taken as "calm skin"
 GLOBAL_TEX_MAX = 1.6        # the local texture counts at most this many times the calm skin's
 SMALL_GAIN = 1.35           # how many times further above the texture a 3 px spot must stand than a large one
+SHADE_FROM = 0.45           # share of the largest spot size from which the face's own round shade is not a dark spot
 BUMP_SIZE_MAX = 1.0         # share of the largest spot size up to which bumps are looked for
 LINE_LEN = 0.05             # of the face width: a neck line is at least this long (shorter marks are texture)
 FOLD_LEN = 0.12
@@ -203,7 +204,7 @@ def spots(Y: np.ndarray, Cr: np.ndarray, skin: np.ndarray, size: float,
         run = np.where(b1 > 1e-7, 1 - _ss(0.25, 0.6, np.abs(b2) / np.maximum(b1, 1e-7)), 0.0).astype(np.float32)
         strong = _ss(1.5, 3.0, b1 / (float(np.median(np.abs(b1[sel]))) + 1e-7))
         sc = sc * (1.0 - cv2.GaussianBlur(run * strong, (0, 0), max(0.8, 0.3 * s)))
-        if shd is not None and f > 0.75:
+        if shd is not None and f > SHADE_FROM:
             # the dip at the end of the fold beside the mouth, a dimple, the hollow under the lip's corner: round
             # and dark at the largest spot size, and part of the face
             sc = sc * (1.0 - (shd if red_ == 1.0 else cv2.resize(shd, (roi.shape[1], roi.shape[0]), interpolation=cv2.INTER_AREA)))
@@ -263,7 +264,7 @@ def spots(Y: np.ndarray, Cr: np.ndarray, skin: np.ndarray, size: float,
     return out
 
 
-def fold_zone(lm: Optional[np.ndarray], shape, wf: float) -> Optional[np.ndarray]:
+def fold_zone(lm: Optional[np.ndarray], shape, wf: float, part: str = "all") -> Optional[np.ndarray]:
     """Where the face has its own round shading: along the folds from the nose's wings past the mouth's corners, and
     round the corners (dimples). lm: 68 landmarks in this picture's pixels."""
     if lm is None or len(lm) < 68 or not np.isfinite(lm[[31, 35, 48, 54, 8], :2]).all():
@@ -272,7 +273,7 @@ def fold_zone(lm: Optional[np.ndarray], shape, wf: float) -> Optional[np.ndarray
     m = np.zeros(shape, np.uint8)
     down = L[8] - L[27]
     down = down / max(float(np.hypot(*down)), 1e-6)
-    for wing, corner, side in ((31, 48, -1.0), (35, 54, 1.0)):
+    for wing, corner, side in ((31, 48, -1.0), (35, 54, 1.0)) if part in ("all", "folds") else ():
         out_ = np.array([-down[1], down[0]]) * side
         if (L[corner] - L[30]) @ out_ < 0:
             out_ = -out_
@@ -284,6 +285,8 @@ def fold_zone(lm: Optional[np.ndarray], shape, wf: float) -> Optional[np.ndarray
         cv2.circle(m, (int(b[0]), int(b[1])), max(2, int(0.10 * wf)), 1, -1)
     # the hollow between the lower lip and the chin, and the hollows under the eyes (from the inner corner along
     # the lower lid): round shade of the face's build, as large as a spot (lngshot 058: both were marked dark)
+    if part == "folds":
+        return cv2.GaussianBlur(m.astype(np.float32), (0, 0), max(1.0, 0.02 * wf))
     if np.isfinite(L[57]).all():
         c = L[57] + down * 0.07 * wf
         ang = float(np.degrees(np.arctan2(down[1], down[0]))) - 90.0

@@ -83,3 +83,28 @@ def test_wide_mean_on_a_reduced_picture_agrees_with_the_exact_one(monkeypatch):
         a, b = fast[k] > 0.5, exact[k] > 0.5
         assert (a != b).sum() <= 0.1 * max(b.sum(), 1) + 12, (k, int((a != b).sum()), int(b.sum()))
     assert _peak(fast["dark"], 120, 150) > 0.5 and _peak(fast["line"], 230, 240) > 0.5
+
+
+def test_dip_along_the_mouth_fold_goes_only_when_the_fold_is_to_go():
+    """2611 cut 011 (j2721): the dip at the mouth's corner is the face's own shade, so the spot finder leaves it; but
+    before 1.19 the blemish step took it, and with 팔자주름·입가주름 asked for the user wants it gone. Then it counts."""
+    from contour.retouch import engine as RE
+    from test_detect import _g
+    Y0, Cb, Cr, m, xx, yy = _skin(seed=21)
+    Y = (Y0 * (1 - 0.13 * _g(xx, yy, 121, 226, 5.5))).astype(np.float32)
+    face = np.zeros((68, 3), np.float32)
+    face[:, 0], face[:, 1] = 180, 120
+    face[27, :2], face[30, :2], face[8, :2] = (180, 120), (180, 170), (180, 300)
+    face[31, :2], face[35, :2], face[48, :2], face[54, :2], face[57, :2] = (160, 180), (200, 180), (145, 225), (215, 225), (180, 240)
+    sm = lambda a: cv2.GaussianBlur(a, (0, 0), 1.5)
+
+    def left(**opts):
+        v = {k: 0.0 for k in RE.RETOUCH_KEYS}
+        v["blemish"] = 1.0
+        v.update(opts)
+        job = RE.Job(0, 1, v, 0.45, "face", 1.0, face, 1.0, 600.0, masks={"skinx": m}, wf_src=WF, blemish_size=0.5)
+        Y1, _, _ = RE.process_ycc(Y, Cb, Cr, RE.RetouchFrame(0, [job], (360, 360), (360, 360)), 1.0)
+        return abs(float(sm(Y1 - Y0)[226, 121])) / abs(float(sm(Y - Y0)[226, 121]))
+    assert left() > 0.8, left()
+    assert left(nasolabial=0.8) < 0.5, left(nasolabial=0.8)
+    assert left(mouth_lines=0.8) < 0.5, left(mouth_lines=0.8)
