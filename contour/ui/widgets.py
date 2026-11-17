@@ -779,7 +779,11 @@ class BusyOverlay(QWidget):
     def __init__(self, parent: QWidget):
         super().__init__(parent)
         self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setStyleSheet("background: rgba(18,18,18,0.82);")
+        self.setObjectName("BusyOverlay")
+        # only the overlay itself is dimmed: a bare "background" rule would also paint every child (the button)
+        self.setStyleSheet("QWidget#BusyOverlay { background: rgba(18,18,18,0.82); }")
+        self._t0 = 0.0
+        self._est = 0.0
         box = QWidget(self)
         box.setObjectName("BusyBox")
         box.setStyleSheet(f"QWidget#BusyBox {{ background: {C['bg2']}; border: 1px solid {C['line2']}; border-radius: 12px; }}"
@@ -796,8 +800,12 @@ class BusyOverlay(QWidget):
         self.bar = QProgressBar()
         self.bar.setRange(0, 1000)
         self.bar.setFixedHeight(6)
-        self.cancel = button("취소", "ghost")
+        self.cancel = button("취소", "")
+        self.cancel.setMinimumWidth(64)
         self.cancel.clicked.connect(self.cancelRequested.emit)
+        self.eta = QLabel("")
+        self.eta.setFont(font(12, 400, tabular=True))
+        self.eta.setObjectName("Faint")
         row = QHBoxLayout()
         row.addWidget(self.msg, 1)
         row.addWidget(self.cancel)
@@ -808,13 +816,19 @@ class BusyOverlay(QWidget):
         bl.addLayout(th)
         bl.addWidget(self.bar)
         bl.addLayout(row)
+        bl.addWidget(self.eta)
         box.setFixedWidth(420)
         self.box = box
         self.hide()
 
-    def start(self, title: str, cancellable: bool = True):
+    def start(self, title: str, cancellable: bool = True, est_s: float = 0.0):
+        """est_s: expected total seconds (0 = unknown): shown as time left until the pace itself can be measured."""
+        import time
+        self._t0 = time.time()
+        self._est = max(0.0, float(est_s or 0.0))
         self.title.setText(title)
         self.msg.setText("준비 중")
+        self._eta_text(0.0)
         self.bar.setValue(0)
         self.cancel.setVisible(cancellable)
         self.cancel.setEnabled(True)
@@ -825,10 +839,29 @@ class BusyOverlay(QWidget):
         if not was:
             fade_in(self, 180)
 
+    def _eta_text(self, f: float):
+        import time
+        from .batchdlg import fmt_dur, fmt_end
+        el = time.time() - self._t0 if self._t0 else 0.0
+        left = None
+        if f >= 0.05 and el >= 4.0:
+            left = el * (1 - f) / f                         # the pace so far
+            if self._est > 0:
+                w = min(1.0, f / 0.5)                       # early on the estimate still counts a little
+                left = w * left + (1 - w) * self._est * (1 - f)
+        elif self._est > 0:
+            left = self._est * (1 - f)
+        if left is None or f >= 0.995:
+            self.eta.setText("")
+            return
+        self.eta.setText(f"남은 시간 약 {fmt_dur(left)} · {fmt_end(left)} 완료 예상"
+                         + (" (처음엔 예상치)" if f < 0.05 else ""))
+
     def progress(self, f: float, msg: str = ""):
         self.bar.setValue(int(max(0, min(1, f)) * 1000))
         if msg:
             self.msg.setText(msg)
+        self._eta_text(f)
 
     def resizeEvent(self, e):
         self.box.adjustSize()
