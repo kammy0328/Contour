@@ -206,6 +206,9 @@ class SourceFrames:
             self._cursors = []
         with self._glock:
             self._gray.clear()
+        sc = self.__dict__.get("_src_crops")
+        if sc is not None:
+            sc.close()
 
     def decode_fps(self) -> float:
         return self.decoded / self.decode_s if self.decode_s > 0 else 0.0
@@ -324,6 +327,117 @@ class SourceFrames:
 
     def meta(self) -> dict:
         return {}
+
+
+# ---------------------------------------------------------------------------------------------- pieces of the original
+CROP_GRID = 96          # the piece decoded is the piece asked for, widened to this grid: a face moving a little
+                        # keeps its piece (one reader going on) instead of a new reader every frame
+
+
+class SourceCrops:
+    """Pieces of the original at (up to) its own resolution, in the display view: for looking at fine skin detail
+    (1.19: the analysis picture of a 4K original is a third to a half of its size, and a pore, a thin neck line or a
+    small spot on a small face is gone from it). Only the piece is converted and kept; the reader goes on through
+    the frames as long as the piece asked for stays inside the piece it decodes.
+
+    piece(i, box, scale): frame i, box (x0, y0, x1, y1) in source pixels, scale <= 1 (pixels handed out per source
+    pixel). The same frame numbers, the same colour conversion as the frames of the cut."""
+
+    def __init__(self, info: MediaInfo, cm, vs):
+        self.info, self.cm, self.vs = info, cm, vs
+        self.n = int(info.frames)
+        self.base = (info.kind, str(info.path if info.kind == "video" else info.seq_pattern),
+                     int(getattr(info, "seq_start", 0) or 0), _sig(info), int(getattr(info, "offset", 0) or 0),
+                     self.n, vs.key(), _decode_key(info), "crop")
+        self._lock = threading.RLock()
+        self._reader: Optional[FrameReader] = None
+        self._key = None            # (grid box, out size) of the open reader
+        self._next = -1
+        self.decoded = 0
+        self.seeks = 0
+
+    def close(self) -> None:
+        with self._lock:
+            if self._reader is not None:
+                try:
+                    self._reader.close()
+                except Exception:
+                    pass
+            self._reader, self._key, self._next = None, None, -1
+
+    def _grid(self, box) -> Tuple[int, int, int, int]:
+        W, H = int(self.info.width), int(self.info.height)
+        g = CROP_GRID
+        x0 = max(0, (int(box[0]) - g // 3) // g * g)
+        y0 = max(0, (int(box[1]) - g // 3) // g * g)
+        x1 = min(W, -(-(int(box[2]) + g // 3) // g) * g)
+        y1 = min(H, -(-(int(box[3]) + g // 3) // g) * g)
+        x1 -= (x1 - x0) % 2
+        y1 -= (y1 - y0) % 2
+        return x0, y0, x1, y1
+
+    def piece(self, i: int, box, scale: float = 1.0) -> np.ndarray:
+        i = int(np.clip(int(i), 0, self.n - 1))
+        scale = float(min(1.0, max(0.05, scale)))
+        gb = self._grid(box)
+        gw, gh = gb[2] - gb[0], gb[3] - gb[1]
+        ow, oh = max(2, int(round(gw * scale))), max(2, int(round(gh * scale)))
+        key = (self.base, gb, (ow, oh))
+        p = pool()
+        a = p.get((key, i))
+        if a is None:
+            with self._lock:
+                a = p.get((key, i))
+                if a is None:
+                    a = self._decode(i, gb, (ow, oh), key)
+        # the piece asked for inside the piece decoded
+        fx, fy = ow / gw, oh / gh
+        xa, ya = int(round((box[0] - gb[0]) * fx)), int(round((box[1] - gb[1]) * fy))
+        xb, yb = int(round((box[2] - gb[0]) * fx)), int(round((box[3] - gb[1]) * fy))
+        return np.array(a[max(0, ya):max(ya + 1, yb), max(0, xa):max(xa + 1, xb)])
+
+    def _decode(self, i: int, gb, osz, key) -> np.ndarray:
+        if self._reader is None or self._key != key or not (self._next <= i <= self._next + 8):
+            self.close()
+            pf = "gbrpf32le" if self.info.is_float else "rgb48le"
+            gw, gh = gb[2] - gb[0], gb[3] - gb[1]
+            self._reader = FrameReader(self.info, i, self.n - i, pf, size=osz if osz != (gw, gh) else None, prefetch=2,
+                                       crop=(gb[0], gb[1], gw, gh))
+            self._key, self._next = key, i
+            self.seeks += 1
+        got = None
+        p = pool()
+        while self._next <= i:
+            planes = self._reader.read()
+            if planes is None:
+                err = self._reader.error_text.strip()
+                at = self._next
+                self.close()
+                raise FrameError(f"원본에서 프레임 {i}의 일부를 읽지 못했습니다 ({at}에서 끝남). {err[:300]}")
+            u8 = self.cm.to_display_u8(planes_to_rgb_float(planes, self._reader.layout), self.vs)
+            self.decoded += 1
+            p.put((key, self._next), u8)
+            if self._next == i:
+                got = u8
+            self._next += 1
+        return got
+
+
+def source_crops(px, cm=None, vs=None) -> Optional[SourceCrops]:
+    """The piece reader of a cut's frames (a proxy or the original), made on first use and closed with them. None
+    when the original is not there."""
+    sc = px.__dict__.get("_src_crops")
+    if sc is None:
+        if not source_present(px.info):
+            return None
+        if cm is None:
+            from .colour import manager
+            cm = manager()
+        vs = vs or getattr(px, "vs", None)
+        if vs is None:
+            return None
+        sc = px.__dict__["_src_crops"] = SourceCrops(px.info, cm, vs)
+    return sc
 
 
 # ---------------------------------------------------------------------------------------------- choosing

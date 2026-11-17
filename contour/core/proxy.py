@@ -148,6 +148,9 @@ class Proxy:
     def close(self) -> None:
         self._mm = None
         self._gray_cache.clear()
+        sc = self.__dict__.get("_src_crops")        # pieces of the original read for this cut (frames.SourceCrops)
+        if sc is not None:
+            sc.close()
 
     # ------------------------------------------------------------------ access
     def frame(self, i: int) -> np.ndarray:
