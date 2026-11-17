@@ -705,6 +705,12 @@ class FrameWriter:
                 vf = f"scale=out_color_matrix={sws_m}:out_range=tv:flags=accurate_rnd+full_chroma_int"
             else:
                 vf = "scale=out_range=tv:flags=accurate_rnd"
+        elif in_pix_fmt.startswith("yuv") and src_info is not None and src_info.color_range == "pc":
+            # full-range planes from a full-range source go out as limited range (what the file is tagged as and
+            # what ProRes / H.265 deliverables are): converted, not just relabelled (a relabel darkened the picture)
+            sws_m = _MATRIX_MAP.get(matrix, "bt709")
+            vf = (f"scale=in_color_matrix={sws_m}:out_color_matrix={sws_m}:in_range=pc:out_range=tv"
+                  ":flags=accurate_rnd+full_chroma_int")
         if vf:
             cmd += ["-vf", vf]
         if hevc:

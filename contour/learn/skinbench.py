@@ -262,6 +262,19 @@ def pick_frames(st, cut, n: int = 2, run: int = 4) -> List[tuple]:
     return out
 
 
+def person_mask(rf, pid: int, names=None) -> Optional[np.ndarray]:
+    """The masks of one person's job (as RetouchFrame.union, for that person alone); None if the frame has none."""
+    out = None
+    for j in rf.jobs:
+        if int(j.pid) != int(pid):
+            continue
+        for k, m in j.masks.items():
+            if k == "excl" or (names is not None and k not in names):
+                continue
+            out = m.astype(np.float32) if out is None else np.maximum(out, m)
+    return out
+
+
 # ------------------------------------------------------------------ one cut
 def bench_cut(cut, tr, px, levels=LEVELS, n: int = 2, run: int = 4, render: bool = True) -> List[dict]:
     from ..retouch import engine as RE
@@ -285,7 +298,10 @@ def bench_cut(cut, tr, px, levels=LEVELS, n: int = 2, run: int = 4, render: bool
                         seq.append((src, src.copy(), np.zeros(src.shape[:2], np.float32)))
                         continue
                     out = RE.apply_rgb(src, rf, px.sx)
-                    m = rf.union()
+                    m = person_mask(rf, pid)            # this person's skin only (not every target's, in a group)
+                    if m is None:
+                        seq.append((src, out, np.zeros(src.shape[:2], np.float32)))
+                        continue
                     m = cv2.resize(m.astype(np.float32), (src.shape[1], src.shape[0])) if m.shape != src.shape[:2] else m
                     seq.append((src, out, m))
                     if t == t0:

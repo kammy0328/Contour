@@ -428,6 +428,7 @@ class Cut:
     input_cs: str = ""               # empty = project default
     cs_auto: str = ""                # how the app chose input_cs by itself ('' = chosen by hand / not looked at)
     cs_analysed: Optional[str] = None  # input_cs when the cut was last analysed (None: before 1.16, unknown)
+    models_used: dict = field(default_factory=dict)   # model key -> fingerprint of the files the last analysis ran with
     lut_path: str = ""
     mode: str = "warp"               # warp | separate
     persons: List[Person] = field(default_factory=list)
@@ -482,7 +483,7 @@ class Cut:
     def to_dict(self) -> dict:
         return {
             "id": self.id, "name": self.name, "source": self.source, "info": self.info.to_dict(),
-            "in_frame": self.in_frame, "out_frame": self.out_frame, "input_cs": self.input_cs, "cs_auto": self.cs_auto, "cs_analysed": self.cs_analysed, "lut_path": self.lut_path,
+            "in_frame": self.in_frame, "out_frame": self.out_frame, "input_cs": self.input_cs, "cs_auto": self.cs_auto, "cs_analysed": self.cs_analysed, "models_used": self.models_used, "lut_path": self.lut_path,
             "mode": self.mode, "persons": [p.to_dict() for p in self.persons],
             "params": {str(k): v.to_dict() for k, v in self.params.items()},
             "joint_keys": {str(pid): {str(j): {str(f): xy for f, xy in fr.items()} for j, fr in jd.items()}
@@ -507,6 +508,7 @@ class Cut:
         c.input_cs = d.get("input_cs", "")
         c.cs_auto = d.get("cs_auto", "")
         c.cs_analysed = d.get("cs_analysed")
+        c.models_used = dict(d.get("models_used") or {})
         c.lut_path = d.get("lut_path", "")
         c.mode = d.get("mode", "warp")
         c.persons = [Person.from_dict(p) for p in d.get("persons", [])]

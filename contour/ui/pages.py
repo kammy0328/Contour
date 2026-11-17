@@ -635,7 +635,11 @@ class RenderQueuePage(QWidget):
             if self.train_after.isChecked():
                 self.main.models_page.train(auto=True)
             return
-        self.main.before_render(nxt)
+        if self.main.before_render(nxt) is False:
+            nxt.status = "failed"
+            nxt.message = "프로젝트를 저장하지 못해 렌더하지 않았습니다 (저장 후 다시 시작하세요)"
+            self.refresh()
+            return
         self.current = nxt
         nxt.status = "running"
         nxt.progress = 0

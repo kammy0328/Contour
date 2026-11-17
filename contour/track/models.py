@@ -7,6 +7,7 @@ in-house use). Face detection uses OpenCV YuNet (MIT). Person segmentation uses 
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -100,6 +101,60 @@ def model_path(key: str) -> Path:
     if key in MODELS and MODELS[key].get("files"):
         return settings().models_path / "onnx" / key
     return settings().models_path / "onnx" / f"{key}.onnx"
+
+
+# models an analysis runs with (recorded on the cut, so a result can be told apart from one made with other files)
+ANALYSIS_KEYS = ("det_yolox_m", "det_yolox_x", "pose_rtmw_x", "pose_rtmpose_x", "pose_rtmpose_m", "pose_dwpose_l",
+                 "face_rtm106", "hand_rtm21", "face_yunet", "face_sface", "matte_rvm", "seg_sam31", "seg_sam31_find",
+                 "face_parse")
+
+
+def fingerprint(key: str) -> str:
+    """First 16 hex digits of the SHA-256 of the model's file(s) ('' when not downloaded). Hashed once per file version:
+    cached by name, size and modification time in models/hashes.json (a 940 MB model takes a few seconds once)."""
+    import hashlib
+    p = model_path(key)
+    files = sorted(f for f in p.rglob("*") if f.is_file() and not f.name.endswith((".part", ".json"))
+                   and ".broken" not in f.name and ".noaccess" not in f.name) if p.is_dir() else ([p] if p.is_file() else [])
+    if not files:
+        return ""
+    cache_f = settings().models_path / "hashes.json"
+    try:
+        cache = json.loads(cache_f.read_text(encoding="utf-8"))
+    except Exception:
+        cache = {}
+    h_all = hashlib.sha256()
+    changed = False
+    for f in files:
+        st = f.stat()
+        ck = f"{f.relative_to(settings().models_path).as_posix()}|{st.st_size}|{int(st.st_mtime)}"
+        hx = cache.get(ck)
+        if hx is None:
+            h = hashlib.sha256()
+            with open(f, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 22), b""):
+                    h.update(chunk)
+            hx = cache[ck] = h.hexdigest()
+            changed = True
+        h_all.update(f"{f.name}:{hx};".encode())
+    if changed:
+        try:
+            cache_f.write_text(json.dumps(cache, indent=0), encoding="utf-8")
+        except OSError:
+            pass
+    return h_all.hexdigest()[:16]
+
+
+def fingerprints(keys=ANALYSIS_KEYS) -> dict:
+    out = {}
+    for k in keys:
+        try:
+            fp = fingerprint(k)
+        except Exception:
+            fp = ""
+        if fp:
+            out[k] = fp
+    return out
 
 
 def is_downloaded(key: str) -> bool:
@@ -396,6 +451,25 @@ class Session:
         return getattr(self._s, name)
 
 
+def _check_actual(sess, prov, path) -> None:
+    """onnxruntime can open a session on the CPU by itself (the GPU provider's libraries do not load) and say nothing:
+    what it actually runs on is compared with what was asked, the display and the warning follow the truth."""
+    global _device_label
+    want = [p if isinstance(p, str) else p[0] for p in prov]
+    gpu = [p for p in want if p != "CPUExecutionProvider"]
+    if not gpu:
+        return
+    try:
+        got = list(sess.get_providers())
+    except Exception:
+        return
+    if not any(p in got for p in gpu):
+        sys.stderr.write(f"MODEL ON CPU {Path(path).name} (onnxruntime chose {got} over {gpu})\n")
+        cpu_fallbacks.append((Path(path).name, "GPU 실행 장치를 쓰지 못함"))
+        if not _device_label.endswith("일부 CPU)"):
+            _device_label = f"{_device_label} (일부 CPU)" if _device_label != "CPU" else _device_label
+
+
 def take_cpu_fallbacks() -> List:
     out = list(cpu_fallbacks)
     cpu_fallbacks.clear()
@@ -426,7 +500,9 @@ def _session_raw(path: Path):
     err = None
     for attempt in range(2 if on_gpu else 1):
         try:
-            return Session(ort.InferenceSession(str(path), sess_options=so, providers=prov), path)
+            sess = ort.InferenceSession(str(path), sess_options=so, providers=prov)
+            _check_actual(sess, prov, path)
+            return Session(sess, path)
         except Exception as e:
             err = e
             if not (on_gpu and is_oom(e)) or attempt:
