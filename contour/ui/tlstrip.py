@@ -164,10 +164,20 @@ class _Delegate(QStyledItemDelegate):
         p.setPen(qc("text"))
         p.setFont(font(9, 600, tabular=True))
         p.drawText(ir, Qt.AlignCenter, f"{cut.tl.get('index', 0) + 1:03d}")
+        multi = sel and len(self.strip.list.selectedItems()) > 1
         if cur:
-            p.setPen(QPen(qc("accent"), 2))
+            p.setPen(QPen(qc("accent"), 2.5))
             p.setBrush(Qt.NoBrush)
             p.drawRoundedRect(tr.adjusted(-1, -1, 1, 1), 5, 5)
+        elif multi:
+            c_ = QColor(qc("accent"))
+            c_.setAlpha(200)
+            p.setPen(QPen(c_, 2))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(tr.adjusted(-1, -1, 1, 1), 5, 5)
+        if multi:
+            from .cutlist import draw_selected_badge
+            draw_selected_badge(p, QRectF(tr.left(), tr.bottom() - 26, 30, 30))
         # label (click it to change the state)
         from .cutlist import draw_state_icon
         tc = QColor("#8C8C8C") if ws == "skip" else (col if ws in ("todo", "doing", "done") else qc("text2"))
@@ -257,6 +267,7 @@ class TimelineStrip(QWidget):
         self.list.setResizeMode(QListView.Adjust)
         self.list.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.list.itemSelectionChanged.connect(lambda: self.list.viewport().update())
         self.list.setItemDelegate(_Delegate(self))
         self.list.setMouseTracking(True)
         self.list.setFixedHeight(TH + 58)

@@ -73,6 +73,22 @@ class EditSession:
                 self.proxy = px
                 self.tracker = CutTracker(self.project, cut, px)
 
+    def adopt(self, other: "EditSession") -> None:
+        """Takes over a cut another session opened and pre-rendered in the background (playback going on into the
+        next cut without a pause): its proxy, tracker, caches and the versions their keys were made with."""
+        with self._lock:
+            if self.proxy is not None and self.proxy is not other.proxy:
+                self.proxy.close()
+            with other._lock:
+                self.cut, self.proxy, self.tracker = other.cut, other.proxy, other.tracker
+                self._cache = OrderedDict(other._cache)
+                self._frames = OrderedDict(other._frames)
+                self._mask_cache = dict(other._mask_cache)
+                self._play = dict(other._play)
+                self._play_bytes = other._play_bytes
+                self.vers = dict(other.vers)
+            self.version += 1
+
     def proxy_ready(self) -> bool:
         return self.proxy is not None and self.proxy.is_valid(self.view_settings().key())
 

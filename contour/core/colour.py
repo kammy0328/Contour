@@ -112,6 +112,50 @@ class ColourManager:
         d = display or self.default_display()
         return self.config.getDefaultView(d)
 
+    def detect_input(self, info, name: str = "", look: bool = True) -> Tuple[str, str]:
+        """The input colour space of a file, worked out by itself: (OCIO colour space or '' for Rec.709 as it is,
+        why). The file name and the camera tags first (S-Log3, LogC3, LogC4, the camera maker), then the picture: log
+        footage is flat (no deep black, no bright white, little colour). Float sequences are scene linear."""
+        import re
+        if getattr(info, "is_float", False):
+            g = self.guess_input(info)
+            return ("" if g == PASSTHROUGH else g), "부동소수점 시퀀스"
+        txt = " ".join([str(getattr(info, "path", "")), name, str(getattr(info, "meta_text", ""))]).lower()
+        names = {n for n, _ in self.colorspaces()} if self.config else set()
+
+        def pick(*cands):
+            return next((c for c in cands if c in names), "")
+        slog = pick("S-Log3 S-Gamut3.Cine", "S-Log3 S-Gamut3")
+        logc3, logc4 = pick("ARRI LogC3 (EI800)"), pick("ARRI LogC4")
+        if re.search(r"s[-_ .]?log[-_ .]?3", txt) and slog:
+            return slog, "파일 이름·태그에 S-Log3"
+        if re.search(r"log[-_ .]?c[-_ .]?4", txt) and logc4:
+            return logc4, "파일 이름·태그에 LogC4"
+        if re.search(r"log[-_ .]?c", txt) and logc3:
+            return logc3, "파일 이름·태그에 LogC"
+        # camera originals (the maker in the file's tags): Sony cine cameras shoot S-Log3, ARRI LogC3 (ALEXA 35 LogC4)
+        if any(w in txt for w in ("alexa 35", "alexa35", "alexa_35")) and logc4:
+            return logc4, "카메라 태그 ARRI ALEXA 35"
+        if re.search(r"\b(arri|alexa)\b", txt) and logc3:
+            return logc3, "카메라 태그 ARRI"
+        if re.search(r"\b(venice|burano|ilme-fx\d|fx[369]|pxw-fx9)\b", txt) and slog:
+            return slog, "카메라 태그 Sony 시네마 카메라"
+        # the picture alone cannot tell log from a flat, dark or desaturated grade (tried on the test plates: the two
+        # overlap), so without a name or a tag it stays Rec.709; the user changes it in the 출력 tab
+        trc = str(getattr(info, "color_trc", "") or "")
+        return "", ("태그 " + trc if trc else "로그 표시 없음") + " → Rec.709"
+
+    @staticmethod
+    def short_name(cs: str) -> str:
+        """A few letters for lists: Rec.709, S-Log3, LogC3, LogC4, ACEScg ..."""
+        if not cs or cs == PASSTHROUGH:
+            return "Rec.709"
+        for k in ("S-Log3", "LogC3", "LogC4", "Apple Log", "V-Log", "D-Log", "CanonLog3", "CanonLog2", "Log3G10",
+                  "ACEScct", "ACEScc", "ACEScg", "ACES2065-1"):
+            if k in cs:
+                return k
+        return cs.split(" - ")[0][:14]
+
     def guess_input(self, info) -> str:
         """Heuristic default: passthrough for display-referred video, linear for float sequences."""
         if getattr(info, "is_float", False) and self.config:

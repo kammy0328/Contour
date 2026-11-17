@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import queue
+import threading
 import traceback
 from typing import Any, Callable, Optional
 
@@ -116,6 +117,87 @@ class PreviewWorker(QThread):
                 img = None
             if img is not None:
                 self.ready.emit(key, img)
+
+
+class NextCutPrep:
+    """Playback going on into the next cut: that cut is opened in a session of its own on a background thread, its
+    first frames decoded and as many results as time allows rendered into that session's playback cache. When the
+    playhead reaches the end of the current cut, the main session adopts it (no proxy to open, nothing to wait for)."""
+
+    def __init__(self):
+        self.cut_id: Optional[str] = None
+        self.session = None
+        self.ready = False
+        self.failed = False
+        self._stop = threading.Event()
+
+    def start(self, project, cut, head: int = 24) -> None:
+        if self.cut_id == cut.id and (self.ready or not self.failed) and not self._stop.is_set():
+            return
+        self.cancel()
+        self.cut_id, self.session, self.ready, self.failed = cut.id, None, False, False
+        stop = threading.Event()
+        self._stop = stop
+        from .session import EditSession
+
+        def run():
+            try:
+                sh = EditSession()
+                sh.project = project
+                sh.open_cut(cut)
+                if sh.proxy is None or not sh.proxy_ready():
+                    # no proxy yet (a cut never opened): made here, in the background, like opening it would
+                    from ..core.colour import manager
+                    if sh.proxy is not None:
+                        sh.proxy.close()
+                    sh.proxy, sh.tracker = None, None
+                    vs = sh.view_settings(cut)
+                    if cut.tl and (project.timeline or {}).get("baked"):
+                        from ..core.tlimport import build_bake_proxy
+                        ok = build_bake_proxy(project, manager(), vs, None, stop.is_set)
+                    else:
+                        ok = sh.make_proxy(cut).build(manager(), vs, None, stop.is_set)
+                    if not ok or stop.is_set():
+                        self.failed = not stop.is_set()
+                        return
+                    sh.open_cut(cut)
+                    if sh.proxy is None or not sh.proxy_ready():
+                        self.failed = True
+                        return
+                a, b = cut.work_range
+                for t in range(a, min(b, a + head)):          # the originals of the first frames, decoded
+                    if stop.is_set():
+                        return
+                    sh.frame(t)
+                if stop.is_set():
+                    return
+                self.session = sh
+                self.ready = True
+                for t in range(a, b):                          # then results, as far as time allows
+                    if stop.is_set():
+                        return
+                    key = sh.result_key(t, True)
+                    img = sh.result(t, final=True)
+                    if img is not None and not stop.is_set():
+                        sh.play_put(t, key, img, near=a)
+            except Exception:
+                traceback.print_exc()
+                self.failed = True
+
+        threading.Thread(target=run, name="diap-nextcut", daemon=True).start()
+
+    def take(self, cut_id: str):
+        """The prepared session for cut_id (the background work stops), or None if it is not ready yet."""
+        if self.cut_id != cut_id or not self.ready or self.session is None:
+            return None
+        self._stop.set()
+        sh = self.session
+        self.cut_id, self.session, self.ready = None, None, False
+        return sh
+
+    def cancel(self) -> None:
+        self._stop.set()                 # the thread ends after the frame it is on; its session is then dropped
+        self.cut_id, self.session, self.ready, self.failed = None, None, False, False
 
 
 class CacheWorker(QThread):

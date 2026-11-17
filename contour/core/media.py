@@ -146,6 +146,7 @@ class MediaInfo:
     has_audio: bool = False
     duration: float = 0.0
     offset: int = 0                  # a stretch of a longer file (a cut of a baked timeline): its first frame
+    meta_text: str = ""              # camera / encoder tags of the file (for telling its colour space)
 
     @property
     def fps(self) -> float:
@@ -306,6 +307,10 @@ def probe(path: str) -> MediaInfo:
         if s.get("codec_tag_string") == "tmcd" or s.get("codec_type") == "data":
             tags.setdefault("timecode", (s.get("tags") or {}).get("timecode", ""))
     info.timecode = tags.get("timecode", "") or ""
+    keep = [f"{k}={v}" for k, v in tags.items() if isinstance(v, str) and any(
+        w in k.lower() for w in ("make", "model", "camera", "encoder", "com.apple", "com.sony", "com.arri", "comment",
+                                 "handler", "manufacturer", "product"))]
+    info.meta_text = " ".join(keep)[:400]
     try:
         info.duration = float(data.get("format", {}).get("duration") or v.get("duration") or 0)
     except ValueError:

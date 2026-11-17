@@ -141,6 +141,8 @@ class MainWindow(QMainWindow):
         # results computed ahead for smooth playback
         from .workers import CacheWorker
         self.cache_worker = CacheWorker(self.session, self)
+        from .workers import NextCutPrep
+        self.next_prep = NextCutPrep()
         self.cache_worker.progressed.connect(lambda: self.timeline.update())
         self.cache_timer = QTimer(self)
         self.cache_timer.timeout.connect(lambda: self.cache_worker.kick(self.frame) if self.session.cut else None)
@@ -374,6 +376,12 @@ class MainWindow(QMainWindow):
         self.fr_lbl.setFont(font(11, 500, tabular=True))
         h.addWidget(self.fr_lbl)
         h.addStretch(1)
+        # the play buttons sit in the exact middle of the bar (the timecode and frame count on the left change width
+        # while playing; in the layout they pushed the buttons sideways)
+        grp = QWidget(w)
+        gl = QHBoxLayout(grp)
+        gl.setContentsMargins(0, 0, 0, 0)
+        gl.setSpacing(2)
         for ic, tip, fn in (("skip-back", "처음  Home", lambda: self.set_frame(self.session.cut.work_range[0] if self.session.cut else 0)),
                             ("step-back", "이전 프레임  ←", lambda: self.step(-1)),
                             ("play", "재생/정지  Space", self.toggle_play),
@@ -381,10 +389,18 @@ class MainWindow(QMainWindow):
                             ("skip-forward", "끝  End", lambda: self.set_frame((self.session.cut.work_range[1] - 1) if self.session.cut else 0))):
             b = Wd.tool(ic, tip, size=17)
             b.clicked.connect(fn)
-            h.addWidget(b)
+            gl.addWidget(b)
             if ic == "play":
                 self.play_btn = b
-        h.addStretch(1)
+        gl.addSpacing(8)
+        self.loop_btn = Wd.tool("repeat", "구간 반복: 켜면 이 컷만 반복 재생, 끄면 다음 컷으로 이어서 재생", checkable=True, size=16)
+        self.loop_btn.setChecked(bool(getattr(settings(), "play_loop", False)))
+        self.loop_btn.toggled.connect(self._loop_toggled)
+        gl.addWidget(self.loop_btn)
+        grp.adjustSize()
+        grp.setFixedSize(grp.sizeHint())
+        self._play_center = _CenterFilter(w, grp)
+        w.installEventFilter(self._play_center)
         # one pill: ‹ 확인 필요 ›
         pill = QWidget()
         pill.setObjectName("Pill")
@@ -816,9 +832,8 @@ class MainWindow(QMainWindow):
                 seen_seq.add(info.seq_pattern)
             name = Path(info.seq_pattern).stem.split("%")[0].rstrip("._-") if info.kind == "sequence" else Path(p).stem
             cut = self.session.project.add_cut(info, name)
-            cut.input_cs = manager().guess_input(info) if info.is_float else (self.session.project.input_cs or "")
-            if cut.input_cs == "__passthrough__":
-                cut.input_cs = ""
+            # colour space from the file name and the camera tags (changed by hand in the 출력 tab)
+            cut.input_cs, cut.cs_auto = manager().detect_input(info, name)
             if p in pairs:
                 cut.retouch_ref = pairs[p]
             added.append(cut)
@@ -861,7 +876,10 @@ class MainWindow(QMainWindow):
         self.viewer._img_cache.clear()            # cached pictures are per frame number, not per cut
         if hasattr(self.viewer, "_last_res"):
             self.viewer._last_res = None
+        self.viewer._skin_last = None
         self.tlstrip.set_current(cut.id)
+        if len(self.cutlist.selected_ids()) <= 1:
+            self.cutlist.show_current(cut.id)       # the open cut in the middle of the list, as in the timeline
         self.activity.set_cut(prj.name, cut)
         self.selection = None
         self.timeline.selection = None
@@ -2129,9 +2147,85 @@ class MainWindow(QMainWindow):
             self.cache_worker.kick(self.frame)
             self.play_timer.start(int(1000 / max(1, fps)))
             self.play_btn.setIcon(I.icon("pause", 17))
+            self._prep_next_cut()
+
+    # ---- playback into the next cut
+    def _loop_toggled(self, on: bool):
+        st = settings()
+        st.play_loop = bool(on)
+        st.save()
+        if on:
+            self.next_prep.cancel()
+        elif self.play_timer.isActive():
+            self._prep_next_cut()
+
+    def _next_play_cut(self):
+        from .cutlist import listed
+        prj, cur = self.session.project, self.session.cut
+        if prj is None or cur is None:
+            return None
+        order = [c for c in listed(prj) if c.tl.get("kind", "clip") == "clip"]
+        ids = [c.id for c in order]
+        if cur.id not in ids:
+            return None
+        i = ids.index(cur.id)
+        return order[i + 1] if i + 1 < len(order) else None
+
+    def _prep_next_cut(self):
+        if self.loop_btn.isChecked():
+            return
+        nxt = self._next_play_cut()
+        if nxt is not None:
+            fps = max(1.0, float(nxt.info.fps or 24.0))
+            self.next_prep.start(self.session.project, nxt, head=int(fps * 2))
+
+    def _play_into_next(self) -> bool:
+        """At the end of the cut with 구간 반복 off: the prepared next cut takes over and playback goes on.
+        False: nothing to go on to (repeat this cut). None: the next cut is still being opened (hold the last frame)."""
+        nxt = self._next_play_cut()
+        if nxt is None or self.job is not None or self.batch.current == nxt.id:
+            return False
+        sh = self.next_prep.take(nxt.id)
+        if sh is None:
+            if self.next_prep.failed or self.next_prep.cut_id != nxt.id:
+                if self.next_prep.cut_id != nxt.id:
+                    self._prep_next_cut()
+                    return None
+                self.toast("다음 컷의 프록시가 아직 없어 이 컷을 반복합니다", "warn")
+                return False
+            return None
+        prj = self.session.project
+        if self.session.dirty:
+            self.save()
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.session.adopt(sh)
+        cut = self.session.cut
+        self.viewer._img_cache.clear()
+        self.viewer._last_res = None
+        self.viewer._skin_last = None
+        self.tlstrip.set_current(cut.id)
+        self.cutlist.show_current(cut.id)
+        self.activity.set_cut(prj.name, cut)
+        self.selection = None
+        self.timeline.selection = None
+        self.viewer.selection = None
+        self.timeline.view0, self.timeline.view1 = 0.0, 1.0
+        targets = cut.targets()
+        self.sel_pid = targets[0].id if targets else (cut.persons[0].id if cut.persons else None)
+        self.viewer.message = ""
+        self.frame = cut.work_range[0]
+        fps = max(1.0, float(cut.info.fps or 24.0))
+        self.play_timer.setInterval(int(1000 / fps))
+        self._refresh_all(skip_inspector=True)
+        QTimer.singleShot(250, lambda: self.inspector.refresh())     # the inspector after the first frames show
+        self.cache_worker.kick(self.frame)
+        self._prep_next_cut()
+        return True
 
     def stop_play(self):
         self.viewer.playing = False
+        self.next_prep.cancel()
         if self.play_timer.isActive():
             self.play_timer.stop()
             self.play_btn.setIcon(I.icon("play", 17))
@@ -2141,6 +2235,12 @@ class MainWindow(QMainWindow):
         a, b = self.session.cut.work_range
         nf = self.frame + 1
         if nf >= b:
+            if not self.loop_btn.isChecked():
+                r = self._play_into_next()
+                if r:
+                    return
+                if r is None:
+                    return                      # the next cut is still opening: stay on the last frame
             nf = a
         self.set_frame(nf)
 
@@ -3221,10 +3321,23 @@ class MainWindow(QMainWindow):
             self.inspector.refresh("output")
 
     def set_input_cs(self, cs: str):
+        """Chosen by hand in the 출력 tab: for the open cut, and for every other cut selected in the cut list."""
         cut = self.session.cut
-        if cut is None or cs == (cut.input_cs or ""):
+        if cut is None:
             return
-        cut.input_cs = cs
+        prj = self.session.project
+        others = [c for c in (prj.cut(i) for i in self.cutlist.selected_ids()) if c is not None and c is not cut]
+        for c in others:
+            c.input_cs, c.cs_auto = cs, ""        # their proxies follow when they are opened next
+        if others:
+            self.toast(f"{len(others) + 1}컷의 색공간을 {manager().short_name(cs)}(으)로 바꿨습니다", "ok")
+        self.cutlist.update_rows()
+        if cs == (cut.input_cs or ""):
+            cut.cs_auto = ""
+            self.session.project.save()
+            self.inspector.refresh("output")
+            return
+        cut.input_cs, cut.cs_auto = cs, ""
         self.session.project.save()
         self.session.open_cut(cut)
         self.build_proxy()
