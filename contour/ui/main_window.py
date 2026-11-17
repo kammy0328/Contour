@@ -256,6 +256,7 @@ class MainWindow(QMainWindow):
         cv.setSpacing(0)
         cv.addWidget(self._viewer_bar())
         self.viewer = Viewer(self.session)
+        self.viewer.hover_pick = bool(settings().hover_pick)
         self.viewer.jointDragged.connect(self._joint_drag)
         self.viewer.jointCommitted.connect(self._joint_commit)
         self.viewer.jointKeyDeleted.connect(self._joint_delete)
@@ -409,6 +410,10 @@ class MainWindow(QMainWindow):
             b.toggled.connect(lambda v, k=key: self._overlay(k, v))
             self.ov[key] = b
             h.addWidget(b)
+        self.hover_btn = Wd.tool("mouse-pointer-click", "마우스를 올린 인물 강조·선택 켜기/끄기", checkable=True)
+        self.hover_btn.setChecked(bool(settings().hover_pick))
+        self.hover_btn.toggled.connect(self._hover_pick)
+        h.addWidget(self.hover_btn)
         h.addStretch(1)
         self.cs_lbl = QLabel("")
         self.cs_lbl.setObjectName("Faint")
@@ -2500,6 +2505,17 @@ class MainWindow(QMainWindow):
             self.compare.set_current("orig" if self.compare.current == "result" else "result", emit=True)
         else:
             self.compare.set_current("result", emit=True)
+
+    def _hover_pick(self, v):
+        settings().hover_pick = bool(v)
+        try:
+            settings().save()
+        except Exception:
+            pass
+        self.viewer.hover_pick = bool(v)
+        if not v:
+            self.viewer.clear_hover()
+        self.toast("호버 인물 강조 " + ("켜짐" if v else "꺼짐 (클릭으로 선택은 그대로 됩니다)"))
 
     def _overlay(self, k, v):
         if k == "skel":
