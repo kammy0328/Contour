@@ -18,7 +18,7 @@ from typing import List, Tuple
 STATES: List[Tuple[str, str]] = [("pre", "분석 전"), ("todo", "작업 전"), ("doing", "작업 중"), ("done", "완료"),
                                  ("skip", "작업 불필요")]
 LABEL = dict(STATES)
-COLOR = {"pre": "#6F6F6F", "todo": "#A6A6A6", "doing": "#4F8BFF", "done": "#5CC8A0", "skip": "#5A5A5A"}
+COLOR = {"pre": "#8A8A8A", "todo": "#FF7A59", "doing": "#4F8BFF", "done": "#5CC8A0", "skip": "#5E5E5E"}
 
 
 def _active(cut) -> bool:
@@ -40,6 +40,8 @@ def state(cut) -> str:
         return "skip"
     if w == "done":
         return "done"
+    if w in ("todo", "doing"):
+        return w                        # set by hand from the status label or the menu
     if not w and (st.get("user") == "skip" or (st.get("auto") == "none" and not st.get("user"))):
         return "skip"
     if not cut.analyzed:
@@ -48,9 +50,9 @@ def state(cut) -> str:
 
 
 def set_state(cut, s: str) -> None:
-    """'done' / 'skip' are kept; '' goes back to automatic (pre / todo / doing / auto skip)."""
+    """'done' / 'skip' / 'todo' / 'doing' are kept; '' goes back to automatic (pre / todo / doing / auto skip)."""
     st = dict(cut.status or {})
-    if s in ("done", "skip"):
+    if s in ("done", "skip", "todo", "doing"):
         st["work"] = s
     else:
         st.pop("work", None)

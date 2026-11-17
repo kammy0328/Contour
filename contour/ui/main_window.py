@@ -165,6 +165,7 @@ class MainWindow(QMainWindow):
         self.cutlist.addRequested.connect(self.add_cuts)
         self.cutlist.action.connect(self._cut_action)
         self.cutlist.menuRequested.connect(self._cut_menu)
+        self.cutlist.stateRequested.connect(self._state_menu)
         split.addWidget(self.cutlist)
         center = QWidget()
         cv = QVBoxLayout(center)
@@ -206,6 +207,7 @@ class MainWindow(QMainWindow):
         self.tlstrip.cutSelected.connect(self.open_cut)
         self.tlstrip.action.connect(self._tl_action)
         self.tlstrip.menuRequested.connect(self._cut_menu)
+        self.tlstrip.stateRequested.connect(self._state_menu)
         self.tlstrip.versionPicked.connect(self.switch_version)
         self.tlstrip.hide()
         cv.addWidget(self.tlstrip)
@@ -300,7 +302,7 @@ class MainWindow(QMainWindow):
             h.addWidget(b)
         self.tool_btns["edit"].setChecked(True)
         h.addWidget(Wd.vline())
-        self.compare = Wd.Segmented([("result", "결과"), ("orig", "원본"), ("side", "나란히"), ("wipe", "와이프")], compact=True)
+        self.compare = Wd.Segmented([("result", "결과"), ("orig", "원본"), ("side", "비교"), ("wipe", "와이프")], compact=True)
         self.compare.setFixedWidth(260)
         self.compare.setToolTip("\\ 키: 결과/원본 빠르게 전환 (A/B)")
         self.compare.changed.connect(self._compare)
@@ -992,6 +994,36 @@ class MainWindow(QMainWindow):
             ids = [self.session.cut.id]
         return ids
 
+    def _state_menu(self, ids: list, gpos):
+        """A click on a cut's status label: set the work state of that cut (or of every selected cut)."""
+        from ..core import workstate as WS
+        prj = self.session.project
+        cuts = [c for c in (prj.cut(i) for i in ids) if c is not None] if prj else []
+        if not cuts:
+            return
+        n = len(cuts)
+        cur = {WS.state(c) for c in cuts}
+        m = QMenu(self)
+        acts = {}
+        for key, name in (("todo", "작업 전"), ("doing", "작업 중"), ("skip", "작업 불필요"), ("done", "완료")):
+            a = m.addAction(name + (f" ({n}컷)" if n > 1 else ""))
+            a.setCheckable(True)
+            a.setChecked(cur == {key})
+            acts[a] = key
+        m.addSeparator()
+        acts[m.addAction("자동 (분석·보정 상태에 따름)")] = ""
+        a = m.exec(gpos)
+        if a not in acts:
+            return
+        key = acts[a]
+        self.push_undo()
+        for c in cuts:
+            WS.set_state(c, key)
+        self.session.dirty = True
+        self._after_status_change()
+        self.cutlist.update_rows()
+        self.toast(f"{n}컷: {WS.LABEL[key]}" if key else f"{n}컷: 작업 상태를 자동으로 되돌렸습니다", "ok")
+
     def _cut_menu(self, ids: list, gpos):
         from ..core import workstate as WS
         prj = self.session.project
@@ -1461,7 +1493,7 @@ class MainWindow(QMainWindow):
         if action == "analyze":
             self.analyze_all(ids)
         elif action == "analyze_force":
-            self._start_batch([c for c in (prj.cut(i) for i in ids) if c is not None])
+            self._start_batch([c for c in (prj.cut(i) for i in ids) if c is not None], "선택 컷 분석")
         elif action == "stop":
             self.batch.stop()
             self.toast("지금 분석 중인 컷이 끝나면 멈춥니다")
@@ -1618,17 +1650,18 @@ class MainWindow(QMainWindow):
             return
         from .batchdlg import AnalyzeAllDialog
         frames = sum(int(c.info.frames) for c in todo)
+        title = "선택 컷 분석" if ids else "전체 분석"
         dlg = AnalyzeAllDialog(self, len(todo), frames, sum(1 for c in pool if c.analyzed),
-                               float(getattr(settings(), "analysis_spf", 0.0) or 0.0))
+                               float(getattr(settings(), "analysis_spf", 0.0) or 0.0), title)
         if dlg.exec() != QDialog.Accepted:
             return
         self._batch_skin = dlg.skin()
         self._batch_preset = None
         self._batch_dlg = None
         self._batch_skin = None
-        self._start_batch(todo)
+        self._start_batch(todo, title)
 
-    def _start_batch(self, todo: list):
+    def _start_batch(self, todo: list, title: str = "전체 분석"):
         prj = self.session.project
         if prj is None or not todo:
             return
@@ -1648,13 +1681,13 @@ class MainWindow(QMainWindow):
                     raise Cancelled()
 
             self.run_job("편집 타임라인 프록시 만드는 중 (한 번만)", work,
-                         lambda _: self._start_batch(todo))
+                         lambda _: self._start_batch(todo, title))
             return
         link_bake_proxy(prj)
         from .batchdlg import BatchProgress
         run = {c.id: -1.0 for c in todo}
         self.tlstrip.set_running(run, f"분석 대기 {len(todo)}컷")
-        dlg = BatchProgress(self, "전체 분석", [c.id for c in todo], {c.id: c.name for c in todo},
+        dlg = BatchProgress(self, title, [c.id for c in todo], {c.id: c.name for c in todo},
                             {c.id: int(c.info.frames) for c in todo},
                             float(getattr(settings(), "analysis_spf", 0.0) or 0.0))
         dlg.pauseToggled.connect(self._batch_pause)
@@ -2209,6 +2242,8 @@ class MainWindow(QMainWindow):
             self.inspector.refresh("reshape")
 
     def _compare(self, mode: str):
+        if (mode == "side") != (self.viewer.mode == "side"):
+            self.viewer.fit_view()          # one picture <-> two panes: the layout changes, so fit again
         self.viewer.mode = mode
         self.viewer.ab_flip = False
         self.viewer.update()

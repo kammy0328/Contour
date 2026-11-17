@@ -85,8 +85,8 @@ class _Dialog(QDialog):
 
 
 class AnalyzeAllDialog(_Dialog):
-    def __init__(self, parent, n_cuts: int, frames: int, n_done: int, spf: float):
-        super().__init__(parent, "전체 분석")
+    def __init__(self, parent, n_cuts: int, frames: int, n_done: int, spf: float, title: str = "전체 분석"):
+        super().__init__(parent, title)
         est = frames * (spf or DEFAULT_SPF)
         self.v.addWidget(Wd.label(f"분석할 컷 {n_cuts}개 · {frames:,}프레임", "", 14))
         sub = f"예상 소요 약 {fmt_dur(est)} · 끝나는 시각 약 {fmt_end(est)}"
