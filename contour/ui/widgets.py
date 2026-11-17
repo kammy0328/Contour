@@ -837,11 +837,8 @@ class BusyOverlay(QWidget):
         self.setGeometry(self.parentWidget().rect())
         self._fit()
         self.raise_()
-        was = self.isVisible()
         self.show()
-        self._fit()
-        if not was:
-            fade_in(self, 180)
+        self._fit()                                     # no fade: it stuttered while the app was busy starting the work
 
     def _eta_text(self, f: float):
         import time

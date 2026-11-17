@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
-from PySide6.QtCore import QEvent, QObject, QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QEventLoop, QObject, QSize, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
                                QPushButton, QSplitter, QStackedWidget, QToolButton, QVBoxLayout, QWidget)
@@ -1471,7 +1471,12 @@ class MainWindow(QMainWindow):
 
         self.job.succeeded.connect(ok)
         self.job.failed.connect(fail)
-        self.job.start(QThread.LowPriority)       # the UI stays responsive while it works
+        # the panel is painted before the worker starts: loading the models (DLLs, CUDA) holds the interpreter for
+        # long stretches, and the panel came up seconds late (or after the work was well under way)
+        self.busy.repaint()
+        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+        job = self.job
+        QTimer.singleShot(60, lambda: job.start(QThread.LowPriority) if self.job is job and not job.isRunning() else None)
 
     def _batch_warned(self, cid: str, text: str):
         seen = getattr(self, "_batch_warn_seen", set())

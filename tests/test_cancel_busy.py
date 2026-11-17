@@ -73,3 +73,12 @@ def test_segment_run_raises_cancelled_not_break():
     import inspect
     src = inspect.getsource(SG.run)
     assert "raise Cancelled()" in src and "                break" not in src
+
+
+def test_busy_panel_is_painted_before_the_worker_starts():
+    """2026-11-18: after 다시 분석 the panel came up late. run_job paints it first and starts the worker a moment later."""
+    import inspect
+    from contour.ui import main_window as MW
+    src = inspect.getsource(MW.MainWindow.run_job)
+    i, j = src.index("self.busy.repaint()"), src.index("job.start(QThread.LowPriority)")
+    assert i < j and "self.job.start(" not in src
