@@ -215,7 +215,27 @@ class PartParams:
         sb = d.get("skin_basic") or {}
         if isinstance(sb, dict) and sb.get("level") in ("light", "std", "strong"):
             p.skin_basic = {"level": sb["level"], "remove": [str(x) for x in (sb.get("remove") or [])]}
+            p._basic_upgrade()
         return p
+
+    def _basic_upgrade(self) -> None:
+        """A basic adjustment made by an older version: its level's values of then become the level's values of
+        now, only where the value is still exactly the old one and has no keys (set by hand: left as it is)."""
+        from .params import (SKIN_LEVEL_VALUES, SKIN_LEVEL_VALUES_V1, SKIN_REMOVE, SKIN_REMOVE_VALUES,
+                             SKIN_REMOVE_VALUES_V1)
+        lv = self.skin_basic.get("level")
+        old, new = dict(SKIN_LEVEL_VALUES_V1.get(lv, {})), dict(SKIN_LEVEL_VALUES.get(lv, {}))
+        rm = set(self.skin_basic.get("remove", []))
+        for sw, key, _ in SKIN_REMOVE:
+            if sw in rm and lv in SKIN_REMOVE_VALUES_V1:
+                old[key], new[key] = SKIN_REMOVE_VALUES_V1[lv], SKIN_REMOVE_VALUES[lv]
+        for k, v_old in old.items():
+            v_new = new.get(k, v_old)
+            c = self.amounts.get(k)
+            if v_new == v_old or c is None or c.keys:
+                continue
+            if abs(c.base - v_old) < 1e-6:
+                c.base = float(v_new)
 
     def copy_static(self, frame: float) -> "PartParams":
         """Values evaluated at `frame`, without keyframes (used for cut-to-cut copy)."""

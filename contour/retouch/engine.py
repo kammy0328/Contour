@@ -1783,6 +1783,73 @@ def _fold_fill(I: np.ndarray, m: np.ndarray, excl: Optional[np.ndarray], k: floa
     return out
 
 
+# 2611 cut 024 (user 2026-11-17: at 강하게 with 팔자주름·입가주름 제거 the folds stayed). On a young full face the fold
+# is not a thin valley but a soft shading band from the nose wing to the mouth corner, a tenth of the face wide: the
+# valley finder above sees nothing (the band lifted 4 %). This lifts what is darker than the skin around it at that
+# width, inside the fold's band only, the lips and nostrils (and a margin round them) left alone.
+FOLD_BROAD = 0.8            # share of the fold's value
+FOLD_BROAD_SCALE = {"nasolabial": 0.12, "mouth_lines": 0.08}   # widest shading taken, share of the face width
+FOLD_BROAD_CAP = 0.06
+
+
+def _fold_broad(Y: np.ndarray, m: np.ndarray, excl: Optional[np.ndarray], wf: float, k: float, scale: float,
+                cap: float = FOLD_BROAD_CAP) -> np.ndarray:
+    """Lift the dark shading of a broad fold: a closing (black-hat) at `scale` of the face width finds what is darker
+    than the skin either side of it; only that is added back, smoothly, inside m. Luma only, never darker."""
+    if k < 1e-4:
+        return Y
+    r = _roi(m, int(scale * wf) + 8)
+    if r is None:
+        return Y
+    y0, y1, x0, x1 = r
+    roi = Y[y0:y1, x0:x1].astype(np.float32)
+    mm = m[y0:y1, x0:x1].astype(np.float32)
+    Ys = cv2.GaussianBlur(roi, (0, 0), max(1.0, 0.006 * wf))
+    ks = max(3, int(scale * wf) | 1)
+    bh = cv2.morphologyEx(Ys, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks)))
+    bh = cv2.GaussianBlur(np.clip(bh, 0, cap), (0, 0), max(1.0, 0.01 * wf))
+    if excl is not None:
+        e = np.clip(excl[y0:y1, x0:x1].astype(np.float32), 0, 1)
+        d_ = max(3, int(0.04 * wf) | 1)
+        e = cv2.dilate(e, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d_, d_)))
+        mm = mm * (1.0 - np.clip(cv2.GaussianBlur(e, (0, 0), max(1.0, 0.02 * wf)), 0, 1))
+    out = Y.astype(np.float32, copy=True)
+    out[y0:y1, x0:x1] = roi + k * mm * bh
+    return out
+
+
+NECK_RING = 0.8            # 2611 cut 024: the soft rings across the neck (a tenth of the face high) stayed at 강하게
+NECK_RING_HW = (0.35, 0.10)  # the closing's width and height (share of the face width): lies across the neck
+
+
+def _ring_fill(Y: np.ndarray, m: np.ndarray, hold: Optional[np.ndarray], wf: float, k: float, axis=None,
+               cap: float = FOLD_BROAD_CAP) -> np.ndarray:
+    """Lift the broad soft rings across the neck: darker than the skin above and below them at a tenth of the face
+    width, measured with a wide flat closing turned to lie across the neck. Luma only, never darker; hold (the
+    jaw line) keeps the jaw's own shadow."""
+    if k < 1e-4:
+        return Y
+    w_, h_ = NECK_RING_HW
+    r = _roi(m, int(w_ * wf) + 8)
+    if r is None:
+        return Y
+    y0, y1, x0, x1 = r
+    roi = Y[y0:y1, x0:x1].astype(np.float32)
+    mm = m[y0:y1, x0:x1].astype(np.float32)
+    Ys = cv2.GaussianBlur(roi, (0, 0), max(1.0, 0.006 * wf))
+    W, H = max(3, int(w_ * wf) | 1), max(3, int(h_ * wf) | 1)
+    se = np.zeros((max(W, H), max(W, H)), np.uint8)
+    cv2.ellipse(se, (se.shape[1] // 2, se.shape[0] // 2), (W // 2, H // 2),
+                float(np.degrees(np.arctan2(-axis[0], axis[1]))) if axis is not None else 0.0, 0, 360, 1, -1)
+    bh = cv2.morphologyEx(Ys, cv2.MORPH_BLACKHAT, se)
+    bh = cv2.GaussianBlur(np.clip(bh, 0, cap), (0, 0), max(1.0, 0.012 * wf))
+    if hold is not None:
+        mm = mm * hold[y0:y1, x0:x1]
+    out = Y.astype(np.float32, copy=True)
+    out[y0:y1, x0:x1] = roi + k * mm * bh
+    return out
+
+
 def _fold_find(Y: np.ndarray, band: np.ndarray, wf: float, width: float) -> np.ndarray:
     """Where in the search band the fold really is: a dark valley at the fold's width (curved strongly across,
     little along), darker than the skin beside it. Returns 0..1 at Y resolution (only inside the band's ROI).
@@ -1941,6 +2008,11 @@ def _blemish(Y, Cb, Cr, mY, mC, k: float, size: float, cs: float):
     return Yo, Cbo, Cro
 
 
+# 2611 cut 024 (user 2026-11-17): the shine's white went the skin's colour. A highlight keeps its own colour; the
+# shine slider only takes its brightness down (and the basic adjustment no longer sets it)
+SHINE_KEEP_COLOUR = True
+
+
 def _shine(Y, Cb, Cr, mY, mC, k: float, wf: float, cs: float, zone: Optional[np.ndarray] = None):
     """Press down oily specular shine: patches brighter than the skin base and whiter than the skin colour.
     Pores and fine texture stay; the shine's colour goes back to the skin's."""
@@ -1996,6 +2068,8 @@ def _shine(Y, Cb, Cr, mY, mC, k: float, wf: float, cs: float, zone: Optional[np.
         out = out - k * 0.3 * zr * np.clip(fine, 0, None)
     Yo[y0:y1, x0:x1] = out
     Cbo, Cro = Cb.astype(np.float32, copy=True), Cr.astype(np.float32, copy=True)
+    if SHINE_KEEP_COLOUR:
+        return Yo, Cbo, Cro
     if Cb.shape == Y.shape:
         c0, c1, d0, d1 = y0, y1, x0, x1
         swc = sw
@@ -2852,6 +2926,13 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                     mY = mY * (1.0 - he_)
                 Y = _fold_fill(Y, mY, exY, 0.95 * k, max(0.8, sf * wf), max(2.0, ss * wf), True,
                                valley=max(1.5, 1.6 * fw_ * wf))
+                if FOLD_BROAD > 1e-4:
+                    mb_ = band
+                    if key == "nasolabial" and nh_ is not None:
+                        mb_ = mb_ * nh_
+                    if he_ is not None:
+                        mb_ = mb_ * (1.0 - he_)
+                    Y = _fold_broad(Y, mb_, exY, wf, FOLD_BROAD * k, FOLD_BROAD_SCALE[key])
                 mC = M(mY, (hC, wC))
                 Cb = _fold_fill(Cb, mC, exC, 0.7 * k, max(0.8, sf * wf * cs), max(1.5, ss * wf * cs), False)
                 Cr = _fold_fill(Cr, mC, exC, 0.7 * k, max(0.8, sf * wf * cs), max(1.5, ss * wf * cs), False)
@@ -2930,6 +3011,12 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
             Y, Cb, Cr = _crease_lift(Y, Cb, Cr, mN, k, max(1.5, 0.018 * wf), None, jh_)
             # the soft folds (rings) of the neck, wider and fainter than a line
             Y = _fold_flat(Y, mN if jh_ is None else mN * jh_, wf, k)
+            if NECK_RING > 1e-4:
+                try:
+                    ax_ = neck_axis(lmj)
+                except Exception:
+                    ax_ = None
+                Y = _ring_fill(Y, mN, jh_, wf, NECK_RING * k, ax_)
         # 3b'. goose bumps on the neck: softened, never wiped
         if "neck" in job.masks and v.get("neck_bumps", 0) > 1e-4:
             k = float(np.clip(v["neck_bumps"], 0, 1))

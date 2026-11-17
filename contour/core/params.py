@@ -152,13 +152,22 @@ def is_neutral(key: str, v: float) -> bool:
 SKIN_LEVELS: List[Tuple[str, str]] = [("light", "약하게"), ("std", "표준"), ("strong", "강하게")]
 SKIN_LEVEL_VALUES: Dict[str, Dict[str, float]] = {
     "light": {"skin": 45, "shine": 0, "dark_circle": 15, "redness": 0, "neck_lines": 15, "neck_bumps": 0},
+    "std": {"skin": 70, "shine": 0, "dark_circle": 30, "redness": 15, "neck_lines": 30, "neck_bumps": 20},
+    "strong": {"skin": 90, "shine": 0, "dark_circle": 50, "redness": 30, "neck_lines": 70, "neck_bumps": 40},
+}
+# what the basic adjustment set before 1.18 (2611 cut 024, user 2026-11-17: the shine's white went dim and took the
+# skin's colour; the skin's brightness is to stay as it was). A person whose values are still exactly a level's old
+# ones gets the level's values of now when the project is read (values changed by hand are never touched).
+SKIN_LEVEL_VALUES_V1: Dict[str, Dict[str, float]] = {
+    "light": {"skin": 45, "shine": 0, "dark_circle": 15, "redness": 0, "neck_lines": 15, "neck_bumps": 0},
     "std": {"skin": 70, "shine": 15, "dark_circle": 30, "redness": 15, "neck_lines": 30, "neck_bumps": 20},
     "strong": {"skin": 90, "shine": 30, "dark_circle": 50, "redness": 30, "neck_lines": 50, "neck_bumps": 40},
 }
 # switch -> (detail slider, label, value at light / std / strong when 제거)
 SKIN_REMOVE: List[Tuple[str, str, str]] = [("mouth", "mouth_lines", "입가주름"), ("naso", "nasolabial", "팔자주름"),
                                            ("acne", "blemish", "여드름")]
-SKIN_REMOVE_VALUES: Dict[str, float] = {"light": 25, "std": 40, "strong": 60}
+SKIN_REMOVE_VALUES: Dict[str, float] = {"light": 25, "std": 40, "strong": 80}
+SKIN_REMOVE_VALUES_V1: Dict[str, float] = {"light": 25, "std": 40, "strong": 60}     # before 1.18 (cut 024: folds stayed)
 SKIN_BASIC_KEYS: List[str] = list(SKIN_LEVEL_VALUES["std"]) + [k for _, k, _ in SKIN_REMOVE]
 
 
