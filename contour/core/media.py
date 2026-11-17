@@ -685,9 +685,17 @@ class FrameWriter:
         self.layout = plane_layout(in_pix_fmt, width, height)
         self.out_path = out_path
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        # what the raw planes are (YUV: the source's own matrix and range). Left unsaid, newer ffmpeg (8, 9) takes
+        # untagged YUV as BT.601 and converts it to the BT.709 the output is tagged as: a plain render changed colour.
+        in_tags: List[str] = []
+        if in_pix_fmt.startswith("yuv") and not gray:
+            m_ = src_info.color_matrix if src_info is not None else "bt709"
+            m_ = m_ if m_ in _MAT_OK else ("bt709" if height >= 700 else "smpte170m")
+            r_ = src_info.color_range if src_info is not None and src_info.color_range in ("tv", "pc") else "tv"
+            in_tags = ["-colorspace", m_, "-color_range", r_]
         cmd = [ffmpeg_bin(), "-hide_banner", "-v", "error", "-nostdin", "-y",
                "-f", "rawvideo", "-pix_fmt", in_pix_fmt, "-s", f"{width}x{height}",
-               "-framerate", f"{fps_num}/{fps_den}", "-i", "-"]
+               "-framerate", f"{fps_num}/{fps_den}"] + in_tags + ["-i", "-"]
         if audio_from:
             apath, astart, adur = audio_from
             cmd += ["-ss", f"{max(0.0, astart):.6f}", "-t", f"{adur:.6f}", "-i", apath]
