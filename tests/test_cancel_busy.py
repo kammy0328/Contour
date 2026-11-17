@@ -80,5 +80,25 @@ def test_busy_panel_is_painted_before_the_worker_starts():
     import inspect
     from contour.ui import main_window as MW
     src = inspect.getsource(MW.MainWindow.run_job)
-    i, j = src.index("self.busy.repaint()"), src.index("job.start(QThread.LowPriority)")
-    assert i < j and "self.job.start(" not in src
+    i, j = src.index("self.busy.repaint()"), src.index("self.job.start(QThread.LowPriority)")
+    assert i < j and "singleShot" not in src[i:j + 40]
+
+
+def test_closed_reader_with_a_full_queue_leaves_no_thread(tmp_path):
+    """A frame reader closed while its prefetch queue was full left its pump thread blocked for good (holding frames);
+    in the test run that leftover crashed a later test's event loop."""
+    import subprocess, time
+    from contour.core import media as M
+    src = tmp_path / "s.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=24", "-frames:v", "40",
+                    "-c:v", "libx264", str(src)], check=True)
+    info = M.probe(str(src))
+    rd = M.FrameReader(info, 0, 40, "rgb24", prefetch=2)
+    t0 = time.time()
+    while rd._q.qsize() < 2 and time.time() - t0 < 5:
+        time.sleep(0.02)
+    time.sleep(0.2)                                 # the pump is now waiting to put the third frame
+    rd.close()
+    rd._t.join(2.0)
+    assert not rd._t.is_alive()
+    assert rd.read() is None

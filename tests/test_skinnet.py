@@ -117,3 +117,19 @@ def test_network_learns_the_hand_smoothing_on_held_out_samples():
                          log=lambda *a: None)
     ev = SN.evaluate(net, samples, [6, 7], "cpu")
     assert ev["net"]["err"] < 0.8 * ev["none"]["err"], ev
+
+
+def test_saved_sample_reads_back_compact_and_full(tmp_path):
+    from contour.learn import style as SL
+    b, a, lm, skin, tex = _face(seed=4, spot=False)
+    s = SN.make_sample(b, a, lm, skin, SL.fit_grade(b, a), diap=b)
+    SN.save_sample(tmp_path / "x.npz", s)
+    full = SN.load_sample(tmp_path / "x.npz")
+    comp = SN.load_sample(tmp_path / "x.npz", compact=True)
+    assert comp["before"].dtype == np.uint16 and comp["weight"].dtype == np.uint8
+    assert np.abs(SN._f(comp["before"]) - s["before"]).max() < 1e-4
+    assert np.abs(full["delta"] - s["delta"]).max() < 1e-3
+    assert np.array_equal(SN._f(comp["weight"]) > 0.5, s["weight"] > 0.5)
+    x, y, w = SN._batch([comp], [0], None, SN.CROP, False)
+    x2, y2, w2 = SN._batch([full], [0], None, SN.CROP, False)
+    assert np.abs(x - x2).max() < 1e-4 and np.abs(y - y2).max() < 1e-3

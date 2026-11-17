@@ -171,15 +171,26 @@ def save_sample(path, smp: dict) -> None:
     os.replace(tmp, str(path))
 
 
-def load_sample(path) -> dict:
+def load_sample(path, compact: bool = False, diap: bool = True) -> dict:
+    """compact: the arrays as stored (uint16 / float16 / uint8, a third of the memory; read with _f), for training on
+    a thousand samples in the PC's memory."""
     z = np.load(str(path))
-    d = dict(before=z["before"].astype(np.float32) / 65535.0, skin=z["skin"].astype(np.float32) / 255.0,
-             delta=z["delta"].astype(np.float32), keep=z["keep"].astype(np.float32),
-             weight=z["weight"].astype(np.float32), meta=json.loads(str(z["meta"])))
-    for k in ("diap_delta", "diap_keep"):
-        if k in z.files:
-            d[k] = z[k].astype(np.float32)
+    keys = ["before", "skin", "delta", "keep", "weight"] + ([k for k in ("diap_delta", "diap_keep") if k in z.files]
+                                                            if diap else [])
+    d = {k: z[k] for k in keys}
+    d["meta"] = json.loads(str(z["meta"]))
+    if not compact:
+        d = {k: (_f(v) if k != "meta" else v) for k, v in d.items()}
     return d
+
+
+def _f(a: np.ndarray) -> np.ndarray:
+    """A sample array as float32 (0..1 for the stored integer pictures and masks)."""
+    if a.dtype == np.uint16:
+        return a.astype(np.float32) / 65535.0
+    if a.dtype == np.uint8:
+        return a.astype(np.float32) / (255.0 if a.max(initial=0) > 1 else 1.0)
+    return a.astype(np.float32)
 
 
 # ------------------------------------------------------------------------------------------------ split
@@ -248,7 +259,7 @@ def _batch(samples: List[dict], idx, rng, size: int, train: bool):
         else:
             y0 = x0 = (H - size) // 2 if size < H else 0
         sl = (slice(y0, y0 + size), slice(x0, x0 + size))
-        b, m, d, k, w = s["before"][sl], s["skin"][sl], s["delta"][sl], s["keep"][sl], s["weight"][sl]
+        b, m, d, k, w = (_f(s[q][sl]) for q in ("before", "skin", "delta", "keep", "weight"))
         if train:
             if rng.random() < 0.5:
                 b, m, d, k, w = b[:, ::-1], m[:, ::-1], d[:, ::-1], k[:, ::-1], w[:, ::-1]
@@ -316,8 +327,8 @@ def evaluate(net, samples: List[dict], idx: List[int], device: Optional[str] = N
             p = net(torch.from_numpy(x).to(dev)).cpu().numpy()
             cands = {"none": np.concatenate([np.zeros_like(y[:, :3]), np.ones_like(y[:, 3:])], 1), "net": p}
             if "diap_delta" in s:
-                cands["diap"] = np.concatenate([s["diap_delta"].transpose(2, 0, 1)[None],
-                                                s["diap_keep"][None, None]], 1)
+                cands["diap"] = np.concatenate([_f(s["diap_delta"]).transpose(2, 0, 1)[None],
+                                                _f(s["diap_keep"])[None, None]], 1)
             ww = w[0, 0] > 0.5
             if ww.sum() < 50:
                 continue

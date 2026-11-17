@@ -1475,8 +1475,9 @@ class MainWindow(QMainWindow):
         # long stretches, and the panel came up seconds late (or after the work was well under way)
         self.busy.repaint()
         QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
-        job = self.job
-        QTimer.singleShot(60, lambda: job.start(QThread.LowPriority) if self.job is job and not job.isRunning() else None)
+        # started right here, not from a timer: a timer outlived the window in the tests and started a job for a
+        # window already gone (a crash)
+        self.job.start(QThread.LowPriority)
 
     def _batch_warned(self, cid: str, text: str):
         seen = getattr(self, "_batch_warn_seen", set())

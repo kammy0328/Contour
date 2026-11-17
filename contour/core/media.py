@@ -521,9 +521,21 @@ class FrameReader:
                     got += len(c)
                 if got < nb:
                     break
-                self._q.put(b"".join(chunks))
+                buf = b"".join(chunks)
+                # never blocked for good on a full queue: a reader closed while its queue was full left this thread
+                # (and the frames it held) behind for the rest of the session
+                while not self._stop:
+                    try:
+                        self._q.put(buf, timeout=0.2)
+                        break
+                    except queue.Full:
+                        continue
         finally:
-            self._q.put(None)
+            try:
+                self._q.put_nowait(None)
+            except queue.Full:
+                if not self._stop:
+                    self._q.put(None)
 
     def read(self) -> Optional[List[np.ndarray]]:
         buf = self._q.get()
@@ -557,6 +569,12 @@ class FrameReader:
             pass
         try:
             self._proc.wait(timeout=5)
+        except Exception:
+            pass
+        try:                                     # a read after this ends at once
+            while not self._q.empty():
+                self._q.get_nowait()
+            self._q.put_nowait(None)
         except Exception:
             pass
 
