@@ -58,6 +58,12 @@ class _Delegate(QStyledItemDelegate):
             p.setPen(Qt.NoPen)
             p.setBrush(qc("bg3") if sel else qc("bg2"))
             p.drawRoundedRect(r, 8, 8)
+        multi = sel and len(self.panel.list.selectedItems()) > 1
+        if multi:
+            # one of several selected cuts (Ctrl / Shift): an accent outline round the row
+            p.setPen(QPen(qc("accent"), 1.5))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(r.adjusted(0.75, 0.75, -0.75, -0.75), 8, 8)
         th = self.panel.thumbs.get(cut.id)
         tr = QRectF(r.left() + 6, r.top() + 6, 96, 54)
         p.setPen(Qt.NoPen)
@@ -78,6 +84,8 @@ class _Delegate(QStyledItemDelegate):
             p.setBrush(QColor(0, 0, 0, 120))
             p.drawRoundedRect(tr, 5, 5)             # nothing to do here: dimmed
         draw_analysed(p, tr, cut)
+        if multi:
+            draw_selected_badge(p, tr)
         x = tr.right() + 10
         p.setFont(font(12, 600))
         p.setPen(qc("text"))
@@ -106,6 +114,12 @@ class _Delegate(QStyledItemDelegate):
         ws = WS0.state(cut)
         pr = QRectF(x, r.top() + 46, pill_width(status), 18)
         draw_pill(p, pr, ws, status)
+        # the cut's input colour space, small, at the right end of the status row
+        from ..core.colour import ColourManager
+        csn = ColourManager.short_name(cut.input_cs or "")
+        p.setFont(font(10, 500))
+        p.setPen(qc("text3") if csn == "Rec.709" else qc("accent"))
+        p.drawText(QRectF(r.right() - 64, pr.top(), 58, 18), Qt.AlignRight | Qt.AlignVCenter, csn)
         # tracking needs a look (automatic check): a small amber note after the pill
         from ..core import workstate as WS
         from ..track import status as ST
@@ -121,6 +135,23 @@ class _Delegate(QStyledItemDelegate):
             p.drawText(QRectF(pr.right() + 6, pr.top(), r.right() - pr.right() - 6, 18), Qt.AlignLeft | Qt.AlignVCenter,
                        "추적 확인")
         p.restore()
+
+
+def draw_selected_badge(p: QPainter, tr: QRectF) -> None:
+    """A filled accent circle with a check, top left on a thumbnail: this cut is one of the selected ones."""
+    p.save()
+    p.setRenderHint(QPainter.Antialiasing)
+    c = QRectF(tr.left() + 4, tr.top() + 4, 16, 16)
+    p.setPen(QPen(QColor(0, 0, 0, 140), 1))
+    p.setBrush(qc("accent"))
+    p.drawEllipse(c)
+    pen = QPen(QColor("white"), 1.8)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(pen)
+    cx, cy = c.center().x(), c.center().y()
+    p.drawPolyline([QPointF(cx - 3.6, cy + 0.2), QPointF(cx - 1.0, cy + 2.8), QPointF(cx + 3.8, cy - 2.6)])
+    p.restore()
 
 
 def pill_width(label: str) -> float:
@@ -296,6 +327,7 @@ class CutList(QWidget):
         self.list.setSelectionMode(QAbstractItemView.ExtendedSelection)     # Shift: range, Ctrl: add
         self.list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.list.currentItemChanged.connect(self._changed)
+        self.list.itemSelectionChanged.connect(self._sel_changed)
         self.list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._menu)
         lay.addWidget(self.list, 1)
@@ -314,6 +346,18 @@ class CutList(QWidget):
         it = self.list.currentItem()
         return it.data(Qt.UserRole).id if it is not None else None
 
+    def show_current(self, cut_id: str):
+        """Marks cut_id as the open cut (playback went on into it) without opening it again, in the middle of the list."""
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            if it.data(Qt.UserRole).id == cut_id:
+                if self.list.currentItem() is not it:
+                    self._block = True
+                    self.list.setCurrentItem(it)
+                    self._block = False
+                self.list.scrollToItem(it, QAbstractItemView.PositionAtCenter)
+                return
+
     def selected_ids(self):
         return [it.data(Qt.UserRole).id for it in self.list.selectedItems()]
 
@@ -325,6 +369,7 @@ class CutList(QWidget):
         self.list.viewport().update()
 
     def refresh(self, current_id: Optional[str] = None):
+        cur_it = None
         self._block = True
         self.list.clear()
         prj = self.s.project
@@ -345,10 +390,13 @@ class CutList(QWidget):
             self.list.addItem(it)
             if c.id == current_id:
                 self.list.setCurrentItem(it)
+                cur_it = it
         self.count.setText((f"{len(cuts)}/{allc}" if f else f"{allc}") if allc else "")
         self.empty.setVisible(not allc)
         self.list.setVisible(bool(allc))
         self._block = False
+        if cur_it is not None:
+            self.list.scrollToItem(cur_it, QAbstractItemView.PositionAtCenter)
 
     def update_rows(self):
         self.list.viewport().update()
@@ -360,6 +408,12 @@ class CutList(QWidget):
         if QApplication.keyboardModifiers() & (Qt.ShiftModifier | Qt.ControlModifier) and len(self.list.selectedItems()) > 1:
             return                       # building a multi-selection: stay on the open cut
         self.cutSelected.emit(cur.data(Qt.UserRole).id)
+
+    def _sel_changed(self):
+        n = len(self.list.selectedItems())
+        tot = self.list.count()
+        self.count.setText(f"{n}컷 선택 / {tot}" if n > 1 else (str(tot) if tot else ""))
+        self.list.viewport().update()          # the outlines of every selected row
 
     def _state_click(self, cut, gpos):
         ids = self.selected_ids()

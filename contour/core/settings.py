@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 APP_NAME = "DIAP"
-APP_VERSION = "1.14.0"
+APP_VERSION = "1.15.0"
 
 
 def default_data_dir() -> Path:
@@ -45,6 +45,7 @@ class AppSettings:
     recent_projects: list = field(default_factory=list)
     known_projects: list = field(default_factory=list)   # every project the project manager lists (no limit)
     pm_sort: str = "modified"             # project manager order: modified | name | created (last chosen)
+    play_loop: bool = False               # transport: repeat the cut (off: playback goes on into the next cut)
     open_last_on_start: bool = False      # skip the project manager at start and open the last project
     output_dir: str = ""
     qc_thresholds: dict = field(default_factory=dict)

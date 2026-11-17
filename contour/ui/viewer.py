@@ -94,6 +94,16 @@ class Viewer(QWidget):
         from .workers import PreviewWorker
         self.preview = PreviewWorker(self._compute_preview, self)
         self.preview.ready.connect(self._preview_ready)
+        # the skin area overlay is worked out on its own thread too (seconds per frame on a 4K cut)
+        self.skin_worker = PreviewWorker(self._compute_skin, self)
+        self.skin_worker.ready.connect(self._skin_ready)
+        self._skin_last = None           # (frame, QImage) last skin overlay shown
+        # a small turning arc while a result is being worked out
+        from PySide6.QtCore import QTimer as _QT
+        self._spin_a = 0.0
+        self._spin_t = _QT(self)
+        self._spin_t.setInterval(40)
+        self._spin_t.timeout.connect(self._spin_tick)
         self.message = ""
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -415,37 +425,63 @@ class Viewer(QWidget):
         self._img_cache[key] = img
         return img
 
+    def _skin_key(self):
+        return ("skin", self.t, self.s.vers["ret"], self.s.vers["trk"], self.s.vers["geo"],
+                self.s.cut.id if self.s.cut else "", self.sel_pid)
+
     def _skin_img(self) -> Optional[QImage]:
-        key = ("skin", self.t, self.s.vers["ret"], self.s.vers["trk"], self.s.vers["geo"],
-               self.s.cut.id if self.s.cut else "", self.sel_pid)
+        """The skin area overlay of this frame, from the background thread. Until it is ready: the last one of the
+        same frame (settings changed), else nothing; during playback only frames already worked out show it."""
+        key = self._skin_key()
         if key in self._img_cache:
             return self._img_cache[key]
-        # the selected person's area (even before their skin sliders are moved); else everyone retouched
+        self.skin_worker.request((key, self.t, self.sel_pid))
+        if self._skin_last is not None and self._skin_last[0] == self.t and not self.playing:
+            self._res_pending = True
+            return self._skin_last[1]
+        return None
+
+    def _compute_skin(self, req):
+        key, t, sel_pid = req
+        if self.s.cut is None or key != self._skin_key():
+            return None                          # settings or frame moved on: a newer request follows
         rf = None
-        if self.sel_pid is not None and self.s.cut is not None and self.s.tracker is not None:
+        if sel_pid is not None and self.s.tracker is not None:
             try:
                 from ..retouch.engine import person_masks
-                rf = person_masks(self.s.cut, self.s.tracker, self.t, self.sel_pid)
+                rf = person_masks(self.s.cut, self.s.tracker, t, sel_pid)
             except Exception:
                 rf = None
         if rf is None or rf.empty():
-            rf = self.s.retouch(self.t)
+            rf = self.s.retouch(t)
         if rf is None:
-            return None
+            return (key, t, None)
         m = rf.union()
         if m is None:
-            return None
+            return (key, t, None)
         # show the area where it ends up: the overlay follows face size and other shape changes
-        fr = self.s.field(self.t)
+        fr = self.s.peek_field(t)
         if fr is not None and not fr.empty():
             from ..warp.field import warp_image
             m = warp_image(m.astype(np.float32), fr, cv2.INTER_LINEAR)
         rgba = np.zeros(m.shape + (4,), np.uint8)
         rgba[..., 0], rgba[..., 1], rgba[..., 2] = 79, 139, 255
         rgba[..., 3] = np.clip(m * 170, 0, 255).astype(np.uint8)
-        img = np_to_qimage(rgba)
-        self._img_cache[key] = img
-        return img
+        return (key, t, rgba)
+
+    def _skin_ready(self, req, payload):
+        if payload is None:
+            return
+        key, t, rgba = payload
+        img = np_to_qimage(rgba) if rgba is not None else QImage()
+        self._store_img(key, img)
+        if t == self.t:
+            self._skin_last = (t, img)
+            self.update()
+
+    def _spin_tick(self):
+        self._spin_a = (self._spin_a + 14.0) % 360.0
+        self.update()
 
     # ------------------------------------------------------------------ paint
     def paintEvent(self, e):
@@ -514,6 +550,8 @@ class Viewer(QWidget):
                 p.drawImage(r, mi)
         if self.show_skin:
             si = self._skin_img()
+            if si is not None and si.isNull():
+                si = None
             if si is not None:
                 p.drawImage(r, si)
         if clipped:
@@ -521,7 +559,7 @@ class Viewer(QWidget):
         if mode == "side":
             p.save()
             p.setClipRect(cells[1])
-        if self._hover_pid is not None and self.tool == "edit" and self._drag is None:
+        if self._hover_pid is not None and self.tool == "edit" and self._drag is None and not self.playing:
             self._paint_hover(p, r, self._hover_pid)
         if self.show_protect:
             self._paint_protect(p, r)
@@ -546,8 +584,32 @@ class Viewer(QWidget):
         self._paint_n = getattr(self, "_paint_n", 0) + 1
         if self.playing and getattr(self, "_raw_shown_until", -1) > self._paint_n:
             self._tag(p, cells[-1], "미리 계산 전 · 원본")
-        elif not self.playing and getattr(self, "_res_pending", False) and mode in ("result", "side", "wipe"):
-            self._tag(p, cells[-1], "보정 계산 중", bottom=True)
+        pend = not self.playing and getattr(self, "_res_pending", False) and mode in ("result", "side", "wipe")
+        if pend:
+            self._busy_tag(p, cells[-1], "보정 계산 중")
+            if not self._spin_t.isActive():
+                self._spin_t.start()
+        elif self._spin_t.isActive():
+            self._spin_t.stop()
+
+    def _busy_tag(self, p: QPainter, r: QRectF, text: str):
+        """Bottom right: a turning arc and the text (a result is being worked out)."""
+        p.save()
+        p.setFont(font(11, 600))
+        fm = p.fontMetrics()
+        w = fm.horizontalAdvance(text) + 14 + 22
+        x, y = r.right() - w - 8, r.bottom() - 30
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(0, 0, 0, 160))
+        p.drawRoundedRect(QRectF(x, y, w, 22), 5, 5)
+        pen = QPen(qc("accent"), 2)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawArc(QRectF(x + 8, y + 5, 12, 12), int(-self._spin_a * 16), int(-250 * 16))
+        p.setPen(QColor(235, 235, 235))
+        p.drawText(QRectF(x + 24, y, w - 28, 22), Qt.AlignVCenter | Qt.AlignLeft, text)
+        p.restore()
 
     def _tag(self, p: QPainter, r: QRectF, text: str, left: bool = False, bottom: bool = False):
         p.save()
@@ -1152,7 +1214,7 @@ class Viewer(QWidget):
                 self._hover_ghost = gh
                 self.update()
             hp = None
-            if hv is None and gh is None and ph is None and self.s.cut is not None:
+            if hv is None and gh is None and ph is None and self.s.cut is not None and not self.playing:
                 hp = self.s.person_at(self.t, *self.w_to_src(pos))
             if hp != self._hover_pid:
                 self._hover_pid = hp

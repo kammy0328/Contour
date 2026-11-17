@@ -251,6 +251,11 @@ def tone_mask(lm: Optional[np.ndarray], shape, prob: np.ndarray, alpha: Optional
     return np.clip(region, 0, 1)
 
 
+DARK_INNER_TAPER = 0.35   # the dark circle fades in over this share of the eye's width from the inner corner
+DARK_VALLEY = 0.06        # the under-eye is lifted by at most its own depth against the skin within this share of the face
+DARK_CAP = 0.07           # and never by more than this (luma 0..1)
+
+
 def under_eye_mask(lm: np.ndarray, shape, prob: np.ndarray, fth: float = 1.5) -> np.ndarray:
     """Crescents under the eyes, from just below the lashes down towards the cheek."""
     h, w = shape
@@ -281,6 +286,22 @@ def under_eye_mask(lm: np.ndarray, shape, prob: np.ndarray, fth: float = 1.5) ->
         c = e.mean(0)
         _poly(eye, c + (e - c) * 1.15)
     f = f * (1 - _feather(cv2.dilate(eye, np.ones((3, 3), np.uint8)), 0.008 * Wf))
+    if DARK_INNER_TAPER > 0:
+        # cut 009 (user 16:46): at the inner corner the crescent ran into the deep shadow beside the nose bridge and lifted
+        # it to the cheek's level, a pale patch by the eye. The crescent now fades out towards the inner corner.
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        mid = (L[39] + L[42]) / 2
+        side = (xx - mid[0]) * ex[0] + (yy - mid[1]) * ex[1]          # < 0: the first eye (36..41), > 0: the second
+        tap = np.ones((h, w), np.float32)
+        for inner, outer, sel in ((L[39], L[36], side < 0), (L[42], L[45], side >= 0)):
+            o = outer - inner
+            ew = max(1e-3, float(np.hypot(*o)))
+            o = o / ew
+            along = (xx - inner[0]) * o[0] + (yy - inner[1]) * o[1]
+            ramp = np.clip(along / (DARK_INNER_TAPER * ew), 0, 1)
+            ramp = ramp * ramp * (3 - 2 * ramp)
+            tap = np.where(sel, ramp, tap)
+        f = f * tap
     soft = np.clip(cv2.GaussianBlur(prob, (0, 0), max(1.0, 0.02 * Wf)) * 1.5, 0, 1)
     return np.clip(f * 1.2, 0, 1) * soft
 
@@ -1699,7 +1720,7 @@ def mouth_open(lm: Optional[np.ndarray]) -> float:
 
 
 def _fold_fill(I: np.ndarray, m: np.ndarray, excl: Optional[np.ndarray], k: float, sig_f: float, sig_s: float,
-               luma: bool = True, valley: float = 0.0) -> np.ndarray:
+               luma: bool = True, valley: float = 0.0, cap: float = 0.25) -> np.ndarray:
     """Fill in the shading of a crease from the skin around it.
 
     The skin next to the crease (eyes, lips, nostrils and non-skin left out) gives the level the crease
@@ -1729,7 +1750,7 @@ def _fold_fill(I: np.ndarray, m: np.ndarray, excl: Optional[np.ndarray], k: floa
         own = cv2.GaussianBlur(roi, (0, 0), valley) - loc
         d = np.minimum(d, np.clip(own, 0, None) * FOLD_OWN)
     if luma:
-        d = np.clip(d, 0.0, 0.25)
+        d = np.clip(d, 0.0, cap)
     else:
         d = np.clip(d, -0.035, 0.035)
     d = cv2.GaussianBlur(d, (0, 0), max(0.6, 0.6 * sig_f))
@@ -2569,6 +2590,23 @@ def _crease_lift(Y, Cb, Cr, mY, k: float, width: float, axis=None, hold: Optiona
     return Yo, Cb, Cr
 
 
+REDNESS_KEEP_MEAN = True
+GRAIN_KEEP = True        # the skin smoothing gives the original's finest band (film grain, sensor noise) back
+GRAIN_SIGMA = 1.2        # that band, in pixels of a 1080-line picture (scaled with the plane's height)
+
+
+def _keep_fine(before: np.ndarray, after: np.ndarray, m: np.ndarray) -> np.ndarray:
+    """after with the finest detail band of before inside m: whatever the smoothing took of the grain is put back,
+    so every strength keeps the footage's own grain. The band follows the plane's size (about a pixel at 1080)."""
+    if before.shape != after.shape or m is None or m.shape != after.shape:
+        return after
+    sg = float(np.clip(GRAIN_SIGMA * after.shape[0] / 1080.0, 0.8, 2.4))
+    fb = before - cv2.GaussianBlur(before, (0, 0), sg)
+    fa = after - cv2.GaussianBlur(after, (0, 0), sg)
+    # all of it wherever the smoothing reached (scaled by the mask, the partly smoothed edges kept less grain)
+    return after + np.clip(m * 4.0, 0, 1) * (fb - fa)
+
+
 def _redness(Cb, Cr, Y, mC, mY, k: float, wf: float, cs: float):
     """Bring red patches (cheeks, around the nose) back to the face's own skin colour."""
     r = _roi(mC, 4)
@@ -2590,8 +2628,16 @@ def _redness(Cb, Cr, Y, mC, mY, k: float, wf: float, cs: float):
     ex = np.clip(crs - cr_ref, 0, 0.12)
     on = _ss(0.0, 0.025, ex)
     Cro, Cbo = Cr.astype(np.float32, copy=True), Cb.astype(np.float32, copy=True)
-    Cro[c0:c1, d0:d1] = cr - k * 0.85 * mm * ex
-    Cbo[c0:c1, d0:d1] = cb + k * 0.5 * mm * on * np.clip(cb_ref - cbs, 0, 0.06)
+    dcr = -k * 0.85 * mm * ex
+    dcb = k * 0.5 * mm * on * np.clip(cb_ref - cbs, 0, 0.06)
+    if REDNESS_KEEP_MEAN:
+        # the face keeps its own average colour: only the patches are evened out (cut 009, user 16:46: at 강하게 the
+        # skin read paler and cooler, the redness step alone took dE 0.6-0.7 off the face's mean colour)
+        wsum = float((mm * mm).sum()) + 1e-6
+        dcr = dcr - mm * (float((dcr * mm).sum()) / wsum)
+        dcb = dcb - mm * (float((dcb * mm).sum()) / wsum)
+    Cro[c0:c1, d0:d1] = cr + dcr
+    Cbo[c0:c1, d0:d1] = cb + dcb
     # red patches also read a little dark
     exY = cv2.resize(ex * mm, (0, 0), fx=Y.shape[1] / Cr.shape[1], fy=Y.shape[0] / Cr.shape[0],
                      interpolation=cv2.INTER_LINEAR) if Cr.shape != Y.shape else ex * mm
@@ -2728,6 +2774,8 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
             if src is not None and src["Y"].shape == Y.shape:
                 Ys0 = src["Y"]
                 Ys1 = SK.smooth_channel(Ys0, mY, job.skin.strength, job.keep, r, relative=True)
+                if GRAIN_KEEP:
+                    Ys1 = _keep_fine(Ys0, Ys1, mY)
                 dS = Ys1 - Ys0
                 src["Y"] = Ys1
                 src["dY"] += dS
@@ -2736,7 +2784,10 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                     Cb = Cb + src["Jcb"] * dS
                     Cr = Cr + src["Jcr"] * dS
             else:
+                Y0_ = Y
                 Y = SK.smooth_channel(Y, mY, job.skin.strength, job.keep, r, relative=True)
+                if GRAIN_KEEP:
+                    Y = _keep_fine(Y0_, Y, mY)
             rc = max(1, int(round(r * cs)))
             Cb = SK.smooth_channel(Cb, mC, job.skin.strength * SKIN_CHROMA, 0.0, rc, eps=0.0004)
             Cr = SK.smooth_channel(Cr, mC, job.skin.strength * SKIN_CHROMA, 0.0, rc, eps=0.0004)
@@ -2803,7 +2854,8 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
         if "dark" in job.masks and v.get("dark_circle", 0) > 1e-4:
             k = float(np.clip(v["dark_circle"], 0, 1))
             mY = M(job.masks["dark"], (hY, wY))
-            Y = _fold_fill(Y, mY, exY, 0.95 * k, max(0.8, 0.008 * wf), max(3.0, 0.07 * wf), True)
+            Y = _fold_fill(Y, mY, exY, 0.95 * k, max(0.8, 0.008 * wf), max(3.0, 0.07 * wf), True,
+                           valley=max(1.5, DARK_VALLEY * wf) if DARK_VALLEY > 0 else 0.0, cap=DARK_CAP)
             mC = M(job.masks["dark"], (hC, wC))
             Cb = _fold_fill(Cb, mC, exC, 0.8 * k, max(0.8, 0.008 * wf * cs), max(2.0, 0.07 * wf * cs), False)
             Cr = _fold_fill(Cr, mC, exC, 0.8 * k, max(0.8, 0.008 * wf * cs), max(2.0, 0.07 * wf * cs), False)

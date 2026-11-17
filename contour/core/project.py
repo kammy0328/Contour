@@ -426,6 +426,7 @@ class Cut:
     in_frame: int = 0
     out_frame: int = -1              # exclusive; -1 = end
     input_cs: str = ""               # empty = project default
+    cs_auto: str = ""                # how the app chose input_cs by itself ('' = chosen by hand / not looked at)
     lut_path: str = ""
     mode: str = "warp"               # warp | separate
     persons: List[Person] = field(default_factory=list)
@@ -480,7 +481,7 @@ class Cut:
     def to_dict(self) -> dict:
         return {
             "id": self.id, "name": self.name, "source": self.source, "info": self.info.to_dict(),
-            "in_frame": self.in_frame, "out_frame": self.out_frame, "input_cs": self.input_cs, "lut_path": self.lut_path,
+            "in_frame": self.in_frame, "out_frame": self.out_frame, "input_cs": self.input_cs, "cs_auto": self.cs_auto, "lut_path": self.lut_path,
             "mode": self.mode, "persons": [p.to_dict() for p in self.persons],
             "params": {str(k): v.to_dict() for k, v in self.params.items()},
             "joint_keys": {str(pid): {str(j): {str(f): xy for f, xy in fr.items()} for j, fr in jd.items()}
@@ -503,6 +504,7 @@ class Cut:
         c.in_frame = int(d.get("in_frame", 0))
         c.out_frame = int(d.get("out_frame", -1))
         c.input_cs = d.get("input_cs", "")
+        c.cs_auto = d.get("cs_auto", "")
         c.lut_path = d.get("lut_path", "")
         c.mode = d.get("mode", "warp")
         c.persons = [Person.from_dict(p) for p in d.get("persons", [])]

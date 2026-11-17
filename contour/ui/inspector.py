@@ -889,7 +889,11 @@ class OutputTab(_Tab):
         self.add(self.src)
         self.cs = QComboBox()
         self.cs.currentIndexChanged.connect(self._cs)
-        self.add(Wd.FieldRow("입력 색공간", self.cs, "뷰어와 분석에 쓰는 표시 변환입니다. 렌더 결과의 픽셀 값은 바꾸지 않습니다."))
+        self.add(Wd.FieldRow("입력 색공간", self.cs, "이 컷 원본의 색공간입니다. 화면 표시와 분석에만 쓰고, 렌더 결과의 픽셀 값은 "
+                             "바꾸지 않습니다. 컷 리스트에서 여러 컷을 선택한 채 바꾸면 모두에 적용됩니다."))
+        self.cs_note = Wd.label("", "Faint", 11)
+        self.cs_note.setWordWrap(True)
+        self.add(self.cs_note)
         self.lut = Wd.button("뷰 LUT 없음", "", "file-video")
         self.lut.clicked.connect(self.ctl.choose_lut)
         self.add(Wd.FieldRow("뷰 LUT", self.lut))
@@ -968,7 +972,7 @@ class OutputTab(_Tab):
                          f"{info.color_primaries or '?'} / {info.color_trc or '?'} / {info.color_matrix or '?'} · {info.color_range}")
         cm = manager()
         if self.cs.count() == 0:
-            self.cs.addItem("변환 없음 (코드값 그대로)", "")
+            self.cs.addItem("Rec.709 (변환 없음)", "")
             for name, fam in cm.colorspaces():
                 if fam.startswith("Display"):
                     continue
@@ -978,6 +982,13 @@ class OutputTab(_Tab):
                 self.ocs.addItem(name, name)
         idx = max(0, self.cs.findData(cut.input_cs or ""))
         self.cs.setCurrentIndex(idx)
+        n_sel = len(self.ctl.cutlist.selected_ids()) if hasattr(self.ctl, "cutlist") else 0
+        note = (f"자동 판정: {cut.cs_auto}" if cut.cs_auto and cut.cs_auto != "판정 중" else
+                ("자동 판정 중…" if cut.cs_auto == "판정 중" else ""))
+        if n_sel > 1:
+            note = (note + " · " if note else "") + f"바꾸면 선택한 {n_sel}컷 모두에 적용"
+        self.cs_note.setText(note)
+        self.cs_note.setVisible(bool(note))
         self.lut.setText(cut.lut_path.split("/")[-1].split("\\")[-1] if cut.lut_path else "뷰 LUT 없음")
         a, b = cut.work_range
         self.range_lbl.setText(f"{a} ~ {b - 1}  ({b - a}f)")
