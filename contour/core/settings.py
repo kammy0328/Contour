@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 APP_NAME = "DIAP"
-APP_VERSION = "1.10.0"
+APP_VERSION = "1.11.0"
 
 
 def default_data_dir() -> Path:
@@ -52,6 +52,7 @@ class AppSettings:
     autosave_keep: int = 10
     skip_version: str = ""                # an update the user chose to skip
     auto_update_check: bool = True
+    analysis_spf: float = 0.0             # seconds per frame of a whole-cut analysis on this PC (learned; 0 = unknown)
 
     # ------------------------------------------------------------------ paths
     @property

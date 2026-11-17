@@ -55,6 +55,7 @@ class Viewer(QWidget):
     shapeEdited = Signal(str, list)
     interacted = Signal()
     contextAction = Signal(str, int, int)                # action, pid, joint
+    personAction = Signal(str, int)                      # rename | role | delete, pid (right click on a person)
     editStarted = Signal()                               # a drag that changes the project begins (undo point)
     sculptEdited = Signal(int, object, bool)             # dense face point, offset (face units) or None, committed
     bodyEdited = Signal(object, bool)                    # {body point key: edge change or None}, committed
@@ -83,6 +84,7 @@ class Viewer(QWidget):
         self.fit = True
         self.pan = QPointF(0, 0)
         self._hover: Optional[Tuple[int, int]] = None
+        self._hover_pid: Optional[int] = None         # the tracked person under the mouse (edit tool)
         self._drag = None
         self._panning = None
         self._draw = None
@@ -243,6 +245,81 @@ class Viewer(QWidget):
         self._img_cache[key] = img
         return img
 
+    def _hover_img(self, pid: int):
+        """The hovered person's area (tinted) and its box in matte pixels."""
+        key = ("hover", self.t, pid, self.s.vers["trk"], self.s.cut.id if self.s.cut else "")
+        if key in self._img_cache:
+            return self._img_cache[key]
+        tr = self.s.tracker
+        if tr is None or tr.store is None or not tr.store.has(pid):
+            return None
+        lab = tr.labels(self.t)
+        if lab is None:
+            return None
+        m = lab == tr.store.index(pid)
+        if not m.any():
+            return None
+        import cv2
+        h, w = lab.shape
+        p_ = self.s.cut.person(pid)
+        col = QColor(p_.color if p_ is not None else "#FFFFFF")
+        rgba = np.zeros((h, w, 4), np.uint8)
+        rgba[m] = (col.red(), col.green(), col.blue(), 70)
+        edge = cv2.morphologyEx(m.astype(np.uint8), cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8)) > 0
+        rgba[edge] = (col.red(), col.green(), col.blue(), 235)
+        ys, xs = np.nonzero(m)
+        out = (np_to_qimage(rgba), (float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max()), w, h))
+        if len(self._img_cache) > 64:
+            self._img_cache.clear()
+        self._img_cache[key] = out
+        return out
+
+    def _paint_hover(self, p: QPainter, r: QRectF, pid: int):
+        hi = self._hover_img(pid)
+        if hi is None:
+            return
+        img, (x0, y0, x1, y1, w, h) = hi
+        p.drawImage(r, img)
+        q = self.s.cut.person(pid)
+        if q is None:
+            return
+        sx, sy = r.width() / w, r.height() / h
+        name = q.name + ("  ·  보호" if q.role != "target" else "")
+        p.setFont(font(11, 600))
+        fm = p.fontMetrics()
+        tw = fm.horizontalAdvance(name) + 16
+        cx = r.left() + (x0 + x1) / 2 * sx
+        ty = max(r.top() + 4, r.top() + y0 * sy - 26)
+        box = QRectF(cx - tw / 2, ty, tw, 21)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(0, 0, 0, 185))
+        p.drawRoundedRect(box, 6, 6)
+        p.setPen(QColor(q.color))
+        p.drawText(box, Qt.AlignCenter, name)
+
+    def _person_menu(self, pid: int, gpos):
+        q = self.s.cut.person(pid) if self.s.cut else None
+        if q is None:
+            return
+        m = QMenu(self)
+        head = m.addAction(q.name)
+        head.setEnabled(False)
+        m.addSeparator()
+        a_sel = m.addAction("이 인물 선택")
+        a_ren = m.addAction("이름 변경…")
+        a_role = m.addAction("보호로 바꾸기" if q.role == "target" else "보정 대상으로 바꾸기")
+        m.addSeparator()
+        a_del = m.addAction("이 인물 삭제…")
+        act = m.exec(gpos)
+        if act is None:
+            return
+        if act == a_sel:
+            self.sel_pid = pid
+            self.personClicked.emit(pid)
+            self.update()
+            return
+        self.personAction.emit({a_ren: "rename", a_role: "role", a_del: "delete"}.get(act, ""), pid)
+
     def _matte_img(self) -> Optional[QImage]:
         key = ("matte", self.t, self.s.vers["trk"], self.s.vers["geo"], self.s.cut.id if self.s.cut else "",
                self.sel_pid)
@@ -382,6 +459,8 @@ class Viewer(QWidget):
                 p.drawImage(r, si)
         if mode == "wipe":
             p.restore()
+        if self._hover_pid is not None and self.tool == "edit" and self._drag is None:
+            self._paint_hover(p, r, self._hover_pid)
         if self.show_protect:
             self._paint_protect(p, r)
         if self.show_skel and self.tool not in ("sculpt", "bodypts"):
@@ -905,6 +984,11 @@ class Viewer(QWidget):
             gh = self._hit_ghost(pos)
             if gh:
                 self._ghost_menu(gh, e.globalPosition().toPoint())
+                return
+            if self.tool == "edit":
+                pid = self.s.person_at(self.t, *self.w_to_src(pos))
+                if pid is not None:
+                    self._person_menu(pid, e.globalPosition().toPoint())
             return
         if e.button() != Qt.LeftButton:
             return
@@ -1001,7 +1085,13 @@ class Viewer(QWidget):
                 self._hover = hv
                 self._hover_ghost = gh
                 self.update()
-            if hv is not None or ph is not None or gh is not None:
+            hp = None
+            if hv is None and gh is None and ph is None and self.s.cut is not None:
+                hp = self.s.person_at(self.t, *self.w_to_src(pos))
+            if hp != self._hover_pid:
+                self._hover_pid = hp
+                self.update()
+            if hv is not None or ph is not None or gh is not None or hp is not None:
                 self.setCursor(Qt.PointingHandCursor)
             elif self.mode == "wipe" and abs(pos.x() - (self._panes()[0].left() + self._panes()[0].width() * self.wipe)) < 10:
                 self.setCursor(Qt.SplitHCursor)
@@ -1009,6 +1099,12 @@ class Viewer(QWidget):
                 self.setCursor(Qt.ArrowCursor)
         else:
             self.setCursor(Qt.CrossCursor)
+
+    def leaveEvent(self, e):
+        if self._hover_pid is not None:
+            self._hover_pid = None
+            self.update()
+        super().leaveEvent(e)
 
     def _drag_sculpt(self, pos, committed: bool):
         sp = self._sculpt_points()

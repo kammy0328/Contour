@@ -106,6 +106,8 @@ class _Delegate(QStyledItemDelegate):
             from PySide6.QtGui import QPolygonF
             q = tr.topRight()
             p.drawPolygon(QPolygonF([QPointF(q.x() - 14, q.y()), q, QPointF(q.x(), q.y() + 14)]))
+        from .cutlist import draw_analysed
+        draw_analysed(p, tr, cut, left=True)
         # running / queued
         run = self.strip.running.get(cut.id)
         if run is not None:

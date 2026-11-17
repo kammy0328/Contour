@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Dict, Optional
 
 import numpy as np
-from PySide6.QtCore import QPoint, QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFontMetrics, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMenu,
                                QStyle, QStyledItemDelegate, QVBoxLayout, QWidget)
@@ -71,6 +71,7 @@ class _Delegate(QStyledItemDelegate):
             dw, dh = iw * s, ih * s
             p.drawImage(QRectF(tr.center().x() - dw / 2, tr.center().y() - dh / 2, dw, dh), th)
             p.restore()
+        draw_analysed(p, tr, cut)
         x = tr.right() + 10
         p.setFont(font(12, 600))
         p.setPen(qc("text"))
@@ -110,13 +111,47 @@ class _Delegate(QStyledItemDelegate):
         # tracking needs a look (automatic check): a small amber note after the pill
         from ..core import workstate as WS
         from ..track import status as ST
-        if (ST.effective(cut) == "bad" and not (cut.status or {}).get("reviewed")
+        if (cut.status or {}).get("failed") and not cut.analyzed:
+            p.setPen(qc("error"))
+            p.setFont(font(10, 600))
+            p.drawText(QRectF(pr.right() + 6, pr.top(), r.right() - pr.right() - 6, 18), Qt.AlignLeft | Qt.AlignVCenter,
+                       "분석 실패")
+        elif (ST.effective(cut) == "bad" and not (cut.status or {}).get("reviewed")
                 and WS.state(cut) not in ("skip", "done")):
             p.setPen(qc("warn"))
             p.setFont(font(10, 500))
             p.drawText(QRectF(pr.right() + 6, pr.top(), r.right() - pr.right() - 6, 18), Qt.AlignLeft | Qt.AlignVCenter,
                        "추적 확인")
         p.restore()
+
+
+def draw_analysed(p: QPainter, tr: QRectF, cut, left: bool = False) -> None:
+    """On a cut's thumbnail: a green check once analysed, a red ! when the last analysis failed."""
+    st = cut.status or {}
+    if cut.analyzed:
+        col, mark = QColor("#30A46C"), "check"
+    elif st.get("failed"):
+        col, mark = QColor("#E5484D"), "fail"
+    else:
+        return
+    p.save()
+    p.setRenderHint(QPainter.Antialiasing)
+    d = 15.0
+    c = QRectF(tr.left() + 3, tr.bottom() - d - 6, d, d) if left else QRectF(tr.right() - d - 3, tr.top() + 3, d, d)
+    p.setPen(QPen(QColor(0, 0, 0, 120), 1))
+    p.setBrush(col)
+    p.drawEllipse(c)
+    pen = QPen(QColor("white"), 1.8)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(pen)
+    cx, cy = c.center().x(), c.center().y()
+    if mark == "check":
+        p.drawPolyline([QPointF(cx - 3.6, cy + 0.2), QPointF(cx - 1.0, cy + 2.8), QPointF(cx + 3.8, cy - 2.6)])
+    else:
+        p.drawLine(QPointF(cx, cy - 3.6), QPointF(cx, cy + 0.8))
+        p.drawPoint(QPointF(cx, cy + 3.4))
+    p.restore()
 
 
 class CutList(QWidget):
@@ -146,11 +181,25 @@ class CutList(QWidget):
         head.addStretch(1)
         head.addWidget(add)
         lay.addLayout(head)
+        # whole project: analyse every cut not analysed yet / skin basic adjustment on every analysed cut
+        allb = QHBoxLayout()
+        allb.setSpacing(6)
+        self.all_analyze = Wd.button("전체 분석", "", "scan",
+                                     "분석 전인 컷을 모두 차례로 분석 (컷을 여러 개 선택하면 그 컷만)")
+        self.all_analyze.clicked.connect(lambda: self.action.emit("analyze_all", ""))
+        self.all_skin = Wd.button("전체 피부 보정", "", "wand-sparkles",
+                                  "분석된 모든 컷의 보정 대상 인물에 피부 기본 조정을 적용")
+        self.all_skin.clicked.connect(lambda: self.action.emit("skin_all", ""))
+        allb.addWidget(self.all_analyze, 1)
+        allb.addWidget(self.all_skin, 1)
+        lay.addLayout(allb)
         from ..core.workstate import STATES
         self.filter = QComboBox()
         self.filter.addItem("전체", "")
         for k, lab in STATES:
             self.filter.addItem(lab, k)
+        self.filter.addItem("분석 완료", "analyzed")
+        self.filter.addItem("분석 실패", "failed")
         self.filter.currentIndexChanged.connect(lambda _: self.refresh(self._current_id()))
         lay.addWidget(self.filter)
         self.list = QListWidget()
@@ -195,7 +244,11 @@ class CutList(QWidget):
         cuts = listed(prj)
         allc = len(cuts)
         f = self.filter.currentData() if hasattr(self, "filter") else ""
-        if f:
+        if f == "analyzed":
+            cuts = [c for c in cuts if c.analyzed]
+        elif f == "failed":
+            cuts = [c for c in cuts if (c.status or {}).get("failed")]
+        elif f:
             from ..core import workstate as WS
             cuts = [c for c in cuts if WS.state(c) == f]
         for c in cuts:
