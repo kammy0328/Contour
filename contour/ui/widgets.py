@@ -802,6 +802,7 @@ class BusyOverlay(QWidget):
         self.bar.setFixedHeight(6)
         self.cancel = button("취소", "")
         self.cancel.setMinimumWidth(64)
+        self.cancel.setMinimumHeight(30)
         self.cancel.clicked.connect(self.cancelRequested.emit)
         self.eta = QLabel("")
         self.eta.setFont(font(12, 400, tabular=True))
@@ -833,9 +834,11 @@ class BusyOverlay(QWidget):
         self.cancel.setVisible(cancellable)
         self.cancel.setEnabled(True)
         self.setGeometry(self.parentWidget().rect())
+        self._fit()
         self.raise_()
         was = self.isVisible()
         self.show()
+        self._fit()
         if not was:
             fade_in(self, 180)
 
@@ -853,9 +856,11 @@ class BusyOverlay(QWidget):
             left = self._est * (1 - f)
         if left is None or f >= 0.995:
             self.eta.setText("")
+            self._fit()
             return
         self.eta.setText(f"남은 시간 약 {fmt_dur(left)} · {fmt_end(left)} 완료 예상"
                          + (" (처음엔 예상치)" if f < 0.05 else ""))
+        self._fit()
 
     def progress(self, f: float, msg: str = ""):
         self.bar.setValue(int(max(0, min(1, f)) * 1000))
@@ -863,9 +868,19 @@ class BusyOverlay(QWidget):
             self.msg.setText(msg)
         self._eta_text(f)
 
-    def resizeEvent(self, e):
-        self.box.adjustSize()
+    def _fit(self):
+        """The box has no layout of its own in the overlay: size it to its content again whenever the content changes
+        (the time-left line appears later; with a stale height the button and texts got squeezed and cut off)."""
+        lay = self.box.layout()
+        if lay is not None:
+            lay.activate()
+            h = lay.totalHeightForWidth(self.box.width()) if lay.hasHeightForWidth() else lay.sizeHint().height()
+            h = max(h, lay.sizeHint().height())
+            self.box.setFixedHeight(h)
         self.box.move((self.width() - self.box.width()) // 2, (self.height() - self.box.height()) // 2)
+
+    def resizeEvent(self, e):
+        self._fit()
 
 
 class Toast(QLabel):
