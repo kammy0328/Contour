@@ -79,6 +79,26 @@ def _load_project(path: str, long_side: int, progress) -> tuple:
     return prj, thumbs
 
 
+class _CenterFilter(QObject):
+    """Keeps a child widget in the middle of its parent (horizontally and vertically)."""
+    def __init__(self, parent, child):
+        super().__init__(parent)
+        self.child = child
+        self.place()
+
+    def place(self):
+        bar = self.parent()
+        c = self.child
+        w, h = c.width(), c.height()
+        c.setGeometry((bar.width() - w) // 2, (bar.height() - h) // 2, w, h)
+        c.raise_()
+
+    def eventFilter(self, obj, ev):
+        if ev.type() in (QEvent.Resize, QEvent.Show):
+            self.place()
+        return False
+
+
 class _ProjectOpen(QThread):
     progressed = Signal(float, str)
     loaded = Signal(object, object)
@@ -272,9 +292,13 @@ class MainWindow(QMainWindow):
         # statistics and cumulative learning run on their own in the background; no tabs for them
         self.page_tabs = Wd.Segmented([("edit", "편집"), ("queue", "렌더")])
         self.page_tabs.setFixedWidth(200)
+        self.page_tabs.setFixedHeight(30)
         self.page_tabs.changed.connect(self._page)
-        h.addWidget(self.page_tabs)
-        h.addStretch(1)
+        # the tabs sit in the exact middle of the bar, whatever the widths on either side do (project name, save
+        # state, device): not in the layout, placed on every resize
+        self.page_tabs.setParent(bar)
+        self._bar_center = _CenterFilter(bar, self.page_tabs)
+        bar.installEventFilter(self._bar_center)
         self.saved_lbl = Wd.SaveIndicator()
         h.addWidget(self.saved_lbl)
         self.dev_lbl = QLabel("")
