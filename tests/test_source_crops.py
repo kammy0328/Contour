@@ -46,7 +46,7 @@ def test_piece_equals_cut_of_full_frame(vids, kind, tmp_path):
     assert sc.seeks - s0 == 1
     half = sc.piece(3, box, 0.5)
     assert abs(half.shape[0] - 66) <= 1 and abs(half.shape[1] - 70) <= 1
-    proc = sc._reader._proc
+    proc = next(iter(sc._readers.values()))[0]._proc
     sc.close()
     assert proc.poll() is not None
 

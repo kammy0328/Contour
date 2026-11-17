@@ -230,7 +230,9 @@ class NextCutPrep:
         self._stop.set()                 # the thread ends after the frame it is on and closes its session
         own = getattr(self, "_own", None)
         if own is not None:
-            _release(own)                # a run that already finished closes nothing itself
+            # a run that already finished closes nothing itself, so it is closed here; but not on the caller's thread:
+            # closing waits for a decode in progress, and the caller is the UI (stop, cut change; review c84dc81)
+            threading.Thread(target=_release, args=(own,), name="diap-nextcut-close", daemon=True).start()
         self.cut_id, self.session, self.ready, self.failed = None, None, False, False
 
 

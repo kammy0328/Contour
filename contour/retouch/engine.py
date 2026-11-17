@@ -1719,10 +1719,10 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             km = get("knee", mk_knee)
             if km.max() > 0.01:
                 job.masks["knee"] = km
-        if DET_ON and job.masks and lm is not None and (v.get("blemish", 0) > 1e-4 or v.get("neck_lines", 0) > 1e-4):
+        if DET_ON and job.masks and lm is not None and _det_wanted(v):
             try:
                 job.det = get("det", lambda: _det_raw(cut, px, t, job, lm, base()["rgb"]),
-                              f"{job.blemish_size:.3f}:{int(v.get('blemish', 0) > 1e-4)}{int(v.get('neck_lines', 0) > 1e-4)}:{fth:.2f}")
+                              f"{job.blemish_size:.3f}:{int(v.get('blemish', 0) > 1e-4)}{int(v.get('neck_lines', 0) > 1e-4)}{int(v.get('neck_bumps', 0) > 1e-4)}:{fth:.2f}")
             except Exception:
                 import traceback
                 traceback.print_exc()
@@ -2075,6 +2075,11 @@ DET_SRC = True             # read the piece from the original where it has clear
 DET_SRC_GAIN = 1.25        # "clearly more": this many times the analysis picture's
 
 
+def _det_wanted(v) -> bool:
+    """A correction that works from the detection maps is on (잡티 제거, 목주름, 목 오돌토돌)."""
+    return any(v.get(k, 0) > 1e-4 for k in ("blemish", "neck_lines", "neck_bumps"))
+
+
 def _det_raw(cut, px, t: int, job, lm: np.ndarray, rgb_u8: np.ndarray) -> Optional[dict]:
     """One frame's score maps for a job, on the best picture there is of its face and neck: a piece of the original
     at (up to) its own resolution where the analysis picture is a reduced copy (a 4K original seen at 1920: fine
@@ -2083,7 +2088,7 @@ def _det_raw(cut, px, t: int, job, lm: np.ndarray, rgb_u8: np.ndarray) -> Option
     display view."""
     v = job.v
     sk = job.masks.get("skinx") if v.get("blemish", 0) > 1e-4 else None
-    nk = job.masks.get("neck") if (v.get("neck_lines", 0) > 1e-4 or v.get("blemish", 0) > 1e-4) else None
+    nk = job.masks.get("neck") if _det_wanted(v) else None
     if sk is None and nk is None:
         return None
     reg = sk if nk is None else (nk if sk is None else np.maximum(sk, nk))
@@ -2218,7 +2223,7 @@ def _det_now(job, Y, Cb, Cr, wf: float, y_per_src: float, M) -> dict:
     v = job.v
     skin = M(job.masks["skinx"], (hY, wY)) if ("skinx" in job.masks and v.get("blemish", 0) > 1e-4) else None
     neck = None
-    if "neck" in job.masks and (v.get("neck_lines", 0) > 1e-4 or v.get("blemish", 0) > 1e-4):
+    if "neck" in job.masks and _det_wanted(v):
         neck = M(job.masks["neck"], (hY, wY))
     if skin is None and neck is None:
         return {}
@@ -2254,6 +2259,11 @@ def _det_place(job, rf, shape) -> dict:
             a = cv2.warpAffine(m, A, (wY, hY), flags=cv2.INTER_LINEAR, borderValue=0).astype(np.float32) / 255.0
         out[k] = a
     return out
+
+
+# the most a found spot's colour is moved. 0.06 left a strong pimple (Cr +0.1) 40 % red (review 6c3dcb3); what is far
+# redder than any pimple is protected (detect.RED_THING) and never reaches this
+SPOT_CHROMA_CAP = 0.12
 
 
 def _spot_fill(Y, Cb, Cr, mY, S, Sred, k: float, size: float, cs: float):
@@ -2317,7 +2327,7 @@ def _spot_fill(Y, Cb, Cr, mY, S, Sred, k: float, size: float, cs: float):
         pr = P[c0:c1, d0:d1].astype(np.float32)
         ps = cv2.GaussianBlur(pr, (0, 0), max(0.5, sig_f * cs))
         pb, okc = around(ps, wc, csz)
-        O[c0:c1, d0:d1] = pr + k * spc * okc * np.clip(pb - ps, -0.06, 0.06)
+        O[c0:c1, d0:d1] = pr + k * spc * okc * np.clip(pb - ps, -SPOT_CHROMA_CAP, SPOT_CHROMA_CAP)
     return Yo, Cbo, Cro
 
 
@@ -3150,7 +3160,7 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
         wf = job.wf_src * y_per_src if job.wf_src > 0 else 0.11 * max(job.scale, 200.0) * y_per_src
         hd_ = he_ = None
         det = {}
-        if DET_ON and (v.get("blemish", 0) > 1e-4 or v.get("neck_lines", 0) > 1e-4):
+        if DET_ON and _det_wanted(v):
             # where the flaws are: found before anything is changed. With the job when it was prepared with its
             # neighbours (held steady through time), else found here on this picture
             try:
@@ -3414,6 +3424,14 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
         # 3b'. goose bumps on the neck: softened, never wiped
         if "neck" in job.masks and v.get("neck_bumps", 0) > 1e-4:
             k = float(np.clip(v["neck_bumps"], 0, 1))
+            if det and "bump" in det:
+                # the raised bumps the detector is sure of go (as with 잡티 제거, but on the neck and at this
+                # slider's strength); the softening below then evens the rest of the texture (review 6c3dcb3: the
+                # slider alone never used the detection)
+                mN_ = M(job.masks["neck"], (hY, wY))
+                Sb_ = det["bump"] * mN_ * ((1.0 - prot_) if prot_ is not None else 1.0)
+                if float(Sb_.max()) > 0.05:
+                    Y, Cb, Cr = _spot_fill(Y, Cb, Cr, mN_, Sb_, None, k, spot_size(job, wf), cs)
             Y, Cb, Cr = _bump_soften(Y, Cb, Cr, M(job.masks["neck"], (hY, wY)), M(job.masks["neck"], (hC, wC)),
                                      k, wf, cs)
         # 3c. redness

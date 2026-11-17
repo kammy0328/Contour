@@ -43,6 +43,8 @@ WORK_LINE = 2.5             # the same for a line's Gaussian width
 GLOBAL_TEX_Q = 30.0         # percentile of the local texture over the skin taken as "calm skin"
 GLOBAL_TEX_MAX = 1.6        # the local texture counts at most this many times the calm skin's
 SMALL_GAIN = 1.35           # how many times further above the texture a 3 px spot must stand than a large one
+RED_SPOT_MAX = 0.07          # of the face width: a red blot up to this across is looked at as a possible pimple
+RED_THING = (0.12, 0.18)     # hue off the skin's toward red: a small blot this far off is a thing (paint, a gem), not skin
 SHADE_FROM = 0.45           # share of the largest spot size from which the face's own round shade is not a dark spot
 BUMP_SIZE_MAX = 1.0         # share of the largest spot size up to which bumps are looked for
 LINE_LEN = 0.05             # of the face width: a neck line is at least this long (shorter marks are texture)
@@ -457,7 +459,25 @@ def protect(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, region: np.ndarray, w
     thing = np.maximum(thing, _ss(0.5, 0.75, grey) * _ss(0.015, 0.03, cref))
     rb, rr = _gm(cbs, wsk, max(3.0, 2.4 * w)), _gm(crs, wsk, max(3.0, 2.4 * w))
     dc = np.hypot(cbs - rb, crs - rr)
-    thing = np.maximum(thing, cv2.dilate(_ss(0.03, 0.06, dc), sed))
+    # the skin's colour without the off-colour things themselves: a strong red spot raised the colour around it, and
+    # the skin beside it then read as off-hue (less red) and was protected, the spot with it
+    wc_ = wsk * np.exp(-(dc / 0.03) ** 2)
+    rb, rr = _gm(cbs, wc_, max(3.0, 2.4 * w)), _gm(crs, wc_, max(3.0, 2.4 * w))
+    dc = np.hypot(cbs - rb, crs - rr)
+    off = _ss(0.03, 0.06, dc)
+    # a red spot is skin turned redder: its hue is off the skin's toward red. Small and red that way, it is a pimple
+    # unless far redder than any (a painted dot, a gem): the general hue test took every strong pimple (review
+    # 6c3dcb3: from Cr +0.06 up the red spot was found and then fully protected). Another hue (blue, green, grey
+    # threads, glitter) and red that is wide (paint, a tattoo, a bruise of colour) keep the general test
+    red_way = (crs - rr) > 0.75 * dc
+    cand = (off > 0.02).astype(np.uint8)                 # the whole blot, its soft edge with it
+    if cand.any() and red_way.any():
+        n_, lab_, st_, _c = cv2.connectedComponentsWithStats(cand, connectivity=8)
+        small_ = np.hypot(st_[:, 2], st_[:, 3]) <= RED_SPOT_MAX * wf
+        small_[0] = False
+        spot_ = small_[lab_] & red_way
+        off = np.where(spot_, _ss(RED_THING[0], RED_THING[1], dc), off)
+    thing = np.maximum(thing, cv2.dilate(off, sed))
     # strong edges: a step of a quarter of the skin's level within a line width
     gx = cv2.Sobel(rq, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(rq, cv2.CV_32F, 0, 1, ksize=3)
