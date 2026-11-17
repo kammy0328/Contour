@@ -34,4 +34,5 @@ def test_plain_render_keeps_picture(tmp_path, rng, matrix, pix):
     a = M.read_frame_rgb(info, 1).astype(float) * 255
     b = M.read_frame_rgb(out, 1).astype(float) * 255
     d = np.abs(a - b)
-    assert np.percentile(d, 99) <= 2.5, f"{rng} {matrix} {pix}: p99 diff {np.percentile(d, 99):.2f}, max {d.max():.2f}"
+    tags = (info.color_matrix, info.color_range, out.color_matrix, out.color_range, out.color_primaries, out.color_trc)
+    assert np.percentile(d, 99) <= 2.5, f"{rng} {matrix} {pix}: p99 diff {np.percentile(d, 99):.2f}, max {d.max():.2f}, tags {tags}"

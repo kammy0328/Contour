@@ -23,4 +23,6 @@ jobs:
       - name: Tests
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python -m pytest -q tests
+        run: |
+          ffmpeg -version | head -1
+          python -m pytest -q tests
