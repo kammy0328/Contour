@@ -72,7 +72,7 @@ def analyze(project_path: str, cut_id: str, accuracy: str = "high", all_targets:
     from .core import media as M
 
     s = settings()
-    M.configure_ffmpeg(s.ffmpeg_dir or None)
+    M.configure_ffmpeg()
     prj = Project.load(project_path)
     cut = prj.cut(cut_id)
     if cut is None:

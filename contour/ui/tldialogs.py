@@ -223,7 +223,7 @@ class BatchApplyDialog(QDialog):
             self.preset.addItem(f"{d['name']}  ({P.summary(d)})", d["name"])
         i = next((k for k, d in enumerate(self.presets) if d["name"] == "학습된_스타일"), None)
         if i is None:
-            i = next((k for k, d in enumerate(self.presets) if d["name"] == "수작업_기준"), 0)
+            i = 0
         self.preset.setCurrentIndex(i)
         v.addWidget(self.preset)
         self.all_faces = QCheckBox("얼굴이 잘 보이는 인물은 모두 보정 (군무)")

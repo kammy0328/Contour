@@ -350,6 +350,11 @@ class TrackingSettings:
         t = cls(**{k: d[k] for k in cls.__dataclass_fields__ if k in d})
         t.adapt = True          # learning is always on (no switch in the app any more)
         t.refiner = True
+        # accuracy is always decided by the app (1.14: no switches): every cut gets the automatic settings
+        auto = cls()
+        for k in ("models", "face", "point_tracker", "second_pass", "smoothing", "flip_tta", "detail", "reid",
+                  "video_track", "seg"):
+            setattr(t, k, getattr(auto, k))
         return t
 
 

@@ -137,14 +137,11 @@ def main():
             g = gpu()
         say(f"[3/5] 추론 장치: {g}")
 
-    # 4. ffmpeg
+    # 4. ffmpeg: packed into the installer ({app}\ffmpeg\bin); only checked here
     try:
-        if ffmpeg_found():
-            say("[4/5] ffmpeg 확인됨")
-        elif not ci:
-            get_ffmpeg()
+        say("[4/5] ffmpeg 확인됨" if ffmpeg_found() else "[4/5] ffmpeg가 없습니다 (설치 파일 문제: 다시 설치하세요)")
     except Exception as e:
-        say(f"[4/5] ffmpeg를 받지 못했습니다 ({e}). 앱 설정에서 ffmpeg 폴더를 지정하세요.")
+        say(f"[4/5] ffmpeg 확인 실패 ({e})")
 
     # 5. models (once; they live in the data folder and survive updates)
     if not (a.no_models or ci):

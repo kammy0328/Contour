@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 APP_NAME = "DIAP"
-APP_VERSION = "1.13.9"
+APP_VERSION = "1.14.0"
 
 
 def default_data_dir() -> Path:
@@ -32,8 +32,8 @@ def default_data_dir() -> Path:
 @dataclass
 class AppSettings:
     data_dir: str = ""
-    ffmpeg_dir: str = ""
-    ocio_config: str = ""                 # empty = built-in ACES studio config
+    ffmpeg_dir: str = ""                  # (unused since 1.14: ffmpeg ships with DIAP) kept so old files load
+    ocio_config: str = ""                 # (unused since 1.14: always the built-in ACES Studio config)
     display: str = ""
     view: str = ""
     proxy_long_side: int = 1920

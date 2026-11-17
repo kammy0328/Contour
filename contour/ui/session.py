@@ -39,6 +39,8 @@ class EditSession:
         self._play_bytes = 0
         self.play_limit = 1200 * 1024 * 1024
         self.last_touch = 0.0
+        self.last_seek = 0.0          # the user moved to another frame (the playback cache waits a moment)
+        self.preview_wait = 0         # preview frames waiting: the playback cache gives way to them
         self.dirty = False
 
     # ------------------------------------------------------------------ project / cut

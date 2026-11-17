@@ -16,6 +16,7 @@ permissions:
 
 env:
   PY_VER: "3.12.10"
+  FFMPEG_VER: "7.1"
   PUBLIC_REPO: kammy0328/Contour-Releases
   PIP_CACHE_DIR: C:\pipcache
   GITHUB_TOKEN: ${{ github.token }}
@@ -65,6 +66,20 @@ jobs:
           & build\rcedit.exe build\python\DIAP.exe --set-icon assets\icon.ico --set-version-string FileDescription DIAP --set-version-string ProductName DIAP --set-version-string CompanyName SEWOO --set-version-string OriginalFilename DIAP.exe --set-version-string InternalName DIAP
           if ($LASTEXITCODE -ne 0) { throw "rcedit failed" }
 
+      - name: ffmpeg (packed into the installer)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force ci | Out-Null; Start-Transcript -Append -Path ci\log.txt | Out-Null
+          # pinned build (gyan.dev essentials: ProRes, DNx, x264/x265, NVENC, EXR)
+          Invoke-WebRequest "https://github.com/GyanD/codexffmpeg/releases/download/$env:FFMPEG_VER/ffmpeg-$env:FFMPEG_VER-essentials_build.zip" -OutFile build\ffmpeg.zip
+          Expand-Archive build\ffmpeg.zip -DestinationPath build\ffx -Force
+          New-Item -ItemType Directory -Force build\ffmpeg\bin | Out-Null
+          Get-ChildItem build\ffx -Recurse -Include ffmpeg.exe, ffprobe.exe | Copy-Item -Destination build\ffmpeg\bin
+          & build\ffmpeg\bin\ffmpeg.exe -hide_banner -version | Select-Object -First 1
+          $enc = & build\ffmpeg\bin\ffmpeg.exe -hide_banner -encoders
+          foreach ($e in "prores_ks", "libx265", "hevc_nvenc", "aac") { if (-not ($enc -match " $e ")) { throw "ffmpeg lacks $e" } }
+          Get-ChildItem build\ffmpeg\bin | Format-Table Name, Length
+
       - name: Build installer
         shell: pwsh
         run: |
@@ -72,7 +87,7 @@ jobs:
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
           "iscc: $iscc exists=$(Test-Path $iscc)"
-          & $iscc /Qp "/DAppVer=${{ steps.v.outputs.ver }}" "/DSrc=$PWD" "/DPy=$PWD\build\python" installer\contour.iss 2>&1 | Tee-Object -FilePath ci\iscc.txt | Out-Null
+          & $iscc /Qp "/DAppVer=${{ steps.v.outputs.ver }}" "/DSrc=$PWD" "/DPy=$PWD\build\python" "/DFfm=$PWD\build\ffmpeg" installer\contour.iss 2>&1 | Tee-Object -FilePath ci\iscc.txt | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
           $exe = "dist\DIAP_Setup_${{ steps.v.outputs.ver }}.exe"
           $h = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
@@ -92,6 +107,12 @@ jobs:
           Get-Content C:\ct\setup_log.txt
           Get-Process pythonw, DIAP -ErrorAction SilentlyContinue | Stop-Process -Force
           if (-not (Test-Path C:\ct\python\DIAP.exe)) { throw "DIAP.exe missing" }
+          if (-not (Test-Path C:\ct\ffmpeg\bin\ffmpeg.exe)) { throw "bundled ffmpeg missing" }
+          if (-not (Test-Path C:\ct\ffmpeg\bin\ffprobe.exe)) { throw "bundled ffprobe missing" }
+          Push-Location C:\ct\app
+          & C:\ct\python\python.exe -c "from contour.core import media as M; f, p = M.configure_ffmpeg(); print('ffmpeg', f, p); assert f and 'ct' in f.lower() and p" 2>&1 | Tee-Object -FilePath "$env:GITHUB_WORKSPACE\ci\ffmpeg.txt"
+          if ($LASTEXITCODE -ne 0) { throw "bundled ffmpeg not used" }
+          Pop-Location
           & C:\ct\python\python.exe -c "import sys; print(sys.version); import numpy, cv2, PySide6, onnxruntime, scipy, PyOpenColorIO; import contour.batch; from contour.ui import main_window, update, gatedlg, splash; from contour.core import gate, updater; from contour.track import faceparse, facelayer, faceflow; assert gate.check('0328'); print('ok', onnxruntime.get_available_providers())" 2>&1 | Tee-Object -FilePath ci\smoke.txt
           if ($LASTEXITCODE -ne 0) { throw "import failed" }
           Push-Location C:\ct\app

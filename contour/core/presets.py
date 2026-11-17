@@ -20,30 +20,25 @@ GROUP_KEYS: Dict[str, List[str]] = {g: [p.key for p in PARAMS if p.group == g] f
 GROUP_TITLE: Dict[str, str] = {g: t for g, t, _ in GROUPS}
 
 
-# Shipped presets, written once into the presets folder (the user may change or delete them afterwards).
-# "수작업_기준" was matched against hand beauty retouches of two music video plates: the retoucher kept 90-100%
-# of the skin texture, lifted uneven blotches gently, cut skin colour noise a little and left every shading
-# and edge alone. Of the slider settings tried, this one came closest to the hand result.
-BUILTIN = [dict(version=VERSION, name="수작업_기준", created="Contour 1.5.2", groups=["skin"],
-                values={"skin": 30.0}, skin=dict(detail=25.0, scope="face")),
-           # 2026-11 reference stills (five MV frames, retouched by hand): texture kept 96-100 % in every band,
-           # broad frontal hotspots pressed a little, only the main face edited
-           dict(version=VERSION, name="레퍼런스_기준", created="Contour 1.8.0", groups=["skin"],
-                values={"skin": 20.0, "shine": 8.0}, skin=dict(detail=35.0, scope="face"))]
+# 1.14: no shipped presets any more. The two that earlier versions wrote ("수작업_기준", "레퍼런스_기준") are
+# removed once from the presets folder (only when they are still the shipped ones, not a preset the user saved
+# under the same name).
+BUILTIN: List[dict] = []
+_RETIRED = {"수작업_기준": "Contour 1.5.2", "레퍼런스_기준": "Contour 1.8.0"}
 
 
 def folder() -> Path:
     p = settings().data_path / "presets"
     p.mkdir(parents=True, exist_ok=True)
-    mark = p / ".builtin_2"
+    mark = p / ".builtin_retired"
     if not mark.exists():
-        for d in BUILTIN:
-            f = p / f"{d['name']}.json"
-            if not f.exists():
-                try:
-                    f.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
-                except OSError:
-                    pass
+        for name, created in _RETIRED.items():
+            f = p / f"{name}.json"
+            try:
+                if f.exists() and json.loads(f.read_text(encoding="utf-8")).get("created") == created:
+                    f.unlink()
+            except Exception:
+                pass
         try:
             mark.write_text("1", encoding="utf-8")
         except OSError:
