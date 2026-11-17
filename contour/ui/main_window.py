@@ -79,6 +79,47 @@ def _load_project(path: str, long_side: int, progress) -> tuple:
     return prj, thumbs
 
 
+class _JobGuard(QObject):
+    """While a job runs in this window (analysis, proxy, merge...) or a project is being opened, clicks, keys and
+    shortcuts anywhere in the window except the progress panel (its cancel button) are swallowed: the job works on
+    the open cut, and switching tabs or pressing buttons meanwhile changed it under the job's feet."""
+    BLOCK = (QEvent.MouseButtonPress, QEvent.MouseButtonDblClick, QEvent.MouseButtonRelease, QEvent.KeyPress,
+             QEvent.KeyRelease, QEvent.Shortcut, QEvent.Wheel, QEvent.ContextMenu, QEvent.Drop)
+
+    def __init__(self, win):
+        super().__init__(win)
+        self.win = win
+        self._told = 0.0
+
+    def busy(self) -> bool:
+        w = self.win
+        return getattr(w, "job", None) is not None or getattr(w, "_opening", None) is not None
+
+    def eventFilter(self, obj, ev):
+        if ev.type() not in self.BLOCK or not self.busy():
+            return False
+        w = self.win
+        if isinstance(obj, (QShortcut, QAction)):
+            return QApplication.activeModalWidget() is None
+        if not isinstance(obj, QWidget):
+            return False
+        if obj.window() is not w:
+            return False                    # dialogs, message boxes, the batch window: their own business
+        busy = getattr(w, "busy", None)
+        if busy is not None and (obj is busy or busy.isAncestorOf(obj)):
+            return False                    # the progress panel itself (cancel)
+        if ev.type() == QEvent.Wheel and getattr(w, "viewer", None) is not None and \
+                (obj is w.viewer or w.viewer.isAncestorOf(obj)):
+            return False                    # looking around in the picture changes nothing
+        if ev.type() in (QEvent.MouseButtonPress, QEvent.KeyPress) and time.time() - self._told > 3.0:
+            self._told = time.time()
+            try:
+                w.toast("작업이 끝난 뒤 조작할 수 있습니다 (진행 창에서 취소 가능)", kind="warn")
+            except Exception:
+                pass
+        return True
+
+
 class _CenterFilter(QObject):
     """Keeps a child widget in the middle of its parent (horizontally and vertically)."""
     def __init__(self, parent, child):
@@ -277,6 +318,8 @@ class MainWindow(QMainWindow):
         h.addWidget(split)
         self.center = center
         self.busy = Wd.BusyOverlay(center)
+        self._job_guard = _JobGuard(self)
+        QApplication.instance().installEventFilter(self._job_guard)
         self.busy.cancelRequested.connect(self._cancel_job)
         self.pages.addWidget(edit)
         # ---- other pages
