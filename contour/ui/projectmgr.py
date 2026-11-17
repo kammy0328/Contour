@@ -432,7 +432,7 @@ class ProjectsPage(QWidget):
         r = QMessageBox.question(
             self, "프록시 캐시 정리",
             f"'{d.get('name')}'의 프록시 {PJ.human(sz.get('proxy', 0))}를 지울까요?\n\n"
-            "분석 결과, 매트, 보정 값은 그대로 남습니다. 컷을 다시 열면 이 PC의 캐시 폴더에 프록시를 새로 만듭니다"
+            "분석 결과, 매트, 보정 값은 그대로 남습니다. 컷은 원본으로 바로 열리고, 프록시는 설정에 따라 백그라운드에서 다시 만듭니다"
             "(컷마다 시간이 걸립니다).")
         if r != QMessageBox.Yes:
             return

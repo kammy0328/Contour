@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 APP_NAME = "DIAP"
-APP_VERSION = "1.17.0"
+APP_VERSION = "1.18.0"
 
 
 def default_data_dir() -> Path:
@@ -51,6 +51,8 @@ class AppSettings:
     output_dir: str = ""
     qc_thresholds: dict = field(default_factory=dict)
     cloth_model_ok: bool = False          # the user has read the clothing model's licence note
+    proxy_mode: str = "auto"              # auto: a proxy in the background when the original is slow / always / off
+    frame_cache_mb: int = 1536            # memory for frames decoded from originals (all cuts together)
     hover_pick: bool = True               # edit tool: highlight the person under the mouse
     ask_proxy: bool = True                # ask for the proxy resolution when footage comes in
     autosave: bool = True

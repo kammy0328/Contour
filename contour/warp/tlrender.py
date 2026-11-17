@@ -164,14 +164,12 @@ def _clear(out: _Out, cut, cancel, tick) -> int:
 
 
 def _retouch(project: Project, out: _Out, cut, cancel, tick, rep: TimelineReport, progress_msg) -> int:
-    from ..core.proxy import Proxy
-    from ..core.settings import settings
+    from ..core.frames import frames_for, source_present
     from ..track.analyze import CutTracker
     from .render import render_cut
-    px = Proxy(project.proxy_dir(cut), cut.info, settings().proxy_long_side)
-    if not px.has_frames():
-        rep.warnings.append(f"{cut.name}: 프록시가 없어 원본으로 넣었습니다")
-        return _copy(out, cut, cancel, tick)
+    if not source_present(cut.info):
+        raise RuntimeError(f"{cut.name}: 원본 파일을 찾을 수 없습니다 ({cut.source or cut.info.path})")
+    px = frames_for(project, cut)              # the masks' frames: its proxy, else the original (no proxy needed)
     tr = CutTracker(project, cut, px)
     o = OutputSettings.from_dict(cut.output.to_dict())
     o.format = "prores_4444_xq" if _pf(out.fmt) == "yuv444p10le" else "prores_422_hq"

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import threading
 import json
 import os
 import sys
@@ -31,6 +32,7 @@ from ..core import media as M
 from ..core.colour import manager
 from ..core.copyset import CopyOptions, apply_copy, suggest_mapping
 from ..core.project import PART_KEYS, PERSON_COLORS, Project, ProtectLine, ProtectShape, safe_name
+from ..core.frames import SCRUB_SEEKS
 from ..core.settings import APP_NAME, APP_VERSION, settings
 from ..stats.tracker import ActivityClock, log_event
 from ..track import skeleton as S
@@ -175,8 +177,11 @@ def resolve_task(session, pid: int, t: int = 0, frame_end: Optional[int] = None,
 
 
 class MainWindow(QMainWindow):
+    thumbReady = Signal(str, object)          # cut id, thumbnail (made off the UI thread)
+
     def __init__(self):
         super().__init__()
+        self.thumbReady.connect(lambda cid, th: self.cutlist.set_thumb(cid, th))
         self.setWindowTitle(APP_NAME)
         self.session = EditSession()
         self.frame = 0
@@ -202,8 +207,10 @@ class MainWindow(QMainWindow):
         # results computed ahead for smooth playback
         from .workers import CacheWorker
         self.cache_worker = CacheWorker(self.session, self)
-        from .workers import NextCutPrep
+        from .workers import NextCutPrep, ProxyBuilder
         self.next_prep = NextCutPrep()
+        self.proxy_builder = ProxyBuilder(self)
+        self.proxy_builder.finished.connect(self._bg_proxy_done)
         self.cache_worker.progressed.connect(lambda: self.timeline.update())
         self.cache_timer = QTimer(self)
         self.cache_timer.timeout.connect(lambda: self.cache_worker.kick(self.frame) if self.session.cut else None)
@@ -763,6 +770,8 @@ class MainWindow(QMainWindow):
         self.activity.set_cut("", None)
         if self.batch.busy:
             self.batch.kill()
+        self.proxy_builder.cancel()
+        self.next_prep.cancel()
         self.session.project = None
         self._undo_by_cut.clear()
         self.session.open_cut(None)
@@ -974,6 +983,8 @@ class MainWindow(QMainWindow):
             self.cutlist.refresh(self.session.cut.id)
             return
         self._switch_undo(cut.id)
+        if not cut.analyzed:
+            self._ask_proxy_size()                  # the analysis size, once per project (no file is made for it)
         self.session.open_cut(cut)
         self.viewer._img_cache.clear()            # cached pictures are per frame number, not per cut
         if hasattr(self.viewer, "_last_res"):
@@ -991,18 +1002,19 @@ class MainWindow(QMainWindow):
         targets = cut.targets()
         self.sel_pid = targets[0].id if targets else (cut.persons[0].id if cut.persons else None)
         self.viewer.fit_view()
-        if not self.session.proxy_ready():
-            self.build_proxy()
-        else:
-            self._after_open()
+        self.build_proxy()
 
     def _after_open(self):
         cut = self.session.cut
-        if self.session.proxy is not None:
-            try:
-                self.cutlist.set_thumb(cut.id, self.session.proxy.thumbnail(cut.info.frames // 2, 192))
-            except Exception:
-                pass
+        px = self.session.proxy
+        if px is not None:
+            # the middle frame: a seek in the original, so on a thread of its own (never on the UI thread)
+            def thumb(px=px, cid=cut.id, t=cut.info.frames // 2):
+                try:
+                    self.thumbReady.emit(cid, px.thumbnail(t, 192))
+                except Exception:
+                    pass
+            threading.Thread(target=thumb, name="diap-thumb", daemon=True).start()
         if not cut.analyzed and cut.tl and (cut.status or {}).get("auto") == "none":
             self.viewer.message = f"리터칭 불필요 컷 · {(cut.status or {}).get('reason', '')}"
         elif not cut.analyzed and self.batch.busy and cut.id in self.batch.queue:
@@ -1045,48 +1057,54 @@ class MainWindow(QMainWindow):
         self.edit_worker.submit(("facelayer", -1), work)
 
     def build_proxy(self):
+        """After a cut was (re)opened (session.open_cut): go on with its frames. Since 1.18 nothing waits for a proxy:
+        the frames come from the proxy when there is one in this view, else straight from the original; a proxy is
+        only made in the background (설정 > 프록시 만들기)."""
         s = self.session
         cut = s.cut
-        # release any open mapping of the same files before rewriting them
-        if s.proxy is not None:
-            s.proxy.close()
-        s.proxy = None
-        s.tracker = None
         self.viewer._img_cache.clear()
-        self.viewer.update()
-        if not self._ask_proxy_size():
-            self.viewer.message = "프록시를 만들지 않았습니다. 컷을 다시 누르면 만들 수 있습니다."
-            self.viewer.update()
+        if cut is None:
             return
-        vs = s.view_settings(cut)
-        cm = manager()
-        prj = s.project
-        # the bake's one proxy is in the colour view most shots share; a shot set to another colour space or LUT
-        # gets its own proxy (rebuilding the shared one in its view showed every other shot wrong)
-        from ..core.tlimport import shares_bake
-        bake = shares_bake(prj, cut)
+        from ..core.frames import source_present
+        if s.proxy is None:
+            self.viewer.message = ("원본 파일을 찾을 수 없습니다: " + str(cut.source or cut.info.path)
+                                   + "\n파일을 원래 자리에 두거나 다시 연결하세요.")
+            self.viewer.update()
+            self._refresh_all()
+            return
+        self.viewer._last_orig = None
+        # the first picture is decoded by the viewer's loader thread (a file that cannot be read says so there)
+        if not s.proxy_ready() and not source_present(cut.info):
+            self.toast("원본이 없어 예전 프록시로 보여 줍니다. 바뀐 색공간은 원본이 있어야 반영되고, 분석·렌더도 원본이 필요합니다.",
+                       "warn")
+        self._after_open()
+        self._maybe_bg_proxy(first=True)
+        if getattr(self, "_reanalyse_after_proxy", None) == cut.id:
+            self._reanalyse_after_proxy = None
+            QTimer.singleShot(0, self.run_analysis)
 
-        def work(progress, cancelled):
-            from ..track.analyze import Cancelled
-            if bake:
-                # one proxy for the whole bake, shared by every shot (made once, then each shot opens at once)
-                from ..core.tlimport import build_bake_proxy
-                if not build_bake_proxy(prj, cm, vs, progress, cancelled):
-                    raise Cancelled()
-                return None
-            px = s.make_proxy(cut)
-            if not px.build(cm, vs, progress, cancelled):
-                raise Cancelled()
-            return px
+    def _maybe_bg_proxy(self, first: bool = False):
+        """설정 > 프록시 만들기: 'always' makes the open cut's proxy in the background; 'auto' only once reading the
+        original turned out slower than it plays."""
+        from ..core.frames import proxy_mode, wants_proxy
+        s = self.session
+        if s.cut is None or s.project is None or not s.from_source() or self.job is not None:
+            return
+        if proxy_mode() == "always" or wants_proxy(s.proxy, s.cut.info.fps):
+            self.proxy_builder.start(s.project, s.cut, s.view_settings(s.cut))
 
-        def done(_):
-            s.open_cut(cut)
-            self._after_open()
-            if getattr(self, "_reanalyse_after_proxy", None) == cut.id:
-                self._reanalyse_after_proxy = None
-                QTimer.singleShot(0, self.run_analysis)
-
-        self.run_job("편집 타임라인 프록시 만드는 중 (한 번만)" if bake else "프록시 만드는 중", work, done)
+    def _bg_proxy_done(self, cut_id: str, ok: bool, msg: str):
+        s = self.session
+        if not ok:
+            if msg:
+                print("background proxy:", msg, flush=True)
+            return
+        if s.cut is None or s.cut.id != cut_id or s.project is None:
+            return
+        from ..core.frames import frames_for
+        new = frames_for(s.project, s.cut, s.view_settings(s.cut))
+        if getattr(new, "kind", "") == "proxy" and self.job is None and s.swap_frames(cut_id, new):
+            self.toast("프록시가 준비되어 이 컷을 더 빠르게 읽습니다", "ok")
 
     def _ask_proxy_size(self) -> bool:
         """Once per project and app session (when footage first needs a proxy): which proxy resolution."""
@@ -1453,9 +1471,7 @@ class MainWindow(QMainWindow):
                 return
             if err == "__cancelled__":
                 self.toast("취소했습니다.")
-                if self.session.cut is not None and not self.session.proxy_ready():
-                    self.viewer.message = "프록시가 없습니다. 컷을 다시 선택하면 만듭니다."
-                    self.viewer.update()
+                pass
             else:
                 self.show_error(title + " 실패", err)
 
@@ -1499,6 +1515,10 @@ class MainWindow(QMainWindow):
         s = self.session
         cut = s.cut
         if cut is None or s.tracker is None:
+            return
+        if not s.proxy_ready():
+            # only an old proxy in another colour view is left (the original is missing): not analysed in that view
+            self.toast("원본 파일이 없어 분석할 수 없습니다. 원본을 원래 자리에 두세요.", "error")
             return
         if cut.analyzed and cut.joint_keys:
             if QMessageBox.question(self, "다시 분석",
@@ -1828,24 +1848,9 @@ class MainWindow(QMainWindow):
             return
         if not self.save():                     # the analysis process reads the project from disk
             return
-        # the bake's shared proxy first (one decode), then every shot's analysis reads from it
-        from ..core.tlimport import bake_proxy, build_bake_proxy, link_bake_proxy
-        tlm = prj.timeline or {}
-        if tlm.get("baked") and Path(tlm["baked"]).exists() and bake_proxy(prj) is None and self.job is None:
-            if not self._ask_proxy_size():
-                return
-            cm = manager()
-            from ..core.tlimport import bake_view_cut
-            vs = self.session.view_settings(bake_view_cut(prj) or todo[0])
-
-            def work(progress, cancelled):
-                from ..track.analyze import Cancelled
-                if not build_bake_proxy(prj, cm, vs, progress, cancelled):
-                    raise Cancelled()
-
-            self.run_job("편집 타임라인 프록시 만드는 중 (한 번만)", work,
-                         lambda _: self._start_batch(todo, title))
-            return
+        # 1.18: no proxy first. A bake proxy that exists is still shared by the shots; else each shot's analysis
+        # reads its stretch of the original
+        from ..core.tlimport import link_bake_proxy
         link_bake_proxy(prj)
         from .batchdlg import BatchProgress
         run = {c.id: -1.0 for c in todo}
@@ -2118,9 +2123,13 @@ class MainWindow(QMainWindow):
         if s.cut is cut and s.tracker is not None:
             tr = s.tracker
         else:
-            from ..core.proxy import Proxy
+            from ..core.frames import frames_for
             from ..track.analyze import CutTracker
-            tr = CutTracker(prj, cut, Proxy(prj.proxy_dir(cut), cut.info, settings().proxy_long_side))
+            fr = frames_for(prj, cut)
+            if fr is None:
+                self.toast("원본 파일을 찾을 수 없습니다", "error")
+                return
+            tr = CutTracker(prj, cut, fr)
 
         def work(progress, cancelled):
             sample = SL.fit_pair(cut, tr, after, progress, cancelled)
@@ -2275,6 +2284,8 @@ class MainWindow(QMainWindow):
         t = int(np.clip(t, 0, s.proxy.n - 1))
         if t != self.frame and not self.play_timer.isActive():
             s.last_seek = time.time()
+            if s.from_source() and getattr(s.proxy, "seeks", 0) >= SCRUB_SEEKS:
+                self._maybe_bg_proxy()          # jumping around a cut read from its original: a proxy helps
         self.frame = t
         self.viewer.set_frame(t)
         self.timeline.set_frame(t)
@@ -2362,7 +2373,7 @@ class MainWindow(QMainWindow):
                 if self.next_prep.cut_id != nxt.id:
                     self._prep_next_cut()
                     return None
-                self.toast("다음 컷의 프록시가 아직 없어 이 컷을 반복합니다", "warn")
+                self.toast("다음 컷을 열지 못해 이 컷을 반복합니다", "warn")
                 return False
             return None
         prj = self.session.project
@@ -2402,6 +2413,7 @@ class MainWindow(QMainWindow):
             self.play_timer.stop()
             self.play_btn.setIcon(I.icon("play", 17))
             self.inspector.refresh("reshape")
+            self._maybe_bg_proxy()              # playback measured how fast the original reads
 
     def _tick(self):
         a, b = self.session.cut.work_range
@@ -3891,6 +3903,10 @@ class MainWindow(QMainWindow):
                 return
             self.queue_page.job.cancel()
             self.queue_page.job.wait(5000)
+        try:
+            self.proxy_builder.cancel()
+        except Exception:
+            pass
         if self.batch.busy:
             if QMessageBox.question(self, "일괄 분석 중", "일괄 분석이 진행 중입니다. 종료하면 지금 컷의 분석은 버려집니다. 종료할까요?") != QMessageBox.Yes:
                 e.ignore()
@@ -3910,8 +3926,7 @@ class MainWindow(QMainWindow):
         self.activity.flush()
         self.edit_worker.stop()
         self.edit_worker.wait(3000)
-        self.viewer.preview.stop()
-        self.viewer.preview.wait(3000)
+        self.viewer.stop_workers(3000)
         self.cache_timer.stop()
         self.cache_worker.stop()
         self.cache_worker.wait(5000)

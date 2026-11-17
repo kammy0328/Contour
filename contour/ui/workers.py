@@ -140,6 +140,19 @@ class PreviewWorker(QThread):
                 self.ready.emit(key, img)
 
 
+def _release(own: dict) -> None:
+    """Closes a next-cut session nobody took (its decoders end). Safe to call more than once."""
+    with own["lock"]:
+        if own["taken"]:
+            return
+        sh = own["sh"]
+    if sh is not None and sh.proxy is not None:
+        try:
+            sh.proxy.close()
+        except Exception:
+            pass
+
+
 class NextCutPrep:
     """Playback going on into the next cut: that cut is opened in a session of its own on a background thread, its
     first frames decoded and as many results as time allows rendered into that session's playback cache. When the
@@ -159,32 +172,21 @@ class NextCutPrep:
         self.cut_id, self.session, self.ready, self.failed = cut.id, None, False, False
         stop = threading.Event()
         self._stop = stop
+        # who owns this run's session: the run until take() hands it over; a session never handed over is closed
+        # (its decoders are ffmpeg processes reading the original)
+        own = {"sh": None, "taken": False, "lock": threading.Lock()}
+        self._own = own
         from .session import EditSession
 
         def run():
             try:
                 sh = EditSession()
+                own["sh"] = sh
                 sh.project = project
-                sh.open_cut(cut)
+                sh.open_cut(cut)              # its proxy, else its original: no proxy is made for this
                 if sh.proxy is None or not sh.proxy_ready():
-                    # no proxy yet (a cut never opened): made here, in the background, like opening it would
-                    from ..core.colour import manager
-                    if sh.proxy is not None:
-                        sh.proxy.close()
-                    sh.proxy, sh.tracker = None, None
-                    vs = sh.view_settings(cut)
-                    from ..core.tlimport import build_bake_proxy, shares_bake
-                    if shares_bake(project, cut):
-                        ok = build_bake_proxy(project, manager(), vs, None, stop.is_set)
-                    else:
-                        ok = sh.make_proxy(cut).build(manager(), vs, None, stop.is_set)
-                    if not ok or stop.is_set():
-                        self.failed = not stop.is_set()
-                        return
-                    sh.open_cut(cut)
-                    if sh.proxy is None or not sh.proxy_ready():
-                        self.failed = True
-                        return
+                    self.failed = True
+                    return
                 a, b = cut.work_range
                 for t in range(a, min(b, a + head)):          # the originals of the first frames, decoded
                     if stop.is_set():
@@ -204,6 +206,10 @@ class NextCutPrep:
             except Exception:
                 traceback.print_exc()
                 self.failed = True
+                stop.set()
+            finally:
+                if stop.is_set():
+                    _release(own)
 
         threading.Thread(target=run, name="diap-nextcut", daemon=True).start()
 
@@ -211,13 +217,20 @@ class NextCutPrep:
         """The prepared session for cut_id (the background work stops), or None if it is not ready yet."""
         if self.cut_id != cut_id or not self.ready or self.session is None:
             return None
+        own = getattr(self, "_own", None)
+        if own is not None:
+            with own["lock"]:
+                own["taken"] = True      # the main session owns it now: its decoders stay open
         self._stop.set()
         sh = self.session
         self.cut_id, self.session, self.ready = None, None, False
         return sh
 
     def cancel(self) -> None:
-        self._stop.set()                 # the thread ends after the frame it is on; its session is then dropped
+        self._stop.set()                 # the thread ends after the frame it is on and closes its session
+        own = getattr(self, "_own", None)
+        if own is not None:
+            _release(own)                # a run that already finished closes nothing itself
         self.cut_id, self.session, self.ready, self.failed = None, None, False, False
 
 
@@ -294,3 +307,60 @@ class CacheWorker(QThread):
                 time.sleep(0.002)
             if n_new:
                 self.progressed.emit()
+
+
+class ProxyBuilder(QObject):
+    """A proxy made in the background (1.18: never needed to open, analyse or render a cut; it only makes reading
+    the cut's frames faster). One at a time; cancelled when another cut's starts, the project closes or the app
+    quits. finished(cut_id, ok, message)."""
+    finished = Signal(str, bool, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.cut_id: Optional[str] = None
+        self._stop = threading.Event()
+        self._t: Optional[threading.Thread] = None
+        self.tried: set = set()            # (project path, cut id, view): not again after it finished or failed
+
+    @property
+    def busy(self) -> bool:
+        return self._t is not None and self._t.is_alive()
+
+    def start(self, project, cut, vs) -> bool:
+        key = (str(project.path), cut.id, vs.key())
+        if key in self.tried or (self.busy and self.cut_id == cut.id):
+            return False
+        self.cancel()
+        self.tried.add(key)
+        self.cut_id = cut.id
+        stop = threading.Event()
+        self._stop = stop
+
+        def run():
+            ok, msg = False, ""
+            try:
+                from ..core.colour import manager
+                from ..core.frames import proxy_for
+                from ..core.tlimport import build_bake_proxy, shares_bake
+                if shares_bake(project, cut):
+                    ok = bool(build_bake_proxy(project, manager(), vs, None, stop.is_set))
+                else:
+                    ok = bool(proxy_for(project, cut).build(manager(), vs, None, stop.is_set))
+            except Exception as e:
+                msg = str(e)
+                traceback.print_exc()
+            if not stop.is_set():
+                self.finished.emit(cut.id, ok, msg)
+
+        t = threading.Thread(target=run, name="diap-proxy", daemon=True)
+        self._t = t
+        t.start()
+        return True
+
+    def cancel(self, wait: float = 5.0) -> None:
+        self._stop.set()
+        t = self._t
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(wait)
+        self._t = None
+        self.cut_id = None

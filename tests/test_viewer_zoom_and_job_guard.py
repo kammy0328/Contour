@@ -11,7 +11,7 @@ from PySide6.QtGui import QMouseEvent, QWheelEvent
 
 def _stop(v):
     """The viewer's worker threads end before the test does (a QThread still running at exit aborts Python)."""
-    for w in (v.preview, v.skin_worker):
+    for w in (v.preview, v.skin_worker, v.orig_loader):
         w.stop()
         w.wait(3000)
 

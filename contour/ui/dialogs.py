@@ -83,7 +83,7 @@ class SettingsDialog(QDialog):
         self.cache = QLineEdit(getattr(s, "cache_dir", "") or "")
         self.cache.setPlaceholderText(str(s.data_path / "cache"))
         self.cache.setToolTip("프록시(원본에서 언제든 다시 만들 수 있는 미리보기용 영상)를 두는 곳입니다. 빠른 로컬 SSD를 권장합니다.\n"
-                              "바꾸면 컷을 열 때 새 폴더에 프록시를 다시 만듭니다. 분석 결과와 매트는 프로젝트 폴더에 그대로 있습니다.")
+                              "컷은 프록시 없이 원본으로 열리고, 프록시는 '프록시 만들기' 설정에 따라 백그라운드에서만 만듭니다. 분석 결과와 매트는 프로젝트 폴더에 그대로 있습니다.")
         cb_ = Wd.button("찾기", "ghost")
         cb_.clicked.connect(lambda: self._pick_dir(self.cache))
         form.addRow("캐시 폴더", self._row(self.cache, cb_))
@@ -115,6 +115,13 @@ class SettingsDialog(QDialog):
             self.proxy.addItem(t, v)
         self.proxy.setCurrentIndex(max(0, self.proxy.findData(s.proxy_long_side)))
         form.addRow("프록시 해상도", self.proxy)
+        self.proxy_mode = QComboBox()
+        for v, t in (("auto", "자동 (원본 읽기가 느리거나 탐색이 잦을 때)"), ("always", "항상 (백그라운드)"),
+                     ("off", "만들지 않음 (원본에서 바로 읽기)")):
+            self.proxy_mode.addItem(t, v)
+        self.proxy_mode.setCurrentIndex(max(0, self.proxy_mode.findData(getattr(s, "proxy_mode", "auto"))))
+        self.proxy_mode.setToolTip("컷은 원본으로 바로 열립니다. 프록시는 반복해서 읽을 때 빠르게 하려고 백그라운드에서만 만듭니다.")
+        form.addRow("프록시 만들기", self.proxy_mode)
         self.ask_proxy = QCheckBox("영상을 불러올 때마다 프록시 해상도 묻기")
         self.ask_proxy.setChecked(bool(getattr(s, "ask_proxy", True)))
         form.addRow("", self.ask_proxy)
@@ -220,7 +227,7 @@ class SettingsDialog(QDialog):
             return
         if QMessageBox.question(self, "쓰지 않는 캐시 지우기",
                                 f"프로젝트 목록에 없는 프로젝트 {len(dirs)}개의 프록시를 지울까요?\n"
-                                "나중에 그 프로젝트를 다시 열면 프록시를 새로 만듭니다.") != QMessageBox.Yes:
+                                "그 프로젝트는 원본으로 열리며, 필요하면 프록시를 백그라운드에서 다시 만듭니다.") != QMessageBox.Yes:
             return
         freed = PJ.clear_orphans(dirs)
         self._cache_usage()
@@ -263,6 +270,7 @@ class SettingsDialog(QDialog):
         s.display = self.display.currentText()
         s.view = self.view.currentText()
         s.proxy_long_side = int(self.proxy.currentData())
+        s.proxy_mode = str(self.proxy_mode.currentData())
         s.ask_proxy = self.ask_proxy.isChecked()
         s.autosave = self.autosave.isChecked()
         s.autosave_minutes = int(self.as_min.value())
