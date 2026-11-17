@@ -140,6 +140,19 @@ class PreviewWorker(QThread):
                 self.ready.emit(key, img)
 
 
+def _release(own: dict) -> None:
+    """Closes a next-cut session nobody took (its decoders end). Safe to call more than once."""
+    with own["lock"]:
+        if own["taken"]:
+            return
+        sh = own["sh"]
+    if sh is not None and sh.proxy is not None:
+        try:
+            sh.proxy.close()
+        except Exception:
+            pass
+
+
 class NextCutPrep:
     """Playback going on into the next cut: that cut is opened in a session of its own on a background thread, its
     first frames decoded and as many results as time allows rendered into that session's playback cache. When the
@@ -159,11 +172,16 @@ class NextCutPrep:
         self.cut_id, self.session, self.ready, self.failed = cut.id, None, False, False
         stop = threading.Event()
         self._stop = stop
+        # who owns this run's session: the run until take() hands it over; a session never handed over is closed
+        # (its decoders are ffmpeg processes reading the original)
+        own = {"sh": None, "taken": False, "lock": threading.Lock()}
+        self._own = own
         from .session import EditSession
 
         def run():
             try:
                 sh = EditSession()
+                own["sh"] = sh
                 sh.project = project
                 sh.open_cut(cut)              # its proxy, else its original: no proxy is made for this
                 if sh.proxy is None or not sh.proxy_ready():
@@ -188,6 +206,10 @@ class NextCutPrep:
             except Exception:
                 traceback.print_exc()
                 self.failed = True
+                stop.set()
+            finally:
+                if stop.is_set():
+                    _release(own)
 
         threading.Thread(target=run, name="diap-nextcut", daemon=True).start()
 
@@ -195,13 +217,20 @@ class NextCutPrep:
         """The prepared session for cut_id (the background work stops), or None if it is not ready yet."""
         if self.cut_id != cut_id or not self.ready or self.session is None:
             return None
+        own = getattr(self, "_own", None)
+        if own is not None:
+            with own["lock"]:
+                own["taken"] = True      # the main session owns it now: its decoders stay open
         self._stop.set()
         sh = self.session
         self.cut_id, self.session, self.ready = None, None, False
         return sh
 
     def cancel(self) -> None:
-        self._stop.set()                 # the thread ends after the frame it is on; its session is then dropped
+        self._stop.set()                 # the thread ends after the frame it is on and closes its session
+        own = getattr(self, "_own", None)
+        if own is not None:
+            _release(own)                # a run that already finished closes nothing itself
         self.cut_id, self.session, self.ready, self.failed = None, None, False, False
 
 

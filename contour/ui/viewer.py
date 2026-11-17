@@ -98,6 +98,10 @@ class Viewer(QWidget):
         # the skin area overlay is worked out on its own thread too (seconds per frame on a 4K cut)
         self.skin_worker = PreviewWorker(self._compute_skin, self)
         self.skin_worker.ready.connect(self._skin_ready)
+        # the original picture: decoded from the original file (1.18) off the UI thread; the newest frame asked wins
+        self.orig_loader = PreviewWorker(self._load_orig, self)
+        self.orig_loader.ready.connect(self._orig_ready)
+        self._last_orig = None           # (cut id, QImage) shown while the next original frame decodes
         self._skin_last = None           # (frame, QImage) last skin overlay shown
         # a small turning arc while a result is being worked out
         from PySide6.QtCore import QTimer as _QT
@@ -212,11 +216,19 @@ class Viewer(QWidget):
             key = ("orig", self.t, cid)
             if key in self._img_cache:
                 return self._img_cache[key]
-            a = self.s.frame(self.t)
+            # never decoded here: only a frame already in memory (or a proxy's mapped file) is taken at once;
+            # else it is decoded on the loader thread and the last original stays on screen meanwhile
+            peek = getattr(self.s, "frame_peek", None)
+            a = peek(self.t) if peek is not None else None
             if a is None:
-                return None
+                ld = getattr(self, "orig_loader", None)
+                if ld is not None:
+                    ld.request((self.t, cid))
+                lo = getattr(self, "_last_orig", None)
+                return lo[1] if lo is not None and lo[0] == cid else None
             img = np_to_qimage(a)
             self._store_img(key, img)
+            self._last_orig = (cid, img)
             return img
         if self.s.cut is None:
             return None
@@ -255,6 +267,38 @@ class Viewer(QWidget):
         self._store_img(key, img)
         self._last_res = (self.t, img)
         return img
+
+    def _load_orig(self, key):
+        t, cid = key
+        if self.s.cut is None or self.s.cut.id != cid:
+            return None
+        try:
+            a = self.s.frame(t)
+        except Exception as e:
+            return (t, cid, None, str(e))
+        return (t, cid, a, "")
+
+    def _orig_ready(self, key, payload):
+        if payload is None:
+            return
+        t, cid, a, err = payload
+        if self.s.cut is None or cid != self.s.cut.id:
+            return                      # decoded for a cut that is no longer open
+        if a is None:
+            self.message = "원본을 읽지 못했습니다.\n" + err[:300]
+            self.update()
+            return
+        img = np_to_qimage(a)
+        self._store_img(("orig", t, cid), img)
+        if t == self.t:
+            self._last_orig = (cid, img)
+        self.update()
+
+    def stop_workers(self, wait_ms: int = 3000) -> None:
+        for w in (self.preview, self.skin_worker, self.orig_loader):
+            w.stop()
+        for w in (self.preview, self.skin_worker, self.orig_loader):
+            w.wait(wait_ms)
 
     def _compute_preview(self, key):
         t, rkey = key

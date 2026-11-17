@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import threading
 import json
 import os
 import sys
@@ -175,8 +176,11 @@ def resolve_task(session, pid: int, t: int = 0, frame_end: Optional[int] = None,
 
 
 class MainWindow(QMainWindow):
+    thumbReady = Signal(str, object)          # cut id, thumbnail (made off the UI thread)
+
     def __init__(self):
         super().__init__()
+        self.thumbReady.connect(lambda cid, th: self.cutlist.set_thumb(cid, th))
         self.setWindowTitle(APP_NAME)
         self.session = EditSession()
         self.frame = 0
@@ -1001,11 +1005,15 @@ class MainWindow(QMainWindow):
 
     def _after_open(self):
         cut = self.session.cut
-        if self.session.proxy is not None:
-            try:
-                self.cutlist.set_thumb(cut.id, self.session.proxy.thumbnail(cut.info.frames // 2, 192))
-            except Exception:
-                pass
+        px = self.session.proxy
+        if px is not None:
+            # the middle frame: a seek in the original, so on a thread of its own (never on the UI thread)
+            def thumb(px=px, cid=cut.id, t=cut.info.frames // 2):
+                try:
+                    self.thumbReady.emit(cid, px.thumbnail(t, 192))
+                except Exception:
+                    pass
+            threading.Thread(target=thumb, name="diap-thumb", daemon=True).start()
         if not cut.analyzed and cut.tl and (cut.status or {}).get("auto") == "none":
             self.viewer.message = f"리터칭 불필요 컷 · {(cut.status or {}).get('reason', '')}"
         elif not cut.analyzed and self.batch.busy and cut.id in self.batch.queue:
@@ -1063,24 +1071,12 @@ class MainWindow(QMainWindow):
             self.viewer.update()
             self._refresh_all()
             return
-        bad = ""
-        if s.from_source():
-            # the first picture now (one short decode): a file ffmpeg cannot read says so here, not with a blank view
-            from ..core.frames import FrameError
-            try:
-                s.frame(int(cut.work_range[0]))
-            except FrameError as e:
-                bad = "원본을 읽지 못했습니다.\n" + str(e)[:300]
-            except Exception:
-                pass
+        self.viewer._last_orig = None
+        # the first picture is decoded by the viewer's loader thread (a file that cannot be read says so there)
         if not s.proxy_ready() and not source_present(cut.info):
             self.toast("원본이 없어 예전 프록시로 보여 줍니다. 바뀐 색공간은 원본이 있어야 반영되고, 분석·렌더도 원본이 필요합니다.",
                        "warn")
         self._after_open()
-        if bad:
-            self.viewer.message = bad
-            self.viewer.update()
-            return
         self._maybe_bg_proxy(first=True)
         if getattr(self, "_reanalyse_after_proxy", None) == cut.id:
             self._reanalyse_after_proxy = None
@@ -3927,8 +3923,7 @@ class MainWindow(QMainWindow):
         self.activity.flush()
         self.edit_worker.stop()
         self.edit_worker.wait(3000)
-        self.viewer.preview.stop()
-        self.viewer.preview.wait(3000)
+        self.viewer.stop_workers(3000)
         self.cache_timer.stop()
         self.cache_worker.stop()
         self.cache_worker.wait(5000)

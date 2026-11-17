@@ -82,6 +82,16 @@ def analyze(project_path: str, cut_id: str, accuracy: str = "high", all_targets:
     if out.exists():
         out.unlink()
     t0 = time.time()
+    from .core.frames import frames_for, proxy_for, proxy_mode
+    vs = _vs_for(cut)
+    px = frames_for(prj, cut, vs)
+    if px is None or not px.is_valid(vs.key()):
+        # neither the original nor a proxy made in this colour view (an old proxy in another view is for looking
+        # at only): not analysed, and not taken for a cut without people either (before the quick check)
+        if px is not None:
+            px.close()
+        print("ERROR 원본 파일을 찾을 수 없습니다: " + str(cut.source or cut.info.path), flush=True)
+        return 3
     if prescan and cut.tl.get("kind", "clip") == "clip" and not cut.analyzed:
         _say(0.01, "인물 확인 중")
         try:
@@ -95,18 +105,17 @@ def analyze(project_path: str, cut_id: str, accuracy: str = "high", all_targets:
                                       ensure_ascii=False), encoding="utf-8")
             _say(1.0, "인물 없음")
             return 0
-    from .core.frames import frames_for, proxy_for, proxy_mode
-    vs = _vs_for(cut)
-    px = frames_for(prj, cut, vs)
-    if px is None:
-        print("ERROR 원본 파일을 찾을 수 없습니다: " + str(cut.source or cut.info.path), flush=True)
-        return 3
     if px.kind == "source" and proxy_mode() == "always":
-        # 설정 > 프록시 만들기 > 항상: made first, the analysis then reads it (else it reads the original)
+        # 설정 > 프록시 만들기 > 항상: made first, the analysis then reads it. It is optional: when it cannot be made
+        # (no room, a write error) the analysis reads the original as it would without the setting
         _say(0.02, "프록시 만드는 중")
-        pf = proxy_for(prj, cut)
-        if pf.build(manager(), vs, lambda f, m="": _say(0.02 + 0.18 * f, "프록시 만드는 중"), lambda: False):
-            px = frames_for(prj, cut, vs)
+        try:
+            pf = proxy_for(prj, cut)
+            if pf.build(manager(), vs, lambda f, m="": _say(0.02 + 0.18 * f, "프록시 만드는 중"), lambda: False):
+                px.close()
+                px = frames_for(prj, cut, vs)
+        except Exception as e:
+            print(f"WARN 프록시를 만들지 못해 원본에서 읽어 분석합니다: {str(e)[:200]}", flush=True)
     tr = CutTracker(prj, cut, px)
     try:
         tr.analyze(lambda f, m="": _say(0.2 + 0.75 * f, m), lambda: False, accuracy=accuracy)

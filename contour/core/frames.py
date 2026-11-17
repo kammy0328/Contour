@@ -126,9 +126,17 @@ def source_present(info: MediaInfo) -> bool:
 def _sig(info: MediaInfo) -> str:
     try:
         st = os.stat(info.path if info.kind == "video" else info.seq_pattern % info.seq_start)
-        return f"{st.st_size}:{int(st.st_mtime)}"
+        return f"{st.st_size}:{st.st_mtime_ns}"
     except (OSError, TypeError):
         return ""
+
+
+def _decode_key(info: MediaInfo) -> tuple:
+    """The fields of the file's description the decode command and the conversion read (frame rate for seeking,
+    pixel layout, matrix and range for the RGB conversion)."""
+    return tuple(str(getattr(info, k, "")) for k in ("fps_num", "fps_den", "width", "height", "pix_fmt", "chroma",
+                                                       "color_range", "color_matrix", "color_space", "is_float",
+                                                       "bit_depth", "fps_fraction"))
 
 
 class _Cursor:
@@ -164,8 +172,9 @@ class SourceFrames:
         self.cm, self.vs = cm, vs
         self.view_key = vs.key()
         # what the decoded pixels depend on: the file (and its version), the stretch, the size and the view
-        self.owner = (str(info.path if info.kind == "video" else info.seq_pattern), _sig(info),
-                      int(getattr(info, "offset", 0) or 0), self.n, self.w, self.h, self.view_key)
+        self.owner = (info.kind, str(info.path if info.kind == "video" else info.seq_pattern),
+                      int(getattr(info, "seq_start", 0) or 0), _sig(info), int(getattr(info, "offset", 0) or 0),
+                      self.n, self.w, self.h, self.view_key, _decode_key(info))
         self._lock = threading.RLock()      # the readers
         self._cursors: list = []
         self._last = -1
@@ -211,6 +220,11 @@ class SourceFrames:
                 if a is None:
                     a = self._decode_to(i)
         return np.array(a)                  # a copy: the pool's frame is never handed out
+
+    def peek(self, i: int) -> Optional[np.ndarray]:
+        """Frame i if it is already decoded (a copy), else None: never decodes (for the UI thread)."""
+        a = pool().get((self.owner, int(np.clip(int(i), 0, self.n - 1))))
+        return None if a is None else np.array(a)
 
     def gray(self, i: int) -> np.ndarray:
         with self._glock:
@@ -285,8 +299,24 @@ class SourceFrames:
         out[..., 1] /= self.sy
         return out
 
+    def one(self, i: int) -> np.ndarray:
+        """Frame i with a reader of its own that ends at once (a thumbnail, a look at one frame from another
+        thread): no reader is left open by it, whoever closes this source and when."""
+        i = int(np.clip(int(i), 0, self.n - 1))
+        a = self.peek(i)
+        if a is not None:
+            return a
+        pf = "gbrpf32le" if self.info.is_float else "rgb48le"
+        with FrameReader(self.info, i, 1, pf, size=(self.w, self.h), prefetch=1) as r:
+            planes = r.read()
+            if planes is None:
+                raise FrameError(f"원본에서 프레임 {i}을(를) 읽지 못했습니다. {r.error_text.strip()[:300]}")
+            u8 = self.cm.to_display_u8(planes_to_rgb_float(planes, r.layout), self.vs)
+        pool().put((self.owner, i), u8)
+        return np.array(u8)
+
     def thumbnail(self, i: int, width: int = 160) -> np.ndarray:
-        f = self.frame(i)
+        f = self.one(i)
         h = max(1, int(round(f.shape[0] * width / f.shape[1])))
         return cv2.resize(f, (width, h), interpolation=cv2.INTER_AREA)
 

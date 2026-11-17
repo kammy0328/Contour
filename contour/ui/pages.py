@@ -354,8 +354,8 @@ class RenderQueuePage(QWidget):
             from ..core.frames import frames_for
             from .viewer import np_to_qimage
             px = frames_for(prj, cut)
-            if px is None:
-                return None
+            if px is None or px.kind != "proxy":
+                return None                 # painted on the UI thread: never a decode of the original here
             a, b = cut.work_range
             th = px.thumbnail((a + b) // 2, 160)
             px.close()

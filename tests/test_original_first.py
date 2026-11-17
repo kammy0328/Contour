@@ -278,3 +278,28 @@ def test_reopen_same_cut_is_warm_and_fresh(project):
     assert np.array_equal(s.frame(2), a)
     assert s.proxy.decoded == d0, "served from the pool"
     s.open_cut(None)
+
+
+def test_viewer_original_frame_comes_from_loader_thread(qapp, project):
+    """The viewer never decodes on the UI thread: the first call asks the loader, the picture comes back from it."""
+    from contour.core import frames as FR
+    from contour.ui.session import EditSession
+    from contour.ui.viewer import Viewer
+    FR.pool().clear()
+    s = EditSession()
+    s.project = project
+    s.open_cut(project.cuts[0])
+    v = Viewer(s)
+    try:
+        v.t = 3
+        assert v._qimg("orig") is None, "nothing decoded on this thread"
+        t0 = time.time()
+        img = None
+        while img is None and time.time() - t0 < 10:
+            _pump(qapp, 0.05)
+            img = v._img_cache.get(("orig", 3, project.cuts[0].id))
+        assert img is not None and v._qimg("orig") is img
+    finally:
+        v.stop_workers()
+        s.open_cut(None)
+

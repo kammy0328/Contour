@@ -170,6 +170,28 @@ class EditSession:
         return False
 
     # ------------------------------------------------------------------ preview
+    def frame_peek(self, t: int) -> Optional[np.ndarray]:
+        """Frame t only if it can be had without decoding (for the UI thread): from this session's frames, a proxy's
+        mapped file, or the decoded-frame pool. None means: ask frame() on a worker thread."""
+        with self._lock:
+            px = self.proxy
+            if px is None:
+                return None
+            f = self._frames.get(t)
+            if f is not None:
+                return f
+        if getattr(px, "kind", "") != "source":
+            return self.frame(t)
+        a = px.peek(t)
+        if a is None:
+            return None
+        with self._lock:
+            if self.proxy is px:
+                self._frames[t] = a
+                while len(self._frames) > 8:
+                    self._frames.popitem(last=False)
+        return a
+
     def frame(self, t: int) -> Optional[np.ndarray]:
         with self._lock:
             px, ep = self.proxy, self.epoch
