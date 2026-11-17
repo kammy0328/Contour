@@ -146,9 +146,17 @@ def main():
     # 5. models (once; they live in the data folder and survive updates)
     if not (a.no_models or ci):
         say("[5/5] 모델 확인 (처음 한 번 약 1.1GB)")
-        run([PY, APP / "tools" / "download_models.py", "--max"])
+        if not models_step(run):
+            say("=== 일부 모델을 받지 못했습니다. 인터넷 연결을 확인하고 설치 파일을 다시 실행하세요 "
+                "(처음 분석할 때도 다시 받으려고 시도합니다)")
+            return 3
     say("=== 완료")
     return 0
+
+
+def models_step(runner) -> bool:
+    """Downloads the models; False when a required one could not be had (download_models exits non-zero)."""
+    return runner([PY, APP / "tools" / "download_models.py", "--max"]) == 0
 
 
 if __name__ == "__main__":

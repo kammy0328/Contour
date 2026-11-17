@@ -21,13 +21,21 @@ from ..warp import field as F
 from ..warp.separate import fill_background
 
 
+_EPOCHS = __import__("itertools").count(1)
+
+
 class EditSession:
+    """epoch: changes whenever another cut is opened (unique over every session of the app). The cache keys of a
+    frame's intermediate results (proxy frame, retouch masks, retouched picture, warp field) carry it, so a frame of
+    the cut that was open when its computation started can never be found as the same frame of the cut open now."""
+
     def __init__(self):
         self.project: Optional[Project] = None
         self.cut: Optional[Cut] = None
         self.proxy: Optional[Proxy] = None
         self.tracker: Optional[CutTracker] = None
         self.version = 0                     # bump to invalidate previews (any change)
+        self.epoch = next(_EPOCHS)
         self.vers = {"geo": 0, "ret": 0, "trk": 0}   # what changed: shape params / retouch params / tracking
         self.interactive = False             # a slider is being dragged: coarser preview field
         self._cache: "OrderedDict[tuple, object]" = OrderedDict()
@@ -66,6 +74,7 @@ class EditSession:
             self._play = {}
             self._play_bytes = 0
             self.version += 1
+            self._new_epoch()
             if cut is None or self.project is None:
                 return
             px = self.make_proxy(cut)
@@ -87,7 +96,12 @@ class EditSession:
                 self._play = dict(other._play)
                 self._play_bytes = other._play_bytes
                 self.vers = dict(other.vers)
+                self.epoch = other.epoch          # the other session's entries were made for this cut
             self.version += 1
+
+    def _new_epoch(self) -> None:
+        with self._lock:
+            self.epoch = next(_EPOCHS)
 
     def proxy_ready(self) -> bool:
         return self.proxy is not None and self.proxy.is_valid(self.view_settings().key())
@@ -119,35 +133,38 @@ class EditSession:
         kind = key[0]
         v = self.vers
         if kind == "field":
-            return key[2:4] == (v["geo"], v["trk"])
+            return key[2:4] == (v["geo"], v["trk"]) and key[-1] == self.epoch
         if kind in ("retouch", "ret_img"):
-            return key[2:4] == (v["ret"], v["trk"])
+            return key[2:4] == (v["ret"], v["trk"]) and key[-1] == self.epoch
         if kind == "res":
             return key[2:5] == (v["geo"], v["ret"], v["trk"])
         return False
 
     # ------------------------------------------------------------------ preview
     def frame(self, t: int) -> Optional[np.ndarray]:
-        if self.proxy is None:
-            return None
         with self._lock:
+            px, ep = self.proxy, self.epoch
+            if px is None:
+                return None
             f = self._frames.get(t)
             if f is not None:
                 self._frames.move_to_end(t)
                 return f
-        f = np.asarray(self.proxy.frame(t))
+        f = np.asarray(px.frame(t))
         with self._lock:
-            self._frames[t] = f
-            while len(self._frames) > 8:
-                self._frames.popitem(last=False)
+            if self.epoch == ep:                  # still the same cut: else this frame is not the open cut's
+                self._frames[t] = f
+                while len(self._frames) > 8:
+                    self._frames.popitem(last=False)
         return f
 
     def field(self, t: int, coarse: Optional[bool] = None) -> Optional[F.FieldResult]:
         if self.tracker is None or self.tracker.store is None or self.cut is None:
             return None
         coarse = self.interactive if coarse is None else coarse
-        key = ("field", t, self.vers["geo"], self.vers["trk"], coarse)
-        fine = ("field", t, self.vers["geo"], self.vers["trk"], False)
+        ep = self.epoch
+        key = ("field", t, self.vers["geo"], self.vers["trk"], coarse, ep)
+        fine = ("field", t, self.vers["geo"], self.vers["trk"], False, ep)
         with self._lock:
             if key in self._cache:
                 return self._cache[key]
@@ -169,7 +186,7 @@ class EditSession:
         with self._lock:
             best = None
             for key, val in reversed(self._cache.items()):
-                if key[0] != "field" or key[1] != t:
+                if key[0] != "field" or key[1] != t or key[-1] != self.epoch:
                     continue
                 if key[2:4] == (self.vers["geo"], self.vers["trk"]):
                     return val
@@ -237,15 +254,16 @@ class EditSession:
             return self._cache.get(self.result_key(t))
 
     def retouched(self, t: int) -> Optional[np.ndarray]:
+        ep = self.epoch                     # before the frame is read: the key is for the cut this frame is of
         img = self.frame(t)
         if img is None:
             return None
         live = bool(self.interactive)
-        key = ("ret_img", t, self.vers["ret"], self.vers["trk"], live)
+        key = ("ret_img", t, self.vers["ret"], self.vers["trk"], live, ep)
         with self._lock:
             if key in self._cache:
                 return self._cache[key]
-            full = ("ret_img", t, self.vers["ret"], self.vers["trk"], False)
+            full = ("ret_img", t, self.vers["ret"], self.vers["trk"], False, ep)
             if live and full in self._cache:
                 return self._cache[full]
         rf = self.retouch(t)
@@ -294,7 +312,7 @@ class EditSession:
         """Retouch masks and values for frame t (None when nothing is active)."""
         if self.tracker is None or self.tracker.store is None or self.cut is None:
             return None
-        key = ("retouch", t, self.vers["ret"], self.vers["trk"])
+        key = ("retouch", t, self.vers["ret"], self.vers["trk"], self.epoch)
         with self._lock:
             if key in self._cache:
                 return self._cache[key]

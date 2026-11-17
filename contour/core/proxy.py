@@ -202,10 +202,14 @@ class Proxy:
         mm.flush()
         del mm
         if done < self.n:
-            # Some containers report more frames than they decode; keep what we have.
+            # fewer frames than the file says: the rest of the proxy would be black (analysed as an empty picture,
+            # shown as a black tail). Never marked complete; the cut cannot be used until the file is fixed.
             meta["n_decoded"] = done
+            self.meta_path.write_text(json.dumps(meta), encoding="utf-8")
             if done == 0:
                 raise RuntimeError("프레임을 디코딩하지 못했습니다. " + err[:300])
+            raise RuntimeError(f"영상에서 {done}/{self.n} 프레임만 읽혔습니다. 파일이 잘렸거나 메타데이터의 프레임 수가 "
+                               f"실제와 다릅니다. 원본을 다시 내보낸 뒤 불러오세요. {err[:200]}")
         meta["complete"] = True
         self.meta_path.write_text(json.dumps(meta), encoding="utf-8")
         return True

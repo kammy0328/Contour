@@ -192,7 +192,8 @@ def render_frame(cut, t: int, rf, proxy_wh) -> Optional[dict]:
         planes = next(iter(rd), None)
     if planes is None:
         return None
-    out = RE.apply_planes([p.copy() for p in planes], layout.subsample, layout.max_value, pf, rf, 1.0, disp_)
+    out = RE.apply_planes([p.copy() for p in planes], layout.subsample, layout.max_value, pf, rf, 1.0, disp_,
+                           info.color_range)
 
     def disp(pl):
         if pf.startswith("yuv"):
@@ -468,7 +469,8 @@ def compare_hand(cut, tr, after_path: str, levels=("light", "std", "strong"), at
                 try:
                     rf = RE.prepare(cut, tr, t, {})
                     out = fr["planes"] if rf is None else RE.apply_planes([x.copy() for x in fr["planes"]], layout.subsample,
-                                                                          layout.max_value, pf, rf, 1.0)
+                                                                          layout.max_value, pf, rf, 1.0, None,
+                                                                          info.color_range)
                 finally:
                     restore()
                 x0, y0, x1, y1 = fr["box"]

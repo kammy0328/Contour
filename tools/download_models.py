@@ -27,6 +27,7 @@ def main():
             "face_rtm106", "hand_rtm21", "seg_sam31", "seg_sam31_find", "seg_sam2_s", "face_sface", "face_parse"]
     if "--max" in sys.argv:
         keys += ["det_yolox_x", "pose_dwpose_l", "seg_sam2_b"]
+    failed = []
     for k in keys:
         spec = M.MODELS[k]
         if M.is_downloaded(k):
@@ -43,10 +44,15 @@ def main():
             M.ensure_model(k, prog)
             print(f"\r  [완료] {spec['label']}                                  ")
         except Exception as e:
+            failed.append(k)
             print(f"\r  [실패] {spec['label']}: {e}")
             print("         인터넷 연결을 확인하고 install.bat을 다시 실행하세요. (처음 분석할 때도 자동으로 받습니다)")
     print(f"  모델 위치: {M.model_path('det_yolox_m').parent}")
+    if failed:
+        print(f"  받지 못한 모델 {len(failed)}개: {', '.join(failed)}")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

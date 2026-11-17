@@ -116,6 +116,23 @@ class _ProjectOpen(QThread):
             self.failed.emit(f"{e}\n{traceback.format_exc()}")
 
 
+def resolve_task(session, pid: int, t: int = 0, frame_end: Optional[int] = None, every: bool = False):
+    """A joint re-solve for the edit worker, bound to the cut open now. If the user has gone to another cut by the
+    time it runs, it still re-solves (and saves) that cut's own tracker, never the one open then."""
+    tr = session.tracker
+
+    def run():
+        if tr is None or tr.store is None:
+            return None
+        rng = tr.resolve_all() if every else tr.resolve_local(pid, t, frame_end=frame_end)
+        if session.tracker is tr:
+            session.touch()
+        else:
+            tr.save()                       # its cut was saved and closed before this ran
+        return rng
+    return run
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -602,7 +619,9 @@ class MainWindow(QMainWindow):
             self._set_loading(False, hide=self.job is None)     # a job the cut started keeps the overlay
 
     def _project_loaded(self, prj, thumbs: dict):
-        self.close_project()
+        if not self.close_project():
+            self.toast("지금 프로젝트를 저장하지 못해 새 프로젝트를 열지 않았습니다", kind="error")
+            return
         self.session.project = prj
         self._undo_by_cut.clear()
         self.undo_stack, self.redo_stack = [], []
@@ -689,9 +708,9 @@ class MainWindow(QMainWindow):
                 self.show_error("복구하지 못했습니다", str(e))
         self._clear_recovery(p)
 
-    def close_project(self):
-        if self.session.project is not None:
-            self.save()
+    def close_project(self) -> bool:
+        if self.session.project is not None and not self._save_or_ask("프로젝트를 닫기"):
+            return False
         self.activity.set_cut("", None)
         if self.batch.busy:
             self.batch.kill()
@@ -700,21 +719,41 @@ class MainWindow(QMainWindow):
         self.session.open_cut(None)
         self.tlstrip.refresh()
         self.proj_btn.setText("프로젝트 없음")
+        return True
 
-    def save(self, quiet: bool = False):
+    def save(self, quiet: bool = False) -> bool:
+        """False when the project could not be written: callers that would drop what is in memory (closing the
+        project, going to another cut, quitting) must stop then."""
         if self.session.project is None:
-            return
+            return True
         if not quiet:
             self.saved_lbl.start("저장 중")
         self.activity.flush()
+        # joint re-solves still queued are part of what is saved (and must not write the tracks while they are saved)
+        self.edit_worker.drain(30.0)
         try:
             self.session.save()
-            self._clear_recovery(Path(self.session.project.path))
-            self._collect_learning()
-            self.saved_lbl.done(f"저장됨 {time.strftime('%H:%M')}")
         except Exception as e:
             self.saved_lbl.done("저장 실패")
             self.show_error("저장 실패", f"{e}\n{traceback.format_exc()}")
+            return False
+        try:
+            self._clear_recovery(Path(self.session.project.path))
+            self._collect_learning()
+        except Exception:
+            traceback.print_exc()
+        self.saved_lbl.done(f"저장됨 {time.strftime('%H:%M')}")
+        return True
+
+    def _save_or_ask(self, what: str) -> bool:
+        """Saves; if that fails, asks whether to go on anyway (losing what was not saved). Default: no."""
+        if self.save():
+            return True
+        return QMessageBox.question(
+            self, "저장 실패",
+            f"프로젝트를 저장하지 못했습니다. 저장하지 않은 변경 사항을 버리고 {what}할까요?\n"
+            "(아니요: 그대로 두고 공간·권한·네트워크 연결을 확인한 뒤 다시 저장하세요)",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
 
     def apply_autosave_settings(self):
         s = settings()
@@ -875,8 +914,11 @@ class MainWindow(QMainWindow):
             self.toast("일괄 분석 중인 컷입니다. 분석이 끝나면 열 수 있습니다.", kind="warn")
             return
         self.stop_play()
-        if self.session.cut is not None:
-            self.save()
+        if self.session.cut is not None and not self.save():
+            # the open cut's tracks and edits are written with the project: never dropped unsaved
+            self.toast("저장하지 못해 컷을 바꾸지 않았습니다", kind="error")
+            self.cutlist.refresh(self.session.cut.id)
+            return
         self._switch_undo(cut.id)
         self.session.open_cut(cut)
         self.viewer._img_cache.clear()            # cached pictures are per frame number, not per cut
@@ -2260,8 +2302,9 @@ class MainWindow(QMainWindow):
                 return False
             return None
         prj = self.session.project
-        if self.session.dirty:
-            self.save()
+        if self.session.dirty and not self.save():
+            self.stop_play()                    # not into the next cut with this one unsaved
+            return True
         self._switch_undo(nxt.id)
         self.session.adopt(sh)
         cut = self.session.cut
@@ -3170,7 +3213,7 @@ class MainWindow(QMainWindow):
             s.tracker.set_hidden(pid, [j], t, t, False)     # placing a joint means it is visible here
         s.commit_joint(pid, j, self.frame, (x, y))
         s.tracker.store.flags[s.tracker.store.index(pid), t, j] |= S.FLAG_USER
-        self.edit_worker.submit(("resolve", pid), lambda: s.resolve_local(pid, t))
+        self.edit_worker.submit(("resolve", pid), resolve_task(s, pid, t))
         self.timeline.update()
         self.inspector.refresh("track")
 
@@ -3179,7 +3222,7 @@ class MainWindow(QMainWindow):
         self.push_undo()
         if s.delete_joint_key(pid, j, self.frame):
             t = self.frame
-            self.edit_worker.submit(("resolve", pid), lambda: s.resolve_local(pid, t))
+            self.edit_worker.submit(("resolve", pid), resolve_task(s, pid, t))
             self.toast(f"{S.JOINT_NAMES_KO[j]} 키를 지웠습니다.")
 
     def _person_action(self, action: str, pid: int):
@@ -3255,7 +3298,7 @@ class MainWindow(QMainWindow):
             s.cut.joint_keys.get(pid, {}).pop(j, None)
             s.touch()
             for f in frames[:1]:
-                self.edit_worker.submit(("resolve", pid), lambda f=f: s.tracker.resolve_all())
+                self.edit_worker.submit(("resolve", pid), resolve_task(s, pid, every=True))
 
     def _hide_joint(self, action: str, pid: int, j: int):
         s = self.session
@@ -3286,7 +3329,7 @@ class MainWindow(QMainWindow):
         rng = f"{a}" if a == b else f"{a}~{b}"
         self.toast(f"{names}: {rng} 프레임 " + ("안 보이는 관절로 지정" if hide else "자동 판단으로 되돌림"))
         s.touch()
-        self.edit_worker.submit(("resolve", pid), lambda: s.resolve_local(pid, a, frame_end=b))
+        self.edit_worker.submit(("resolve", pid), resolve_task(s, pid, a, frame_end=b))
         self.viewer.update()
 
     def _edit_done(self, tag, res):
@@ -3574,14 +3617,14 @@ class MainWindow(QMainWindow):
                 changed = a ^ b
                 changed |= {(j, f) for (j, f) in a & b if old_keys[pid][j][f] != cut.joint_keys[pid][j][f]}
                 for f in sorted({f for _, f in changed}):
-                    self.edit_worker.submit(("resolve", pid), lambda pid=pid, f=f: s.resolve_local(pid, f))
+                    self.edit_worker.submit(("resolve", pid), resolve_task(s, pid, f))
             for pid in set(old_hidden) | set(cut.hidden):
                 if old_hidden.get(pid) != cut.hidden.get(pid):
                     rs = [r for jd in (old_hidden.get(pid, {}), cut.hidden.get(pid, {})) for v in jd.values() for r in v]
                     if rs:
                         a0, b0 = min(r[0] for r in rs), max(r[1] for r in rs)
                         self.edit_worker.submit(("resolve_h", pid),
-                                                lambda pid=pid, a0=a0, b0=b0: s.resolve_local(pid, a0, frame_end=b0))
+                                                resolve_task(s, pid, a0, frame_end=b0))
         s.touch()
         self._refresh_all()
 
@@ -3733,6 +3776,7 @@ class MainWindow(QMainWindow):
             self.busy.setGeometry(self.center.rect())
 
     def closeEvent(self, e):
+        self._close_saved = False
         if self.session.project is not None and self.session.dirty and not getattr(self, "_close_decided", False):
             m = QMessageBox(self)
             m.setWindowTitle("DIAP")
@@ -3745,7 +3789,10 @@ class MainWindow(QMainWindow):
             m.setDefaultButton(b_save)
             m.exec()
             if m.clickedButton() is b_save:
-                self.save()
+                if not self.save():
+                    e.ignore()                  # not saved: the window stays open
+                    return
+                self._close_saved = True
             elif m.clickedButton() is b_no:
                 self.session.dirty = False
                 self._discard_on_close = True
@@ -3753,6 +3800,12 @@ class MainWindow(QMainWindow):
             else:
                 e.ignore()
                 return
+        if not getattr(self, "_discard_on_close", False) and not self._close_saved and self.job is None:
+            # saved before anything is stopped: a failed save leaves the window (and a running render) as they were
+            if not self._save_or_ask("종료"):
+                e.ignore()
+                return
+            self._close_saved = True
         if self.queue_page.job is not None:
             if QMessageBox.question(self, "렌더 중", "렌더가 진행 중입니다. 종료하면 현재 렌더는 취소됩니다. 종료할까요?") != QMessageBox.Yes:
                 e.ignore()
@@ -3771,8 +3824,10 @@ class MainWindow(QMainWindow):
             self._opening.wait(15000)
         self.projects_page.shutdown()
         self.stop_play()
-        if not getattr(self, "_discard_on_close", False):
-            self.save(quiet=True)
+        if not getattr(self, "_discard_on_close", False) and not self._close_saved \
+                and not self._save_or_ask("종료"):
+            e.ignore()
+            return
         self.activity.flush()
         self.edit_worker.stop()
         self.edit_worker.wait(3000)

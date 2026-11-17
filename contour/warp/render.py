@@ -282,7 +282,7 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
             rf_ = RE.prepare(cut, tracker, t_)
             fi_ = F.build_input(cut, tracker, t_)
         if rf_ is not None:
-            planes_ = RE.apply_planes(planes_, subs, maxv, pf, rf_, 1.0, disp_)
+            planes_ = RE.apply_planes(planes_, subs, maxv, pf, rf_, 1.0, disp_, info.color_range)
         fr_ = F.compute_field(fi_, W, H, grid_step)
         if not warper[1] and not fr_.empty():
             with prep_lock:
@@ -371,7 +371,7 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
                 break
             rf = RE.prepare(cut, tracker, t)
             if rf is not None:
-                planes = RE.apply_planes(planes, subs, maxv, pf, rf, 1.0, disp_)
+                planes = RE.apply_planes(planes, subs, maxv, pf, rf, 1.0, disp_, info.color_range)
             fi = F.build_input(cut, tracker, t)
             fr = F.compute_field(fi, W, H, grid_step)
             alpha_out = None
@@ -399,6 +399,14 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
             w.abort()
         raise
     reader.close()
+    if not rep.cancelled and rep.frames < n:
+        # the source ended early: a shorter file is not this cut (in an edited timeline every later shot would move)
+        if writer and ext_writer is None:
+            writer.abort()
+        for w in matte_writers.values():
+            w.abort()
+        raise RuntimeError(f"원본에서 {rep.frames}/{n} 프레임만 읽혀 렌더를 중단했습니다 (파일이 잘렸거나 메타데이터의 프레임 "
+                           f"수가 실제와 다릅니다). 원본을 다시 내보낸 뒤 렌더하세요.")
     if writer and ext_writer is None:
         if rep.cancelled:
             writer.abort()

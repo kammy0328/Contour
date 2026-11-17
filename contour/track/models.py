@@ -112,18 +112,29 @@ def is_downloaded(key: str) -> bool:
     return _usable(p)
 
 
+MIN_MODEL_BYTES = 1024           # no model (nor weights file) is smaller: an empty or error page download is
+
+
 def _usable(p: Path) -> bool:
-    """present and readable by this user (a file can exist and still be closed to us: see _set_aside)"""
+    """present, readable by this user (a file can exist and still be closed to us: see _set_aside) and plausibly a
+    model: not empty or a few bytes, and an .onnx file is not text (an error page saved in its place).
+    A file that passes and still does not load is set aside by session() and downloaded again."""
     if not p.is_file():
         return False
     try:
+        if p.stat().st_size < MIN_MODEL_BYTES:
+            return False
         with open(p, "rb") as fh:
-            fh.read(16)
-        return True
+            head = fh.read(16)
     except PermissionError:
         return not _set_aside(p)
     except OSError:
-        return True
+        return False
+    # an error page saved in place of the model (HTML, JSON, XML): never the start of a protobuf (the first byte of a
+    # model is a field tag; any field order is accepted, only text is turned away)
+    if p.suffix.lower() == ".onnx" and head.lstrip(b"\xef\xbb\xbf \t\r\n")[:1] in (b"<", b"{", b"["):
+        return False
+    return True
 
 
 def _set_aside(p: Path) -> bool:
@@ -155,6 +166,9 @@ def _download(url: str, dst: Path, progress: Optional[Callable[[float, str], Non
                     got += len(chunk)
                     if progress and total:
                         progress(got / total, f"{label} 다운로드 {got / 1e6:.0f}/{total / 1e6:.0f} MB")
+            if (total and got != total) or got < MIN_MODEL_BYTES:
+                # the connection ended early (no error is raised for that): never kept as if complete
+                raise IOError(f"{label}: 다운로드가 중간에 끊겼습니다 ({got / 1e6:.1f}/{total / 1e6:.1f} MB). 다시 시도하세요.")
             shutil.move(tmp, dst)
         finally:
             if os.path.exists(tmp):
@@ -430,16 +444,39 @@ def _session_raw(path: Path):
     return Session(sess, path)
 
 
+class ModelFileError(RuntimeError):
+    pass
+
+
+# what onnxruntime says of a file that is not a whole model (not of one it could not open: locked, no access)
+BROKEN_MARKERS = ("invalid_protobuf", "protobuf parsing failed", "unexpected end")
+
+
+def _broken(e: BaseException) -> bool:
+    t = str(e).lower()
+    return any(m in t for m in BROKEN_MARKERS)
+
+
 def session(path: Path):
     """Load an ONNX model. If the file itself cannot be opened (another process holds it, a scanner locks it, a sharing
     violation, errno 13), load a private copy from the temp folder: a silent loss of a model (the face parser) costs
-    mask quality without any message."""
+    mask quality without any message. A model file that is not a model (cut off, damaged) is set aside so the next
+    ensure_model downloads it again, and a ModelFileError says so."""
     try:
         return _session_raw(path)
     except Exception as first:
         p = Path(path)
         if not p.is_file():
             raise
+        if _broken(first) and not isinstance(first, PermissionError):
+            import time as _t
+            try:
+                p.rename(p.with_name(p.name + f".broken{int(_t.time())}"))
+            except OSError:
+                pass
+            sys.stderr.write(f"MODEL BROKEN {p.name}: {str(first)[:300]}\n")
+            raise ModelFileError(f"모델 파일이 손상되었습니다 ({p.name}). 다음에 필요할 때 자동으로 다시 받습니다. "
+                                 "인터넷 연결을 확인하고 다시 실행하세요.") from first
         import atexit
         d = Path(tempfile.gettempdir()) / "diap_model_cache" / str(os.getpid())
         try:
