@@ -116,7 +116,7 @@ class SettingsDialog(QDialog):
         self.proxy.setCurrentIndex(max(0, self.proxy.findData(s.proxy_long_side)))
         form.addRow("프록시 해상도", self.proxy)
         self.proxy_mode = QComboBox()
-        for v, t in (("auto", "자동 (원본 읽기가 재생보다 느릴 때만)"), ("always", "항상 (백그라운드)"),
+        for v, t in (("auto", "자동 (원본 읽기가 느리거나 탐색이 잦을 때)"), ("always", "항상 (백그라운드)"),
                      ("off", "만들지 않음 (원본에서 바로 읽기)")):
             self.proxy_mode.addItem(t, v)
         self.proxy_mode.setCurrentIndex(max(0, self.proxy_mode.findData(getattr(s, "proxy_mode", "auto"))))
