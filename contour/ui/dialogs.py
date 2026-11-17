@@ -132,6 +132,10 @@ class SettingsDialog(QDialog):
         self.upd.setToolTip("새 버전이 있으면 시작할 때 알려 줍니다. 설치는 '지금 업데이트'를 눌러야만 합니다.\n"
                             "끄더라도 프로젝트 메뉴 > 업데이트 확인으로 언제든 확인할 수 있습니다.")
         form.addRow("업데이트", self.upd)
+        self.open_last = QCheckBox("시작할 때 마지막 프로젝트 바로 열기")
+        self.open_last.setChecked(bool(getattr(s, "open_last_on_start", False)))
+        self.open_last.setToolTip("끄면(기본) 시작할 때 프로젝트 관리 화면이 먼저 뜹니다")
+        form.addRow("시작", self.open_last)
         self.gpu = QComboBox()
         for v, t in (("auto", "자동"), ("cuda", "CUDA (NVIDIA)"), ("dml", "DirectML"), ("cpu", "CPU")):
             self.gpu.addItem(t, v)
@@ -194,6 +198,7 @@ class SettingsDialog(QDialog):
         s.autosave_minutes = int(self.as_min.value())
         s.autosave_keep = int(self.as_keep.value())
         s.auto_update_check = self.upd.isChecked()
+        s.open_last_on_start = self.open_last.isChecked()
         if s.gpu != self.gpu.currentData():
             s.gpu = self.gpu.currentData()
             from ..track.models import reset_providers

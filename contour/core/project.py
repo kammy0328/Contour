@@ -11,7 +11,8 @@ from typing import Dict, List, Optional, Tuple
 
 from .media import MediaInfo
 
-PROJECT_EXT = ".contour"
+PROJECT_EXT = ".dpprj"              # project folder (older projects end in .contour and open the same)
+PROJECT_EXTS = (".dpprj", ".contour")
 
 from .params import ALL_KEYS, GEOMETRY_KEYS, PARAM, RETOUCH_KEYS, WIDTH_KEYS, default as param_default
 
@@ -532,7 +533,7 @@ class Cut:
 @dataclass
 class Project:
     name: str
-    path: str                         # folder ending with .contour
+    path: str                         # folder ending with .dpprj (or .contour from before 1.13)
     cuts: List[Cut] = field(default_factory=list)
     input_cs: str = ""                # default input colourspace for new cuts ('' = passthrough)
     created: float = field(default_factory=time.time)
