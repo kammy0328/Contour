@@ -152,8 +152,8 @@ class NextCutPrep:
                         sh.proxy.close()
                     sh.proxy, sh.tracker = None, None
                     vs = sh.view_settings(cut)
-                    if cut.tl and (project.timeline or {}).get("baked"):
-                        from ..core.tlimport import build_bake_proxy
+                    from ..core.tlimport import build_bake_proxy, shares_bake
+                    if shares_bake(project, cut):
                         ok = build_bake_proxy(project, manager(), vs, None, stop.is_set)
                     else:
                         ok = sh.make_proxy(cut).build(manager(), vs, None, stop.is_set)

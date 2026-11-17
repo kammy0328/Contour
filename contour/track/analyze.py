@@ -673,6 +673,7 @@ class CutTracker:
         p_w(1.0, "완료")
         self.cut.analyzed = True
         self.cut.analysis_version += 1
+        self.cut.cs_analysed = self.cut.input_cs or ""
         self.save()
         return st
 

@@ -139,7 +139,7 @@ class _CardDelegate(QStyledItemDelegate):
         if sz:
             line2 += f" · {PJ.human(sz['total'])}"
             if sz.get("proxy"):
-                line2 += f" (프록시 {PJ.human(sz['proxy'])})"
+                line2 += f" · 프록시 {PJ.human(sz['proxy'])}"
         p.drawText(QRectF(tr.left(), y, tr.width(), 17), Qt.AlignLeft | Qt.AlignVCenter,
                    fm.elidedText(line2.strip(" ·"), Qt.ElideRight, int(tr.width())))
         y += 17
@@ -432,7 +432,8 @@ class ProjectsPage(QWidget):
         r = QMessageBox.question(
             self, "프록시 캐시 정리",
             f"'{d.get('name')}'의 프록시 {PJ.human(sz.get('proxy', 0))}를 지울까요?\n\n"
-            "분석 결과, 매트, 보정 값은 그대로 남습니다. 컷을 다시 열면 프록시를 새로 만듭니다(컷마다 시간이 걸립니다).")
+            "분석 결과, 매트, 보정 값은 그대로 남습니다. 컷을 다시 열면 이 PC의 캐시 폴더에 프록시를 새로 만듭니다"
+            "(컷마다 시간이 걸립니다).")
         if r != QMessageBox.Yes:
             return
         freed = PJ.clear_proxies(path)
@@ -473,6 +474,7 @@ class ProjectsPage(QWidget):
         elif c is b_trash:
             if not self._release_if_open(path, "삭제"):
                 return
+            lc = PJ.local_cache(path)            # this computer's proxies of the project (read before it moves)
             ok = QFile.moveToTrash(path)
             if isinstance(ok, tuple):
                 ok = ok[0]
@@ -480,6 +482,9 @@ class ProjectsPage(QWidget):
                 QMessageBox.warning(self, "삭제", "휴지통으로 보내지 못했습니다. 다른 프로그램이 폴더의 파일을 쓰고 있거나, "
                                     "네트워크 드라이브처럼 휴지통이 없는 위치일 수 있습니다.\n폴더는 그대로 있습니다.")
                 return
+            if lc is not None:
+                import shutil
+                shutil.rmtree(lc, ignore_errors=True)
             PJ.forget(path)
             self.thumbs.pop(path, None)
             self.sizes.pop(path, None)

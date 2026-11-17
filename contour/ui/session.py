@@ -51,7 +51,7 @@ class EditSession:
         return ViewSettings(input_cs=cs, display=s.display, view=s.view, lut_path=cut.lut_path if cut else "")
 
     def make_proxy(self, cut: Cut) -> Proxy:
-        return Proxy(self.project.cache_dir(cut), cut.info, settings().proxy_long_side)
+        return Proxy(self.project.proxy_dir(cut), cut.info, settings().proxy_long_side)
 
     def open_cut(self, cut: Optional[Cut]) -> None:
         with self._lock:

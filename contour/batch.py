@@ -95,7 +95,7 @@ def analyze(project_path: str, cut_id: str, accuracy: str = "high", all_targets:
                                       ensure_ascii=False), encoding="utf-8")
             _say(1.0, "인물 없음")
             return 0
-    px = Proxy(prj.cache_dir(cut), cut.info, s.proxy_long_side)
+    px = Proxy(prj.proxy_dir(cut), cut.info, s.proxy_long_side)
     vs = _vs_for(cut)
     if not px.is_valid(vs.key()):
         _say(0.02, "프록시 만드는 중")
@@ -115,6 +115,15 @@ def analyze(project_path: str, cut_id: str, accuracy: str = "high", all_targets:
         return 0
     cut.stats.analysis_runs += 1
     cut.stats.auto_ok_rate = tr.auto_ok_rate(cut.tracking.conf_threshold)
+    try:
+        from .track.models import take_cpu_fallbacks
+        fb = take_cpu_fallbacks()
+        if fb:
+            why = "GPU 메모리가 부족해" if any(w == "GPU 메모리 부족" for _, w in fb) else "GPU에서 열지 못해"
+            print(f"WARN {why} 일부 모델을 CPU로 실행했습니다 ({', '.join(sorted({n for n, _ in fb}))[:120]}). "
+                  "분석이 많이 느려질 수 있습니다", flush=True)
+    except Exception:
+        pass
     try:
         from .learn.refiner import collect_auto
         from .learn import fusion as FU

@@ -1261,8 +1261,23 @@ def person_masks(cut, tracker, t: int, pid: int) -> Optional[RetouchFrame]:
 PARSE_NOW = True          # a face the analysis kept no parser maps for is parsed when its frame is retouched
 PARSE_NOW_MIN = 60.0      # proxy px of face width from which that is done
 _FPARSER = [None]
+_FP_COOL = [0.0]          # out of GPU memory: no parse-now until then (time.time())
 import threading as _threading
+import time as _time
 _FPLOCK = _threading.Lock()
+
+
+def _drop_parser() -> None:
+    """GPU memory is short: the parser is made again the next time it is needed."""
+    if _FPARSER[0]:
+        _FPARSER[0] = None
+
+
+try:
+    from ..track import models as _M
+    _M.on_low_gpu_memory(_drop_parser)
+except Exception:
+    pass
 
 
 def _parse_now(rgb_u8: np.ndarray, lm: np.ndarray) -> Optional[dict]:
@@ -1273,6 +1288,8 @@ def _parse_now(rgb_u8: np.ndarray, lm: np.ndarray) -> Optional[dict]:
             return None
         from ..track import faceparse as FP
         from ..track import facelayer as FL
+        if _FP_COOL[0] > _time.time():
+            return None
         with _FPLOCK:                           # frames are prepared on several threads: one parser, one call at a time
             if _FPARSER[0] is None:
                 _FPARSER[0] = FP.FaceParser() if FP.ready() else False
@@ -1287,6 +1304,13 @@ def _parse_now(rgb_u8: np.ndarray, lm: np.ndarray) -> Optional[dict]:
         return dict(tex=None, skin=FP.to_image(r["skin"], r["M"], shape), neck=FP.to_image(r["neck"], r["M"], shape),
                     cover=cover, trust=float(np.clip((rel - 0.35) / 0.25, 0, 1)))
     except Exception as e_:
+        from ..track import models as M_
+        if M_.is_oom(e_):
+            # short of GPU memory (an analysis or another program): not for good, again in a while
+            print("parse-now paused (GPU memory):", repr(e_)[:200], flush=True)
+            _FPARSER[0] = None
+            _FP_COOL[0] = _time.time() + 30.0
+            return None
         if _FPARSER[0] is not False:
             print("parse-now off:", repr(e_)[:200], flush=True)
         _FPARSER[0] = False

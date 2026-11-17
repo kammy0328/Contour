@@ -81,6 +81,7 @@ class BatchRunner(QObject):
     progressed = Signal(str, float, str)       # cut id, 0..1, message
     finishedCut = Signal(str, bool, str)       # cut id, ok, error text
     finishedAll = Signal(int, int)             # done, failed
+    warned = Signal(str, str)                  # cut id, a warning the analysis printed (WARN ...)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -216,6 +217,8 @@ class BatchRunner(QObject):
                 self.progressed.emit(self.current or "", f, parts[2] if len(parts) > 2 else "")
             elif t.startswith("ERROR "):
                 self._errline = t[6:]
+            elif t.startswith("WARN "):
+                self.warned.emit(self.current or "", t[5:])
 
     def _finished(self, code, _status):
         self.paused = False

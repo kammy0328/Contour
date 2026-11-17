@@ -4,6 +4,8 @@ Pre/post-processing follows the RTMPose reference implementation (rtmlib, Apache
 """
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import cv2
@@ -401,6 +403,9 @@ class Segmenter31:
     def __init__(self, key: str = "seg_sam31"):
         d = M.ensure_model(key)
         enc_path = d / "image-encoder-gpu.onnx"
+        alt = os.environ.get("DIAP_SAM_ENCODER", "")          # another build of the encoder (tests)
+        if alt and Path(alt).is_file():
+            enc_path = Path(alt)
         self.enc = M.session(enc_path if enc_path.is_file() else d / "image-encoder.onnx")
         self.dec = M.session(d / "click-decoder.onnx")
         self.enc_in = self.enc.get_inputs()[0]

@@ -168,7 +168,7 @@ def _retouch(project: Project, out: _Out, cut, cancel, tick, rep: TimelineReport
     from ..core.settings import settings
     from ..track.analyze import CutTracker
     from .render import render_cut
-    px = Proxy(project.cache_dir(cut), cut.info, settings().proxy_long_side)
+    px = Proxy(project.proxy_dir(cut), cut.info, settings().proxy_long_side)
     if not px.has_frames():
         rep.warnings.append(f"{cut.name}: 프록시가 없어 원본으로 넣었습니다")
         return _copy(out, cut, cancel, tick)

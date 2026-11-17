@@ -12,6 +12,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -279,7 +280,12 @@ def providers() -> List:
         chosen: List = []
         if want in ("auto", "cuda") and "CUDAExecutionProvider" in avail:
             _preload_cuda()
-            chosen.append(("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC"}))
+            opts = {"cudnn_conv_algo_search": "HEURISTIC"}
+            if os.environ.get("DIAP_ARENA", ARENA) == "same":
+                # the GPU memory pool grows by what is asked, not to the next power of two (SAM 3.1's attention asks
+                # for buffers of a few hundred MB: doubling them filled a 12 GB card)
+                opts["arena_extend_strategy"] = "kSameAsRequested"
+            chosen.append(("CUDAExecutionProvider", opts))
             _device_label = "CUDA"
         elif want in ("auto", "dml") and "DmlExecutionProvider" in avail:
             chosen.append("DmlExecutionProvider")
@@ -301,25 +307,127 @@ def reset_providers() -> None:
     _providers_cache = None
 
 
+# session settings (measured on the 4070 Ti, j2682); DIAP_ARENA / DIAP_SPIN / DIAP_THREADS override them
+ARENA = "default"           # "same": the CUDA memory pool grows by what is asked (kSameAsRequested)
+SPIN = "1"                  # "0": idle threads do not spin
+
+# ---------------------------------------------------------------------------------------------- GPU memory
+OOM_MARKERS = ("out of memory", "failed to allocate", "cudnn_status_alloc_failed", "cudaerrormemoryallocation",
+               "cuda_error_out_of_memory", "bfcarena", "e_outofmemory", "887a0005", "887a0006")
+
+
+class GpuMemoryError(RuntimeError):
+    pass
+
+
+GPU_OOM_TEXT = ("GPU 메모리가 부족합니다. GPU를 쓰는 다른 프로그램(다빈치 리졸브 등)이나 함께 돌고 있는 분석·렌더를 "
+                "끝낸 뒤 다시 하세요.")
+_release_hooks: List = []
+cpu_fallbacks: List = []          # (model file, reason): models that run on the CPU although a GPU was chosen
+
+
+def is_oom(e: BaseException) -> bool:
+    t = str(e).lower()
+    return isinstance(e, (GpuMemoryError, MemoryError)) or any(m in t for m in OOM_MARKERS)
+
+
+def on_low_gpu_memory(fn) -> None:
+    """fn() is called when the GPU runs out of memory: drop what can be made again later (cached sessions...)."""
+    if fn not in _release_hooks:
+        _release_hooks.append(fn)
+
+
+def free_gpu_memory() -> None:
+    import gc
+    for fn in list(_release_hooks):
+        try:
+            fn()
+        except Exception:
+            pass
+    gc.collect()
+    if "torch" in sys.modules:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+class Session:
+    """An onnxruntime session whose run() gets over a moment without GPU memory: what can be dropped is dropped and
+    the run is tried again (another process, the preview or a render often frees its memory a moment later). Still
+    without memory, a GpuMemoryError with a message for the user. Everything else is the session's own."""
+
+    RETRIES = 2
+
+    def __init__(self, sess, path):
+        self._s = sess
+        self._path = str(path)
+
+    def run(self, *a, **k):
+        for attempt in range(self.RETRIES + 1):
+            try:
+                return self._s.run(*a, **k)
+            except Exception as e:
+                if not is_oom(e):
+                    raise
+                sys.stderr.write(f"GPU OOM {Path(self._path).name} (try {attempt + 1}): {str(e)[:300]}\n")
+                if attempt >= self.RETRIES:
+                    raise GpuMemoryError(GPU_OOM_TEXT) from e
+                free_gpu_memory()
+                time.sleep(1.5 * (attempt + 1))
+
+    def __getattr__(self, name):
+        return getattr(self._s, name)
+
+
+def take_cpu_fallbacks() -> List:
+    out = list(cpu_fallbacks)
+    cpu_fallbacks.clear()
+    return out
+
+
 def _session_raw(path: Path):
     import onnxruntime as ort
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    so.log_severity_level = 3
+    so.log_severity_level = int(os.environ.get("DIAP_ORT_LOG", "3"))
     # leave two cores to the rest of the computer (the app's own preview, other programs): an analysis used
     # every core and made the whole PC sluggish
     n = os.cpu_count() or 4
-    so.intra_op_num_threads = max(1, n - 2)
+    so.intra_op_num_threads = int(os.environ.get("DIAP_THREADS", "0") or 0) or max(1, n - 2)
     so.inter_op_num_threads = 1
+    if os.environ.get("DIAP_SPIN", SPIN) == "0":
+        # an idle session's threads stop at once instead of spinning: with a dozen models loaded, their spinning
+        # threads took the CPU from the one that was working
+        so.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        so.add_session_config_entry("session.inter_op.allow_spinning", "0")
     if "DmlExecutionProvider" in [p if isinstance(p, str) else p[0] for p in providers()]:
         # DirectML requires sequential execution without memory patterns
         so.enable_mem_pattern = False
         so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-    try:
-        return ort.InferenceSession(str(path), sess_options=so, providers=providers())
-    except Exception:
-        # A broken GPU setup should never stop the app: fall back to CPU.
-        return ort.InferenceSession(str(path), sess_options=so, providers=["CPUExecutionProvider"])
+    prov = providers()
+    on_gpu = any((p if isinstance(p, str) else p[0]) != "CPUExecutionProvider" for p in prov)
+    err = None
+    for attempt in range(2 if on_gpu else 1):
+        try:
+            return Session(ort.InferenceSession(str(path), sess_options=so, providers=prov), path)
+        except Exception as e:
+            err = e
+            if not (on_gpu and is_oom(e)) or attempt:
+                break
+            # out of GPU memory while loading: free what can be freed and try once more on the GPU
+            sys.stderr.write(f"GPU OOM loading {Path(path).name}: {str(e)[:300]}\n")
+            free_gpu_memory()
+            time.sleep(1.0)
+    # A broken GPU setup should never stop the app: fall back to CPU (much slower: noted and shown to the user)
+    sess = ort.InferenceSession(str(path), sess_options=so, providers=["CPUExecutionProvider"])
+    if on_gpu:
+        why = "GPU 메모리 부족" if err is not None and is_oom(err) else "GPU에서 열지 못함"
+        sys.stderr.write(f"MODEL ON CPU {Path(path).name} ({why}): {str(err)[:300]}\n")
+        cpu_fallbacks.append((Path(path).name, why))
+    return Session(sess, path)
 
 
 def session(path: Path):

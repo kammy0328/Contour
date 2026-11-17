@@ -124,10 +124,11 @@ def bake_proxy(project: Project):
     info = M.probe(baked) if Path(baked).exists() else None
     if info is None:
         return None
-    cands = [Path(project.path) / "bake_cache"]
+    cands = [project.bake_cache_dir(), Path(project.path) / "bake_cache"]
     cuts_dir = Path(project.path) / "cuts"
     for c in project.cuts:
         if not c.tl and c.info.kind == "video" and _same_file(c.source, baked):
+            cands.append(project.proxy_dir(c))
             cands.append(cuts_dir / c.id / "cache")
     if cuts_dir.exists():
         # the plain cut may already be gone from the project (it became this timeline); its cache is still there
@@ -135,7 +136,11 @@ def bake_proxy(project: Project):
             mp = d / "cache" / "proxy_meta.json"
             if mp.exists() and (d / "cache") not in cands:
                 cands.append(d / "cache")
+    seen = set()
     for d in cands:
+        if str(d) in seen:
+            continue
+        seen.add(str(d))
         px = Proxy(d, info, settings().proxy_long_side)
         if px.shared:
             continue
@@ -151,11 +156,55 @@ def link_bake_proxy(project: Project, px=None) -> int:
     px = px or bake_proxy(project)
     if px is None:
         return 0
+    view = px.meta().get("view")
     n = 0
     for c in project.timeline_cuts():
-        link_shared(project.cache_dir(c), px, int(getattr(c.info, "offset", 0)))
+        if view and not same_view(c, view):
+            continue                # seen in another colour space or LUT than the bake's proxy: its own proxy
+        link_shared(project.proxy_dir(c), px, int(getattr(c.info, "offset", 0)))
         n += 1
     return n
+
+
+def cut_view_key(cut) -> str:
+    from ..warp.render import _vs_for
+    return _vs_for(cut).key()
+
+
+def same_view(cut, view_key: str) -> bool:
+    try:
+        return cut_view_key(cut) == view_key
+    except Exception:
+        return True
+
+
+def shares_bake(project: Project, cut) -> bool:
+    """The shot's proxy is a stretch of the bake's one proxy (else it has its own)."""
+    tlm = project.timeline or {}
+    if not (cut.tl and tlm.get("baked") and Path(tlm["baked"]).exists()):
+        return False
+    ref = bake_view_cut(project)
+    try:
+        return ref is None or cut_view_key(ref) == cut_view_key(cut)
+    except Exception:
+        return True
+
+
+def bake_view_cut(project: Project):
+    """The timeline shot whose colour view the bake's one proxy is made in: the view most shots share (a shot set
+    to another colour space or LUT by hand gets its own proxy, the others keep sharing the bake's)."""
+    cnt: dict = {}
+    first: dict = {}
+    for c in project.timeline_cuts():
+        try:
+            k = cut_view_key(c)
+        except Exception:
+            continue
+        cnt[k] = cnt.get(k, 0) + 1
+        first.setdefault(k, c)
+    if not cnt:
+        return None
+    return first[max(cnt, key=cnt.get)]
 
 
 def build_bake_proxy(project: Project, cm, vs, progress=None, cancel=None) -> bool:
@@ -167,7 +216,7 @@ def build_bake_proxy(project: Project, cm, vs, progress=None, cancel=None) -> bo
     if not baked or not Path(baked).exists():
         return False
     info = M.probe(baked)
-    px = Proxy(Path(project.path) / "bake_cache", info, settings().proxy_long_side)
+    px = Proxy(project.bake_cache_dir(), info, settings().proxy_long_side)
     if not px.is_valid(vs.key()):
         if not px.build(cm, vs, progress, cancel):
             return False

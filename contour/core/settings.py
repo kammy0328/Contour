@@ -32,6 +32,7 @@ def default_data_dir() -> Path:
 @dataclass
 class AppSettings:
     data_dir: str = ""
+    cache_dir: str = ""                   # proxies (made again from the footage whenever missing); "" = data folder\cache
     ffmpeg_dir: str = ""                  # (unused since 1.14: ffmpeg ships with DIAP) kept so old files load
     ocio_config: str = ""                 # (unused since 1.14: always the built-in ACES Studio config)
     display: str = ""
@@ -63,6 +64,17 @@ class AppSettings:
     def data_path(self) -> Path:
         p = Path(self.data_dir) if self.data_dir else default_data_dir()
         p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    @property
+    def cache_path(self) -> Path:
+        """This computer's cache of proxies: a fast local disk, not the project's (often network) folder."""
+        p = Path(self.cache_dir) if self.cache_dir else self.data_path / "cache"
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            p = self.data_path / "cache"
+            p.mkdir(parents=True, exist_ok=True)
         return p
 
     @property

@@ -364,7 +364,7 @@ def face_thumb(project, cut, pid: int, size: int = 96) -> Optional[np.ndarray]:
         im = cv2.imdecode(np.frombuffer(f.read_bytes(), np.uint8), cv2.IMREAD_COLOR)
         if im is not None:
             return cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
-    px = Proxy(project.cache_dir(cut), cut.info, settings().proxy_long_side)
+    px = Proxy(project.proxy_dir(cut), cut.info, settings().proxy_long_side)
     if not px.has_frames():
         return None
     try:

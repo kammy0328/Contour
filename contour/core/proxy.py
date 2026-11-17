@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import time
 from pathlib import Path
 from typing import Callable, Optional, Tuple
@@ -23,6 +24,36 @@ def proxy_size(info: MediaInfo, long_side: int) -> Tuple[int, int]:
 
 
 SHARED = "proxy_shared.json"       # in a timeline cut's cache: its frames are a stretch of the bake's proxy
+SPACE_MARGIN = 1 << 30             # free space left on the drive after a proxy or matte is written
+
+
+class DiskSpaceError(RuntimeError):
+    pass
+
+
+def ensure_space(path: Path, total: int, what: str) -> None:
+    """Before a memory-mapped file of `total` bytes is made at `path`: enough room on its drive (a full drive halfway
+    through writing a mapped file stops the app with an error deep in numpy)."""
+    path = Path(path)
+    have = 0
+    try:
+        if path.exists():
+            have = path.stat().st_size
+    except OSError:
+        pass
+    need = max(0, int(total) - have)
+    if need <= 0:
+        return
+    try:
+        free = shutil.disk_usage(path.parent if path.parent.exists() else path.anchor).free
+    except OSError:
+        return
+    if free < need + SPACE_MARGIN:
+        drive = path.anchor or str(path.parent)
+        raise DiskSpaceError(
+            f"{what}을(를) 만들 공간이 부족합니다 ({drive}): 필요 {need / 1e9:.1f}GB, 남은 공간 {free / 1e9:.1f}GB.\n"
+            "프로젝트 관리에서 쓰지 않는 프로젝트의 '프록시 캐시 정리'로 공간을 비우거나, 설정에서 캐시 폴더를 "
+            "공간이 넉넉한 드라이브로 바꾸세요.")
 
 
 class Proxy:
@@ -147,6 +178,7 @@ class Proxy:
             self.path = self.dir / f"proxy_{self.w}x{self.h}.u8"
         self.close()
         self.dir.mkdir(parents=True, exist_ok=True)
+        ensure_space(self.path, self.n * self.h * self.w * 3, "프록시")
         mm = np.memmap(self.path, dtype=np.uint8, mode="w+", shape=(self.n, self.h, self.w, 3))
         pf = "gbrpf32le" if self.info.is_float else "rgb48le"
         meta = {"w": self.w, "h": self.h, "n": self.n, "view": vs.key(), "complete": False, "sig": self._source_sig(),
@@ -199,6 +231,7 @@ class MatteStore:
 
     def create(self) -> np.memmap:
         self._mm = None
+        ensure_space(self.path, self.n * self.h * self.w, "인물 매트")
         return np.memmap(self.path, dtype=np.uint8, mode="w+", shape=(self.n, self.h, self.w))
 
     def get(self, i: int) -> Optional[np.ndarray]:
@@ -230,5 +263,12 @@ def link_shared(cut_cache_dir: Path, bake_proxy: "Proxy", offset: int) -> None:
     """Points a timeline shot at the bake's proxy (frames offset .. offset + shot length)."""
     d = Path(cut_cache_dir)
     d.mkdir(parents=True, exist_ok=True)
+    if d.resolve() != Path(bake_proxy.dir).resolve():
+        # a proxy of its own made while the shot was in another colour space: no longer used
+        for f in list(d.glob("proxy_*.u8")) + [d / "proxy_meta.json"]:
+            try:
+                f.unlink()
+            except OSError:
+                pass
     (d / SHARED).write_text(json.dumps(dict(path=str(bake_proxy.path), meta=str(bake_proxy.meta_path),
                                             offset=int(offset))), encoding="utf-8")

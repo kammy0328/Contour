@@ -427,6 +427,7 @@ class Cut:
     out_frame: int = -1              # exclusive; -1 = end
     input_cs: str = ""               # empty = project default
     cs_auto: str = ""                # how the app chose input_cs by itself ('' = chosen by hand / not looked at)
+    cs_analysed: Optional[str] = None  # input_cs when the cut was last analysed (None: before 1.16, unknown)
     lut_path: str = ""
     mode: str = "warp"               # warp | separate
     persons: List[Person] = field(default_factory=list)
@@ -481,7 +482,7 @@ class Cut:
     def to_dict(self) -> dict:
         return {
             "id": self.id, "name": self.name, "source": self.source, "info": self.info.to_dict(),
-            "in_frame": self.in_frame, "out_frame": self.out_frame, "input_cs": self.input_cs, "cs_auto": self.cs_auto, "lut_path": self.lut_path,
+            "in_frame": self.in_frame, "out_frame": self.out_frame, "input_cs": self.input_cs, "cs_auto": self.cs_auto, "cs_analysed": self.cs_analysed, "lut_path": self.lut_path,
             "mode": self.mode, "persons": [p.to_dict() for p in self.persons],
             "params": {str(k): v.to_dict() for k, v in self.params.items()},
             "joint_keys": {str(pid): {str(j): {str(f): xy for f, xy in fr.items()} for j, fr in jd.items()}
@@ -505,6 +506,7 @@ class Cut:
         c.out_frame = int(d.get("out_frame", -1))
         c.input_cs = d.get("input_cs", "")
         c.cs_auto = d.get("cs_auto", "")
+        c.cs_analysed = d.get("cs_analysed")
         c.lut_path = d.get("lut_path", "")
         c.mode = d.get("mode", "warp")
         c.persons = [Person.from_dict(p) for p in d.get("persons", [])]
@@ -537,6 +539,13 @@ class Cut:
         return c
 
 
+def _complete(meta: Path) -> bool:
+    try:
+        return bool(json.loads(meta.read_text(encoding="utf-8")).get("complete"))
+    except Exception:
+        return False
+
+
 @dataclass
 class Project:
     name: str
@@ -561,7 +570,54 @@ class Project:
         return d
 
     def cache_dir(self, cut: Cut) -> Path:
+        """Analysis results that only an analysis makes again (mattes, person labels, face layer): kept with the
+        project. Proxies are in proxy_dir (this computer's cache)."""
         d = self.cut_dir(cut) / "cache"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    # ------------------------------------------------------------------ proxies (this computer's cache, 1.16)
+    def cache_key(self) -> str:
+        """The project's folder name in the cache: its creation time (stays when the project is renamed or moved)."""
+        return f"{int(self.created)}"
+
+    def local_cache(self) -> Path:
+        from .settings import settings
+        root = settings().cache_path
+        key = self.cache_key()
+        d = next((p for p in root.glob(key + "_*") if p.is_dir()), None) if root.exists() else None
+        if d is None:
+            safe = re.sub(r"[^0-9A-Za-z가-힣_.-]+", "_", self.name).strip("_")[:40] or "project"
+            d = root / f"{key}_{safe}"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def proxy_dir(self, cut: Cut) -> Path:
+        """Where the cut's proxy is: this computer's cache. A proxy an older version made in the project folder is
+        used where it is until it is cleared (설정 > 캐시 정리), then it is made again here."""
+        old = self.cut_dir(cut) / "cache"
+        if _complete(old / "proxy_meta.json"):
+            return old
+        sh = old / "proxy_shared.json"
+        if sh.exists():
+            try:
+                if Path(json.loads(sh.read_text(encoding="utf-8"))["path"]).exists():
+                    return old
+            except Exception:
+                pass
+            try:
+                sh.unlink()                 # a link to a bake proxy that is gone
+            except OSError:
+                pass
+        d = self.local_cache() / "cuts" / cut.id
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def bake_cache_dir(self) -> Path:
+        old = self.folder / "bake_cache"
+        if _complete(old / "proxy_meta.json"):
+            return old
+        d = self.local_cache() / "bake_cache"
         d.mkdir(parents=True, exist_ok=True)
         return d
 
