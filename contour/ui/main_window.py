@@ -460,31 +460,18 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         a_save = m.addAction(I.icon("save", 14), "저장  Ctrl+S")
         a_save.setEnabled(self.session.project is not None)
-        a_client = m.addAction("클라이언트/메모…")
-        a_client.setEnabled(self.session.project is not None)
         a_learn = m.addAction("이 프로젝트를 학습 데이터에 포함")
         a_learn.setCheckable(True)
         a_learn.setChecked(bool(self.session.project and self.session.project.learn))
         a_learn.setEnabled(self.session.project is not None)
-        a_xml = m.addAction("편집 XML에서 컷 경계 불러오기…")
-        a_xml.setEnabled(self.session.project is not None)
-        a_tl = m.addAction("편집 타임라인 불러오기 (XML·FCPXML·EDL + 베이크 영상)…")
+        a_tl = m.addAction("타임라인 불러오기…")
         a_tl.setEnabled(self.session.project is not None)
         a_tlx = m.addAction("타임라인 내보내기…")
         a_tlx.setEnabled(self.session.project is not None and bool(self.session.project.timeline_cuts()))
-        a_style = m.addAction("수작업 결과로 리터칭 스타일 학습…")
-        a_style.setEnabled(self.session.cut is not None)
-        a_style_v = m.addAction("학습된 리터칭 스타일 보기")
         a_reveal = m.addAction("프로젝트 폴더 열기")
         a_reveal.setEnabled(self.session.project is not None)
-        m.addSeparator()
-        a_upd = m.addAction(f"업데이트 확인 (지금 {APP_VERSION})")
         act = m.exec(self.proj_btn.mapToGlobal(self.proj_btn.rect().bottomLeft()))
         if act is None:
-            return
-        if act == a_upd:
-            from . import update as UP
-            UP.check(self, manual=True)
             return
         if act == a_mgr:
             self.show_page("projects")
@@ -497,27 +484,13 @@ class MainWindow(QMainWindow):
                 self.show_page("edit")
         elif act == a_save:
             self.save()
-        elif act == a_client:
-            t = TextPrompt.ask(self, "클라이언트", "클라이언트/메모 (통계와 학습 데이터에 기록됩니다)",
-                               self.session.project.client)
-            if t is not None:
-                self.session.project.client = t
-                self.session.dirty = True
         elif act == a_learn:
             self.session.project.learn = act.isChecked()
             self.session.dirty = True
-        elif act == a_xml:
-            f, _ = QFileDialog.getOpenFileName(self, "편집 XML (Premiere / FCP7)", str(Path.home()), "XML (*.xml)")
-            if f:
-                self.import_edit_xml(f)
         elif act == a_tl:
             self.import_timeline()
         elif act == a_tlx:
             self._tl_action("export", self.tlstrip.selected_ids())
-        elif act == a_style:
-            self.pick_style_ref()
-        elif act == a_style_v:
-            self.show_style_samples()
         elif act == a_reveal:
             QDesktopServices.openUrl(QUrl.fromLocalFile(self.session.project.path))
         elif act.data():
@@ -1979,40 +1952,6 @@ class MainWindow(QMainWindow):
 
         self.run_job(f"수작업 결과로 스타일 학습 · {cut.name}", work, done)
 
-    def pick_style_ref(self):
-        from ..learn import style as SL
-        cut = self.session.cut
-        if cut is None:
-            self.toast("컷을 먼저 여세요", "warn")
-            return
-        start = cut.retouch_ref or SL.find_after(cut.source) or str(Path(cut.source).parent)
-        flt = "수작업 결과 (영상 또는 보정 후 이미지) (*.mov *.mp4 *.mxf *.m4v *.avi *.mkv *.png *.jpg *.jpeg *.tif *.tiff);;모든 파일 (*)"
-        p, _ = QFileDialog.getOpenFileName(self, f"{cut.name}의 수작업 리터칭 결과 (영상 또는 한 프레임 이미지)", start, flt)
-        if p:
-            self.learn_style(cut, p)
-
-    def show_style_samples(self):
-        from ..learn import style as SL
-        ss = SL.load_samples()
-        if not ss:
-            QMessageBox.information(self, "학습된 리터칭 스타일",
-                                    "아직 학습한 수작업 결과가 없습니다.\n\n원본과 수작업 결과(이름_AFTER)를 함께 끌어다 놓으면 "
-                                    "분석 뒤 자동으로 학습합니다.")
-            return
-        agg = SL.aggregate(ss)
-        lines = []
-        for x in ss:
-            v = x.get("values", {})
-            lines.append(f"{x.get('clip')}  ({x.get('date', '')})  피부결 {v.get('skin', 0):.0f} · 질감 {x.get('detail', 45):.0f} · "
-                         f"잡티 {v.get('blemish', 0):.0f} · 그레인 {v.get('grain', 0):.0f}  |  차이 {x.get('err_before', 0):.2f} → {x.get('err_after', 0):.2f}"
-                         f"  |  수작업 피부결 유지 {100 * x.get('hand_texture_kept', 1):.0f}%")
-        head = ""
-        if agg:
-            v = agg["values"]
-            head = (f"프리셋 '{SL.PRESET_NAME}' (영상 {agg['n']}개): 피부결 {v['skin']} · 질감 유지 {agg['detail']} · 잡티 {v['blemish']} · "
-                    f"홍조 {v['redness']} · 다크서클 {v['dark_circle']} · 팔자 {v['nasolabial']} · 번들 {v['shine']} · 그레인 {v['grain']}\n\n")
-        QMessageBox.information(self, "학습된 리터칭 스타일", head + "\n".join(lines))
-
     def _apply_pending_copy(self, cut):
         pc = cut.pending_copy
         if not pc:
@@ -3454,6 +3393,9 @@ class MainWindow(QMainWindow):
         d = SettingsDialog(self)
         if d.exec():
             changed = d.apply()
+            if d.check_update:
+                from . import update as UP
+                UP.check(self, manual=True)
             try:
                 from ..track.models import device_label
                 self.dev_lbl.setText(f"추론: {device_label()}")

@@ -50,7 +50,7 @@ def _path_row(edit: QLineEdit, title: str, flt: str, parent, folder=False) -> QW
 class TimelineImportDialog(QDialog):
     def __init__(self, parent, edit_path: str = "", baked_path: str = "", has_timeline: bool = False):
         super().__init__(parent)
-        self.setWindowTitle("편집 타임라인 불러오기")
+        self.setWindowTitle("타임라인 불러오기")
         self.setMinimumWidth(620)
         v = QVBoxLayout(self)
         t = QLabel("편집 파일(XML·FCPXML·EDL)과 그 시퀀스를 통째로 뽑은 베이크 영상을 고르세요.\n"

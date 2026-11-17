@@ -60,6 +60,10 @@ class TextPrompt(QDialog):
 
 
 class SettingsDialog(QDialog):
+    def _check_now(self):
+        self.check_update = True
+        self.accept()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("설정")
@@ -130,8 +134,18 @@ class SettingsDialog(QDialog):
         self.upd = QCheckBox("시작할 때 새 버전 확인")
         self.upd.setChecked(bool(getattr(s, "auto_update_check", True)))
         self.upd.setToolTip("새 버전이 있으면 시작할 때 알려 줍니다. 설치는 '지금 업데이트'를 눌러야만 합니다.\n"
-                            "끄더라도 프로젝트 메뉴 > 업데이트 확인으로 언제든 확인할 수 있습니다.")
-        form.addRow("업데이트", self.upd)
+                            "끄더라도 오른쪽의 '지금 확인'으로 언제든 확인할 수 있습니다.")
+        self.check_update = False
+        ub = QPushButton("지금 확인")
+        ub.setToolTip("설정을 저장하고 새 버전이 있는지 확인합니다")
+        ub.clicked.connect(self._check_now)
+        urow = QWidget()
+        ul = QHBoxLayout(urow)
+        ul.setContentsMargins(0, 0, 0, 0)
+        ul.addWidget(self.upd)
+        ul.addStretch(1)
+        ul.addWidget(ub)
+        form.addRow("업데이트", urow)
         self.open_last = QCheckBox("시작할 때 마지막 프로젝트 바로 열기")
         self.open_last.setChecked(bool(getattr(s, "open_last_on_start", False)))
         self.open_last.setToolTip("끄면(기본) 시작할 때 프로젝트 관리 화면이 먼저 뜹니다")
