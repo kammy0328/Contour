@@ -59,7 +59,14 @@ class EditSession:
         return ViewSettings(input_cs=cs, display=s.display, view=s.view, lut_path=cut.lut_path if cut else "")
 
     def make_proxy(self, cut: Cut) -> Proxy:
-        return Proxy(self.project.proxy_dir(cut), cut.info, settings().proxy_long_side)
+        """The cut's proxy file at its analysis size (made or not): only to build one."""
+        from ..core.frames import proxy_for
+        return proxy_for(self.project, cut)
+
+    def make_frames(self, cut: Cut):
+        """What the cut's frames are read from: its proxy when there is one in this view, else its original."""
+        from ..core.frames import frames_for
+        return frames_for(self.project, cut, self.view_settings(cut))
 
     def open_cut(self, cut: Optional[Cut]) -> None:
         with self._lock:
@@ -77,8 +84,8 @@ class EditSession:
             self._new_epoch()
             if cut is None or self.project is None:
                 return
-            px = self.make_proxy(cut)
-            if px.has_frames():
+            px = self.make_frames(cut)
+            if px is not None:
                 self.proxy = px
                 self.tracker = CutTracker(self.project, cut, px)
 
@@ -104,7 +111,29 @@ class EditSession:
             self.epoch = next(_EPOCHS)
 
     def proxy_ready(self) -> bool:
+        """Frames can be read in the cut's current view (from a proxy or the original)."""
         return self.proxy is not None and self.proxy.is_valid(self.view_settings().key())
+
+    def from_source(self) -> bool:
+        return getattr(self.proxy, "kind", "") == "source"
+
+    def swap_frames(self, cut_id: str, new) -> bool:
+        """A proxy finished in the background for the open cut: read from it from now on. Same size, same frame
+        numbers and the same pixels as the original's frames, so nothing else changes (tracks and mattes stay)."""
+        with self._lock:
+            if self.cut is None or self.cut.id != cut_id or new is None or self.proxy is None:
+                return False
+            if (new.w, new.h, new.n) != (self.proxy.w, self.proxy.h, self.proxy.n):
+                return False
+            old, self.proxy = self.proxy, new
+            if self.tracker is not None:
+                self.tracker.proxy = new
+            self._frames.clear()
+        try:
+            old.close()
+        except Exception:
+            pass
+        return True
 
     def save(self) -> None:
         if self.project:

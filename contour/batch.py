@@ -95,13 +95,18 @@ def analyze(project_path: str, cut_id: str, accuracy: str = "high", all_targets:
                                       ensure_ascii=False), encoding="utf-8")
             _say(1.0, "인물 없음")
             return 0
-    px = Proxy(prj.proxy_dir(cut), cut.info, s.proxy_long_side)
+    from .core.frames import frames_for, proxy_for, proxy_mode
     vs = _vs_for(cut)
-    if not px.is_valid(vs.key()):
+    px = frames_for(prj, cut, vs)
+    if px is None:
+        print("ERROR 원본 파일을 찾을 수 없습니다: " + str(cut.source or cut.info.path), flush=True)
+        return 3
+    if px.kind == "source" and proxy_mode() == "always":
+        # 설정 > 프록시 만들기 > 항상: made first, the analysis then reads it (else it reads the original)
         _say(0.02, "프록시 만드는 중")
-        if not px.build(manager(), vs, lambda f, m="": _say(0.02 + 0.18 * f, "프록시 만드는 중"), lambda: False):
-            print("ERROR 프록시를 만들지 못했습니다", flush=True)
-            return 3
+        pf = proxy_for(prj, cut)
+        if pf.build(manager(), vs, lambda f, m="": _say(0.02 + 0.18 * f, "프록시 만드는 중"), lambda: False):
+            px = frames_for(prj, cut, vs)
     tr = CutTracker(prj, cut, px)
     try:
         tr.analyze(lambda f, m="": _say(0.2 + 0.75 * f, m), lambda: False, accuracy=accuracy)

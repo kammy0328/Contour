@@ -1,0 +1,381 @@
+"""Frames for viewing and analysis, straight from the original (1.18).
+
+Before 1.18 every cut was first decoded whole into a proxy file (display-referred 8-bit RGB, about 11 GB per minute
+of 1080p) and nothing could be seen or analysed until that file was complete. Now a cut opens on its original:
+
+- SourceFrames gives the same frames a proxy would hold (same size, same colour conversion, same frame numbers),
+  decoded from the original with ffmpeg as they are asked for.
+- Decoding is sequential: a reader stays open and keeps going forward (playback, analysis passes). A jump starts a
+  new reader at that frame; a step backwards starts it a block earlier so the frames before are decoded with it
+  (analysis passes that run backwards decode one block per BLOCK frames, not one seek per frame). Two readers are
+  kept so playback and an analysis pass do not keep restarting each other.
+- Decoded frames go into one memory pool shared by every SourceFrames of the app, capped in bytes; the least
+  recently used frames leave first. Nothing is written to disk.
+- A proxy file is still used when there is one, and can still be made (in the background) when the original is
+  too slow to decode: frames_for() picks.
+
+The analysis size of a cut never changes once it has been analysed: a proxy keeps the size it was made at, and the
+person mattes an analysis wrote fix it as well (frame_size), so a cut analysed on a proxy opens on its original with
+the same coordinates and the same mattes.
+
+Frames handed out are always fresh copies (never a view of the pool or of a reader's buffer)."""
+from __future__ import annotations
+
+import os
+import re
+import threading
+import time
+from collections import OrderedDict
+from pathlib import Path
+from typing import Optional, Tuple
+
+import cv2
+import numpy as np
+
+from .media import FrameReader, MediaInfo, planes_to_rgb_float
+from .proxy import Proxy, proxy_size
+
+BLOCK = 16              # frames decoded with one backwards step
+AHEAD = 48              # a request this far past a reader's position reads on instead of seeking
+READERS = 2             # open readers per source (playback and an analysis pass at once)
+DEFAULT_POOL_MB = 1536
+
+
+class FrameError(RuntimeError):
+    pass
+
+
+# ---------------------------------------------------------------------------------------------- the memory pool
+class FramePool:
+    """Decoded frames of every source, least recently used out first, at most `limit` bytes."""
+
+    def __init__(self, limit: int):
+        self.limit = int(limit)
+        self._d: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
+        self.bytes = 0
+        self.peak = 0
+        self._lock = threading.Lock()
+
+    def get(self, key) -> Optional[np.ndarray]:
+        with self._lock:
+            a = self._d.get(key)
+            if a is not None:
+                self._d.move_to_end(key)
+            return a
+
+    def put(self, key, a: np.ndarray) -> None:
+        with self._lock:
+            old = self._d.pop(key, None)
+            if old is not None:
+                self.bytes -= old.nbytes
+            self._d[key] = a
+            self.bytes += a.nbytes
+            while self.bytes > self.limit and len(self._d) > 1:
+                _, x = self._d.popitem(last=False)
+                self.bytes -= x.nbytes
+            self.peak = max(self.peak, self.bytes)
+
+    def drop(self, owner) -> None:
+        with self._lock:
+            for k in [k for k in self._d if k[0] == owner]:
+                self.bytes -= self._d.pop(k).nbytes
+
+    def clear(self) -> None:
+        with self._lock:
+            self._d.clear()
+            self.bytes = 0
+            self.peak = 0
+
+    def set_limit(self, limit: int) -> None:
+        with self._lock:
+            self.limit = int(limit)
+            while self.bytes > self.limit and self._d:
+                _, x = self._d.popitem(last=False)
+                self.bytes -= x.nbytes
+
+
+_pool: Optional[FramePool] = None
+_pool_lock = threading.Lock()
+
+
+def pool() -> FramePool:
+    global _pool
+    with _pool_lock:
+        if _pool is None:
+            mb = DEFAULT_POOL_MB
+            try:
+                from .settings import settings
+                mb = int(getattr(settings(), "frame_cache_mb", DEFAULT_POOL_MB) or DEFAULT_POOL_MB)
+            except Exception:
+                pass
+            mb = int(os.environ.get("DIAP_FRAME_CACHE_MB", mb))
+            _pool = FramePool(max(64, mb) * 1024 * 1024)
+        return _pool
+
+
+# ---------------------------------------------------------------------------------------------- source frames
+def source_present(info: MediaInfo) -> bool:
+    try:
+        if info.kind == "sequence":
+            return Path(info.seq_pattern % info.seq_start).exists()
+        return bool(info.path) and Path(info.path).exists()
+    except Exception:
+        return False
+
+
+def _sig(info: MediaInfo) -> str:
+    try:
+        st = os.stat(info.path if info.kind == "video" else info.seq_pattern % info.seq_start)
+        return f"{st.st_size}:{int(st.st_mtime)}"
+    except (OSError, TypeError):
+        return ""
+
+
+class _Cursor:
+    def __init__(self, reader: FrameReader, start: int, end: int):
+        self.reader = reader
+        self.next = start          # the frame the reader yields next
+        self.end = end
+        self.used = time.monotonic()
+
+    def close(self):
+        try:
+            self.reader.close()
+        except Exception:
+            pass
+
+
+class SourceFrames:
+    """The frames of a cut decoded from its original at the analysis size, converted to the display view exactly
+    as a proxy is made. Same interface as Proxy for everything that reads frames (n, w, h, sx, sy, frame, gray,
+    to_proxy, to_source, thumbnail, has_frames, is_valid, close)."""
+    kind = "source"
+    shared = False
+    offset = 0
+
+    def __init__(self, cache_dir: Path, info: MediaInfo, size: Tuple[int, int], cm, vs):
+        self.dir = Path(cache_dir)
+        self.info = info
+        self.w, self.h = int(size[0]), int(size[1])
+        self.n = int(info.frames)
+        self.n_file = self.n
+        self.sx = self.w / info.width
+        self.sy = self.h / info.height
+        self.cm, self.vs = cm, vs
+        self.view_key = vs.key()
+        # what the decoded pixels depend on: the file (and its version), the stretch, the size and the view
+        self.owner = (str(info.path if info.kind == "video" else info.seq_pattern), _sig(info),
+                      int(getattr(info, "offset", 0) or 0), self.n, self.w, self.h, self.view_key)
+        self._lock = threading.RLock()      # the readers
+        self._cursors: list = []
+        self._last = -1
+        self._gray: "OrderedDict[int, np.ndarray]" = OrderedDict()
+        self._glock = threading.Lock()
+        self.decoded = 0
+        self.decode_s = 0.0
+        self.seeks = 0
+        self.error = ""
+
+    # ------------------------------------------------------------------ state
+    def has_frames(self) -> bool:
+        """The original is there (it is decoded when frames are asked for)."""
+        return source_present(self.info)
+
+    def is_valid(self, view_key: str) -> bool:
+        return view_key == self.view_key and self.has_frames()
+
+    def open(self) -> None:
+        pass
+
+    def close(self) -> None:
+        """Readers and their ffmpeg processes end; decoded frames stay in the pool for a reopening."""
+        with self._lock:
+            for c in self._cursors:
+                c.close()
+            self._cursors = []
+        with self._glock:
+            self._gray.clear()
+
+    def decode_fps(self) -> float:
+        return self.decoded / self.decode_s if self.decode_s > 0 else 0.0
+
+    # ------------------------------------------------------------------ access
+    def frame(self, i: int) -> np.ndarray:
+        i = int(np.clip(int(i), 0, self.n - 1))
+        key = (self.owner, i)
+        p = pool()
+        a = p.get(key)
+        if a is None:
+            with self._lock:
+                a = p.get(key)
+                if a is None:
+                    a = self._decode_to(i)
+        return np.array(a)                  # a copy: the pool's frame is never handed out
+
+    def gray(self, i: int) -> np.ndarray:
+        with self._glock:
+            g = self._gray.get(i)
+        if g is None:
+            g = cv2.cvtColor(self.frame(i), cv2.COLOR_RGB2GRAY)
+            with self._glock:
+                self._gray[i] = g
+                while len(self._gray) > 64:
+                    self._gray.popitem(last=False)
+        return g
+
+    def _open_cursor(self, start: int) -> _Cursor:
+        pf = "gbrpf32le" if self.info.is_float else "rgb48le"
+        r = FrameReader(self.info, start, self.n - start, pf, size=(self.w, self.h), prefetch=4)
+        c = _Cursor(r, start, self.n)
+        self._cursors.append(c)
+        self.seeks += 1
+        while len(self._cursors) > READERS:
+            old = min(self._cursors, key=lambda x: x.used)
+            self._cursors.remove(old)
+            old.close()
+        return c
+
+    def _decode_to(self, i: int) -> np.ndarray:
+        """Called with the reader lock held. Reads on with the reader that is just before i, else starts a reader at
+        i (or a block before i when going backwards), keeping every frame read on the way."""
+        back = 0 <= i < self._last
+        self._last = i
+        cur = None
+        for c in self._cursors:
+            if c.next <= i <= c.next + AHEAD and (cur is None or c.next > cur.next):
+                cur = c
+        if cur is None:
+            start = max(0, i - BLOCK + 1) if back else i
+            cur = self._open_cursor(start)
+        cur.used = time.monotonic()
+        p = pool()
+        got = None
+        while cur.next <= i:
+            t0 = time.perf_counter()
+            planes = cur.reader.read()
+            if planes is None:
+                err = cur.reader.error_text.strip()
+                self._cursors.remove(cur)
+                cur.close()
+                self.error = f"원본에서 프레임 {i}을(를) 읽지 못했습니다 ({cur.next}에서 끝남). {err[:300]}"
+                raise FrameError(self.error)
+            rgb = planes_to_rgb_float(planes, cur.reader.layout)
+            u8 = self.cm.to_display_u8(rgb, self.vs)
+            self.decode_s += time.perf_counter() - t0
+            self.decoded += 1
+            p.put((self.owner, cur.next), u8)
+            if cur.next == i:
+                got = u8
+            cur.next += 1
+        if cur.next >= cur.end:
+            self._cursors.remove(cur)
+            cur.close()
+        return got
+
+    # ------------------------------------------------------------------ coordinates, thumbnails
+    def to_proxy(self, xy: np.ndarray) -> np.ndarray:
+        out = np.array(xy, dtype=np.float32, copy=True)
+        out[..., 0] *= self.sx
+        out[..., 1] *= self.sy
+        return out
+
+    def to_source(self, xy: np.ndarray) -> np.ndarray:
+        out = np.array(xy, dtype=np.float32, copy=True)
+        out[..., 0] /= self.sx
+        out[..., 1] /= self.sy
+        return out
+
+    def thumbnail(self, i: int, width: int = 160) -> np.ndarray:
+        f = self.frame(i)
+        h = max(1, int(round(f.shape[0] * width / f.shape[1])))
+        return cv2.resize(f, (width, h), interpolation=cv2.INTER_AREA)
+
+    def meta(self) -> dict:
+        return {}
+
+
+# ---------------------------------------------------------------------------------------------- choosing
+_MATTE = re.compile(r"^matte_(\d+)x(\d+)\.u8$")
+
+
+def frame_size(project, cut, long_side: Optional[int] = None) -> Tuple[int, int]:
+    """The cut's analysis size: a complete proxy keeps its size; else the size of the mattes an analysis made;
+    else the size the setting gives."""
+    from .settings import settings
+    long_side = int(long_side or settings().proxy_long_side)
+    px = Proxy(project.proxy_dir(cut), cut.info, long_side)
+    if px.has_frames():
+        return px.w, px.h
+    n = int(cut.info.frames)
+    best = None
+    try:
+        for f in Path(project.cache_dir(cut)).iterdir():
+            m = _MATTE.match(f.name)
+            if not m:
+                continue
+            mw, mh = int(m.group(1)), int(m.group(2))
+            st = f.stat()
+            if st.st_size == n * mw * mh and (best is None or st.st_mtime > best[0]):
+                best = (st.st_mtime, mw * 2, mh * 2)
+    except OSError:
+        pass
+    if best is not None:
+        return best[1], best[2]
+    return proxy_size(cut.info, long_side)
+
+
+def proxy_for(project, cut, long_side: Optional[int] = None) -> Proxy:
+    """The cut's proxy file (made or not) at the cut's analysis size."""
+    from .settings import settings
+    long_side = int(long_side or settings().proxy_long_side)
+    px = Proxy(project.proxy_dir(cut), cut.info, long_side)
+    if px.has_frames() or px.shared:
+        return px
+    return Proxy(project.proxy_dir(cut), cut.info, long_side, size=frame_size(project, cut, long_side))
+
+
+def frames_for(project, cut, vs=None, cm=None, long_side: Optional[int] = None):
+    """What a cut's frames are read from, in this order:
+    1. its proxy (or the bake's shared one) made in this view: fastest
+    2. its original, decoded as frames are asked for
+    3. a proxy made in another view, when the original is missing (it can be looked at, not analysed in the right
+       view; callers that need the original check source_present)
+    None when there is neither."""
+    from .colour import manager
+    from .settings import settings
+    if vs is None:
+        from ..warp.render import _vs_for
+        vs = _vs_for(cut)
+    cm = cm or manager()
+    long_side = int(long_side or settings().proxy_long_side)
+    px = proxy_for(project, cut, long_side)
+    if px.has_frames() and px.is_valid(vs.key()):
+        return px
+    if source_present(cut.info):
+        return SourceFrames(project.proxy_dir(cut), cut.info, frame_size(project, cut, long_side), cm, vs)
+    if px.has_frames():
+        return px
+    return None
+
+
+def proxy_mode() -> str:
+    """'auto' (a proxy is made in the background when the original decodes slower than it plays), 'always' (made in
+    the background for every opened cut) or 'off'."""
+    try:
+        from .settings import settings
+        m = str(getattr(settings(), "proxy_mode", "auto") or "auto")
+    except Exception:
+        m = "auto"
+    return m if m in ("auto", "always", "off") else "auto"
+
+
+def wants_proxy(fr, fps: float) -> bool:
+    """Whether a proxy should be made for frames read from this source (by the setting and the measured speed)."""
+    if fr is None or getattr(fr, "kind", "") != "source":
+        return False
+    m = proxy_mode()
+    if m == "off":
+        return False
+    if m == "always":
+        return True
+    return fr.decoded >= 24 and fr.decode_fps() < 0.9 * max(1.0, float(fps or 24.0))

@@ -351,10 +351,10 @@ class RenderQueuePage(QWidget):
         if cut is None:
             return None
         try:
-            from ..core.proxy import Proxy
+            from ..core.frames import frames_for
             from .viewer import np_to_qimage
-            px = Proxy(prj.proxy_dir(cut), cut.info, settings().proxy_long_side)
-            if not px.has_frames():
+            px = frames_for(prj, cut)
+            if px is None:
                 return None
             a, b = cut.work_range
             th = px.thumbnail((a + b) // 2, 160)
@@ -657,9 +657,10 @@ class RenderQueuePage(QWidget):
             cut = prj.cut(nxt.cut_id)
             if cut is None:
                 raise RuntimeError("프로젝트에서 컷을 찾을 수 없습니다.")
-            px = Proxy(prj.proxy_dir(cut), cut.info, settings().proxy_long_side)
-            if not px.has_frames():
-                raise RuntimeError("프록시가 없습니다. 편집 화면에서 컷을 한 번 열어 주세요.")
+            from ..core.frames import frames_for, source_present
+            if not source_present(cut.info):
+                raise RuntimeError("원본 파일을 찾을 수 없습니다: " + str(cut.source or cut.info.path))
+            px = frames_for(prj, cut)              # the masks' frames: its proxy, else the original
             tr = CutTracker(prj, cut, px)
             out = OutputSettings.from_dict(nxt.output)
             return render_cut(prj, cut, tr, out, progress, cancelled,

@@ -57,10 +57,14 @@ def ensure_space(path: Path, total: int, what: str) -> None:
 
 
 class Proxy:
-    def __init__(self, cache_dir: Path, info: MediaInfo, long_side: int = 1920):
+    """A whole cut decoded once into a file. Optional since 1.18: frames come from the original (frames.SourceFrames)
+    when there is none; this file only makes repeated access faster."""
+    kind = "proxy"
+
+    def __init__(self, cache_dir: Path, info: MediaInfo, long_side: int = 1920, size: Optional[Tuple[int, int]] = None):
         self.dir = Path(cache_dir)
         self.info = info
-        self.w, self.h = proxy_size(info, long_side)
+        self.w, self.h = (int(size[0]), int(size[1])) if size else proxy_size(info, long_side)
         self.n = info.frames
         self.offset = 0                 # first frame of this cut inside the (shared) proxy file
         self.n_file = self.n            # frames in the proxy file
@@ -73,7 +77,7 @@ class Proxy:
             self.w, self.h = int(shared["w"]), int(shared["h"])
         else:
             m = self.meta()
-            if m.get("complete") and m.get("n") == self.n and m.get("w") and m.get("h"):
+            if size is None and m.get("complete") and m.get("n") == self.n and m.get("w") and m.get("h"):
                 # keep the size this cut's proxy was made at (the default may have changed since)
                 self.w, self.h = int(m["w"]), int(m["h"])
             self.path = self.dir / f"proxy_{self.w}x{self.h}.u8"
