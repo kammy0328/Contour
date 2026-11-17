@@ -2615,6 +2615,12 @@ def _crease_lift(Y, Cb, Cr, mY, k: float, width: float, axis=None, hold: Optiona
 
 
 REDNESS_KEEP_MEAN = True
+# 2611 cut 024 (user 2026-11-17 21:57: at 강하게 the blush on the cheeks was gone). The red excess was measured
+# against one reference for the whole face, so a broad cheek colour (blush, a flush that is part of the look) was
+# taken as a red patch and pulled to the face's colour. Now the reference follows the colour of the skin around each
+# point over REDNESS_BROAD of the face width: patches smaller than that (spots, blotches, the redness of a pimple)
+# are evened out, a colour spread wider than that stays.
+REDNESS_BROAD = 0.07
 GRAIN_KEEP = True        # the skin smoothing gives the original's finest band (film grain, sensor noise) back
 GRAIN_SIGMA = 1.2        # that band, in pixels of a 1080-line picture (scaled with the plane's height)
 
@@ -2649,7 +2655,11 @@ def _redness(Cb, Cr, Y, mC, mY, k: float, wf: float, cs: float):
     cr_ref = float(np.percentile(crs[sel], 35))
     low = sel & (crs <= cr_ref)
     cb_ref = float(np.median(cbs[low])) if low.sum() > 10 else float(np.median(cbs[sel]))
-    ex = np.clip(crs - cr_ref, 0, 0.12)
+    if REDNESS_BROAD > 0:
+        broad = _gm(crs, mm, max(2.0, REDNESS_BROAD * wf * cs))
+        ex = np.clip(crs - np.maximum(broad, cr_ref), 0, 0.12)
+    else:
+        ex = np.clip(crs - cr_ref, 0, 0.12)
     on = _ss(0.0, 0.025, ex)
     Cro, Cbo = Cr.astype(np.float32, copy=True), Cb.astype(np.float32, copy=True)
     dcr = -k * 0.85 * mm * ex
