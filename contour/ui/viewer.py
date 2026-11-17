@@ -27,6 +27,11 @@ def _heat_lut() -> np.ndarray:
 
 
 HEAT_LUT = _heat_lut()
+# the skin area view: what was found in it (retouch/detect.py), each kind in its own colour
+DET_COLOURS = {"dark": (40, 60, 230), "red": (255, 60, 60), "bump": (60, 220, 90), "line": (255, 225, 40),
+               "fold": (255, 140, 30), "protect": (230, 60, 230)}
+DET_LEGEND = (("dark", "어두운 잡티"), ("red", "붉은 여드름"), ("bump", "돌출·오돌토돌"), ("line", "목주름 (선)"),
+              ("fold", "목주름 (넓은 접힘)"), ("protect", "보호 (털·장신구·경계)"))
 HAND_BONES = [(0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8), (0, 9), (9, 10), (10, 11), (11, 12),
               (0, 13), (13, 14), (14, 15), (15, 16), (0, 17), (17, 18), (18, 19), (19, 20), (5, 9), (9, 13), (13, 17)]
 
@@ -510,13 +515,80 @@ class Viewer(QWidget):
             return (key, t, None)
         # show the area where it ends up: the overlay follows face size and other shape changes
         fr = self.s.peek_field(t)
+        from ..warp.field import warp_image
         if fr is not None and not fr.empty():
-            from ..warp.field import warp_image
             m = warp_image(m.astype(np.float32), fr, cv2.INTER_LINEAR)
-        rgba = np.zeros(m.shape + (4,), np.uint8)
+        rgba = np.zeros(m.shape + (4,), np.float32)
         rgba[..., 0], rgba[..., 1], rgba[..., 2] = 79, 139, 255
-        rgba[..., 3] = np.clip(m * 170, 0, 255).astype(np.uint8)
-        return (key, t, rgba)
+        rgba[..., 3] = np.clip(m * 170, 0, 255)
+        kinds = set()
+        try:
+            # 1.19: what was found in the area, each kind in its own colour, and what is kept out whatever was found
+            from ..retouch import engine as RE
+            for j in rf.jobs:
+                if not j.det:
+                    continue
+                maps = RE._det_place(j, rf, m.shape)
+                on = []
+                if j.v.get("blemish", 0) > 1e-4:
+                    on += ["dark", "red", "bump"]
+                if j.v.get("neck_lines", 0) > 1e-4:
+                    on += ["line", "fold"]
+                pr = maps.get("protect")
+                for k in on:
+                    sc = maps.get(k)
+                    if sc is None:
+                        continue
+                    if pr is not None:
+                        sc = sc * (1.0 - pr)
+                    if fr is not None and not fr.empty():
+                        sc = warp_image(sc, fr, cv2.INTER_LINEAR)
+                    if float(sc.max()) < 0.2:
+                        continue
+                    kinds.add(k)
+                    a = np.clip(sc * 1.4, 0, 1)[..., None]
+                    rgba[..., :3] = rgba[..., :3] * (1 - a) + np.array(DET_COLOURS[k], np.float32) * a
+                    rgba[..., 3] = np.maximum(rgba[..., 3], a[..., 0] * 235)
+                if pr is not None and on:
+                    if fr is not None and not fr.empty():
+                        pr = warp_image(pr, fr, cv2.INTER_LINEAR)
+                    pr = pr * np.clip(m * 3, 0, 1)                       # inside the area only
+                    if float(pr.max()) > 0.3:
+                        kinds.add("protect")
+                        a = np.clip(pr, 0, 1)[..., None] * 0.8
+                        rgba[..., :3] = rgba[..., :3] * (1 - a) + np.array(DET_COLOURS["protect"], np.float32) * a
+                        rgba[..., 3] = np.maximum(rgba[..., 3], a[..., 0] * 200)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+        self._det_kinds = (t, tuple(k for k in DET_LEGEND if k[0] in kinds))
+        return (key, t, np.clip(rgba, 0, 255).astype(np.uint8))
+
+    def _paint_det_legend(self, p: QPainter):
+        """Which colour is which in the skin area view (only the kinds found on this frame)."""
+        dk = getattr(self, "_det_kinds", None)
+        if not dk or dk[0] != self.t or not dk[1]:
+            return
+        items = [("area", "보정 영역", (79, 139, 255))] + [(k, lab, DET_COLOURS[k]) for k, lab in dk[1]]
+        p.save()
+        p.setFont(font(11, 500))
+        fm = p.fontMetrics()
+        w = max(fm.horizontalAdvance(lab) for _, lab, _c in items) + 34
+        h = 20 * len(items) + 10
+        c = self._cells()[-1]
+        box = QRectF(c.left() + 10, c.bottom() - h - 10, w, h)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(18, 18, 18, 200))
+        p.drawRoundedRect(box, 6, 6)
+        y = box.top() + 5
+        for _k, lab, col in items:
+            p.setBrush(QColor(*col))
+            p.drawRoundedRect(QRectF(box.left() + 8, y + 5, 10, 10), 2, 2)
+            p.setPen(QColor(235, 235, 235))
+            p.drawText(QRectF(box.left() + 26, y, w - 30, 20), Qt.AlignVCenter | Qt.AlignLeft, lab)
+            p.setPen(Qt.NoPen)
+            y += 20
+        p.restore()
 
     def _skin_ready(self, req, payload):
         if payload is None:
@@ -603,6 +675,7 @@ class Viewer(QWidget):
                 si = None
             if si is not None:
                 p.drawImage(r, si)
+                self._paint_det_legend(p)
         if clipped:
             p.restore()
         if mode == "side":

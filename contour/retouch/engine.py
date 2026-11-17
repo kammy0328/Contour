@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+from . import detect as DT
 from . import skin as SK
 from ..core.params import RETOUCH_KEYS
 from ..track import skeleton as S
@@ -34,6 +35,9 @@ class Job:
     wf_src: float = 0.0                    # face width, source px
     blemish_size: float = 0.5              # 0..1 largest spot taken by the blemish removal
     sharp_q: float = 1.0                   # this frame's skin sharpness over that of the frames round it
+    # where the skin's flaws are (detect.py), found once per frame and held steady through time (1.19):
+    # {"box": (x0, y0, x1, y1) in proxy px, "maps": {kind: uint8 (h, w)}, "thumb": uint8 luma (for the alignment check)}
+    det: Optional[dict] = None
 
 
 @dataclass
@@ -667,6 +671,10 @@ def body_regions(regions: set, kp: np.ndarray, hand: Optional[np.ndarray], shape
     return out if out.max() > 0 else None
 
 
+NECK_SHADE = True          # the parser's neck counts where the colour model misses a broad stretch of it (shade)
+NECK_SHADE_MIN = 0.045     # of the face width: narrower stretches the colour model leaves out stay out (hair, a chain)
+
+
 def neck_mask(lm: np.ndarray, kp: np.ndarray, widths, shape, sx: float, sy: float, prob: np.ndarray,
               alpha, fth: float = 1.5, rgb: Optional[np.ndarray] = None, hands: Optional[np.ndarray] = None,
               parse: Optional[dict] = None) -> np.ndarray:
@@ -718,7 +726,23 @@ def neck_mask(lm: np.ndarray, kp: np.ndarray, widths, shape, sx: float, sy: floa
     m = np.zeros(shape, np.uint8)
     _poly(m, np.vstack([top, bot]))
     f = _feather(m, 0.035 * Wf * fth)
-    f = f * np.clip(cv2.GaussianBlur(prob, (0, 0), max(1.0, 0.012 * Wf)) * 1.6, 0, 1)
+    pc = np.clip(cv2.GaussianBlur(prob, (0, 0), max(1.0, 0.012 * Wf)) * 1.6, 0, 1)
+    if NECK_SHADE and parse is not None and parse.get("trust", 0) > 0:
+        # 1.19 (2611 cuts 009, 024): the side of the neck in shade, and the skin under the chin, are not the
+        # skin colour model's skin (darker, less colour), so half the neck was no neck and its lines were never
+        # looked at. Where the face parser is sure of neck, a broad stretch the colour model leaves out counts;
+        # thin things it leaves out (a strand of hair, a chain, a painted line) stay out
+        try:
+            sure = _ss(0.55, 0.85, cv2.GaussianBlur(parse["neck"].astype(np.float32), (0, 0), max(1.0, 0.015 * Wf))
+                       * cv2.GaussianBlur(parse["cover"].astype(np.float32), (0, 0), max(1.0, 0.04 * Wf)))
+            hole = (sure * (1.0 - pc)).astype(np.float32)
+            kb = max(3, int(NECK_SHADE_MIN * Wf) | 1)
+            seb = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kb, kb))
+            broad = cv2.dilate(cv2.erode(hole, seb), seb)
+            pc = np.maximum(pc, float(parse["trust"]) * cv2.GaussianBlur(broad, (0, 0), max(1.0, 0.008 * Wf)))
+        except Exception:
+            pass
+    f = f * pc
     if alpha is not None:
         f = f * alpha
     if rgb is not None and f.max() > 0.01:
@@ -1133,7 +1157,8 @@ def _sig(cut, tracker) -> tuple:
             c_ = pp.amounts.get(k_)
             if c_ is not None and (abs(c_.base) > 1e-4 or any(abs(v_) > 1e-4 for v_ in c_.keys.values())):
                 on.append(k_)
-        vals.append((person.id, pp.skin_scope, round(float(fth), 3), tuple(on)))
+        vals.append((person.id, pp.skin_scope, round(float(fth), 3), tuple(on),
+                     round(float(getattr(pp, "blemish_size", 50.0)), 1)))     # the spot sizes the flaws are looked for at
     return (id(tracker.store), getattr(cut, "analysis_version", 0), tuple(vals))
 
 
@@ -1176,6 +1201,7 @@ def _steady(cut, tracker, st, rf: RetouchFrame, cache) -> RetouchFrame:
         frames = [(1.0, own)]                       # (weight, masks on this frame's geometry)
         veto = getattr(j, "veto", None)
         vetos = [veto.astype(np.float32)] if veto is not None else []
+        dets = []                                   # (weight, a neighbour's score maps, its motion onto this frame)
         def usable(s):
             return 0 <= s < N and bool(st.present[j.p, s]) and st.connected(s, t) \
                 and bool(np.isfinite(st.face[j.p, s, :, :2]).all())
@@ -1203,6 +1229,8 @@ def _steady(cut, tracker, st, rf: RetouchFrame, cache) -> RetouchFrame:
                     ws[n] = np.zeros(shp, np.float32) if ms is None else \
                         cv2.warpAffine(ms.astype(np.float32), A, (shp[1], shp[0]), flags=cv2.INTER_LINEAR, borderValue=0)
                 frames.append((w, ws))
+                if j.det is not None:
+                    dets.append((w, js.det, A))
                 vs = getattr(js, "veto", None)
                 if veto is not None and vs is not None and vs.shape == veto.shape:
                     q_ = veto.shape[1] / float(shp[1])
@@ -1249,6 +1277,12 @@ def _steady(cut, tracker, st, rf: RetouchFrame, cache) -> RetouchFrame:
                 avg = acc[n] / wsum
                 acc[n] = (o_ + (avg - o_).clip(None, 0) + (avg - o_).clip(0, None) * v_) * wsum
         j.masks = {n: (m / wsum).astype(np.float32) for n, m in acc.items()}
+        if j.det is not None and dets:
+            try:
+                j.det = _det_fuse(j.det, dets)
+            except Exception:
+                import traceback
+                traceback.print_exc()
     return rf
 
 
@@ -1678,6 +1712,14 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             km = get("knee", mk_knee)
             if km.max() > 0.01:
                 job.masks["knee"] = km
+        if DET_ON and job.masks and lm is not None and (v.get("blemish", 0) > 1e-4 or v.get("neck_lines", 0) > 1e-4):
+            try:
+                job.det = get("det", lambda: _det_raw(cut, px, t, job, lm, base()["rgb"]),
+                              f"{job.blemish_size:.3f}:{int(v.get('blemish', 0) > 1e-4)}{int(v.get('neck_lines', 0) > 1e-4)}:{fth:.2f}")
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                job.det = None
         if job.masks:
             if "prob" in state:
                 # this frame's own view of what is skin (colour, parser, texture): the steadied masks may not
@@ -2006,6 +2048,293 @@ def _blemish(Y, Cb, Cr, mY, mC, k: float, size: float, cs: float):
         pb = _gm(ps, wexcl, slc)
         O[c0:c1, d0:d1] = pr + k * spc * np.clip(pb - ps, -0.06, 0.06)
     return Yo, Cbo, Cro
+
+
+# ----------------------------------------------------------------------------- flaws found by detect.py (1.19)
+DET_ON = True              # False: every correction looks for its flaw itself, on the frame, at one size (before 1.19)
+DET_SURE = (0.45, 0.85)        # score from which a flaw is sure enough for the grain band inside it to be given up .. in full
+DET_FINE = (0.04, 0.5, 1.2)    # what is finer than this stays inside a filled spot (share of the spot size, px floor and cap):
+                               # the picture's own grain at pixel size; the grain protection of the skin around is not changed
+
+
+def spot_size(job, wf: float) -> float:
+    """The largest spot's diameter in pixels of a picture where the face is wf pixels wide."""
+    return max(2.0, (0.012 + 0.05 * job.blemish_size) * wf)
+
+
+DET_WF_MAX = 640.0         # the face is at most this many pixels wide on the picture the flaws are looked for on
+DET_SRC = True             # read the piece from the original where it has clearly more pixels than the analysis picture
+DET_SRC_GAIN = 1.25        # "clearly more": this many times the analysis picture's
+
+
+def _det_raw(cut, px, t: int, job, lm: np.ndarray, rgb_u8: np.ndarray) -> Optional[dict]:
+    """One frame's score maps for a job, on the best picture there is of its face and neck: a piece of the original
+    at (up to) its own resolution where the analysis picture is a reduced copy (a 4K original seen at 1920: fine
+    lines and small spots are gone from the copy), else the analysis picture itself. Never a reduced picture made
+    larger. The masks, the landmarks and the frame number are the analysis picture's; the piece is in the same
+    display view."""
+    v = job.v
+    sk = job.masks.get("skinx") if v.get("blemish", 0) > 1e-4 else None
+    nk = job.masks.get("neck") if (v.get("neck_lines", 0) > 1e-4 or v.get("blemish", 0) > 1e-4) else None
+    if sk is None and nk is None:
+        return None
+    reg = sk if nk is None else (nk if sk is None else np.maximum(sk, nk))
+    wf_p = float(job.wf_src) * px.sx
+    r = _roi(reg, int(0.08 * wf_p) + 4)
+    if r is None or wf_p < 8:
+        return None
+    y0, y1, x0, x1 = r
+    want = min(1.0 / px.sx, DET_WF_MAX / max(wf_p, 1.0))        # picture pixels per analysis pixel wanted
+    img = None
+    from_src = False
+    if DET_SRC and want > DET_SRC_GAIN:
+        try:
+            from ..core import frames as FRM
+            from ..warp.render import _vs_for
+            sc = FRM.source_crops(px, vs=_vs_for(cut))
+            if sc is not None:
+                # steps of an eighth: the reader of the piece goes on while the step stays the same
+                scale = float(np.clip(round(want * px.sx * 8.0) / 8.0, 0.125, 1.0))
+                bx = (int(x0 / px.sx) // 2 * 2, int(y0 / px.sy) // 2 * 2,
+                      min(int(px.info.width), -(-int(np.ceil(x1 / px.sx)) // 2) * 2),
+                      min(int(px.info.height), -(-int(np.ceil(y1 / px.sy)) // 2) * 2))
+                img = sc.piece(t, bx, scale)
+                from_src = True
+                # the piece's place in analysis pixels (it was widened to whole source pixels)
+                x0f, y0f, x1f, y1f = bx[0] * px.sx, bx[1] * px.sy, bx[2] * px.sx, bx[3] * px.sy
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            img = None
+    if img is None:
+        img = rgb_u8[y0:y1, x0:x1]
+        x0f, y0f, x1f, y1f = float(x0), float(y0), float(x1), float(y1)
+        if wf_p > DET_WF_MAX * 1.1:
+            f_ = DET_WF_MAX / wf_p
+            img = cv2.resize(img, (max(8, int(round(img.shape[1] * f_))), max(8, int(round(img.shape[0] * f_)))),
+                             interpolation=cv2.INTER_AREA)
+    hd, wd = img.shape[:2]
+    fx, fy = wd / max(x1f - x0f, 1e-6), hd / max(y1f - y0f, 1e-6)
+    # analysis pixels -> picture pixels
+    A = np.array([[fx, 0, -x0f * fx], [0, fy, -y0f * fy]], np.float32)
+
+    def to_pic(m):
+        return None if m is None else cv2.warpAffine(m.astype(np.float32), A, (wd, hd), flags=cv2.INTER_LINEAR,
+                                                     borderValue=0)
+    Y, Cb, Cr = rgb_to_ycc(img.astype(np.float32) / 255.0)
+    lmd = np.asarray(lm, np.float32)[:, :2].copy()
+    lmd[:, 0] = (lmd[:, 0] - x0f) * fx
+    lmd[:, 1] = (lmd[:, 1] - y0f) * fy
+    wf_d = wf_p * fx
+    maps = DT.detect(Y, Cb, Cr, to_pic(sk), to_pic(nk), wf_d, spot_size(job, wf_d), neck_axis(lmd), lmd)
+    th = cv2.resize(Y, (max(4, wd // 4), max(4, hd // 4)), interpolation=cv2.INTER_AREA)
+    return dict(box=(x0f, y0f, x1f, y1f), maps={k: (np.clip(m, 0, 1) * 255 + 0.5).astype(np.uint8) for k, m in maps.items()},
+                thumb=(np.clip(th, 0, 1) * 255 + 0.5).astype(np.uint8), src=from_src, wf=float(wf_d))
+
+
+DET_ALIGN = 0.006          # of the face width: how far a neighbour's score may sit from this frame's (the alignment's slack)
+DET_SAME = 0.07            # brightness difference (0..1) from which a neighbour's picture is not this frame's skin (a hand, a turn)
+DET_CONFIRM = (0.10, 0.40)  # the neighbours' score from which a flaw found here counts .. counts in full
+
+
+def _det_fuse(own: dict, others: list) -> dict:
+    """The frame's score maps held steady through time. others: [(weight, det of a neighbouring frame, A)], A the
+    similarity that carries that frame's analysis pixels onto this frame's (the face's own motion).
+
+    A flaw is on the skin for as long as the skin is in view; grain is new on every frame. So each neighbour's
+    scores are carried onto this frame, and
+    - where a neighbour's picture is not this frame's picture (something in front of the skin, a turn, a blur, the
+      alignment off: its carried brightness differs) it has no say there;
+    - a score found here that the neighbours do not have is taken down (grain taken for a spot);
+    - a score the neighbours have and this frame misses (the grain hid it) is raised.
+    With no neighbour that has a say, the frame's own scores stand: nothing is carried across a cut, a cover or a
+    failed alignment, and nothing lags behind (the window is the same both ways)."""
+    if not others:
+        return own
+    hd, wd = next(iter(own["maps"].values())).shape
+    x0, y0, x1, y1 = own["box"]
+    fx, fy = wd / max(x1 - x0, 1e-6), hd / max(y1 - y0, 1e-6)
+    Tt = np.array([[fx, 0, -x0 * fx], [0, fy, -y0 * fy], [0, 0, 1]], np.float64)
+    th_t = own["thumb"].astype(np.float32) / 255.0
+    rad = max(1, int(round(DET_ALIGN * own.get("wf", 300.0))))
+    se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rad + 1, 2 * rad + 1))
+    acc = {k: np.zeros((hd, wd), np.float32) for k in own["maps"]}
+    wn = np.zeros((hd, wd), np.float32)
+    wtot = 0.0
+    for w, ds, A in others:
+        if ds is None or not ds.get("maps"):
+            continue
+        hs, ws = next(iter(ds["maps"].values())).shape
+        sx0, sy0, sx1, sy1 = ds["box"]
+        gx, gy = ws / max(sx1 - sx0, 1e-6), hs / max(sy1 - sy0, 1e-6)
+        Ts_inv = np.array([[1 / gx, 0, sx0], [0, 1 / gy, sy0], [0, 0, 1]], np.float64)
+        A3 = np.vstack([np.asarray(A, np.float64), [0, 0, 1]])
+        Mm = (Tt @ A3 @ Ts_inv)[:2].astype(np.float32)
+        # the same skin? the neighbour's picture carried here against this frame's (a quarter of the size)
+        q = np.diag([0.25, 0.25, 1.0])
+        qi = np.diag([4.0, 4.0, 1.0])
+        Mt = (q @ np.vstack([Mm, [0, 0, 1]]) @ qi)[:2].astype(np.float32)
+        ths = cv2.warpAffine(ds["thumb"].astype(np.float32) / 255.0, Mt, (th_t.shape[1], th_t.shape[0]),
+                             flags=cv2.INTER_LINEAR, borderValue=-1.0)
+        dif = cv2.GaussianBlur(np.abs(ths - th_t), (0, 0), 1.5)
+        g = np.exp(-np.square(dif / DET_SAME)) * (ths >= 0)
+        g = cv2.resize(g.astype(np.float32), (wd, hd), interpolation=cv2.INTER_LINEAR) * float(w)
+        for k in acc:
+            ms = ds["maps"].get(k)
+            if ms is None:
+                continue
+            mw = cv2.warpAffine(ms, Mm, (wd, hd), flags=cv2.INTER_LINEAR, borderValue=0)
+            acc[k] += g * cv2.dilate(mw, se).astype(np.float32) / 255.0
+        wn += g
+        wtot += float(w)
+    if wtot <= 0:
+        return own
+    conf = np.clip(wn / (0.5 * wtot), 0, 1)                     # how much the neighbours have a say at each point
+    out = {}
+    for k, m in own["maps"].items():
+        o = m.astype(np.float32) / 255.0
+        p = acc[k] / np.maximum(wn, 1e-3)                       # what the neighbours found here
+        if k == "protect":
+            f = np.maximum(o, p * conf)                         # kept wherever any frame says so
+        else:
+            both = (o + p * wn) / (1.0 + wn)
+            f = conf * both * _ss(DET_CONFIRM[0], DET_CONFIRM[1], p) + (1.0 - conf) * o
+        out[k] = (np.clip(f, 0, 1) * 255 + 0.5).astype(np.uint8)
+    return dict(own, maps=out)
+
+
+def _det_now(job, Y, Cb, Cr, wf: float, y_per_src: float, M) -> dict:
+    """The score maps of this job found on this picture (no detection came with the job: a single frame worked on
+    without its neighbours, a test)."""
+    hY, wY = Y.shape
+    v = job.v
+    skin = M(job.masks["skinx"], (hY, wY)) if ("skinx" in job.masks and v.get("blemish", 0) > 1e-4) else None
+    neck = None
+    if "neck" in job.masks and (v.get("neck_lines", 0) > 1e-4 or v.get("blemish", 0) > 1e-4):
+        neck = M(job.masks["neck"], (hY, wY))
+    if skin is None and neck is None:
+        return {}
+    cbY = Cb if Cb.shape == Y.shape else cv2.resize(Cb, (wY, hY), interpolation=cv2.INTER_LINEAR)
+    crY = Cr if Cr.shape == Y.shape else cv2.resize(Cr, (wY, hY), interpolation=cv2.INTER_LINEAR)
+    lm = None if job.face is None else np.asarray(job.face, np.float32)[:, :2] * y_per_src
+    return DT.detect(Y, cbY, crY, skin, neck, wf, spot_size(job, wf), neck_axis(lm), lm)
+
+
+def _det_place(job, rf, shape) -> dict:
+    """The job's steadied score maps put on a plane of this shape (float32 0..1)."""
+    out = {}
+    d = job.det
+    if not d or not d.get("maps"):
+        return out
+    hY, wY = shape
+    pw, ph = rf.proxy_wh
+    fx, fy = wY / float(pw), hY / float(ph)
+    x0, y0, x1, y1 = d["box"]
+    hd, wd = next(iter(d["maps"].values())).shape
+    # picture pixels -> plane pixels
+    ax, ay = (x1 - x0) * fx / wd, (y1 - y0) * fy / hd
+    A = np.array([[ax, 0, x0 * fx], [0, ay, y0 * fy]], np.float32)
+    inter = cv2.INTER_AREA if ax < 0.75 else cv2.INTER_LINEAR
+    for k, m in d["maps"].items():
+        if inter == cv2.INTER_AREA:
+            a = np.zeros(shape, np.float32)
+            X0, Y0 = max(0, int(round(x0 * fx))), max(0, int(round(y0 * fy)))
+            X1, Y1 = min(wY, int(round(x1 * fx))), min(hY, int(round(y1 * fy)))
+            if X1 - X0 >= 2 and Y1 - Y0 >= 2:
+                a[Y0:Y1, X0:X1] = cv2.resize(m, (X1 - X0, Y1 - Y0), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+        else:
+            a = cv2.warpAffine(m, A, (wY, hY), flags=cv2.INTER_LINEAR, borderValue=0).astype(np.float32) / 255.0
+        out[k] = a
+    return out
+
+
+def _spot_fill(Y, Cb, Cr, mY, S, Sred, k: float, size: float, cs: float):
+    """Fill what detect.py found from the skin around it: S (dark spots and raised bumps, with their dark side) in
+    brightness and colour, Sred (red spots) in colour and brightness. The spot is replaced by the level of the
+    skin beside it (the spots themselves left out of that level), whichever way it differs: a dark spot is lifted,
+    a bump's bright top is taken down and its dark side lifted. What is finer than DET_FINE stays as it is (the
+    picture's grain goes on through the spot), nothing is added."""
+    Sall = np.maximum(S, Sred) if Sred is not None else S
+    r = _roi(Sall, int(2.5 * size) + 6)
+    if r is None or k < 1e-4:
+        return Y, Cb, Cr
+    y0, y1, x0, x1 = r
+    roi = Y[y0:y1, x0:x1].astype(np.float32)
+    mm = mY[y0:y1, x0:x1].astype(np.float32)
+    sp = np.clip(Sall[y0:y1, x0:x1], 0, 1) * np.clip(mm * 1.5, 0, 1)
+    # a red spot is filled in colour; in brightness only half as far (a pimple is hardly darker than the skin, and
+    # what is redder for another reason, skin in shade, must keep its shade)
+    spl = sp if Sred is None else np.clip(np.maximum(S[y0:y1, x0:x1], 0.5 * Sred[y0:y1, x0:x1]), 0, 1) * np.clip(mm * 1.5, 0, 1)
+    sig_f = float(np.clip(DET_FINE[0] * size, DET_FINE[1], DET_FINE[2]))
+    # what stays of the picture's fine detail inside a fill: the whole grain band (the one the skin smoothing gives
+    # back, _keep_fine) where the flaw is only likely; where it is sure, only what is finer than DET_FINE, because
+    # a small spot's sharp core is in that band and stayed as a dot. Nothing is put in its place
+    sig_g = float(np.clip(GRAIN_SIGMA * Y.shape[0] / 1080.0, 0.8, 2.4))
+    Ys = cv2.GaussianBlur(roi, (0, 0), sig_f)
+    if sig_g > sig_f * 1.2:
+        sure = _ss(DET_SURE[0], DET_SURE[1], sp)
+        Yg = cv2.GaussianBlur(roi, (0, 0), sig_g)
+        Ys = Yg + sure * (Ys - Yg)
+    wex = (mm > 0.05).astype(np.float32) * (1.0 - np.clip(sp * 2.0, 0, 1))
+
+    def around(P, w, sizes):
+        # the nearest skin that is not a spot: the narrow surround where it has enough of it, else a wider one
+        out, have = None, None
+        for sg in sizes:
+            num = cv2.GaussianBlur(P * w, (0, 0), sg)
+            den = cv2.GaussianBlur(w, (0, 0), sg)
+            b = num / np.maximum(den, 1e-3)
+            ok = np.clip((den - 0.15) / 0.2, 0, 1)
+            if out is None:
+                out, have = b * ok, ok
+            else:
+                out = out + b * ok * (1 - have)
+                have = have + ok * (1 - have)
+        return np.where(have > 0.05, out / np.maximum(have, 0.05), P), np.clip(have * 2, 0, 1)
+
+    sizes = (max(1.5, 0.45 * size), max(3.0, 0.9 * size), max(6.0, 2.0 * size))
+    base, ok = around(Ys, wex, sizes)
+    Yo = Y.astype(np.float32, copy=True)
+    Yo[y0:y1, x0:x1] = roi + k * spl * ok * np.clip(base - Ys, -0.2, 0.2)
+    Cbo, Cro = Cb.astype(np.float32, copy=True), Cr.astype(np.float32, copy=True)
+    if Cb.shape == Y.shape:
+        c0, c1, d0, d1 = y0, y1, x0, x1
+        spc, wc = sp, wex
+    else:
+        c0, c1, d0, d1 = _croi(y0, y1, x0, x1, Y.shape, Cb.shape)
+        spc = cv2.resize(sp, (d1 - d0, c1 - c0), interpolation=cv2.INTER_AREA)
+        wc = cv2.resize(wex, (d1 - d0, c1 - c0), interpolation=cv2.INTER_AREA)
+    csz = tuple(max(1.0, x * cs) for x in sizes)
+    for P, O in ((Cb, Cbo), (Cr, Cro)):
+        pr = P[c0:c1, d0:d1].astype(np.float32)
+        ps = cv2.GaussianBlur(pr, (0, 0), max(0.5, sig_f * cs))
+        pb, okc = around(ps, wc, csz)
+        O[c0:c1, d0:d1] = pr + k * spc * okc * np.clip(pb - ps, -0.06, 0.06)
+    return Yo, Cbo, Cro
+
+
+def _fold_any(Y: np.ndarray, m: np.ndarray, S: np.ndarray, hold: Optional[np.ndarray], wf: float, k: float,
+              cap: float = 0.06) -> np.ndarray:
+    """Broad folds found by detect.py in any direction (a head turned or tilted: the rings do not lie across the
+    picture's neck axis): what is darker than the skin either side at a tenth of the face width, inside the found
+    fold only. Luma only, never darker."""
+    if k < 1e-4:
+        return Y
+    r = _roi(S * m, int(0.12 * wf) + 8)
+    if r is None:
+        return Y
+    y0, y1, x0, x1 = r
+    roi = Y[y0:y1, x0:x1].astype(np.float32)
+    ww = (S[y0:y1, x0:x1] * m[y0:y1, x0:x1]).astype(np.float32)
+    Ys = cv2.GaussianBlur(roi, (0, 0), max(1.0, 0.006 * wf))
+    ks = max(3, int(0.10 * wf) | 1)
+    bh = cv2.morphologyEx(Ys, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks)))
+    bh = cv2.GaussianBlur(np.clip(bh, 0, cap), (0, 0), max(1.0, 0.012 * wf))
+    if hold is not None:
+        ww = ww * hold[y0:y1, x0:x1]
+    out = Y.astype(np.float32, copy=True)
+    out[y0:y1, x0:x1] = roi + k * ww * bh
+    return out
 
 
 # 2611 cut 024 (user 2026-11-17): the shine's white went the skin's colour. A highlight keeps its own colour; the
@@ -2581,7 +2910,7 @@ def neck_dir(mY: np.ndarray, lm: Optional[np.ndarray], scale: float):
 
 
 def _crease_lift(Y, Cb, Cr, mY, k: float, width: float, axis=None, hold: Optional[np.ndarray] = None,
-                 fine_lines: bool = True):
+                 fine_lines: bool = True, extra: Optional[np.ndarray] = None):
     """Fill thin dark creases (neck lines): a dark valley, curved strongly across and hardly along, darker than
     the skin around it by more than its texture. Only the crease's shading is lifted; broad shading stays.
 
@@ -2642,6 +2971,12 @@ def _crease_lift(Y, Cb, Cr, mY, k: float, width: float, axis=None, hold: Optiona
         fine = None
     if fine is not None:
         score = np.maximum(score, fine)
+    if extra is not None:
+        # lines found by detect.py: several widths, any direction, held steady through time (1.19). They are filled
+        # like the fine lines: from the picture itself, and kept off chains, cords, hair and paint by the test below
+        ex = extra[y0:y1, x0:x1].astype(np.float32)
+        score = np.maximum(score, ex)
+        fine = ex if fine is None else np.maximum(fine, ex)
     if hold is not None:
         score = score * hold[y0:y1, x0:x1]
     rd = max(1, int(round(0.4 * width)))
@@ -2806,8 +3141,32 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
         v = job.v
         wf = job.wf_src * y_per_src if job.wf_src > 0 else 0.11 * max(job.scale, 200.0) * y_per_src
         hd_ = he_ = None
+        det = {}
+        if DET_ON and (v.get("blemish", 0) > 1e-4 or v.get("neck_lines", 0) > 1e-4):
+            # where the flaws are: found before anything is changed. With the job when it was prepared with its
+            # neighbours (held steady through time), else found here on this picture
+            try:
+                det = _det_place(job, rf, (hY, wY)) if job.det else _det_now(job, Y, Cb, Cr, wf, y_per_src, M)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                det = {}
+        prot_ = det.get("protect")
         # 0. blemishes (first, so smoothing never smears a spot around)
-        if "skinx" in job.masks and v.get("blemish", 0) > 1e-4:
+        if v.get("blemish", 0) > 1e-4 and det and ("skinx" in job.masks or "neck" in job.masks):
+            k = float(np.clip(v["blemish"], 0, 1))
+            size = spot_size(job, wf)
+            reg = None
+            for nm_ in ("skinx", "neck"):
+                if nm_ in job.masks:
+                    reg = M(job.masks[nm_], (hY, wY)) if reg is None else np.maximum(reg, M(job.masks[nm_], (hY, wY)))
+            S_ = np.maximum(det["dark"], det["bump"])
+            R_ = det["red"]
+            if prot_ is not None:
+                S_ = S_ * (1.0 - prot_)
+                R_ = R_ * (1.0 - prot_)
+            Y, Cb, Cr = _spot_fill(Y, Cb, Cr, reg, S_, R_, k, size, cs)
+        elif "skinx" in job.masks and v.get("blemish", 0) > 1e-4:
             k = float(np.clip(v["blemish"], 0, 1))
             size = (0.012 + 0.05 * job.blemish_size) * wf
             Y, Cb, Cr = _blemish(Y, Cb, Cr, M(job.masks["skinx"], (hY, wY)), M(job.masks["skinx"], (hC, wC)),
@@ -3008,7 +3367,13 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
             except Exception:
                 pass
             jh_ = jaw_hold(lmj, (hY, wY), y_per_src, wf)
-            Y, Cb, Cr = _crease_lift(Y, Cb, Cr, mN, k, max(1.5, 0.018 * wf), None, jh_)
+            ex_ = det.get("line") if det else None
+            if ex_ is not None and prot_ is not None:
+                ex_ = ex_ * (1.0 - prot_)
+            Y, Cb, Cr = _crease_lift(Y, Cb, Cr, mN, k, max(1.5, 0.018 * wf), None, jh_, extra=ex_)
+            if det and det.get("fold") is not None:
+                fo_ = det["fold"] if prot_ is None else det["fold"] * (1.0 - prot_)
+                Y = _fold_any(Y, mN, fo_, jh_, wf, NECK_RING * k)
             # the soft folds (rings) of the neck, wider and fainter than a line
             Y = _fold_flat(Y, mN if jh_ is None else mN * jh_, wf, k)
             if NECK_RING > 1e-4:

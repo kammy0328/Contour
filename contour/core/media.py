@@ -455,14 +455,19 @@ class FrameReader:
 
     def __init__(self, info: MediaInfo, start: int, count: int, pix_fmt: str,
                  size: Optional[Tuple[int, int]] = None, rgb_convert: bool = False,
-                 prefetch: int = 3):
+                 prefetch: int = 3, crop: Optional[Tuple[int, int, int, int]] = None):
+        """crop: (x, y, w, h) in source pixels, cut out before anything else (size then is the size of the cut-out
+        piece as it is handed out; None: its own size)."""
         self.info = info
         self.count = max(0, int(count))
-        w, h = size if size else (info.width, info.height)
+        src_w, src_h = (int(crop[2]), int(crop[3])) if crop else (info.width, info.height)
+        w, h = size if size else (src_w, src_h)
         self.layout = plane_layout(pix_fmt, w, h)
         vf = []
+        if crop:
+            vf.append(f"crop={int(crop[2])}:{int(crop[3])}:{int(crop[0])}:{int(crop[1])}:exact=1")
         scale_opts = []
-        if size and (w, h) != (info.width, info.height):
+        if size and (w, h) != (src_w, src_h):
             scale_opts += [f"w={w}", f"h={h}"]
         target_rgb = pix_fmt.startswith(("rgb", "gbr"))
         if target_rgb and info.chroma not in ("rgb", "gray"):
@@ -471,7 +476,7 @@ class FrameReader:
             # "area" only where the picture is made smaller: with no resize, ffmpeg 9's swscale converts 8-bit
             # 4:2:0 to rgb48 with its colours wrong under "area" (green near nothing: a 1920x1080 H.264 source read
             # at its own size, lngshot v3); "bicubic" there does nothing but pick the right converter
-            resize = bool(size) and (w, h) != (info.width, info.height)
+            resize = bool(size) and (w, h) != (src_w, src_h)
             flags = "area" if resize else "bicubic"
             vf.append("scale=" + ":".join(scale_opts) + f":flags={flags}+accurate_rnd+full_chroma_int+full_chroma_inp")
         cmd = [ffmpeg_bin(), "-hide_banner", "-v", "error", "-nostdin"]
