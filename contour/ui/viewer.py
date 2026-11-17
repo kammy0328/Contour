@@ -1361,10 +1361,13 @@ class Viewer(QWidget):
             return
         pos = e.position()
         panes = self._panes()
-        k = next((i for i, rr in enumerate(panes) if rr.contains(pos)), None)
+        # the pane is the one whose viewer area (cell) the cursor is in: a zoomed-in picture's own rect runs into the
+        # neighbouring cell, so testing the picture rects picked the left pane while the cursor was over the right
+        # one (비교: the zoom did not centre on the pointer)
+        cells = self._cells()
+        k = next((i for i, cc in enumerate(cells) if cc.contains(pos)), None)
         if k is None:
-            # between or outside the panes: the nearest one
-            k = int(np.argmin([abs(rr.center().x() - pos.x()) for rr in panes]))
+            k = int(np.argmin([abs(cc.center().x() - pos.x()) for cc in cells]))
         r = panes[k]
         ix, iy = self.w_to_img(pos, r)
         f = 1.15 if e.angleDelta().y() > 0 else 1 / 1.15
