@@ -133,23 +133,22 @@ class Timeline(QWidget):
         if b < n:
             p.fillRect(QRectF(self.x_of(b), RULER_H, x1 - self.x_of(b), self.height() - RULER_H), QColor(0, 0, 0, 90))
         self._paint_ruler(p)
-        # frames whose finished result is ready for playback
+        # playback cache line under the ruler: green where the finished result is ready, red where it is not yet
+        # (inside the work range)
         cached = self.s.play_frames() if hasattr(self.s, "play_frames") else []
+        fr = np.zeros(n + 1, bool)
         if cached:
-            fr = np.zeros(n + 1, bool)
             fr[[c for c in cached if 0 <= c < n]] = True
-            p.setPen(Qt.NoPen)
-            p.setBrush(QColor(88, 214, 141, 170))
-            i = 0
-            while i < n:
-                if fr[i]:
-                    j = i
-                    while j < n and fr[j]:
-                        j += 1
-                    p.drawRect(QRectF(self.x_of(i), RULER_H - 3, max(1.0, self.x_of(j) - self.x_of(i)), 2))
-                    i = j
-                else:
-                    i += 1
+        p.setPen(Qt.NoPen)
+        lo, hi = max(0, a), min(n, b)
+        i = lo
+        while i < hi:
+            j = i
+            while j < hi and fr[j] == fr[i]:
+                j += 1
+            p.setBrush(QColor(88, 214, 141, 170) if fr[i] else QColor(229, 72, 77, 190))
+            p.drawRect(QRectF(self.x_of(i), RULER_H - 3, max(1.0, self.x_of(j) - self.x_of(i)), 2))
+            i = j
         lanes = self.lanes()
         st = self.s.tracker.store if self.s.tracker else None
         y = RULER_H + 4
@@ -237,10 +236,10 @@ class Timeline(QWidget):
                 p.setPen(qc("text3"))
                 p.drawText(QRectF(x + 3, 3, 120, 14), Qt.AlignLeft | Qt.AlignVCenter, info.tc_at(f) if info.timecode else str(f))
             f += step
-        # current frame readout in the label column
+        # current frame number (counted from the first frame of this cut) in the label column
         p.setFont(font(11, 600, tabular=True))
         p.setPen(qc("text"))
-        p.drawText(QRectF(8, 2, LEFT - 12, RULER_H - 4), Qt.AlignVCenter | Qt.AlignLeft, f"{self.t}")
+        p.drawText(QRectF(8, 2, LEFT - 12, RULER_H - 4), Qt.AlignVCenter | Qt.AlignLeft, f"프레임 {self.t}")
 
     def _paint_conf(self, p: QPainter, r: QRectF, st, person, thr: float, sel: bool):
         i = st.index(person.id)
