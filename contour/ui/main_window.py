@@ -242,6 +242,9 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.queue_page)
         self.pages.addWidget(self.dash_page)
         self.pages.addWidget(self.models_page)
+        from .projectmgr import ProjectsPage
+        self.projects_page = ProjectsPage(self)
+        self.pages.addWidget(self.projects_page)
         self.toast_w = Wd.Toast(root)
 
     def _topbar(self) -> QWidget:
@@ -433,15 +436,17 @@ class MainWindow(QMainWindow):
             from . import update as UP
             QTimer.singleShot(3000, lambda: UP.check(self))
         last = s.last_project
-        if last and (Path(last) / "project.json").exists():
+        self._refresh_all()
+        self.viewer.message = "왼쪽 위 프로젝트 메뉴에서 새 프로젝트를 만들거나 여세요. 영상을 끌어다 놓아도 됩니다"
+        self.viewer.update()
+        if s.open_last_on_start and last and (Path(last) / "project.json").exists():
             self.open_project(last)
         else:
-            self._refresh_all()
-            self.viewer.message = "왼쪽 위 프로젝트 메뉴에서 새 프로젝트를 만들거나 여세요. 영상을 끌어다 놓아도 됩니다"
-            self.viewer.update()
+            self.show_page("projects")             # the project manager comes first
 
     def _project_menu(self):
         m = QMenu(self)
+        a_mgr = m.addAction(I.icon("layers", 14), "프로젝트 관리…")
         a_new = m.addAction(I.icon("plus", 14), "새 프로젝트…")
         a_open = m.addAction(I.icon("folder-open", 14), "프로젝트 열기…")
         rec = m.addMenu("최근 프로젝트")
@@ -478,12 +483,15 @@ class MainWindow(QMainWindow):
             from . import update as UP
             UP.check(self, manual=True)
             return
-        if act == a_new:
+        if act == a_mgr:
+            self.show_page("projects")
+        elif act == a_new:
             self.new_project()
         elif act == a_open:
-            d = QFileDialog.getExistingDirectory(self, "프로젝트 폴더 (.contour) 선택", str(Path.home()))
+            d = QFileDialog.getExistingDirectory(self, "프로젝트 폴더 (.dpprj) 선택", str(Path.home()))
             if d:
                 self.open_project(d)
+                self.show_page("edit")
         elif act == a_save:
             self.save()
         elif act == a_client:
@@ -511,6 +519,7 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(self.session.project.path))
         elif act.data():
             self.open_project(act.data())
+            self.show_page("edit")
 
     def new_project(self):
         name = TextPrompt.ask(self, "새 프로젝트", "프로젝트 이름 (공백은 _로 바뀝니다)", "", "다음")
@@ -522,6 +531,7 @@ class MainWindow(QMainWindow):
         self.close_project()
         prj = Project.create(d, name)
         self.open_project(prj.path, wait=True)
+        self.show_page("edit")
 
     def open_project(self, path: str, wait: bool = False):
         """Reads the project and the cut thumbnails on a thread (the window keeps turning) and then opens it.
@@ -3358,12 +3368,19 @@ class MainWindow(QMainWindow):
         self.toast("다시 실행")
 
     # ================================================================== misc
+    def show_page(self, key: str):
+        """edit | queue | projects (the top tabs follow)."""
+        self.page_tabs.set_current(key if key in ("edit", "queue") else "")
+        self._page(key)
+
     def _page(self, key: str):
-        idx = {"edit": 0, "queue": 1, "dash": 2, "models": 3}[key]
+        idx = {"edit": 0, "queue": 1, "dash": 2, "models": 3, "projects": 4}[key]
         if key != "edit":
             self.stop_play()
             self.save()
         self.pages.setCurrentIndex(idx)
+        if key == "projects":
+            self.projects_page.reload()
         if key == "dash":
             self.dash_page.refresh()
         elif key == "models":
@@ -3499,6 +3516,7 @@ class MainWindow(QMainWindow):
             self.job.wait(5000)
         if getattr(self, "_opening", None) is not None:
             self._opening.wait(15000)
+        self.projects_page.shutdown()
         self.stop_play()
         if not getattr(self, "_discard_on_close", False):
             self.save(quiet=True)

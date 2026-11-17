@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 APP_NAME = "DIAP"
-APP_VERSION = "1.12.0"
+APP_VERSION = "1.13.0"
 
 
 def default_data_dir() -> Path:
@@ -43,6 +43,8 @@ class AppSettings:
     self_learning: bool = True        # learn from every analysed cut on its own (no corrections needed)
     last_project: str = ""
     recent_projects: list = field(default_factory=list)
+    known_projects: list = field(default_factory=list)   # every project the project manager lists (no limit)
+    open_last_on_start: bool = False      # skip the project manager at start and open the last project
     output_dir: str = ""
     qc_thresholds: dict = field(default_factory=dict)
     cloth_model_ok: bool = False          # the user has read the clothing model's licence note
@@ -115,6 +117,9 @@ class AppSettings:
             self.recent_projects.remove(path)
         self.recent_projects.insert(0, path)
         del self.recent_projects[10:]
+        if path in self.known_projects:
+            self.known_projects.remove(path)
+        self.known_projects.insert(0, path)
         self.last_project = path
 
 
