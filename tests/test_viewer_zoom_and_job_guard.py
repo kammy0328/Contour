@@ -9,6 +9,13 @@ from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
 from PySide6.QtGui import QMouseEvent, QWheelEvent
 
 
+def _stop(v):
+    """The viewer's worker threads end before the test does (a QThread still running at exit aborts Python)."""
+    for w in (v.preview, v.skin_worker):
+        w.stop()
+        w.wait(3000)
+
+
 class _PX:
     w, h, sx, sy, n = 1920, 1080, 1.0, 1.0, 10
 
@@ -35,6 +42,7 @@ def test_side_zoom_keeps_pixel_under_pointer(qapp, side):
         _wheel(v, pos)
         after = v.w_to_img(pos, v._panes()[side])
         assert np.hypot(before[0] - after[0], before[1] - after[1]) < 2.0, f"step {i}: {before} -> {after}"
+    _stop(v)
 
 
 def test_job_guard_blocks_clicks_but_not_cancel(qapp, project, monkeypatch):
@@ -89,4 +97,5 @@ def test_side_zoom_pixel_under_pointer_painted(qapp, project, side):
         _wheel(v, pos)
         qapp.processEvents()
     c1 = v.grab().toImage().pixelColor(int(pos.x()), int(pos.y())).red()
+    _stop(v)
     assert abs(c0 - c1) <= 12, f"colour under the pointer {c0} -> {c1} (zoom {v.zoom:.2f})"
