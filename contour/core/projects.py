@@ -81,7 +81,7 @@ def local_cache(path: str) -> Optional[Path]:
     """The project's folder in this computer's proxy cache (1.16), if there is one."""
     try:
         j = json.loads((Path(path) / "project.json").read_text(encoding="utf-8"))
-        key = f"{int(float(j.get('created', 0) or 0))}"
+        key = f"{int(round(float(j.get('created', 0) or 0) * 1000))}"
         from .settings import settings
         root = settings().cache_path
         return next((p for p in root.glob(key + "_*") if p.is_dir()), None)
@@ -156,7 +156,7 @@ def cache_usage() -> Dict:
     for p in list(st.known_projects) + list(st.recent_projects):
         try:
             j = json.loads((Path(p) / "project.json").read_text(encoding="utf-8"))
-            keys.add(f"{int(float(j.get('created', 0) or 0))}")
+            keys.add(f"{int(round(float(j.get('created', 0) or 0) * 1000))}")
         except Exception:
             pass
     orphans = [d for d in root.iterdir() if d.is_dir() and d.name.split("_", 1)[0] not in keys] if root.exists() else []

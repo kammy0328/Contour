@@ -579,7 +579,7 @@ class Project:
     # ------------------------------------------------------------------ proxies (this computer's cache, 1.16)
     def cache_key(self) -> str:
         """The project's folder name in the cache: its creation time (stays when the project is renamed or moved)."""
-        return f"{int(self.created)}"
+        return f"{int(round(float(self.created) * 1000))}"
 
     def local_cache(self) -> Path:
         from .settings import settings
