@@ -74,7 +74,9 @@ Name: "{autodesktop}\DIAP"; Filename: "{app}\python\DIAP.exe"; Parameters: """{a
 [Run]
 ; first install into this folder (also the update from 1.8.1, which moves to Program Files): visible console,
 ; the package download takes a while
-Filename: "{app}\python\python.exe"; Parameters: """{app}\app\tools\setup_env.py"" --learn 1"; WorkingDir: "{app}\app"; StatusMsg: "패키지, 학습 기능, 모델을 준비하는 중 (처음엔 10~20분, 약 3GB)"; Check: FirstSetup
+Filename: "{app}\python\python.exe"; Parameters: """{app}\app\tools\setup_env.py"" --learn 1"; WorkingDir: "{app}\app"; StatusMsg: "패키지, 학습 기능, 모델을 준비하는 중 (처음엔 10~20분, 약 3GB)"; Check: FirstSetup and not IsUpdate
+; the same from the app's update button: hidden (no console window over the progress)
+Filename: "{app}\python\python.exe"; Parameters: """{app}\app\tools\setup_env.py"" --learn 1"; WorkingDir: "{app}\app"; StatusMsg: "패키지, 학습 기능, 모델을 준비하는 중 (처음엔 10~20분, 약 3GB)"; Flags: runhidden; Check: FirstSetup and IsUpdate
 ; update in place: hidden, packages only when they changed
 Filename: "{app}\python\python.exe"; Parameters: """{app}\app\tools\setup_env.py"" --learn 1"; WorkingDir: "{app}\app"; StatusMsg: "업데이트 마무리 중"; Flags: runhidden; Check: not FirstSetup
 Filename: "{app}\python\DIAP.exe"; Parameters: """{app}\app\app.py"""; WorkingDir: "{app}\app"; Description: "DIAP 실행"; Flags: nowait postinstall skipifsilent
