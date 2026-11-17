@@ -195,6 +195,10 @@ def _track_points(store: TrackStore, fs, frames: np.ndarray, z, R, ok, size, smo
 
 
 SEEN_SCORE = 0.6     # landmark score (eyes, nose, mouth) of both models over which a detected face counts as seen
+# off (j2681, 100 cuts): it brings back the faces turned down over a table (2611 cut 007) but also takes the side of a
+# head (lngshot 014, 066) and printed faces on a poster (049), and the mean share of usable faces barely moved
+# (0.435 -> 0.438). Needs a stricter test before it is used.
+FACE_SEEN_OVERRIDE = False
 
 
 def face_seen(store: TrackStore, f106: Optional[np.ndarray], med: np.ndarray, a: int, b: int) -> np.ndarray:
@@ -258,7 +262,7 @@ def solve_face(store: TrackStore, fs: Optional[SV.FrameSource], frame_range: Tup
     fd = getattr(store, "facing", None)
     if fd is not None:
         fdir = fd[:, a:b]
-        seen = face_seen(store, f106, med, a, b)
+        seen = face_seen(store, f106, med, a, b) if FACE_SEEN_OVERRIDE else np.zeros(med.shape, bool)
         fac = np.where(np.isfinite(fdir), np.clip((fdir + 0.25) / 0.6, 0, 1), 1.0)
         vis_raw = vis_raw * np.where(seen, 1.0, fac)
         ok = ok & ~(np.isfinite(fdir) & (fdir < -0.3) & ~seen)
