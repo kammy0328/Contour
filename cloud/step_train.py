@@ -292,8 +292,12 @@ def export(model, path):
             return logits_of(s.m, pixel_values)
     x = torch.randn(1, 3, SIZE, SIZE)
     wm = W(model).eval()
-    torch.onnx.export(wm, x, path, input_names=["pixel_values"], output_names=["logits"], opset_version=18,
-                      dynamic_axes=None, do_constant_folding=True)
+    kw = dict(input_names=["pixel_values"], output_names=["logits"], opset_version=18, dynamic_axes=None,
+              do_constant_folding=True)
+    import inspect
+    if "dynamo" in inspect.signature(torch.onnx.export).parameters:
+        kw["dynamo"] = False            # torch 2.14's default exporter needs onnxscript, not in the app (j2745)
+    torch.onnx.export(wm, x, path, **kw)
     try:                                  # one single file (the exporter may leave the weights in a .data file)
         import onnx
         m_ = onnx.load(path)
@@ -437,6 +441,17 @@ def main():
     w_old = [w for _, w, _ in old]
     # stage 1: the teacher grows on this project (skipped with --student-only); stage 2: the student learns from it
     t_rec = None
+    if "--export-teacher" in flags:
+        # the teacher's last tuning was saved but its export failed (j2745): export and install it, nothing else
+        teacher = SegformerForSemanticSegmentation.from_pretrained(HF).to(dev).eval()
+        teacher.load_state_dict(torch.load(os.path.join(MODEL, "face_parse_diap.pt"), map_location=dev))
+        tmp = os.path.join(MODEL, "face_parse_diap.onnx")
+        export(teacher.cpu().eval(), tmp)
+        md = models_dir()
+        os.makedirs(md, exist_ok=True)
+        shutil.copyfile(tmp, os.path.join(md, "face_parse_diap.onnx"))
+        print("교사 모델을 다시 내보내 설치했습니다:", os.path.join(md, "face_parse_diap.onnx"), flush=True)
+        return 0
     if "--student-only" in flags:
         teacher = SegformerForSemanticSegmentation.from_pretrained(HF).to(dev).eval()
         tuned = os.path.join(MODEL, "face_parse_diap.pt")

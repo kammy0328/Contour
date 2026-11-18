@@ -24,3 +24,12 @@ def test_held_out_faces_are_whole_cuts(tmp_path):
     ct = {m["_cut"] for _, _, m in tr}
     assert cv and ct and not (cv & ct)
     assert len(val) >= 10 and len(tr) + len(val) == 120
+
+
+def test_exports_do_not_need_onnxscript():
+    """j2745: the teacher's export failed after an hour of tuning (torch 2.14 defaults to the exporter that needs
+    onnxscript, which the app does not ship)."""
+    src = open(os.path.join(os.path.dirname(__file__), "..", "cloud", "step_train.py"), encoding="utf-8").read()
+    assert 'kw["dynamo"] = False' in src and "--export-teacher" in src
+    ref = open(os.path.join(os.path.dirname(__file__), "..", "contour", "learn", "refiner.py"), encoding="utf-8").read()
+    assert "dynamo=False" in ref
