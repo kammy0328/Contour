@@ -69,8 +69,27 @@ def load_items(folder):
                 w += 1.0
             if m["wf"] < 90:
                 w += 1.0
+            m = dict(m, _cut=cut)
             items.append((os.path.join(folder, cut, m["f"]), w, m))
     return items
+
+
+def split_by_cut(items, share=0.1, seed=3):
+    """Held-out faces come from whole cuts: frames next to each other look alike, and a random split put one in
+    training and its neighbour in the check, which made the check too kind (2026-11-18)."""
+    cuts = sorted({m.get("_cut", "") for _, _, m in items})
+    rng = random.Random(seed)
+    rng.shuffle(cuts)
+    want = max(10, int(len(items) * share))
+    held, n = set(), 0
+    for c in cuts:
+        if n >= want or len(held) >= len(cuts) - 1:
+            break
+        held.add(c)
+        n += sum(1 for _, _, m in items if m.get("_cut", "") == c)
+    val = [it for it in items if it[2].get("_cut", "") in held]
+    tr = [it for it in items if it[2].get("_cut", "") not in held]
+    return val, tr
 
 
 def projects():
@@ -412,9 +431,7 @@ def main():
             old += load_items(os.path.join(DONE, n))
     os.makedirs(MODEL, exist_ok=True)
     print(f"프로젝트 {name}: 얼굴 {len(items)}장, 이전 프로젝트 {len(old)}장 섞음, {steps}스텝, {dev}", flush=True)
-    random.Random(3).shuffle(items)
-    k = max(10, len(items) // 10)
-    val, tr = items[:k], items[k:]
+    val, tr = split_by_cut(items)
     val_old = random.Random(5).sample(old, min(60, len(old))) if old else []
     weights = [w for _, w, _ in tr]
     w_old = [w for _, w, _ in old]

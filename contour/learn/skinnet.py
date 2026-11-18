@@ -346,5 +346,9 @@ def export_onnx(net, path) -> None:
     import torch
     net = net.cpu().eval()
     x = torch.zeros(1, 4, 256, 256)
-    torch.onnx.export(net, x, str(path), input_names=["x"], output_names=["y"], opset_version=17,
-                      dynamic_axes={"x": {2: "h", 3: "w"}, "y": {2: "h", 3: "w"}})
+    kw = dict(input_names=["x"], output_names=["y"], opset_version=17,
+              dynamic_axes={"x": {2: "h", 3: "w"}, "y": {2: "h", 3: "w"}})
+    import inspect
+    if "dynamo" in inspect.signature(torch.onnx.export).parameters:
+        kw["dynamo"] = False            # the TorchScript exporter: the new one needs onnxscript, not in the app (j2742)
+    torch.onnx.export(net, x, str(path), **kw)
