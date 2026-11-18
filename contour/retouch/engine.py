@@ -1722,7 +1722,8 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
         if DET_ON and job.masks and lm is not None and _det_wanted(v):
             try:
                 job.det = get("det", lambda: _det_raw(cut, px, t, job, lm, base()["rgb"]),
-                              f"{job.blemish_size:.3f}:{int(v.get('blemish', 0) > 1e-4)}{int(v.get('neck_lines', 0) > 1e-4)}{int(v.get('neck_bumps', 0) > 1e-4)}:{fth:.2f}")
+                              f"{job.blemish_size:.3f}:{int(v.get('blemish', 0) > 1e-4)}{int(v.get('neck_lines', 0) > 1e-4)}{int(v.get('neck_bumps', 0) > 1e-4)}:{fth:.2f}"
+                              f":sn{int(_spot_net_wanted(job))}")
             except Exception:
                 import traceback
                 traceback.print_exc()
@@ -1864,6 +1865,88 @@ def _fold_broad(Y: np.ndarray, m: np.ndarray, excl: Optional[np.ndarray], wf: fl
         mm = mm * (1.0 - np.clip(cv2.GaussianBlur(e, (0, 0), max(1.0, 0.02 * wf)), 0, 1))
     out = Y.astype(np.float32, copy=True)
     out[y0:y1, x0:x1] = roi + k * mm * bh
+    return out
+
+
+FOLD_LEVEL = 1.25          # 2611 cut 024 again (2026-11-18): at 강하게 the soft nasolabial shading stayed: on a young face
+                           # the fold is a soft step on the cheek's gradient, which neither the valley fill nor the
+                           # closing sees. Its middle scale (between FOLD_LEVEL_SIG) is evened out inside the band, the
+                           # broad shading of the face and the fine texture kept; times the fold value (강하게 0.8 -> 1.0).
+                           # A first version only lifted what was darker than the skin beside the band: around a
+                           # dimple at the mouth corner (2611 cut 011) that left a dark notch, so lips and nostrils
+                           # are kept out of the reference and the band fades out well before them.
+FOLD_LEVEL_SIG = (0.008, 0.12)  # fine .. broad scale kept (share of the face width)
+FOLD_LEVEL_CAP = (0.08, 0.03)   # most lift / most darkening (0..1 luma)
+FOLD_LEVEL_EXCL = (0.08, 0.04)  # the band fades out this far from the lips and nostrils (dilation, blur; face width)
+FOLD_LEVEL_EDGE = (0.02, 0.03)  # the same round hair strands and sharp edges in the band
+NECK_LEVEL = 1.25          # the same on the neck (cut 024: the rings and the broad band across the neck stayed)
+NECK_LEVEL_SIG = (0.008, 0.10)
+
+
+def _masked_blur(Y: np.ndarray, w: np.ndarray, sx: float, sy: float) -> np.ndarray:
+    num = cv2.GaussianBlur(Y * w, (0, 0), sigmaX=max(0.5, sx), sigmaY=max(0.5, sy))
+    den = cv2.GaussianBlur(w, (0, 0), sigmaX=max(0.5, sx), sigmaY=max(0.5, sy))
+    return np.where(den > 1e-3, num / np.maximum(den, 1e-3), Y).astype(np.float32)
+
+
+def _even_mid(roi: np.ndarray, w: np.ndarray, wf: float, sig) -> np.ndarray:
+    """What evens out the middle scale of roi: the broad level minus the level at the fine scale (both measured on
+    w only), capped."""
+    mid = _masked_blur(roi, w, sig[0] * wf, sig[0] * wf)
+    low = _masked_blur(roi, w, sig[1] * wf, sig[1] * wf)
+    return np.clip(low - mid, -FOLD_LEVEL_CAP[1], FOLD_LEVEL_CAP[0])
+
+
+def _fold_level(Y: np.ndarray, band: np.ndarray, skin: np.ndarray, excl: Optional[np.ndarray], wf: float,
+                k: float, edges: Optional[np.ndarray] = None) -> np.ndarray:
+    """Even out a fold's soft shading inside its band (luma): the fold's own scale goes, the face's broad modelling
+    and the skin's fine texture stay. Lips, nostrils and eyes (excl) are out of the reference, and the band fades
+    out before them."""
+    if k < 1e-4:
+        return Y
+    r = _roi(band, int(3 * FOLD_LEVEL_SIG[1] * wf) + 8)
+    if r is None:
+        return Y
+    y0, y1, x0, x1 = r
+    roi = Y[y0:y1, x0:x1].astype(np.float32)
+    b = np.clip(band[y0:y1, x0:x1].astype(np.float32), 0, 1)
+    w = np.clip(skin[y0:y1, x0:x1].astype(np.float32), 0, 1)
+    if excl is not None:
+        e = np.clip(excl[y0:y1, x0:x1].astype(np.float32), 0, 1)
+        d_ = max(3, int(0.03 * wf) | 1)
+        w = w * (1.0 - cv2.dilate(e, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d_, d_))))
+        d2 = max(3, int(FOLD_LEVEL_EXCL[0] * wf) | 1)
+        e2 = cv2.dilate(e, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d2, d2)))
+        b = b * (1.0 - np.clip(cv2.GaussianBlur(e2, (0, 0), max(1.0, FOLD_LEVEL_EXCL[1] * wf)), 0, 1))
+    if edges is not None:
+        # a strand of hair or a sharp edge in the band is left as it is, and the skin round it is evened less the
+        # nearer it is: lifted right up to it, a dark strand stood out as a notch (2611 cut 011)
+        h = np.clip(edges[y0:y1, x0:x1].astype(np.float32), 0, 1)
+        w = w * (1.0 - h)
+        d3 = max(3, int(FOLD_LEVEL_EDGE[0] * wf) | 1)
+        h = cv2.dilate(h, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d3, d3)))
+        b = b * (1.0 - np.clip(cv2.GaussianBlur(h, (0, 0), max(1.0, FOLD_LEVEL_EDGE[1] * wf)), 0, 1))
+    out = Y.astype(np.float32, copy=True)
+    out[y0:y1, x0:x1] = roi + k * b * _even_mid(roi, w, wf, FOLD_LEVEL_SIG)
+    return out
+
+
+def _neck_level(Y: np.ndarray, m: np.ndarray, hold: Optional[np.ndarray], wf: float, k: float, axis=None) -> np.ndarray:
+    """Even out the neck's soft rings and bands (luma), measured on the neck only; hold (the jaw line) keeps the
+    jaw's own shadow."""
+    if k < 1e-4:
+        return Y
+    r = _roi(m, int(3 * NECK_LEVEL_SIG[1] * wf) + 8)
+    if r is None:
+        return Y
+    y0, y1, x0, x1 = r
+    roi = Y[y0:y1, x0:x1].astype(np.float32)
+    mm = np.clip(m[y0:y1, x0:x1].astype(np.float32), 0, 1)
+    d = _even_mid(roi, (mm > 0.3).astype(np.float32), wf, NECK_LEVEL_SIG)
+    if hold is not None:
+        mm = mm * hold[y0:y1, x0:x1]
+    out = Y.astype(np.float32, copy=True)
+    out[y0:y1, x0:x1] = roi + k * mm * d
     return out
 
 
@@ -2139,7 +2222,8 @@ def _det_raw(cut, px, t: int, job, lm: np.ndarray, rgb_u8: np.ndarray) -> Option
     lmd[:, 0] = (lmd[:, 0] - x0f) * fx
     lmd[:, 1] = (lmd[:, 1] - y0f) * fy
     wf_d = wf_p * fx
-    maps = DT.detect(Y, Cb, Cr, to_pic(sk), to_pic(nk), wf_d, spot_size(job, wf_d), neck_axis(lmd), lmd)
+    maps = DT.detect(Y, Cb, Cr, to_pic(sk), to_pic(nk), wf_d, spot_size(job, wf_d), neck_axis(lmd), lmd,
+                     net=_spot_net(job, img.astype(np.float32) / 255.0, wf_d))
     th = cv2.resize(Y, (max(4, wd // 4), max(4, hd // 4)), interpolation=cv2.INTER_AREA)
     return dict(box=(x0f, y0f, x1f, y1f), maps={k: (np.clip(m, 0, 1) * 255 + 0.5).astype(np.uint8) for k, m in maps.items()},
                 thumb=(np.clip(th, 0, 1) * 255 + 0.5).astype(np.uint8), src=from_src, wf=float(wf_d))
@@ -2230,7 +2314,25 @@ def _det_now(job, Y, Cb, Cr, wf: float, y_per_src: float, M) -> dict:
     cbY = Cb if Cb.shape == Y.shape else cv2.resize(Cb, (wY, hY), interpolation=cv2.INTER_LINEAR)
     crY = Cr if Cr.shape == Y.shape else cv2.resize(Cr, (wY, hY), interpolation=cv2.INTER_LINEAR)
     lm = None if job.face is None else np.asarray(job.face, np.float32)[:, :2] * y_per_src
-    return DT.detect(Y, cbY, crY, skin, neck, wf, spot_size(job, wf), neck_axis(lm), lm)
+    rgb = None
+    if _spot_net_wanted(job):
+        rgb = ycc_to_rgb(Y, cbY, crY)
+    return DT.detect(Y, cbY, crY, skin, neck, wf, spot_size(job, wf), neck_axis(lm), lm,
+                     net=_spot_net(job, rgb, wf))
+
+
+def _spot_net_wanted(job) -> bool:
+    """The learned spot detector is used: 잡티 제거 on, a large face (SPOTNET_WF source px), the model there."""
+    from . import spotnet_run as SR
+    return job.v.get("blemish", 0) > 1e-4 and float(job.wf_src) >= SR.SPOTNET_WF and SR.available()
+
+
+def _spot_net(job, rgb, wf: float):
+    """The callable DT.detect runs on its region, or None (the rule detector's spots)."""
+    if rgb is None or not _spot_net_wanted(job):
+        return None
+    from . import spotnet_run as SR
+    return lambda region: SR.run(rgb, region, wf)
 
 
 def _det_place(job, rf, shape) -> dict:
@@ -3331,6 +3433,11 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                     if he_ is not None:
                         mb_ = mb_ * (1.0 - he_)
                     Y = _fold_broad(Y, mb_, exY, wf, FOLD_BROAD * k, FOLD_BROAD_SCALE[key])
+                if FOLD_LEVEL > 1e-4 and "skin" in job.masks:
+                    mb_ = band
+                    if key == "nasolabial" and nh_ is not None:
+                        mb_ = mb_ * nh_
+                    Y = _fold_level(Y, mb_, M(job.masks["skin"], (hY, wY)), exY, wf, FOLD_LEVEL * k, he_)
                 mC = M(mY, (hC, wC))
                 Cb = _fold_fill(Cb, mC, exC, 0.7 * k, max(0.8, sf * wf * cs), max(1.5, ss * wf * cs), False)
                 Cr = _fold_fill(Cr, mC, exC, 0.7 * k, max(0.8, sf * wf * cs), max(1.5, ss * wf * cs), False)
@@ -3421,6 +3528,12 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                 except Exception:
                     ax_ = None
                 Y = _ring_fill(Y, mN, jh_, wf, NECK_RING * k, ax_)
+            if NECK_LEVEL > 1e-4:
+                try:
+                    ax2_ = neck_axis(lmj)
+                except Exception:
+                    ax2_ = None
+                Y = _neck_level(Y, mN, jh_, wf, NECK_LEVEL * k, ax2_)
         # 3b'. goose bumps on the neck: softened, never wiped
         if "neck" in job.masks and v.get("neck_bumps", 0) > 1e-4:
             k = float(np.clip(v["neck_bumps"], 0, 1))

@@ -32,7 +32,7 @@ def cloud_dir() -> Optional[Path]:
     cands.append(Path(__file__).resolve().parents[3] / "Cloud")
     try:
         from ..core.settings import settings
-        cands.append(Path(settings().data_path()) / "Cloud")
+        cands.append(Path(settings().data_path) / "Cloud")
     except Exception:
         pass
     for d in cands:

@@ -219,6 +219,53 @@ def face_seen(store: TrackStore, f106: Optional[np.ndarray], med: np.ndarray, a:
     return near & (med >= SEEN_SCORE) & (s106 >= SEEN_SCORE)
 
 
+GATE = True               # landmarks that jump away from their neighbours without the head moving are dropped
+GATE_JUMP = 0.25          # share of the face size: how far a frame's landmarks may sit from what its neighbours say
+GATE_SHAPE = 0.12         # share of the face size: how far the landmark shape may differ from its neighbours'
+GATE_R = 2                # neighbours each side
+GATE_MODE = "soft"        # "soft": the measurement's noise raised GATE_SOFT times; "drop": no measurement
+GATE_SOFT = 10.0
+
+
+def gate_outliers(z: np.ndarray, ok: np.ndarray, size: np.ndarray, nose: Optional[np.ndarray] = None) -> np.ndarray:
+    """ok with the frames whose landmarks are a wild measurement taken out (j2751, LNGSHOT Bananas: on defocused dark
+    faces and extreme close-ups both landmark models jumped a whole face width between frames, 45 % of it without the
+    head moving, and the smoothed track followed a third of it). A frame goes when its landmarks sit far from where
+    its neighbours put them (moved with the body's nose, so a fast real move stays), or when their shape differs from
+    the neighbours' (a tangle). z: (P,T,68,2); ok, size: (P,T); nose: (P,T,2) or None. The track coasts over them."""
+    P, T = ok.shape
+    out = ok.copy()
+    for p in range(P):
+        idx = np.where(ok[p])[0]
+        if len(idx) < 3:
+            continue
+        for i in idx:
+            nb = [j for j in range(i - GATE_R, i + GATE_R + 1) if j != i and 0 <= j < T and ok[p, j]]
+            if len(nb) < 2:
+                continue
+            sz = float(size[p, i]) if np.isfinite(size[p, i]) and size[p, i] > 0 else None
+            if sz is None:
+                continue
+            ci = z[p, i].mean(0)
+            preds = []
+            shapes = []
+            for j in nb:
+                cj = z[p, j].mean(0)
+                mv = np.zeros(2)
+                if nose is not None and np.isfinite(nose[p, i]).all() and np.isfinite(nose[p, j]).all():
+                    mv = nose[p, i] - nose[p, j]
+                preds.append(cj + mv)
+                shapes.append((z[p, j] - cj) / max(1e-6, float(size[p, j]) if np.isfinite(size[p, j]) else sz))
+            pred = np.median(np.array(preds), 0)
+            far = float(np.hypot(*(ci - pred))) / sz
+            shp = (z[p, i] - ci) / sz
+            ref = np.median(np.array(shapes), 0)
+            dev = float(np.median(np.hypot(*(shp - ref).T)))
+            if far > GATE_JUMP or dev > GATE_SHAPE:
+                out[p, i] = False
+    return out
+
+
 def solve_face(store: TrackStore, fs: Optional[SV.FrameSource], frame_range: Tuple[int, int],
                smoothing: float = 0.35, progress: Optional[Callable[[float, str], None]] = None) -> None:
     a, b = frame_range
@@ -266,9 +313,24 @@ def solve_face(store: TrackStore, fs: Optional[SV.FrameSource], frame_range: Tup
         fac = np.where(np.isfinite(fdir), np.clip((fdir + 0.25) / 0.6, 0, 1), 1.0)
         vis_raw = vis_raw * np.where(seen, 1.0, fac)
         ok = ok & ~(np.isfinite(fdir) & (fdir < -0.3) & ~seen)
+    if GATE:
+        try:
+            nose = store.final[:, a:b, 0, :2].astype(np.float64)
+        except Exception:
+            nose = None
+        okg = gate_outliers(z, ok, size, nose)
+        gated = ok & ~okg
+        store.face_gated = int(gated.sum())
+        if GATE_MODE == "drop":
+            ok = okg
+    else:
+        gated = np.zeros(ok.shape, bool)
     # landmarks of a face that is turned away carry no information
     R = np.where(ok[..., None] & (s > 0.15),
                  (0.010 * np.nan_to_num(size, nan=100.0)[..., None] / np.maximum(s, 0.05)) ** 2, np.inf)
+    # a wild measurement is all but ignored (the track follows its neighbours) but the face stays: dropped outright,
+    # a run of them broke the track (j2753: 8 % fewer face frames)
+    R = np.where(gated[..., None], R * GATE_SOFT ** 2, R)
     x = _track_points(store, fs, frames, z, R, ok, size, smoothing, progress)
     # where even the tracked landmarks are a tangle (both models lost on a dark, blurred or turned face in the
     # crowd), face edits and skin masks fade out rather than follow them

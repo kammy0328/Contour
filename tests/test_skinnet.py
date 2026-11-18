@@ -133,3 +133,23 @@ def test_saved_sample_reads_back_compact_and_full(tmp_path):
     x, y, w = SN._batch([comp], [0], None, SN.CROP, False)
     x2, y2, w2 = SN._batch([full], [0], None, SN.CROP, False)
     assert np.abs(x - x2).max() < 1e-4 and np.abs(y - y2).max() < 1e-3
+
+
+def test_export_needs_no_extra_package(tmp_path, monkeypatch):
+    """j2742: torch 2.14's default exporter wants onnxscript, which the app does not ship."""
+    torch = pytest.importorskip("torch")
+    import builtins
+    real = builtins.__import__
+
+    def no_onnxscript(name, *a, **k):
+        if name.split(".")[0] == "onnxscript":
+            raise ModuleNotFoundError("No module named 'onnxscript'")
+        return real(name, *a, **k)
+    monkeypatch.setattr(builtins, "__import__", no_onnxscript)
+    net = SN.build_net(8)
+    SN.export_onnx(net, tmp_path / "n.onnx")
+    import onnxruntime as ort
+    s = ort.InferenceSession(str(tmp_path / "n.onnx"), providers=["CPUExecutionProvider"])
+    y = s.run(None, {"x": np.zeros((1, 4, 96, 128), np.float32)})[0]
+    assert y.shape == (1, 4, 96, 128)
+    assert np.allclose(y[0, 3], 1.0)                 # untrained: keep the texture as it is

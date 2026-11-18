@@ -69,8 +69,27 @@ def load_items(folder):
                 w += 1.0
             if m["wf"] < 90:
                 w += 1.0
+            m = dict(m, _cut=cut)
             items.append((os.path.join(folder, cut, m["f"]), w, m))
     return items
+
+
+def split_by_cut(items, share=0.1, seed=3):
+    """Held-out faces come from whole cuts: frames next to each other look alike, and a random split put one in
+    training and its neighbour in the check, which made the check too kind (2026-11-18)."""
+    cuts = sorted({m.get("_cut", "") for _, _, m in items})
+    rng = random.Random(seed)
+    rng.shuffle(cuts)
+    want = max(10, int(len(items) * share))
+    held, n = set(), 0
+    for c in cuts:
+        if n >= want or len(held) >= len(cuts) - 1:
+            break
+        held.add(c)
+        n += sum(1 for _, _, m in items if m.get("_cut", "") == c)
+    val = [it for it in items if it[2].get("_cut", "") in held]
+    tr = [it for it in items if it[2].get("_cut", "") not in held]
+    return val, tr
 
 
 def projects():
@@ -273,8 +292,12 @@ def export(model, path):
             return logits_of(s.m, pixel_values)
     x = torch.randn(1, 3, SIZE, SIZE)
     wm = W(model).eval()
-    torch.onnx.export(wm, x, path, input_names=["pixel_values"], output_names=["logits"], opset_version=18,
-                      dynamic_axes=None, do_constant_folding=True)
+    kw = dict(input_names=["pixel_values"], output_names=["logits"], opset_version=18, dynamic_axes=None,
+              do_constant_folding=True)
+    import inspect
+    if "dynamo" in inspect.signature(torch.onnx.export).parameters:
+        kw["dynamo"] = False            # torch 2.14's default exporter needs onnxscript, not in the app (j2745)
+    torch.onnx.export(wm, x, path, **kw)
     try:                                  # one single file (the exporter may leave the weights in a .data file)
         import onnx
         m_ = onnx.load(path)
@@ -363,7 +386,7 @@ def tune_teacher(tr, weights, old, w_old, val, val_old, steps):
         export(model, tmp)
         md = models_dir()
         os.makedirs(md, exist_ok=True)
-        shutil.copyfile(tmp, os.path.join(md, "face_parse_diap.onnx"))
+        _install(tmp, os.path.join(md, "face_parse_diap.onnx"))
         model = model.to(dev).eval()
     else:
         del model
@@ -377,11 +400,19 @@ def tune_teacher(tr, weights, old, w_old, val, val_old, steps):
     return model, rec
 
 
+def _install(src, dst):
+    """Copy a model where the app reads it; nothing to do when that is where it already is (models_dir() falls back
+    to Cloud\\model when the app's settings cannot be read: j2747 stopped on copying a file onto itself)."""
+    if os.path.abspath(src).lower() != os.path.abspath(dst).lower():
+        shutil.copyfile(src, dst)
+
+
 def models_dir():
     try:
         from contour.core.settings import settings
-        return os.path.join(str(settings().data_path()), "models", "onnx")
-    except Exception:
+        return os.path.join(str(settings().data_path), "models", "onnx")
+    except Exception as e:
+        print(f"앱 설정을 읽지 못해 Cloud\\model에만 둡니다 ({type(e).__name__}: {str(e)[:120]})", flush=True)
         return MODEL
 
 
@@ -412,14 +443,23 @@ def main():
             old += load_items(os.path.join(DONE, n))
     os.makedirs(MODEL, exist_ok=True)
     print(f"프로젝트 {name}: 얼굴 {len(items)}장, 이전 프로젝트 {len(old)}장 섞음, {steps}스텝, {dev}", flush=True)
-    random.Random(3).shuffle(items)
-    k = max(10, len(items) // 10)
-    val, tr = items[:k], items[k:]
+    val, tr = split_by_cut(items)
     val_old = random.Random(5).sample(old, min(60, len(old))) if old else []
     weights = [w for _, w, _ in tr]
     w_old = [w for _, w, _ in old]
     # stage 1: the teacher grows on this project (skipped with --student-only); stage 2: the student learns from it
     t_rec = None
+    if "--export-teacher" in flags:
+        # the teacher's last tuning was saved but its export failed (j2745): export and install it, nothing else
+        teacher = SegformerForSemanticSegmentation.from_pretrained(HF).to(dev).eval()
+        teacher.load_state_dict(torch.load(os.path.join(MODEL, "face_parse_diap.pt"), map_location=dev))
+        tmp = os.path.join(MODEL, "face_parse_diap.onnx")
+        export(teacher.cpu().eval(), tmp)
+        md = models_dir()
+        os.makedirs(md, exist_ok=True)
+        _install(tmp, os.path.join(md, "face_parse_diap.onnx"))
+        print("교사 모델을 다시 내보내 설치했습니다:", os.path.join(md, "face_parse_diap.onnx"), flush=True)
+        return 0
     if "--student-only" in flags:
         teacher = SegformerForSemanticSegmentation.from_pretrained(HF).to(dev).eval()
         tuned = os.path.join(MODEL, "face_parse_diap.pt")
@@ -494,7 +534,7 @@ def main():
     if use:
         md = models_dir()
         os.makedirs(md, exist_ok=True)
-        shutil.copyfile(tmp, os.path.join(md, "face_parse_own.onnx"))
+        _install(tmp, os.path.join(md, "face_parse_own.onnx"))
         print(f"자체 모델을 앱에 설치했습니다 (일치율 {after:.3f} >= {INSTALL_AT}):", os.path.join(md, "face_parse_own.onnx"))
     else:
         print(f"자체 모델은 저장했지만 아직 앱에 넣지 않았습니다 (일치율 {after:.3f} < {INSTALL_AT}). 프로젝트가 더 쌓이면 올라갑니다.")

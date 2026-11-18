@@ -490,7 +490,7 @@ def protect(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, region: np.ndarray, w
 # --------------------------------------------------------------------------------------------- all of it
 def detect(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, skin: Optional[np.ndarray], neck: Optional[np.ndarray],
            wf: float, spot_size: float, axis: Optional[Tuple[float, float]] = None,
-           lm: Optional[np.ndarray] = None) -> Dict[str, np.ndarray]:
+           lm: Optional[np.ndarray] = None, net=None) -> Dict[str, np.ndarray]:
     """Every score map for one person on one picture. Y 0..1; Cb, Cr centred on 0, at Y's resolution; skin: where
     spots are looked for (the blemish mask: face skin without eyes, brows, lips), neck: the neck mask; either may
     be None. wf: face width in pixels of this picture; spot_size: the largest spot's diameter in pixels; lm: the
@@ -507,6 +507,18 @@ def detect(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, skin: Optional[np.ndar
         for k in ("dark", "red", "bump"):
             out[k] = np.maximum(out[k], ns[k])
         region = neck if region is None else np.maximum(region, neck)
+    if region is not None and net is not None:
+        # the learned spot detector (large faces): its dark, red and raised spots in place of the rule detector's
+        try:
+            nm = net(region)
+        except Exception as e:
+            import sys
+            sys.stderr.write(f"SPOTNET FAILED: {str(e)[:200]}\n")
+            nm = None
+        if nm:
+            for k in ("dark", "red", "bump"):
+                if k in nm:
+                    out[k] = nm[k]
     if region is not None:
         out["protect"] = protect(Y, Cb, Cr, region, wf)
     return out
