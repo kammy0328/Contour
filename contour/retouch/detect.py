@@ -508,9 +508,10 @@ def detect(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, skin: Optional[np.ndar
             out[k] = np.maximum(out[k], ns[k])
         region = neck if region is None else np.maximum(region, neck)
     if region is not None and net is not None:
-        # the learned spot detector (large faces): its dark, red and raised spots in place of the rule detector's
+        # the learned spot detector (large faces): its dark, red and raised spots in place of the rule detector's,
+        # no larger than the same largest spot (spot_size, this picture's pixels)
         try:
-            nm = net(region)
+            nm = net(region, spot_size)
         except Exception as e:
             import sys
             sys.stderr.write(f"SPOTNET FAILED: {str(e)[:200]}\n")

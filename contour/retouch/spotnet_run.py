@@ -48,9 +48,11 @@ def to_score(p: np.ndarray) -> np.ndarray:
     return np.where(p < THR, p * (0.5 / THR), 0.5 + (p - THR) * (0.5 / (1 - THR))).astype(np.float32)
 
 
-def run(rgb: np.ndarray, region: np.ndarray, wf: float, sess=None) -> Optional[Dict[str, np.ndarray]]:
+def run(rgb: np.ndarray, region: np.ndarray, wf: float, sess=None,
+        max_size: Optional[float] = None) -> Optional[Dict[str, np.ndarray]]:
     """dark, red, bump scores (0..1, rule scale) on this picture. rgb float 0..1 (H,W,3); region: where skin is
-    (face skin and neck); wf: face width in this picture's pixels."""
+    (face skin and neck); wf: face width in this picture's pixels; max_size: the largest spot's diameter in this
+    picture's pixels (the 잡티 크기 slider, as the rule detector and the fill get it; None: the model's own)."""
     sess = sess or _session()
     if sess is None or wf < 8:
         return None
@@ -72,20 +74,22 @@ def run(rgb: np.ndarray, region: np.ndarray, wf: float, sess=None) -> Optional[D
     out = {}
     for i, k in enumerate(KINDS):
         m = cv2.resize(to_score(p[i]), (W, H), interpolation=cv2.INTER_LINEAR) * inner
-        out[k] = _spots_only(m.astype(np.float32), wf)
+        out[k] = _spots_only(m.astype(np.float32), wf, max_size)
     return out
 
 
-def _spots_only(m: np.ndarray, wf: float) -> np.ndarray:
-    """Marks that are spots: compact, no larger than SPOT_MAX of the face width (a line or a long edge is not)."""
+def _spots_only(m: np.ndarray, wf: float, max_size: Optional[float] = None) -> np.ndarray:
+    """Marks that are spots: compact, no larger than SPOT_MAX of the face width (the largest the model was taught;
+    a line or a long edge is not a spot), and no larger than the user's largest spot (max_size, diameter)."""
     on = (m > 0.25).astype(np.uint8)
     n, cc, st, _ = cv2.connectedComponentsWithStats(on, connectivity=8)
     if n <= 1:
         return m
-    big = max(3.0, SPOT_MAX * wf)
+    own = max(3.0, SPOT_MAX * wf)
+    big = own if max_size is None else min(own, max(2.0, float(max_size)))
     bad = np.zeros(n, bool)
     for j in range(1, n):
         w_, h_, a_ = st[j, 2], st[j, 3], st[j, 4]
-        if max(w_, h_) > big or a_ < 0.3 * w_ * h_ and max(w_, h_) > 0.25 * big:
+        if max(w_, h_) > big or a_ < 0.3 * w_ * h_ and max(w_, h_) > 0.25 * own:
             bad[j] = True
     return np.where(bad[cc], 0.0, m).astype(np.float32)

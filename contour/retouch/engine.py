@@ -2332,7 +2332,7 @@ def _spot_net(job, rgb, wf: float):
     if rgb is None or not _spot_net_wanted(job):
         return None
     from . import spotnet_run as SR
-    return lambda region: SR.run(rgb, region, wf)
+    return lambda region, size: SR.run(rgb, region, wf, max_size=size)
 
 
 def _det_place(job, rf, shape) -> dict:

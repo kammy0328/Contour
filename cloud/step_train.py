@@ -18,6 +18,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 APP = os.path.join(os.path.dirname(HERE), "app")
 if os.path.isdir(APP):
     sys.path.insert(0, APP)
+elif os.path.isdir(os.path.join(os.path.dirname(HERE), "contour")):
+    sys.path.insert(0, os.path.dirname(HERE))          # run from the source tree
 import numpy as np, cv2, torch, torch.nn.functional as F
 
 DATA = os.path.join(HERE, "data")
@@ -27,6 +29,9 @@ BATCH = int(os.environ.get("DIAP_BATCH", "8"))
 ACCUM = int(os.environ.get("DIAP_ACCUM", "1"))
 LR = 6e-4
 INSTALL_AT = 0.90                # agreement with the teacher (clean crops) from which the app uses the student
+MIN_VAL_CUTS = 2                 # held-out check of this project: at least this many whole cuts ...
+MIN_VAL_CROPS = 20               # ... and this many faces (fewer: nothing is installed, the reason is recorded)
+ONNX_ATOL = 1e-2                 # exported model vs the trained one (logits)
 SIZE = 512
 REPLAY = 0.3                     # share of every batch taken from projects trained before
 MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
@@ -69,27 +74,74 @@ def load_items(folder):
                 w += 1.0
             if m["wf"] < 90:
                 w += 1.0
-            m = dict(m, _cut=cut)
+            m = dict(m, _cut=cut, _prj=os.path.basename(os.path.normpath(folder)))
             items.append((os.path.join(folder, cut, m["f"]), w, m))
     return items
 
 
-def split_by_cut(items, share=0.1, seed=3):
+def split_by_cut(items, share=0.1, seed=3, min_cuts=MIN_VAL_CUTS):
     """Held-out faces come from whole cuts: frames next to each other look alike, and a random split put one in
-    training and its neighbour in the check, which made the check too kind (2026-11-18)."""
+    training and its neighbour in the check, which made the check too kind (2026-11-18). Every crop of a cut (and
+    every augmented view of it, made while training) is on one side only. At least min_cuts cuts are held when
+    the project has more than that, one cut always stays for training."""
     cuts = sorted({m.get("_cut", "") for _, _, m in items})
     rng = random.Random(seed)
     rng.shuffle(cuts)
     want = max(10, int(len(items) * share))
     held, n = set(), 0
     for c in cuts:
-        if n >= want or len(held) >= len(cuts) - 1:
+        if (n >= want and len(held) >= min_cuts) or len(held) >= len(cuts) - 1:
             break
         held.add(c)
         n += sum(1 for _, _, m in items if m.get("_cut", "") == c)
     val = [it for it in items if it[2].get("_cut", "") in held]
     tr = [it for it in items if it[2].get("_cut", "") not in held]
     return val, tr
+
+
+def val_file():
+    return os.path.join(MODEL, "val_fixed.json")
+
+
+def fixed_split(name, items, fixed):
+    """(val, train) of one project with its held-out cuts fixed for good: chosen once (from the project's name, so
+    the same every time) and kept in fixed[name], so a cut used to check one training is never trained on in a
+    later one, also once the project has gone to Cloud\\_trained and is mixed in as an earlier project."""
+    if name in fixed:
+        held = set(fixed[name])
+    else:
+        v, _ = split_by_cut(items, seed=zlib.crc32(name.encode("utf-8")))
+        held = {m.get("_cut", "") for _, _, m in v}
+        fixed[name] = sorted(held)
+    val = [it for it in items if it[2].get("_cut", "") in held]
+    tr = [it for it in items if it[2].get("_cut", "") not in held]
+    return val, tr
+
+
+def old_split(done_dir, fixed):
+    """Earlier projects (Cloud\\_trained): (val_old, old) with each project's fixed held-out cuts on the check side
+    only. Before 2026-11-19 val_old was a random sample of the same crops the replay trained on."""
+    val_old, old = [], []
+    if os.path.isdir(done_dir):
+        for n in sorted(os.listdir(done_dir)):
+            its = load_items(os.path.join(done_dir, n))
+            if not its:
+                continue
+            v, t = fixed_split(n, its, fixed)
+            val_old += v
+            old += t
+    return val_old, old
+
+
+def val_problem(val, val_old, have_old):
+    """Why the check is too small to install on ('' when it is fine)."""
+    why = []
+    nc = len({m.get("_cut", "") for _, _, m in val})
+    if nc < MIN_VAL_CUTS or len(val) < MIN_VAL_CROPS:
+        why.append(f"이 프로젝트 검증 {nc}컷 {len(val)}장 (최소 {MIN_VAL_CUTS}컷 {MIN_VAL_CROPS}장)")
+    if have_old and len(val_old) < MIN_VAL_CROPS:
+        why.append(f"이전 프로젝트 검증 {len(val_old)}장 (최소 {MIN_VAL_CROPS}장)")
+    return "; ".join(why)
 
 
 def projects():
@@ -306,15 +358,18 @@ def export(model, path):
             os.remove(path + ".data")
     except Exception as e:
         print("single-file save skipped:", e)
-    try:
-        import onnxruntime as ort
-        s = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
-        o = s.run(None, {"pixel_values": x.numpy()})[0]
-        with torch.no_grad():
-            ref = wm(x).numpy()
-        print("onnx check: max diff", float(np.abs(o - ref).max()), "shape", o.shape)
-    except Exception as e:
-        print("onnx check skipped:", e)
+    with torch.no_grad():
+        ref = wm(x).numpy()
+    chk = check_export(path, x.numpy(), ref)
+    print("onnx check:", chk, flush=True)
+    return chk
+
+
+def check_export(path, x, ref=None):
+    """The exported parser loads, runs, gives (1, 19, SIZE/4, SIZE/4) finite logits, and agrees with the trained
+    model (ref) within ONNX_ATOL. Nothing is installed without this."""
+    from contour.learn.safe_install import check_onnx
+    return check_onnx(path, {"pixel_values": np.asarray(x, np.float32)}, ref, (1, 19, SIZE // 4, SIZE // 4), ONNX_ATOL)
 
 
 def loss_tune(logits, tprob):
@@ -327,7 +382,7 @@ def loss_tune(logits, tprob):
     return (ce * mask).sum() / mask.sum().clamp(min=1)
 
 
-def tune_teacher(tr, weights, old, w_old, val, val_old, steps):
+def tune_teacher(tr, weights, old, w_old, val, val_old, steps, hold=""):
     """Stage 1: the teacher itself grows. The original parser (frozen) looking at clean, normalised and mirrored
     views is the anchor; the teacher as tuned so far learns to give that answer on hard-looking crops of this
     project too. Kept only when it is not worse. Returns the teacher to use (tuned or as it was)."""
@@ -378,17 +433,26 @@ def tune_teacher(tr, weights, old, w_old, val, val_old, steps):
     ok = after >= base - 0.003 and (after_old is None or after_old >= base_old - 0.01)
     print(f"[1/2 교사] 학습 후 {after:.3f} (전 {base:.3f})" + (f", 이전 프로젝트 {after_old:.3f} (전 {base_old:.3f})" if after_old is not None else "")
           + ("  -> 교사 갱신" if ok else "  -> 좋아지지 않아 교사는 그대로"), flush=True)
-    rec = dict(model="teacher", before=round(base, 4), after=round(after, 4), kept=ok, steps=steps)
+    rec = dict(model="teacher", before=round(base, 4), after=round(after, 4), kept=ok, steps=steps, installed=False,
+               why="")
+    if ok and hold:
+        ok = False
+        rec.update(kept=False, why="설치 보류: " + hold)
+        print("[1/2 교사] 설치 보류:", hold, flush=True)
     if ok:
-        torch.save(model.state_dict(), state + ".tmp")
-        os.replace(state + ".tmp", state)
         tmp = os.path.join(MODEL, "face_parse_diap.onnx")
-        export(model, tmp)
-        md = models_dir()
-        os.makedirs(md, exist_ok=True)
-        _install(tmp, os.path.join(md, "face_parse_diap.onnx"))
+        chk = export(model, tmp)
+        res = _install(tmp, os.path.join(models_dir(), "face_parse_diap.onnx")) if chk["ok"] else dict(ok=False, reason=chk["reason"])
+        rec.update(installed=bool(res["ok"]), why="" if res["ok"] else "설치 실패: " + res["reason"])
+        if res["ok"]:
+            # the weights the next run starts from are the ones installed
+            torch.save(model.state_dict(), state + ".tmp")
+            os.replace(state + ".tmp", state)
+        else:
+            print("[1/2 교사] 설치하지 않았습니다 (쓰던 모델 유지):", res["reason"], flush=True)
+            ok = False
         model = model.to(dev).eval()
-    else:
+    if not ok:
         del model
         model = SegformerForSemanticSegmentation.from_pretrained(HF).to(dev)
         if os.path.exists(state):
@@ -401,10 +465,20 @@ def tune_teacher(tr, weights, old, w_old, val, val_old, steps):
 
 
 def _install(src, dst):
-    """Copy a model where the app reads it; nothing to do when that is where it already is (models_dir() falls back
-    to Cloud\\model when the app's settings cannot be read: j2747 stopped on copying a file onto itself)."""
-    if os.path.abspath(src).lower() != os.path.abspath(dst).lower():
-        shutil.copyfile(src, dst)
+    """Put a checked model where the app reads it: a temporary copy next to it (same drive), checked again (loads,
+    runs, right shape, finite), then swapped in at once. On failure the model in use stays. {'ok', 'reason'}"""
+    from contour.learn.safe_install import install
+    x = np.random.default_rng(0).standard_normal((1, 3, SIZE, SIZE)).astype(np.float32)
+    return install(src, dst, check=lambda p: check_export(p, x))
+
+
+def _record(rec):
+    """Append to Cloud\\history.json, written atomically (a failed run never loses the earlier records)."""
+    from contour.learn.safe_install import atomic_json, read_json
+    hist_f = os.path.join(HERE, "history.json")
+    hist = read_json(hist_f, [])
+    hist.append(rec)
+    atomic_json(hist_f, hist)
 
 
 def models_dir():
@@ -437,14 +511,23 @@ def main():
     if len(items) < 30:
         print(f"{name}: 얼굴 {len(items)}장은 너무 적습니다 (30장 이상 필요)."); return 1
     steps = int(args[1]) if len(args) > 1 else int(min(3000, max(300, len(items) * 1.3)))
-    old = []
-    if os.path.isdir(DONE):
-        for n in sorted(os.listdir(DONE)):
-            old += load_items(os.path.join(DONE, n))
     os.makedirs(MODEL, exist_ok=True)
-    print(f"프로젝트 {name}: 얼굴 {len(items)}장, 이전 프로젝트 {len(old)}장 섞음, {steps}스텝, {dev}", flush=True)
-    val, tr = split_by_cut(items)
-    val_old = random.Random(5).sample(old, min(60, len(old))) if old else []
+    from contour.learn.safe_install import atomic_json, read_json
+    fixed = read_json(val_file(), {})
+    # each project's held-out cuts are fixed once and never trained on: this project's, and the earlier ones'
+    # (their check cuts stay out of the replay)
+    val_old, old = old_split(DONE, fixed)
+    val, tr = fixed_split(name, items, fixed)
+    atomic_json(val_file(), fixed)
+    hold = val_problem(val, val_old, bool(old or val_old))
+    print(f"프로젝트 {name}: 얼굴 {len(items)}장 (검증 {len(val)}장 · {len({m['_cut'] for _, _, m in val})}컷), "
+          f"이전 프로젝트 {len(old)}장 섞음 (검증 {len(val_old)}장), {steps}스텝, {dev}", flush=True)
+    if hold and len(val) < MIN_VAL_CROPS:
+        # nothing to judge this project's training by: not trained, the data stays for when more cuts are in
+        _record(dict(project=name, time=time.strftime("%Y-%m-%d %H:%M:%S"), crops=len(items), model="own",
+                     kept=False, installed=False, why="학습 안 함: " + hold))
+        print("검증할 컷이 부족해 학습하지 않았습니다:", hold, "(컷을 더 분석하면 다시 시도하세요)", flush=True)
+        return 3
     weights = [w for _, w, _ in tr]
     w_old = [w for _, w, _ in old]
     # stage 1: the teacher grows on this project (skipped with --student-only); stage 2: the student learns from it
@@ -454,11 +537,15 @@ def main():
         teacher = SegformerForSemanticSegmentation.from_pretrained(HF).to(dev).eval()
         teacher.load_state_dict(torch.load(os.path.join(MODEL, "face_parse_diap.pt"), map_location=dev))
         tmp = os.path.join(MODEL, "face_parse_diap.onnx")
-        export(teacher.cpu().eval(), tmp)
-        md = models_dir()
-        os.makedirs(md, exist_ok=True)
-        _install(tmp, os.path.join(md, "face_parse_diap.onnx"))
-        print("교사 모델을 다시 내보내 설치했습니다:", os.path.join(md, "face_parse_diap.onnx"), flush=True)
+        chk = export(teacher.cpu().eval(), tmp)
+        dst = os.path.join(models_dir(), "face_parse_diap.onnx")
+        res = _install(tmp, dst) if chk["ok"] else dict(ok=False, reason=chk["reason"])
+        _record(dict(project=name, time=time.strftime("%Y-%m-%d %H:%M:%S"), model="teacher", export_only=True,
+                     installed=bool(res["ok"]), why="" if res["ok"] else "설치 실패: " + res["reason"]))
+        if not res["ok"]:
+            print("설치하지 않았습니다 (쓰던 모델 유지):", res["reason"], flush=True)
+            return 4
+        print("교사 모델을 다시 내보내 설치했습니다:", dst, flush=True)
         return 0
     if "--student-only" in flags:
         teacher = SegformerForSemanticSegmentation.from_pretrained(HF).to(dev).eval()
@@ -468,7 +555,7 @@ def main():
         for p in teacher.parameters():
             p.requires_grad_(False)
     else:
-        teacher, t_rec = tune_teacher(tr, weights, old, w_old, val, val_old, max(150, steps // 2))
+        teacher, t_rec = tune_teacher(tr, weights, old, w_old, val, val_old, max(150, steps // 2), hold)
     print("[2/2 자체 모델]", flush=True)
     state = os.path.join(MODEL, "face_parse_own.pt")
     model = Student(pretrained=not os.path.exists(state)).to(dev)
@@ -516,28 +603,40 @@ def main():
     after_old = evaluate(model, teacher, val_old, clean=True) if val_old else None
     print(f"학습 후 교사와의 일치율: 이 프로젝트 {after:.3f} (전 {base:.3f}), 어렵게 만든 화면 {hard:.3f}"
           + (f", 이전 프로젝트 {after_old:.3f} (전 {base_old:.3f})" if after_old is not None else ""), flush=True)
-    hist_f = os.path.join(HERE, "history.json")
-    hist = json.load(open(hist_f, encoding="utf-8")) if os.path.exists(hist_f) else []
     ok = after >= base - 0.003 and (after_old is None or after_old >= base_old - 0.02)
     use = ok and after >= INSTALL_AT and (after_old is None or after_old >= INSTALL_AT - 0.03)
+    why = ""
+    if use and hold:
+        use, why = False, "설치 보류: " + hold
     rec = dict(project=name, time=time.strftime("%Y-%m-%d %H:%M:%S"), crops=len(items), steps=steps, model="own", before=round(base, 4),
                after=round(after, 4), hard=round(hard, 4), before_old=None if base_old is None else round(base_old, 4),
-               after_old=None if after_old is None else round(after_old, 4), kept=ok, installed=use, teacher=t_rec)
-    hist.append(rec)
-    json.dump(hist, open(hist_f, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+               after_old=None if after_old is None else round(after_old, 4), kept=ok, installed=False,
+               val_cuts=sorted({m["_cut"] for _, _, m in val}), val_crops=len(val), val_old_crops=len(val_old),
+               teacher=t_rec, why=why)
     if not ok:
+        rec["why"] = "좋아지지 않음"
+        _record(rec)
         print("좋아지지 않아 모델을 바꾸지 않았습니다. 데이터는 그대로 둡니다."); return 2
     torch.save(model.state_dict(), state + ".tmp")
     os.replace(state + ".tmp", state)
     tmp = os.path.join(MODEL, "face_parse_own.onnx")
-    export(model, tmp)
+    chk = export(model, tmp)
+    if use and not chk["ok"]:
+        use, rec["why"] = False, "내보내기 검사 실패: " + chk["reason"]
     if use:
-        md = models_dir()
-        os.makedirs(md, exist_ok=True)
-        _install(tmp, os.path.join(md, "face_parse_own.onnx"))
-        print(f"자체 모델을 앱에 설치했습니다 (일치율 {after:.3f} >= {INSTALL_AT}):", os.path.join(md, "face_parse_own.onnx"))
+        dst = os.path.join(models_dir(), "face_parse_own.onnx")
+        res = _install(tmp, dst)
+        rec["installed"] = bool(res["ok"])
+        if res["ok"]:
+            print(f"자체 모델을 앱에 설치했습니다 (일치율 {after:.3f} >= {INSTALL_AT}):", dst)
+        else:
+            rec["why"] = "설치 실패: " + res["reason"]
+            print("설치하지 않았습니다 (쓰던 모델 유지):", res["reason"])
+    elif rec["why"]:
+        print("자체 모델은 저장했지만 앱에 넣지 않았습니다:", rec["why"])
     else:
         print(f"자체 모델은 저장했지만 아직 앱에 넣지 않았습니다 (일치율 {after:.3f} < {INSTALL_AT}). 프로젝트가 더 쌓이면 올라갑니다.")
+    _record(rec)
     how = "delete" if "--delete" in flags else "keep" if "--keep" in flags else None
     if how is None:
         s = input("학습한 데이터: [K] 보관 (권장: 다음 학습에 섞여 이전 프로젝트를 잊지 않게 하고, 나중에 새 모델을 처음부터 만들 때 필요) / [D] 삭제 : ").strip().lower()
@@ -551,6 +650,11 @@ def main():
         if os.path.exists(dst):
             dst = dst + time.strftime("_%Y%m%d_%H%M%S")
         shutil.move(folder, dst)
+        # its held-out cuts go with it (it is mixed in under the archived name from now on)
+        fixed = read_json(val_file(), {})
+        if name in fixed:
+            fixed[os.path.basename(dst)] = fixed[name]
+            atomic_json(val_file(), fixed)
         print("보관했습니다:", dst)
     return 0
 

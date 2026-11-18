@@ -687,6 +687,10 @@ class RenderQueuePage(QWidget):
         if rep.cancelled:
             it.status = "cancelled"
             it.message = "취소됨"
+            kept = [p for p in getattr(rep, "paths", []) if p]
+            if it.kind == "timeline" and kept:
+                # each/replace: the shots finished before the cancel stay; the one being written was removed
+                it.message = f"취소됨 · 완료된 파일 {len(kept)}개는 남김"
         else:
             it.status = "done"
             it.progress = 1.0
