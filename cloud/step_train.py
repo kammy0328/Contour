@@ -386,7 +386,7 @@ def tune_teacher(tr, weights, old, w_old, val, val_old, steps):
         export(model, tmp)
         md = models_dir()
         os.makedirs(md, exist_ok=True)
-        shutil.copyfile(tmp, os.path.join(md, "face_parse_diap.onnx"))
+        _install(tmp, os.path.join(md, "face_parse_diap.onnx"))
         model = model.to(dev).eval()
     else:
         del model
@@ -400,11 +400,19 @@ def tune_teacher(tr, weights, old, w_old, val, val_old, steps):
     return model, rec
 
 
+def _install(src, dst):
+    """Copy a model where the app reads it; nothing to do when that is where it already is (models_dir() falls back
+    to Cloud\\model when the app's settings cannot be read: j2747 stopped on copying a file onto itself)."""
+    if os.path.abspath(src).lower() != os.path.abspath(dst).lower():
+        shutil.copyfile(src, dst)
+
+
 def models_dir():
     try:
         from contour.core.settings import settings
         return os.path.join(str(settings().data_path()), "models", "onnx")
-    except Exception:
+    except Exception as e:
+        print(f"앱 설정을 읽지 못해 Cloud\\model에만 둡니다 ({type(e).__name__}: {str(e)[:120]})", flush=True)
         return MODEL
 
 
@@ -449,7 +457,7 @@ def main():
         export(teacher.cpu().eval(), tmp)
         md = models_dir()
         os.makedirs(md, exist_ok=True)
-        shutil.copyfile(tmp, os.path.join(md, "face_parse_diap.onnx"))
+        _install(tmp, os.path.join(md, "face_parse_diap.onnx"))
         print("교사 모델을 다시 내보내 설치했습니다:", os.path.join(md, "face_parse_diap.onnx"), flush=True)
         return 0
     if "--student-only" in flags:
@@ -526,7 +534,7 @@ def main():
     if use:
         md = models_dir()
         os.makedirs(md, exist_ok=True)
-        shutil.copyfile(tmp, os.path.join(md, "face_parse_own.onnx"))
+        _install(tmp, os.path.join(md, "face_parse_own.onnx"))
         print(f"자체 모델을 앱에 설치했습니다 (일치율 {after:.3f} >= {INSTALL_AT}):", os.path.join(md, "face_parse_own.onnx"))
     else:
         print(f"자체 모델은 저장했지만 아직 앱에 넣지 않았습니다 (일치율 {after:.3f} < {INSTALL_AT}). 프로젝트가 더 쌓이면 올라갑니다.")

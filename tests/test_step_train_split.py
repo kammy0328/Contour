@@ -33,3 +33,14 @@ def test_exports_do_not_need_onnxscript():
     assert 'kw["dynamo"] = False' in src and "--export-teacher" in src
     ref = open(os.path.join(os.path.dirname(__file__), "..", "contour", "learn", "refiner.py"), encoding="utf-8").read()
     assert "dynamo=False" in ref
+
+
+def test_install_onto_itself_is_a_no_op(tmp_path):
+    src = open(os.path.join(os.path.dirname(__file__), "..", "cloud", "step_train.py"), encoding="utf-8").read()
+    ns = {}
+    exec(src[src.index("def _install("):src.index("def models_dir(")], {"os": os, "shutil": __import__("shutil")}, ns)
+    f = tmp_path / "m.onnx"
+    f.write_bytes(b"x")
+    ns["_install"](str(f), str(f))                   # was shutil.SameFileError
+    ns["_install"](str(f), str(tmp_path / "n.onnx"))
+    assert (tmp_path / "n.onnx").read_bytes() == b"x"
