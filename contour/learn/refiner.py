@@ -110,6 +110,88 @@ PSEUDO_W = 0.3        # weight of a self-labelled sample (user correction 1.0, c
 AUTO_CAP = 400        # self-labelled samples kept per cut
 AUTO_SHARDS = 60      # most recent cuts kept for self-learning
 BAD = S.FLAG_DISAGREE | S.FLAG_FB | S.FLAG_BONE | S.FLAG_MISSING
+LABEL = "auto_track_v2"   # how the self-labels are made (recorded in every shard)
+REACH = 4             # frames each side: a conflict, an overlap, a flash takes this much of the shot around it out
+OVERLAP = 0.25        # share of the smaller person's box covered by another person: occlusion / identity risk
+FB_JOINTS = 3         # joints whose forward and backward passes disagree that make a frame a conflict
+FAST = 0.15           # joint speed (share of the person's size per frame) from which the track is not an answer
+FLASH = 1.35          # a frame this many times brighter (or darker) than its neighbours: flash / strobe
+EASY_SHARE = 0.25     # of a cut's samples: easy sharp frames, made hard while training (exposure, light, blur, JPEG)
+
+
+def _dilate_t(m: np.ndarray, r: int) -> np.ndarray:
+    """(P, N) bool spread r frames each side."""
+    out = m.copy()
+    for d in range(1, r + 1):
+        out[:, d:] |= m[:, :-d]
+        out[:, :-d] |= m[:, d:]
+    return out
+
+
+def pseudo_mask(st, cut, reach: int = REACH) -> Tuple[np.ndarray, dict]:
+    """(P, N, K) joints whose automatic track is taken as the answer for self-learning from originals alone, and
+    how many joint-frames each rule took out. On top of fusion.teacher_mask (a sure frame before and after in the
+    same shot, passes agree, plausible bones, visible, not next to a cut):
+    - another person over this one (box overlap): occlusion, and where two people meet their numbers can swap;
+    - a stretch where the forward and backward passes disagree on several joints (a flash, a fast move);
+    - a joint moving faster than FAST of the person's size per frame."""
+    from .fusion import teacher_mask
+    ok = teacher_mask(st, cut, reach)
+    P, N = st.present.shape
+    n0 = int(ok.sum())
+    occ = np.zeros((P, N), bool)
+    B = st.boxes
+    for t in range(N):
+        ps = np.nonzero(st.present[:, t] & np.isfinite(B[:, t]).all(-1))[0]
+        for a_i, i in enumerate(ps):
+            for k in ps[a_i + 1:]:
+                bi, bk = B[i, t], B[k, t]
+                iw = min(bi[2], bk[2]) - max(bi[0], bk[0])
+                ih = min(bi[3], bk[3]) - max(bi[1], bk[1])
+                if iw <= 0 or ih <= 0:
+                    continue
+                small = min((bi[2] - bi[0]) * (bi[3] - bi[1]), (bk[2] - bk[0]) * (bk[3] - bk[1]))
+                if small > 0 and iw * ih / small > OVERLAP:
+                    occ[i, t] = occ[k, t] = True
+    occ = _dilate_t(occ, reach)
+    fb = _dilate_t(((st.flags & S.FLAG_FB) > 0).sum(-1) >= FB_JOINTS, reach)
+    fast = np.zeros(ok.shape, bool)
+    if N >= 3:
+        a = st.auto[..., :2].astype(np.float64)
+        sp = np.hypot(*((a[:, 2:] - a[:, :-2]) / 2.0).transpose(3, 0, 1, 2))
+        sc = st.scale[:, 1:-1, None].astype(np.float64)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            fast[:, 1:-1] = np.nan_to_num(sp / sc, nan=0.0) > FAST
+    stat = dict(teacher=n0, occluded=int((ok & occ[..., None]).sum()), conflict=int((ok & fb[..., None]).sum()),
+                fast=int((ok & fast).sum()))
+    ok = ok & ~occ[..., None] & ~fb[..., None] & ~fast
+    stat["kept"] = int(ok.sum())
+    return ok, stat
+
+
+def _luma(rgb: np.ndarray) -> float:
+    small = rgb[::8, ::8].astype(np.float32)
+    return float(small.mean()) + 1e-3
+
+
+def flash_frames(frames, get, n: int, reach: int = 1) -> set:
+    """Frames among `frames` that are much brighter or darker than the frames next to them (a flash or strobe):
+    the track there may have been carried by its neighbours, and the picture is not what a sure frame looks like."""
+    cache: Dict[int, float] = {}
+
+    def L(t):
+        if t not in cache:
+            cache[t] = _luma(np.asarray(get(t)))
+        return cache[t]
+    out = set()
+    for t in frames:
+        nb = [L(u) for u in (t - reach, t + reach) if 0 <= u < n and u != t]
+        if not nb:
+            continue
+        r = L(t) / float(np.median(nb))
+        if r > FLASH or r < 1.0 / FLASH:
+            out.add(int(t))
+    return out
 
 
 def auto_shard(project, cut) -> Path:
@@ -134,8 +216,7 @@ def collect_auto(project, cut, tracker, seed: int = 0) -> int:
             shard.unlink()
         return 0
     proxy = tracker.proxy
-    from .fusion import teacher_mask
-    ok = teacher_mask(st, cut)
+    ok, stat = pseudo_mask(st, cut)
     for pid, jd in cut.joint_keys.items():
         if st.has(pid):
             p_ = st.index(pid)
@@ -145,6 +226,7 @@ def collect_auto(project, cut, tracker, seed: int = 0) -> int:
                         ok[p_, int(t_), int(j_)] = False
     if st.has_vis:
         ok &= st.vis_meas == 1
+    easy_pf = (st.blur >= 0.8) & (st.auto_conf >= 0.9)
     cand = []
     for p, t, j in np.argwhere(ok):
         sc = st.scale[p, t]
@@ -157,36 +239,56 @@ def collect_auto(project, cut, tracker, seed: int = 0) -> int:
         g = float(np.abs(tgt).max())
         if g > 0.45:
             continue
-        cand.append((g, p, t, j, tgt.astype(np.float32), side))
+        easy = bool(easy_pf[p, t]) and not (st.flags[p, t, j] & (S.FLAG_DISAGREE | S.FLAG_BLUR))
+        cand.append((g, p, t, j, tgt.astype(np.float32), side, easy))
     if len(cand) < 20:
         if shard.exists():
             shard.unlink()
         return 0
     rng = np.random.default_rng(seed + len(cand))
     gaps = np.array([c[0] for c in cand])
-    # half of the budget for the hardest cases (largest teacher-measurement gap), half spread at random
+    # half of the budget for the hardest cases (largest teacher-measurement gap), a quarter for easy sharp frames
+    # (made hard while training: exposure, a coloured light, blur, JPEG; the answer is the sure track), the rest
+    # spread at random
     hard = np.argsort(-gaps)[:AUTO_CAP // 2]
-    rest = np.setdiff1d(np.arange(len(cand)), hard)
-    pick = np.concatenate([hard, rng.choice(rest, size=min(len(rest), AUTO_CAP - len(hard)), replace=False)])
+    left = np.setdiff1d(np.arange(len(cand)), hard)
+    easy_i = np.array([i for i in left if cand[i][6]], np.int64)
+    easy_pick = rng.choice(easy_i, size=min(len(easy_i), int(AUTO_CAP * EASY_SHARE)), replace=False) \
+        if len(easy_i) else np.zeros(0, np.int64)
+    rest = np.setdiff1d(left, easy_pick)
+    n_rest = max(0, AUTO_CAP - len(hard) - len(easy_pick))
+    pick = np.concatenate([hard, easy_pick, rng.choice(rest, size=min(len(rest), n_rest), replace=False)]).astype(int)
+    get = lambda t_: proxy.frame(t_)
+    flash = flash_frames(sorted({cand[i][2] for i in pick}), get, st.n)
+    stat["flash"] = int(sum(1 for i in pick if cand[i][2] in flash))
     by_t: Dict[int, list] = {}
     for i in pick:
+        if cand[i][2] in flash:
+            continue
         by_t.setdefault(cand[i][2], []).append(cand[i])
-    crops, joints, targets, frames = [], [], [], []
+    crops, joints, targets, frames, easy_l = [], [], [], [], []
     for t, items in sorted(by_t.items()):
         rgb = np.asarray(proxy.frame(t))
-        for g, p, _, j, tgt, side in items:
+        for g, p, _, j, tgt, side, ez in items:
             c = st.meas[p, t, j, :2] * [proxy.sx, proxy.sy]
             crops.append(crop_at(rgb, c, side * 1.5 * proxy.sx, STORE))
             joints.append(j)
             targets.append(tgt)
             frames.append(t)
+            easy_l.append(ez)
+    if len(crops) < 20:
+        if shard.exists():
+            shard.unlink()
+        return 0
     meta = dict(project=project.name, project_path=project.path, cut=cut.name, cut_id=cut.id, client=project.client,
-                created=time.time(), n=len(crops), pseudo=True, source=Path(str(cut.source)).name)
+                created=time.time(), n=len(crops), pseudo=True, source=Path(str(cut.source)).name, label=LABEL,
+                excluded=stat, easy=int(sum(easy_l)))
     tmp = shard.with_suffix(".tmp.npz")
     with open(tmp, "wb") as fh:
         np.savez_compressed(fh, crops=np.stack(crops), joints=np.array(joints, np.int64),
                             targets=np.stack(targets), weights=np.full(len(crops), PSEUDO_W, np.float32),
-                            frames=np.array(frames, np.int32), meta=np.array(json.dumps(meta)))
+                            frames=np.array(frames, np.int32), easy=np.array(easy_l, bool),
+                            meta=np.array(json.dumps(meta)))
     tmp.replace(shard)
     # keep the most recent cuts only (memory during training stays bounded)
     autos = sorted(samples_dir().glob("*__auto.npz"), key=lambda f: f.stat().st_mtime, reverse=True)
@@ -243,28 +345,38 @@ def remove_project_samples(project_name: str) -> int:
     return k
 
 
-def load_dataset():
-    X, J, T, Wt, G = [], [], [], [], []
-    gid: Dict[str, int] = {}
+def load_dataset(group: str = "auto"):
+    """(X, J, T, W, G, E, grouping): crops, joints, targets, weights, group per sample (never split between
+    training and check), easy flag (made hard while training). group: 'project' (a music video's cuts together:
+    similar cuts of one video in training and check made the check too kind), 'source', or 'auto' (project when
+    there are at least 3 projects, else source)."""
+    X, J, T, Wt, E, P_, S_ = [], [], [], [], [], [], []
     for f in sorted(samples_dir().glob("*.npz")):
         try:
             with np.load(f) as d:
                 try:
                     mt = json.loads(str(d["meta"]))
-                    key = mt.get("source") or mt.get("cut_id") or f.stem
                 except Exception:
-                    key = f.stem
-                gi = gid.setdefault(key, len(gid))     # a cut's user and self-labelled samples stay together
+                    mt = {}
+                n = len(d["joints"])
                 X.append(d["crops"])
                 J.append(d["joints"])
                 T.append(d["targets"])
                 Wt.append(d["weights"])
-                G.append(np.full(len(d["joints"]), gi))
+                E.append(d["easy"] if "easy" in d.files else np.zeros(n, bool))
+                P_ += [mt.get("project") or f.stem.split("__")[0]] * n
+                S_ += [mt.get("source") or mt.get("cut_id") or f.stem] * n
         except Exception:
             continue
     if not X:
         return None
-    return np.concatenate(X), np.concatenate(J), np.concatenate(T), np.concatenate(Wt), np.concatenate(G)
+    if group == "auto":
+        group = "project" if len(set(P_)) >= 3 else "source"
+    keys = P_ if group == "project" else S_
+    gid: Dict[str, int] = {}
+    G = np.array([gid.setdefault(k, len(gid)) for k in keys])
+    return (np.concatenate(X), np.concatenate(J), np.concatenate(T), np.concatenate(Wt), G,
+            np.concatenate(E).astype(bool), group)
 
 
 # --------------------------------------------------------------------------- registry
@@ -439,7 +551,25 @@ def degrade(c: np.ndarray, rng, p: float = 0.5) -> np.ndarray:
         x = x + rng.normal(0, rng.uniform(2, 9), x.shape).astype(np.float32)
     if rng.random() < p:
         x = x * rng.uniform(0.85, 1.15) + rng.uniform(-12, 12)
-    return np.clip(x, 0, 255).astype(np.uint8)
+    u = np.clip(x, 0, 255).astype(np.uint8)
+    if rng.random() < p * 0.4:                              # compression (streaming, low bitrate proxies)
+        ok_, b_ = cv2.imencode(".jpg", u, [cv2.IMWRITE_JPEG_QUALITY, int(rng.integers(25, 70))])
+        if ok_:
+            u = cv2.imdecode(b_, cv2.IMREAD_UNCHANGED).reshape(u.shape)
+    return u
+
+
+def geo_aug(img: np.ndarray, t: np.ndarray, rng, max_deg: float = 15.0, scale=(0.9, 1.1)):
+    """A stored crop turned and scaled about its centre, and its answer (offset in network windows from the
+    centre) moved with it."""
+    a = float(rng.uniform(-max_deg, max_deg))
+    s_ = float(rng.uniform(*scale))
+    h, w = img.shape[:2]
+    M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), a, s_)
+    out = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    p = np.array([w / 2.0, h / 2.0]) + np.asarray(t, np.float64) * CROP
+    q = M[:, :2] @ p + M[:, 2]
+    return out, ((q - [w / 2.0, h / 2.0]) / CROP).astype(np.float32)
 
 
 def torch_available() -> bool:
@@ -458,7 +588,7 @@ def train_new_version(progress: Optional[Callable[[float, str], None]] = None, e
     data = load_dataset()
     if data is None or len(data[0]) < 40:
         raise RuntimeError("학습 데이터가 부족합니다. 관절 수정이나 확정 구간이 더 쌓이면 다시 시도하세요 (최소 40개).")
-    X, J, T, Wt, G = data
+    X, J, T, Wt, G, E, grouping = data
     rng = np.random.default_rng(0)
     groups = np.unique(G)
     if len(groups) >= 3:
@@ -466,8 +596,10 @@ def train_new_version(progress: Optional[Callable[[float, str], None]] = None, e
         val = np.isin(G, list(val_groups))
     else:
         val = rng.random(len(G)) < 0.2
+        grouping = "random"
     if val.sum() < 5 or (~val).sum() < 20:
         val = rng.random(len(G)) < 0.2
+        grouping = "random"          # recorded: this check mixes similar frames (too kind)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
 
     class Net(nn.Module):
@@ -505,11 +637,16 @@ def train_new_version(progress: Optional[Callable[[float, str], None]] = None, e
             else:
                 dx = dy = 0
             x0, y0 = shift_px + dx, shift_px + dy
+            t0 = T[i]
+            if augment is True and rng.random() < 0.5:
+                img, t0 = geo_aug(img, t0, rng)            # the answer turns with the picture
             # the stored crop covers 1.5 network windows
             c = img[y0:y0 + CROP, x0:x0 + CROP]
-            t = T[i] - np.array([dx, dy], np.float32) / CROP
+            t = t0 - np.array([dx, dy], np.float32) / CROP
             if augment is True:
-                c = degrade(c, rng, 0.5)
+                # an easy sharp frame is always made hard (its answer is sure, the picture is not what a hard
+                # shot looks like); the others half the time
+                c = degrade(c, rng, 1.0 if E[i] else 0.5)
             elif augment == "degrade":
                 c = degrade(c, drng, 1.0)
             crops.append(c)
@@ -605,7 +742,7 @@ def train_new_version(progress: Optional[Callable[[float, str], None]] = None, e
                       output_names=["out"], dynamic_axes={"crop": {0: "n"}, "joint": {0: "n"}, "out": {0: "n"}},
                       opset_version=17, dynamo=False)
     meta = dict(version=ver, created=time.time(), samples=int(len(X)), train=int(len(tr_idx)), val=int(len(va_idx)),
-                cuts=int(len(groups)), val_baseline=base, val_model=applied, coverage=coverage, gate=best_gate,
+                cuts=int(len(groups)), grouping=grouping, easy=int(E.sum()), val_baseline=base, val_model=applied, coverage=coverage, gate=best_gate,
                 joints=[int(j_) for j_ in range(S.K) if int((J[tr_idx] == j_).sum()) >= 8],
                 improvement=(1 - applied / base) if base > 0 else 0.0, bench={},
                 improve_human=improve_human, improve_degraded=improve_degraded, n_human_val=int(human.sum()),

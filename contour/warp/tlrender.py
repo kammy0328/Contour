@@ -53,8 +53,8 @@ class TimelineExport:
 
 @dataclass
 class TimelineReport:
-    paths: List[str] = field(default_factory=list)
-    frames: int = 0
+    paths: List[str] = field(default_factory=list)     # finished files only
+    frames: int = 0                                     # frames written into finished files
     seconds: float = 0.0
     retouched: int = 0
     original: int = 0
@@ -62,7 +62,12 @@ class TimelineReport:
     skipped: int = 0
     warnings: List[str] = field(default_factory=list)
     cancelled: bool = False
+    cancelled_path: str = ""                            # the file being written when it was cancelled (removed)
     out_path: str = ""
+
+
+class _Stop(Exception):
+    """Cancelled while writing a shot."""
 
 
 def plan(project: Project, exp: TimelineExport) -> List[dict]:
@@ -111,6 +116,13 @@ class _Out:
                                audio_from=audio, encoder=exp.encoder, quality=exp.quality)
         self.path = path
         self.info = info
+        self.written = 0             # frames handed to the encoder
+        self.on_write = None         # called once per frame written: the export's progress counts only these
+
+    def _wrote(self):
+        self.written += 1
+        if self.on_write is not None:
+            self.on_write()
 
     def write(self, planes, opaque: bool = True):
         if self.alpha:
@@ -118,6 +130,7 @@ class _Out:
                 self.ones = np.full(planes[0].shape, int(self.maxv), np.uint16)
             planes = list(planes) + [self.ones if opaque else np.zeros_like(self.ones)]
         self.w.write(planes)
+        self._wrote()
 
     def write_clear(self):
         """A transparent black frame (4444 XQ)."""
@@ -128,6 +141,7 @@ class _Out:
             c = np.full((H, W), int(round(512 / 1023 * mx)), np.uint16)
             self.zero_frame = [y, c, c, np.zeros((H, W), np.uint16)]
         self.w.write(self.zero_frame)
+        self._wrote()
 
     def close(self):
         self.w.close()
@@ -136,7 +150,9 @@ class _Out:
         self.w.abort()
 
 
-def _copy(out: _Out, cut, cancel, tick, a: int = 0, b: Optional[int] = None) -> int:
+def _copy(out: _Out, cut, cancel, tick=None, a: int = 0, b: Optional[int] = None) -> int:
+    """The original frames [a, b) as they are. Cancelled: _Stop. The source ending early: MediaError (a shorter
+    shot would move every later one)."""
     b = cut.info.frames if b is None else b
     n = b - a
     if n <= 0:
@@ -145,25 +161,29 @@ def _copy(out: _Out, cut, cancel, tick, a: int = 0, b: Optional[int] = None) -> 
     with M.FrameReader(cut.info, a, n, out.pf, prefetch=4) as rd:
         for pl in rd:
             if cancel and cancel():
-                break
+                raise _Stop()
             out.write(pl)
             k += 1
-            tick()
+            if k >= n:
+                break
+    if cancel and cancel() and k < n:
+        raise _Stop()
     if k < n:
         raise M.MediaError(f"{cut.name}: {k}/{n}프레임만 읽혔습니다")
     return k
 
 
-def _clear(out: _Out, cut, cancel, tick) -> int:
+def _clear(out: _Out, cut, cancel, tick=None) -> int:
+    """Transparent frames over the shot's length. Cancelled: _Stop."""
     for _ in range(cut.info.frames):
         if cancel and cancel():
-            break
+            raise _Stop()
         out.write_clear()
-        tick()
     return cut.info.frames
 
 
 def _retouch(project: Project, out: _Out, cut, cancel, tick, rep: TimelineReport, progress_msg) -> int:
+    """The shot retouched over its work range, as it was outside it. Cancelled: _Stop."""
     from ..core.frames import frames_for, source_present
     from ..track.analyze import CutTracker
     from .render import render_cut
@@ -176,27 +196,21 @@ def _retouch(project: Project, out: _Out, cut, cancel, tick, rep: TimelineReport
     o.output_cs = ""
     o.matte_person = o.matte_warp = False
     o.include_audio = False
-    n0 = [0]
 
     def prog(f, m=""):
-        k = int(round(f * cut.info.frames))
-        while n0[0] < k:
-            n0[0] += 1
-            tick()
+        # only the message: the export counts the frames as they are written (render_cut's fraction is of the
+        # work range, and counting it as the shot's frames ran the bar to 140 %)
         progress_msg(m)
 
     a, b = cut.work_range
-    k = _copy(out, cut, cancel, tick, 0, a)          # outside the cut's work range: as it was
+    k = _copy(out, cut, cancel, None, 0, a)          # outside the cut's work range: as it was
     r = render_cut(project, cut, tr, o, prog, cancel, ext_writer=out)
-    while n0[0] < r.frames:
-        n0[0] += 1
-        tick()
-    if not r.cancelled and r.frames < b - a:
-        raise M.MediaError(f"{cut.name}: 리터칭 프레임이 모자랍니다 ({r.frames}/{b - a})")
-    k += r.frames + _copy(out, cut, cancel, tick, b, cut.info.frames)
     rep.warnings += [f"{cut.name}: {w}" for w in r.warnings]
     if r.cancelled:
-        rep.cancelled = True
+        raise _Stop()
+    if r.frames < b - a:
+        raise M.MediaError(f"{cut.name}: 리터칭 프레임이 모자랍니다 ({r.frames}/{b - a})")
+    k += r.frames + _copy(out, cut, cancel, None, b, cut.info.frames)
     return k
 
 
@@ -216,30 +230,55 @@ def render_timeline(project: Project, exp: TimelineExport, progress: Callable = 
     total = sum(r["cut"].info.frames for r in work) or 1
     done = [0]
     msg = [""]
+    shown = [-1.0]
+
+    def report(force=False):
+        if not progress:
+            return
+        f = min(1.0, done[0] / total)
+        if not force and done[0] % 2 and f < 1.0:
+            return
+        if f <= shown[0] and not force:
+            return
+        shown[0] = max(shown[0], f)
+        el = time.time() - t0
+        fps = done[0] / max(el, 1e-3)
+        eta = max(0, total - done[0]) / max(fps, 1e-3)
+        progress(shown[0], f"{msg[0]} · {done[0]}/{total} · {fps:.1f} fps · 남은 시간 {int(eta // 60)}분 {int(eta % 60)}초")
 
     def tick():
+        # one per frame the encoder took (every mode, every kind of shot): the bar only goes up and ends at 100 %
         done[0] += 1
-        if progress and done[0] % 2 == 0:
-            el = time.time() - t0
-            fps = done[0] / max(el, 1e-3)
-            eta = (total - done[0]) / max(fps, 1e-3)
-            progress(done[0] / total, f"{msg[0]} · {done[0]}/{total} · {fps:.1f} fps · 남은 시간 {int(eta // 60)}분 {int(eta % 60)}초")
+        report()
 
     def set_msg(m):
         pass
 
-    def run_cut(out: _Out, r: dict):
+    def run_cut(out: _Out, r: dict) -> int:
+        """Writes the shot; returns its frame count after checking the encoder took exactly that many."""
         c = r["cut"]
         act = r["action"]
         msg[0] = f"{c.name} ({ {'retouch': '리터칭', 'original': '원본', 'alpha': '투명'}[act] })"
+        w0 = out.written
+        if act == "retouch":
+            k = _retouch(project, out, c, cancel, tick, rep, set_msg)
+        elif act == "alpha":
+            k = _clear(out, c, cancel, tick)
+        else:
+            k = _copy(out, c, cancel, tick)
+        got = out.written - w0
+        if got != c.info.frames or k != c.info.frames:
+            raise M.MediaError(f"{c.name}: {got}/{c.info.frames}프레임만 기록됐습니다")
         if act == "retouch":
             rep.retouched += 1
-            return _retouch(project, out, c, cancel, tick, rep, set_msg)
-        if act == "alpha":
+        elif act == "alpha":
             rep.transparent += 1
-            return _clear(out, c, cancel, tick)
-        rep.original += 1
-        return _copy(out, c, cancel, tick)
+        else:
+            rep.original += 1
+        return got
+
+    def stopped() -> bool:
+        return bool(cancel and cancel())
 
     ext = _ext(exp.format)
     if exp.mode == "full":
@@ -249,21 +288,30 @@ def render_timeline(project: Project, exp: TimelineExport, progress: Callable = 
             audio = (base_info.path, base_info.offset / base_info.fps, base_info.frames / base_info.fps)
         tc = base_info.tc_at(0) if base_info.timecode else ""
         out = _Out(path, base_info, exp, tc, audio)
+        out.on_write = tick
+        frames = 0
         try:
             for r in rows:
-                if cancel and cancel():
-                    rep.cancelled = True
-                    break
-                rep.frames += run_cut(out, r)
-                if rep.cancelled:
-                    break
+                if stopped():
+                    raise _Stop()
+                if r["action"] == "skip":
+                    continue
+                frames += run_cut(out, r)
+            if stopped():
+                raise _Stop()
+        except _Stop:
+            out.abort()
+            rep.cancelled = True
+            rep.cancelled_path = path
         except Exception:
             out.abort()
             raise
-        if rep.cancelled:
-            out.abort()
-        else:
+        if not rep.cancelled:
+            if out.written != total:
+                out.abort()
+                raise M.MediaError(f"{out.written}/{total}프레임만 기록됐습니다")
             out.close()
+            rep.frames = frames
             rep.paths.append(path)
     else:
         sub = folder / f"{name}_{'shots' if exp.mode == 'each' else 'retouched'}"
@@ -274,7 +322,7 @@ def render_timeline(project: Project, exp: TimelineExport, progress: Callable = 
             if r["action"] == "skip":
                 rep.skipped += 1
                 continue
-            if cancel and cancel():
+            if stopped():
                 rep.cancelled = True
                 break
             path = M.unique_path(str(sub / f"{c.name}_v{int(getattr(c, 'version', 1) or 1)}{ext}"))
@@ -282,22 +330,30 @@ def render_timeline(project: Project, exp: TimelineExport, progress: Callable = 
             if exp.audio and exp.mode == "each" and c.info.has_audio and c.info.kind == "video":
                 audio = (c.info.path, c.info.offset / c.info.fps, c.info.frames / c.info.fps)
             out = _Out(path, c.info, exp, c.info.tc_at(0) if c.info.timecode else "", audio)
+            out.on_write = tick
             try:
-                rep.frames += run_cut(out, r)
+                k = run_cut(out, r)
+                if stopped():
+                    raise _Stop()
+            except _Stop:
+                # the shot being written goes; the shots finished before it stay (rep.paths)
+                out.abort()
+                rep.cancelled = True
+                rep.cancelled_path = path
+                break
             except Exception:
                 out.abort()
                 raise
-            if rep.cancelled or (cancel and cancel()):
-                out.abort()
-                rep.cancelled = True
-                break
             out.close()
+            rep.frames += k
             rep.paths.append(path)
             placed.append((c, path))
         if exp.mode == "replace" and placed and not rep.cancelled:
             xp = M.unique_path(str(folder / f"{name}_retouch_replace.xml"))
             write_replace_xml(xp, project, base_info, placed, name)
             rep.paths.append(xp)
+    if not rep.cancelled:
+        report(force=True)
     rep.out_path = rep.paths[0] if rep.paths else ""
     rep.seconds = time.time() - t0
     return rep

@@ -41,11 +41,25 @@ def available() -> bool:
 
 def ready() -> bool:
     from . import models as M
-    return M.is_downloaded(MODEL_KEY)
+    from . import unified as U
+    return U.active("face") or M.is_downloaded(MODEL_KEY)
 
 
 class FaceParser:
     def __init__(self):
+        from . import unified as U
+        self.unified = None
+        self.tuned = False
+        self.own = False
+        self.s = None
+        if U.active("face"):
+            # DIAP's combined model: face_parse is neither downloaded nor loaded
+            self.unified = U.runtime()
+            if self.unified is not None:
+                return
+        self._load_own()
+
+    def _load_own(self):
         from . import models as M
         import os
         base = M.ensure_model(MODEL_KEY)
@@ -116,7 +130,17 @@ class FaceParser:
                               borderMode=cv2.BORDER_REPLICATE)
         x = (crop.astype(np.float32) / 255.0 - MEAN) / STD
         x = np.ascontiguousarray(x.transpose(2, 0, 1)[None])
-        lo = self.s.run(None, {self.inp: x})[0][0]                     # (19, 128, 128) logits, 1/4 size
+        lo = None
+        if self.unified is not None:
+            try:
+                lo = self.unified.face_logits(crop)
+            except Exception as e:
+                from . import unified as U
+                U.fail("face", e)                  # back to face_parse for the rest of the session
+                self.unified = None
+                self._load_own()
+        if lo is None:
+            lo = self.s.run(None, {self.inp: x})[0][0]                 # (19, 128, 128) logits, 1/4 size
         lo = lo - lo.max(0, keepdims=True)
         e = np.exp(lo)
         pr = e / e.sum(0, keepdims=True)
