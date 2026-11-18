@@ -84,3 +84,25 @@ def test_detect_takes_net_spots_and_keeps_rule_on_failure():
         raise RuntimeError("no gpu")
     bad = DT.detect(Y, Cb, Cr, skin, None, 150.0, 10.0, net=boom)
     assert np.allclose(bad["dark"], rule["dark"])
+
+
+class _EdgeSess(_Sess):
+    """High 'dark' logits along a line (an edge the net took for spots) and one compact spot."""
+    def run(self, _o, feed):
+        x = feed["x"]
+        lg = np.full((1, 3) + x.shape[2:], -8.0, np.float32)
+        lg[0, 0, 50:52, 60:240] = 8.0           # a long line inside the skin
+        lg[0, 0, 20:22, 60:240] = 8.0           # the skin's border (region starts at 20 in the net picture)
+        lg[0, 0, 150:154, 150:154] = 8.0        # a spot
+        return [lg]
+
+
+def test_edges_and_lines_are_not_spots():
+    H = W = 600
+    rgb = np.full((H, W, 3), 0.6, np.float32)
+    region = np.zeros((H, W), np.float32)
+    region[40:560, 40:560] = 1
+    m = SR.run(rgb, region, 600.0, sess=_EdgeSess((0, 0)))
+    assert m["dark"][302, 302] > 0.9            # the spot
+    assert m["dark"][101, 200:400].max() < 0.01  # the line
+    assert m["dark"][41, 200:400].max() < 0.01   # the border

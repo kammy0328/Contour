@@ -18,6 +18,8 @@ SPOTNET_WF = 500.0          # face width in source pixels from which the net fin
 NET_WF = 300.0              # the face width the net was trained at
 THR = 0.7                   # the net's probability that marks as much as the rule detector's 0.5 (j2750)
 KINDS = ("dark", "red", "bump")
+EDGE = 0.03                 # of the face width: nothing this close to the skin's border (as the training labels)
+SPOT_MAX = 0.08             # of the face width: the largest spot (as the training labels)
 MODEL = Path(__file__).resolve().parent.parent / "track" / "data" / "spotnet_v1.onnx"
 
 _sess = None
@@ -63,8 +65,27 @@ def run(rgb: np.ndarray, region: np.ndarray, wf: float, sess=None) -> Optional[D
     inp = sess.get_inputs()[0].name
     lg = sess.run(None, {inp: np.ascontiguousarray(x.transpose(2, 0, 1)[None])})[0][0, :, :h_, :w_]
     p = 1.0 / (1.0 + np.exp(-lg.astype(np.float32)))
+    # where the net was taught: inside the skin, away from its border (the hairline, the lips, the collar: no labels
+    # were made there, and there it marked the border itself)
+    r = max(1, int(round(EDGE * wf)))
+    inner = cv2.erode((region > 0.5).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1,) * 2))
     out = {}
     for i, k in enumerate(KINDS):
-        m = cv2.resize(to_score(p[i]), (W, H), interpolation=cv2.INTER_LINEAR)
-        out[k] = (m * (region > 0.5)).astype(np.float32)
+        m = cv2.resize(to_score(p[i]), (W, H), interpolation=cv2.INTER_LINEAR) * inner
+        out[k] = _spots_only(m.astype(np.float32), wf)
     return out
+
+
+def _spots_only(m: np.ndarray, wf: float) -> np.ndarray:
+    """Marks that are spots: compact, no larger than SPOT_MAX of the face width (a line or a long edge is not)."""
+    on = (m > 0.25).astype(np.uint8)
+    n, cc, st, _ = cv2.connectedComponentsWithStats(on, connectivity=8)
+    if n <= 1:
+        return m
+    big = max(3.0, SPOT_MAX * wf)
+    bad = np.zeros(n, bool)
+    for j in range(1, n):
+        w_, h_, a_ = st[j, 2], st[j, 3], st[j, 4]
+        if max(w_, h_) > big or a_ < 0.3 * w_ * h_ and max(w_, h_) > 0.25 * big:
+            bad[j] = True
+    return np.where(bad[cc], 0.0, m).astype(np.float32)

@@ -223,6 +223,8 @@ GATE = True               # landmarks that jump away from their neighbours witho
 GATE_JUMP = 0.25          # share of the face size: how far a frame's landmarks may sit from what its neighbours say
 GATE_SHAPE = 0.12         # share of the face size: how far the landmark shape may differ from its neighbours'
 GATE_R = 2                # neighbours each side
+GATE_MODE = "soft"        # "soft": the measurement's noise raised GATE_SOFT times; "drop": no measurement
+GATE_SOFT = 10.0
 
 
 def gate_outliers(z: np.ndarray, ok: np.ndarray, size: np.ndarray, nose: Optional[np.ndarray] = None) -> np.ndarray:
@@ -317,11 +319,18 @@ def solve_face(store: TrackStore, fs: Optional[SV.FrameSource], frame_range: Tup
         except Exception:
             nose = None
         okg = gate_outliers(z, ok, size, nose)
-        store.face_gated = int((ok & ~okg).sum())
-        ok = okg
+        gated = ok & ~okg
+        store.face_gated = int(gated.sum())
+        if GATE_MODE == "drop":
+            ok = okg
+    else:
+        gated = np.zeros(ok.shape, bool)
     # landmarks of a face that is turned away carry no information
     R = np.where(ok[..., None] & (s > 0.15),
                  (0.010 * np.nan_to_num(size, nan=100.0)[..., None] / np.maximum(s, 0.05)) ** 2, np.inf)
+    # a wild measurement is all but ignored (the track follows its neighbours) but the face stays: dropped outright,
+    # a run of them broke the track (j2753: 8 % fewer face frames)
+    R = np.where(gated[..., None], R * GATE_SOFT ** 2, R)
     x = _track_points(store, fs, frames, z, R, ok, size, smoothing, progress)
     # where even the tracked landmarks are a tangle (both models lost on a dark, blurred or turned face in the
     # crowd), face edits and skin masks fade out rather than follow them
