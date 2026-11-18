@@ -69,16 +69,34 @@ class Parser:
     SIZE = 512
 
     def __init__(self, key: str = "parse_clothes"):
+        from . import unified as U
+        self.key = key
+        self.unified = U.runtime() if (key == "parse_clothes" and U.active("cloth")) else None
+        self.sess = None
+        if self.unified is None:
+            self._load_own()
+
+    def _load_own(self):
         from . import models as M
-        self.sess = M.session(M.ensure_model(key))
+        self.sess = M.session(M.ensure_model(self.key))
         self.inp = self.sess.get_inputs()[0].name
 
     def __call__(self, crop: np.ndarray) -> np.ndarray:
         """RGB uint8 crop -> class map (h, w) uint8."""
         h, w = crop.shape[:2]
-        x = cv2.resize(crop, (self.SIZE, self.SIZE), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
-        x = ((x - MEAN) / STD).transpose(2, 0, 1)[None].astype(np.float32)
-        lg = self.sess.run(None, {self.inp: x})[0][0]                 # (18, 128, 128)
+        c512 = cv2.resize(crop, (self.SIZE, self.SIZE), interpolation=cv2.INTER_LINEAR)
+        lg = None
+        if self.unified is not None:
+            try:
+                lg = self.unified.cloth_logits(c512)
+            except Exception as e:
+                from . import unified as U
+                U.fail("cloth", e)
+                self.unified = None
+                self._load_own()
+        if lg is None:
+            x = ((c512.astype(np.float32) / 255.0 - MEAN) / STD).transpose(2, 0, 1)[None].astype(np.float32)
+            lg = self.sess.run(None, {self.inp: x})[0][0]             # (18, 128, 128)
         up = np.stack([cv2.resize(c, (w, h), interpolation=cv2.INTER_LINEAR) for c in lg])
         return up.argmax(0).astype(np.uint8)
 

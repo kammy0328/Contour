@@ -282,18 +282,39 @@ class Matter:
     """Robust Video Matting (recurrent). Feed frames in order; call reset() at cuts."""
 
     def __init__(self, key: str = "matte_rvm"):
-        self.sess = M.session(M.ensure_model(key))
+        from . import unified as U
+        self.key = key
+        self.unified = U.runtime() if (key == "matte_rvm" and U.active("matte")) else None
+        self.sess = None
+        if self.unified is None:
+            self._load_own()
+        self.reset()
+
+    def _load_own(self):
+        self.sess = M.session(M.ensure_model(self.key))
         self.names = [i.name for i in self.sess.get_inputs()]
         self.out_names = [o.name for o in self.sess.get_outputs()]
         self.dtype = np.float16 if "float16" in self.sess.get_inputs()[0].type else np.float32
-        self.reset()
 
     def reset(self):
+        """At a cut, a jump or a new run: RVM's memory of the frames before goes (the combined model has none)."""
+        if self.sess is None:
+            self.rec = None
+            return
         z = np.zeros((1, 1, 1, 1), self.dtype)
         self.rec = [z, z, z, z]
 
     def __call__(self, rgb: np.ndarray, downsample: Optional[float] = None) -> np.ndarray:
         """rgb uint8 or float (H,W,3) -> alpha float32 (H,W) 0..1."""
+        if self.unified is not None:
+            try:
+                return self.unified.alpha(rgb)
+            except Exception as e:
+                from . import unified as U
+                U.fail("matte", e)                 # back to RVM, its memory starting fresh
+                self.unified = None
+                self._load_own()
+                self.reset()
         h, w = rgb.shape[:2]
         if downsample is None:
             downsample = min(1.0, 512.0 / max(h, w))

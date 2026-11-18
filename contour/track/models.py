@@ -147,6 +147,13 @@ def fingerprint(key: str) -> str:
 
 def fingerprints(keys=ANALYSIS_KEYS) -> dict:
     out = {}
+    keys = list(keys)
+    try:
+        from . import unified as U
+        if keys == list(ANALYSIS_KEYS) and U.switched_on() and U.path().is_file():
+            keys.append(U.KEY)              # which model made the face, clothing and matte masks
+    except Exception:
+        pass
     for k in keys:
         try:
             fp = fingerprint(k)
