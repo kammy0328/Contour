@@ -410,7 +410,7 @@ def _install(src, dst):
 def models_dir():
     try:
         from contour.core.settings import settings
-        return os.path.join(str(settings().data_path()), "models", "onnx")
+        return os.path.join(str(settings().data_path), "models", "onnx")
     except Exception as e:
         print(f"앱 설정을 읽지 못해 Cloud\\model에만 둡니다 ({type(e).__name__}: {str(e)[:120]})", flush=True)
         return MODEL

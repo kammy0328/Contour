@@ -44,3 +44,20 @@ def test_install_onto_itself_is_a_no_op(tmp_path):
     ns["_install"](str(f), str(f))                   # was shutil.SameFileError
     ns["_install"](str(f), str(tmp_path / "n.onnx"))
     assert (tmp_path / "n.onnx").read_bytes() == b"x"
+
+
+def test_models_dir_is_the_apps(tmp_path, monkeypatch):
+    """data_path is a property: calling it raised, and every step-trained model stayed in Cloud\\model where the app
+    never reads it (j2748)."""
+    from contour.core import settings as S
+    S._settings = S.AppSettings(data_dir=str(tmp_path / "data"))
+    try:
+        src = open(os.path.join(os.path.dirname(__file__), "..", "cloud", "step_train.py"), encoding="utf-8").read()
+        ns = {"os": os, "MODEL": "CLOUD_MODEL"}
+        exec(src[src.index("def models_dir("):src.index("def main(")], ns)
+        assert ns["models_dir"]() == os.path.join(str(S.settings().data_path), "models", "onnx")
+        from contour.track import cloudcollect as CC
+        monkeypatch.delenv("DIAP_CLOUD", raising=False)
+        assert CC.cloud_dir() is not None
+    finally:
+        S._settings = None
