@@ -160,7 +160,7 @@ def build(tracker, progress: Optional[Callable[[float, str], None]] = None,
                 todo.append((p, t))
     if not todo:
         return None
-    parser = FP.FaceParser()
+    parser = FP.make_parser()
     K = FP.KEEP
     M = np.full((P, N, 2, 3), np.nan, np.float32)
     skin = np.zeros((P, N, K, K), np.float16)
@@ -172,6 +172,7 @@ def build(tracker, progress: Optional[Callable[[float, str], None]] = None,
     shift = np.zeros((P, N, 2), np.float32)        # landmark correction found by the parser, proxy px
     from ..retouch.skin import _features_mask, _texture_gate
     last_t, rgb = -1, None
+    occ_t = {}
     for i, (p, t) in enumerate(sorted(todo, key=lambda x: (x[1], x[0]))):
         if cancel and cancel():
             return None
@@ -182,7 +183,13 @@ def build(tracker, progress: Optional[Callable[[float, str], None]] = None,
         lm = (virt[(p, t)] if (p, t) in virt else st.face[p, t]).astype(np.float64).copy()
         lm[:, 0] *= px.sx
         lm[:, 1] *= px.sy
-        r = parser.parse(rgb, lm)
+        occ = None
+        if getattr(parser, "takes_occluders", False):
+            # hands and forearms in front of the neck (the multiclass model calls them body skin, like the neck)
+            occ = occ_t.get(t)
+            if occ is None:
+                occ = occ_t[t] = FP.limb_occluders(st, t, px.sx, px.sy)
+        r = parser.parse(rgb, lm, occ) if occ is not None else parser.parse(rgb, lm)
         if r is None:
             continue
         if ALIGN_ON and (p, t) not in virt:
@@ -190,7 +197,7 @@ def build(tracker, progress: Optional[Callable[[float, str], None]] = None,
             if sh is not None:
                 lm2 = lm.copy()
                 lm2[:, :2] += sh
-                r2 = parser.parse(rgb, lm2)
+                r2 = parser.parse(rgb, lm2, occ) if occ is not None else parser.parse(rgb, lm2)
                 if r2 is not None:
                     lm, r = lm2, r2
                     shift[p, t] = sh

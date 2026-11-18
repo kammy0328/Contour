@@ -19,9 +19,9 @@ import numpy as np
 from . import teach as T
 from .net import CLOTH_CLASSES, FACE_CLASSES
 
-FACE_FLIP = [0, 1, 2, 3, 5, 4, 7, 6, 9, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+FACE_FLIP = [0, 1, 2, 3, 4, 5]                 # MediaPipe multiclass has no left / right classes
 CLOTH_FLIP = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 9, 11, 13, 12, 15, 14, 16, 17]
-FACE_KEY = (1, 2, 17)           # skin, nose, neck: what the retouch needs most
+FACE_KEY = (2, 3)               # body skin (the neck), face skin: what the retouch needs most
 CLOTH_KEY = (4, 5, 6, 7)        # top, skirt, trousers, dress: what 옷 그대로 keeps
 
 
@@ -167,7 +167,7 @@ def quick_eval(model, items: list, dev, n: int = 120) -> dict:
             if "face" in s:
                 pf = torch.softmax(f.float(), 1)[0].cpu().numpy()
                 tf = s["face"].astype(np.float32) / 255.0
-                for name, ids in (("skin", [1, 2]), ("neck", [17])):
+                for name, ids in (("skin", [3]), ("neck", [2])):
                     pm, tm = pf[ids].sum(0) > 0.5, tf[ids].sum(0) > 0.5
                     if tm.sum() > 20:
                         acc[name].append((pm & tm).sum() / max(1, (pm | tm).sum()))
@@ -209,7 +209,9 @@ def train(root: str, out_dir: str, steps: int = 8000, batch: int = 8, lr: float 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(seed)
     rng = random.Random(seed)
-    model = N.build(pretrained=True).to(dev)
+    with np.load(next(it[0] for it in tr if it[1] == "face")) as d0:
+        fc = int(d0["face"].shape[0]) if "face" in d0.files else N.FACE_CLASSES
+    model = N.build(pretrained=True, face_classes=fc).to(dev)
     enc = [p for n_, p in model.named_parameters() if n_.startswith(("stem", "l1", "l2", "l3", "l4"))]
     dec = [p for n_, p in model.named_parameters() if not n_.startswith(("stem", "l1", "l2", "l3", "l4"))]
     opt = torch.optim.AdamW([dict(params=enc, lr=lr * 0.3), dict(params=dec, lr=lr)], weight_decay=0.01)

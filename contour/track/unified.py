@@ -116,12 +116,15 @@ class Runtime:
         for k in ("face", "cloth", "alpha"):
             if k not in self.outs:
                 raise RuntimeError(f"{p.name}: '{k}' 출력이 없습니다")
+        # the face head's classes: 6 (MediaPipe multiclass, the commercially usable teacher) or 19 (CelebAMask-HQ,
+        # a first version taught by the non-commercial parser)
+        self.face_classes = int(self._run(np.zeros((1, 3, 64, 64), np.float32), "face").shape[1])
 
     def _run(self, x: np.ndarray, name: str) -> np.ndarray:
         return self.sess.run([name], {self.inp: x})[0]
 
     def face_logits(self, crop512: np.ndarray) -> np.ndarray:
-        """(19, 128, 128) like face_parse on the same 512 px face crop."""
+        """(face_classes, 128, 128) on a 512 px face crop: MediaPipe multiclass's classes (or face_parse's)."""
         return self._run(_norm(crop512), "face")[0]
 
     def cloth_logits(self, crop512: np.ndarray) -> np.ndarray:

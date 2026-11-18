@@ -42,6 +42,8 @@ class AppSettings:
     accuracy: str = "high"                # high | balanced | fast
     collect_learning_data: bool = True
     self_learning: bool = True        # learn from every analysed cut on its own (no corrections needed)
+    face_model: str = ""              # '' = the default (faceparse.DEFAULT_MODEL), 'mp' (commercial use) or 'face_parse' (non-commercial)
+    cloth_model: str = ""             # '' = the default (clothing.DEFAULT_MODEL), 'sam31' (commercial use) or 'parse_clothes' (non-commercial)
     unified_model: bool = False       # DIAP's combined model in place of face_parse, parse_clothes, matte_rvm (experiment)
     last_project: str = ""
     recent_projects: list = field(default_factory=list)

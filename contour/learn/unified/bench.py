@@ -1,12 +1,13 @@
 """The comparison: the three models the app uses now and the combined model, on held-out projects only.
 
-The reference is each teacher's answer on the picture as it was. Rows:
+The teachers are the commercially usable ones (teach.Teachers). The reference is each teacher's answer on the
+picture as it was. Rows:
 - teacher, hard view : the teacher itself on the same picture made hard (dark, coloured light, soft, noisy, JPEG)
 - combined, clean    : the combined model on the picture as it was
 - combined, hard view: the combined model on the hard view
 so a combined model that only copies its teacher shows on the clean row, and one that holds up better on hard
 frames shows by beating the teacher's own hard row. Measures:
-- face : skin (skin + nose) and neck IoU, edges of eyes / mouth and lips / hair (F1 within 1 px at 128 px),
+- face : face skin and body skin (neck) IoU, edges of the face skin and the hair (F1 within 1 px at 128 px),
          leak (combined skin or neck where the reference says something else, share of its skin),
          flicker (mean change of the skin map from t to t+1, landmark-aligned crops; the reference's own beside it)
 - cloth: garment IoU (top, skirt, trousers, dress), skirt and dress IoU, garment-on-skin (garment where the
@@ -31,7 +32,7 @@ import numpy as np
 from . import teach as T
 from .train import CLOTH_KEY, degrade, load
 
-EYES, MOUTH, HAIR = (4, 5), (10, 11, 12), (13,)
+HAIR, BODY, FACE = (1,), (2,), (3,)           # MediaPipe multiclass
 SKIN_CLOTH = (11, 12, 13, 14, 15)           # face, legs, arms in the clothes model
 
 
@@ -72,12 +73,12 @@ class Student:
 
 
 def face_metrics(pred: np.ndarray, ref: np.ndarray) -> dict:
-    ps, rs = pred[[1, 2]].sum(0) > 0.5, ref[[1, 2]].sum(0) > 0.5
-    pn, rn = pred[17] > 0.5, ref[17] > 0.5
+    """Face skin, body skin (the neck under the face), hair: IoU and edges (F1 within 1 px at 128 px)."""
+    ps, rs = pred[list(FACE)].sum(0) > 0.5, ref[list(FACE)].sum(0) > 0.5
+    pn, rn = pred[list(BODY)].sum(0) > 0.5, ref[list(BODY)].sum(0) > 0.5
     pa, ra = pred.argmax(0), ref.argmax(0)
     out = dict(skin=_iou(ps, rs), neck=_iou(pn, rn),
-               eyes_edge=_edge_f1(np.isin(pa, EYES), np.isin(ra, EYES)),
-               mouth_edge=_edge_f1(np.isin(pa, MOUTH), np.isin(ra, MOUTH)),
+               skin_edge=_edge_f1(np.isin(pa, FACE), np.isin(ra, FACE)),
                hair_edge=_edge_f1(np.isin(pa, HAIR), np.isin(ra, HAIR)))
     pk = ps | pn
     out["leak"] = float((pk & ~(rs | rn)).sum() / max(1, pk.sum())) if pk.sum() > 50 else None
@@ -165,9 +166,9 @@ def flicker(items: list, student: Student, n: int = 150) -> dict:
         a, b = load(prev[0]), load(it[0])
         if it[1] == "face":
             pa, pb = student(a["img"])[0], student(b["img"])[0]
-            sa, sb = pa[[1, 2]].sum(0), pb[[1, 2]].sum(0)
-            ra = a["face"][[1, 2]].astype(np.float32).sum(0) / 255.0
-            rb = b["face"][[1, 2]].astype(np.float32).sum(0) / 255.0
+            sa, sb = pa[list(FACE)].sum(0), pb[list(FACE)].sum(0)
+            ra = a["face"][list(FACE)].astype(np.float32).sum(0) / 255.0
+            rb = b["face"][list(FACE)].astype(np.float32).sum(0) / 255.0
             fs.append(float(np.abs(sb - sa).mean()))
             fr.append(float(np.abs(rb - ra).mean()))
         else:
@@ -201,9 +202,15 @@ def cost(model: str, provider: str, reps: int = 20) -> dict:
     from ...track import models as M
     if provider not in ort.get_available_providers():
         return dict(model=model, provider=provider, supported=False, reason="이 ONNX Runtime에 없음")
-    shapes = {"face_parse": [(1, 3, 512, 512)], "parse_clothes": [(1, 3, 512, 512)],
-              "matte_rvm": [(1, 3, 288, 512)], "unified": [(1, 3, 512, 512), (1, 3, 288, 512)]}[model]
-    p = os.environ.get("DIAP_UNIFIED_FILE") if model == "unified" else str(M.ensure_model(model))
+    shapes = {"mp_multiclass": [(1, 256, 256, 3)], "matte_rvm": [(1, 3, 288, 512)],
+              "unified": [(1, 3, 512, 512), (1, 3, 288, 512)]}[model]
+    if model == "unified":
+        p = os.environ.get("DIAP_UNIFIED_FILE")
+    elif model == "mp_multiclass":
+        from ...track import faceparse as FP
+        p = str(FP.MP_FILE)
+    else:
+        p = str(M.ensure_model(model))
     t0 = time.time()
     try:
         s = ort.InferenceSession(p, providers=[provider] + (["CPUExecutionProvider"] if provider != "CPUExecutionProvider" else []))
@@ -216,6 +223,8 @@ def cost(model: str, provider: str, reps: int = 20) -> dict:
     for sh in shapes:
         x = np.random.default_rng(0).standard_normal(sh).astype(np.float32)
         feed = {names[0]: x}
+        if model == "mp_multiclass":
+            feed = {names[0]: np.clip(x * 0.2 + 0.5, 0, 1).astype(np.float32)}
         if model == "matte_rvm":
             dt = np.float16 if "float16" in s.get_inputs()[0].type else np.float32
             feed = {names[0]: np.clip(x * 0.2 + 0.5, 0, 1).astype(dt)}

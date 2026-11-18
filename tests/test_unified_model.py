@@ -11,13 +11,13 @@ from contour.track import models as M
 from contour.track import unified as U
 
 
-def _tiny_unified(path):
+def _tiny_unified(path, face_classes=19):
     import onnx
     from onnx import TensorProto, helper, numpy_helper
     rng = np.random.default_rng(0)
     x = helper.make_tensor_value_info("image", TensorProto.FLOAT, [1, 3, "h", "w"])
     outs = [helper.make_tensor_value_info(n, TensorProto.FLOAT, None) for n in ("face", "cloth", "alpha")]
-    wf = numpy_helper.from_array(rng.standard_normal((19, 3, 1, 1)).astype(np.float32), "wf")
+    wf = numpy_helper.from_array(rng.standard_normal((face_classes, 3, 1, 1)).astype(np.float32), "wf")
     wc = numpy_helper.from_array(rng.standard_normal((18, 3, 1, 1)).astype(np.float32), "wc")
     nodes = [helper.make_node("AveragePool", ["image"], ["p4"], kernel_shape=[4, 4], strides=[4, 4]),
              helper.make_node("Conv", ["p4", "wf"], ["face"]),
@@ -135,7 +135,7 @@ def _fake_teach(root, project, cut, n=2):
     for t in range(n):
         img = rng.integers(0, 255, (64, 64, 3)).astype(np.uint8)
         base = dict(project=project, cut=cut, cut_id=cut, t=t, pair_of=t - 1 if t else None)
-        face = rng.random((19, 16, 16))
+        face = rng.random((6, 16, 16))
         np.savez_compressed(os.path.join(d, f"face_{t:05d}_p1.npz"), img=T._jpg(img), face=T._q(face / face.sum(0)),
                             meta=np.array(json.dumps(dict(base, kind="face", pid=1))))
         cl = rng.random((18, 16, 16))
@@ -156,7 +156,8 @@ def test_train_split_export_and_compare(tmp_path, monkeypatch):
     from contour.learn.unified import net as N
     from contour.learn.unified import train as TR
     small = N.build
-    monkeypatch.setattr(N, "build", lambda pretrained=True, width=128: small(pretrained=False, width=16))
+    monkeypatch.setattr(N, "build", lambda pretrained=True, width=128, face_classes=6:
+                        small(pretrained=False, width=16, face_classes=face_classes))
     root, out = str(tmp_path / "teach"), str(tmp_path / "out")
     _fake_teach(root, "MV_A", "c1")
     _fake_teach(root, "MV_B", "c2")
@@ -173,5 +174,20 @@ def test_train_split_export_and_compare(tmp_path, monkeypatch):
     assert res["flicker"]["face_pairs"] >= 1
     # the app side reads the same file
     rt = U.Runtime(__import__("pathlib").Path(rec["onnx"]))
-    assert rt.face_logits(np.zeros((64, 64, 3), np.uint8)).shape == (19, 16, 16)
+    assert rt.face_logits(np.zeros((64, 64, 3), np.uint8)).shape == (6, 16, 16) and rt.face_classes == 6
     assert rt.alpha(np.zeros((90, 160, 3), np.uint8)).shape == (90, 160)
+
+
+def test_commercial_face_model_uses_the_combined_model_taught_by_it(on, monkeypatch):
+    """A combined model taught by MediaPipe multiclass (6 face classes) serves face_model 'mp'; one taught by the
+    non-commercial parser (19) is never used for it."""
+    from contour.track import faceparse as FP
+    U.reset_session()
+    _tiny_unified(U.path(), face_classes=6)
+    mp = FP.MPFaceParser()
+    assert mp.unified is not None
+    pr = mp.probs(np.zeros((512, 512, 3), np.uint8))
+    assert pr.shape == (6, FP.MP_SIZE, FP.MP_SIZE) and np.allclose(pr.sum(0), 1, atol=1e-4)
+    U.reset_session()
+    _tiny_unified(U.path(), face_classes=19)
+    assert FP.MPFaceParser().unified is None

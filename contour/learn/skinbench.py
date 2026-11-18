@@ -82,7 +82,7 @@ def parse_maps(rgb_u8: np.ndarray, lm: np.ndarray) -> Optional[Dict[str, np.ndar
     """Per class probability maps of the face parser on the image (eyes, brows, lips with mouth, hair, skin)."""
     from ..track import faceparse as FP
     if _P[0] is None:
-        _P[0] = FP.FaceParser() if FP.ready() else False
+        _P[0] = FP.make_parser() if FP.ready() else False
     P = _P[0]
     if not P:
         return None

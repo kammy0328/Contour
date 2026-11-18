@@ -1,10 +1,11 @@
 """Teacher labels for the combined model, from analysed originals only (no retouched result needed).
 
 Every sample is the picture exactly as the app hands it to that teacher, and the teacher's answer:
-- face   : the face crop of faceparse (raw picture, landmark-aligned, 512 px) and face_parse's class
-           probabilities (19 x 128 x 128) -- the original SegFormer-B5, never a parser trained further;
-- person : the person's box crop of clothing.run (exposure-evened picture, resized to 512 x 512) with
-           parse_clothes' probabilities (18 x 128 x 128) and the RVM alpha cut out of the same box;
+- face   : the face crop of faceparse (raw picture, landmark-aligned, 512 px) and MediaPipe Selfie Multiclass's
+           class probabilities (6 x 128 x 128);
+- person : the person's box crop of clothing.run (exposure-evened picture, resized to 512 x 512) with SAM 3.1's
+           garments found in it (the clothes classes, 18 x 128 x 128 one-hot) and the RVM alpha cut out of the
+           same box;
 - frame  : the whole exposure-evened frame at 512 px wide with the RVM alpha. RVM's alpha is everybody at once:
            it teaches "a person is here, this soft", never who it is (the owner of a pixel stays the tracking's
            person labels, as now).
@@ -62,24 +63,28 @@ def frame_size(w: int, h: int) -> tuple:
 
 
 class Teachers:
-    """The app's three models, as the app runs them (ONNX)."""
+    """Teachers that allow commercial use, as the app runs them (ONNX): MediaPipe multiclass for faces, SAM 3.1
+    garment phrases for clothing, RVM for alpha (never the combined model itself: DIAP_UNIFIED is off here)."""
 
     def __init__(self):
-        from ...track import models as M
+        import os
+        os.environ["DIAP_UNIFIED"] = "0"
         from ...track import faceparse as FP
-        from ...track.clothing import Parser
+        from ...track.clothing import GarmentFinder
         from ...track.infer import Matter
-        self.face = M.session(M.ensure_model(FP.MODEL_KEY))          # the original parser, not one trained further
-        self.face_in = self.face.get_inputs()[0].name
-        self.cloth = Parser()
+        self.face = FP.MPFaceParser()
+        self.garments = GarmentFinder()
         self.matter = Matter()
 
     def face_probs(self, crop: np.ndarray) -> np.ndarray:
-        return _softmax(self.face.run(None, {self.face_in: to_input(crop)})[0][0])
+        """(6, 128, 128) class probabilities of a 512 px face crop."""
+        pr = self.face.probs(crop)
+        return np.stack([cv2.resize(c, (128, 128), interpolation=cv2.INTER_AREA) for c in pr])
 
     def cloth_probs(self, crop512: np.ndarray) -> np.ndarray:
-        lg = self.cloth.sess.run(None, {self.cloth.inp: to_input(crop512)})[0][0]
-        return _softmax(lg)
+        """(18, 128, 128) one-hot of the garments SAM 3.1 finds in a 512 x 512 person crop (0: none)."""
+        cm = self.garments.classes(crop512, (128, 128))
+        return np.eye(18, dtype=np.float32)[np.clip(cm, 0, 17)].transpose(2, 0, 1)
 
 
 def _write(path: Path, **arrays):

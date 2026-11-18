@@ -98,3 +98,10 @@
 ## 실험 8: 원본만으로 포즈 자가학습 강화 (refiner)
 - 라벨 auto_track_v2: teacher_mask에서 인물 겹침(가림·번호 바뀜 위험) ±4프레임, 앞뒤 추적 충돌 구간 ±4프레임, 빠른 관절(인물 크기의 15%/프레임 이상), 플래시 프레임 제외. 쉬운 선명 프레임을 표본의 1/4로 넣고 학습 때 항상 어렵게(노출·색 조명·블러·JPEG). 회전·크기 증강은 정답 좌표도 함께 변환.
 - 검증: 프로젝트가 3개 이상이면 프로젝트 단위로 분리(같은 뮤직비디오가 학습·검증에 섞이지 않게), 기록에 grouping.
+
+
+## 실험 9: 상업 사용 가능한 모델로 교체 (2026-11-19)
+- 얼굴 분할: SegFormer-B5(CelebAMask-HQ, 비상업) → MediaPipe Selfie Multiclass(Apache-2.0, 256px, TFLite → tf2onnx, ONNX와 TFLite 출력 차이 4e-5) + 랜드마크. skin = 얼굴 피부 − 눈·눈썹·입술(랜드마크 다각형), neck = 몸 피부 × 턱 아래 영역(턱 폭 ±12%, 턱끝 아래 0.65wf), 손·팔뚝(추적 손 21점 볼록 껍질, 팔꿈치→손목 선)은 목·피부에서 제외. 입력은 0..1 RGB(−1..1이면 배경이 머리카락으로 바뀜).
+- 로컬 비교(j2752 크롭 4장, face_parse 대비 IoU): 피부 0.61~0.85, 목 0.17~0.94(011·058은 MP가 목을 더 넓게, 058은 손을 목으로 잡아 손 제외 추가). PC 비교 j2758에서 더 많은 컷으로 확인 후 기본값 결정.
+- 옷 분할: SegFormer-B2(NVIDIA 비상업) → SAM 3.1 문구 찾기(SAM License). shirt·jacket·top→상의, pants·shorts→바지, skirt, dress, belt, hat·shoe·bag→소품. 문구 인코딩은 tools/sam31_phrases.py(CLIP BPE 토크나이저, "person" 재현 cos 0.99998)로 만들어 data/sam31_text_garments.npz에 포함.
+- 통합 모델: 교사를 MediaPipe·SAM 3.1 옷·RVM 알파로 교체(비상업 교사의 답으로 학습한 학생은 교사 조건에 묶임). 얼굴 헤드 6클래스, 앱에서는 face_model 'mp'일 때 MPFaceParser가 사용.

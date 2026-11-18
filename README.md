@@ -606,6 +606,17 @@ K-pop 안무영상 여러 개로 군무 추적을 시험하고, 틀린 곳을 �
 - SFace 얼굴 인식: OpenCV Zoo, Apache-2.0
 - OSNet-IBN x1.0 사람 재인식(MSMT17 학습 가중치): Kaiyang Zhou, deep-person-reid, MIT (`tools/build_reid_onnx.py`로 ONNX 변환해 `assets/onnx`에 포함)
 - SegFormer-B2 옷 분할(mattmdjaga/segformer_b2_clothes, ATR 학습): NVIDIA SegFormer 라이선스, 비상업 용도 (선택 기능, 사용 시 다운로드)
+- SegFormer-B5 얼굴 분할(jonathandinu/face-parsing, CelebAMask-HQ 학습): 비상업 연구·교육 용도 (`face_model = "face_parse"`일 때만 다운로드)
+- MediaPipe Selfie Multiclass 분할: Google, Apache-2.0 (TFLite를 tf2onnx로 ONNX 변환해 `contour/track/data/mp_selfie_multiclass_256.onnx`에 포함, 라이선스 전문 `contour/track/data/MEDIAPIPE_LICENSE.txt`). 상업 사용용 얼굴 분할(`face_model = "mp"`)
+- `contour/track/data/sam31_text_garments.npz`: SAM 3.1 문구 인코더(smile-forge 변환, SAM License)가 옷 단어("skirt", "dress" 등)에 대해 낸 결과(`tools/sam31_phrases.py`로 생성). 상업 사용용 옷 분할(`cloth_model = "sam31"`)
+
+### 상업 배포 시
+
+- 비상업 라이선스: SegFormer-B5 얼굴 분할, SegFormer-B2 옷 분할, 그리고 이 둘의 답으로 학습한 모델(얼굴 분할 단계 학습 `face_parse_diap.onnx`·`face_parse_own.onnx`, 이 교사들로 학습한 통합 모델). 상업 배포에서는 `face_model = "mp"`, `cloth_model = "sam31"`을 쓰고 위 모델은 받거나 불러오지 않습니다.
+- SAM 3.1(SAM License): 상업 사용 허용. 라이선스 사본 동봉(포함됨), 무역 통제 대상자 사용 금지, 군사·ITAR·핵·첩보 용도 금지, 역설계 금지.
+- RVM(GPL-3.0): 상업 사용 허용. 앱에 포함하지 않고 사용 시 원 배포처(GitHub 릴리스)에서 받습니다. 앱과 함께 재배포하면 GPL 의무(라이선스 고지, 소스 제공)가 생깁니다.
+- 가중치 라이선스는 허용형이지만 학습 데이터 조건 확인이 필요한 것: OSNet 재인식(MSMT17, 앱에 포함), RTMW·DWPose·YOLOX(여러 공개 데이터셋), SFace. 출시 전 법률 검토 권장.
+- 고객 영상으로 학습한 모델(`contour/track/data/spotnet_v1.onnx`, LNGSHOT Bananas 수작업 결과로 학습): 해당 영상과 수작업 결과의 학습·배포 권한 확인 필요.
 - Pretendard 글꼴: SIL Open Font License 1.1 (`assets/fonts`)
 - Lucide 아이콘: ISC (`assets/icons`)
 - PySide6(Qt): LGPL-3.0, OpenColorIO: BSD-3-Clause, ONNX Runtime: MIT, OpenCV: Apache-2.0
