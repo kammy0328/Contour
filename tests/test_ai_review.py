@@ -198,3 +198,16 @@ def test_menu_item_makes_it_from_the_saved_project(qapp, tmp_path, monkeypatch):
         w.session.dirty = False
         w._discard_on_close = True
         w.close()
+
+
+def test_a_timeline_index_saved_as_a_float(tmp_path, no_models):
+    """PC check on the Ballin project: a cut whose timeline place was saved as 3.0 stopped the whole review."""
+    from contour import review as RV
+    from contour.core.project import Project
+    prj, cut, v = _analysed(tmp_path)
+    p = Project.load(prj.path)
+    p.cuts[0].tl = dict(index=3.0, kind="clip", rec_in=10, rec_out=50, base=0)
+    p.timeline = dict(seq_start=0, fps=24.0, drop=False, name="t")
+    p.save()
+    c = json.loads((RV.build(prj.path, images=False) / "review.json").read_text(encoding="utf-8"))["cuts"][0]
+    assert c["number"] == "004" and c["timeline"]["index"] == 3 and c["work"]["rec_tc_in"] == "00:00:00:10"

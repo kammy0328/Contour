@@ -528,7 +528,7 @@ def review_cut(ctx: _Ctx, cut, number: str = "") -> dict:
     d = dict(id=cut.id, name=cut.name, number=number, source=dict(path=src, found=bool(found)),
              fps=round(float(cut.info.fps), 3), size=[int(cut.info.width), int(cut.info.height)],
              frames=int(cut.info.frames), work=dict(**_where(prj, cut, *wr)),
-             timeline=dict(index=cut.tl.get("index"), kind=cut.tl.get("kind"), name=cut.tl.get("name", ""))
+             timeline=dict(index=int(cut.tl["index"]) if isinstance(cut.tl.get("index"), (int, float)) else None, kind=cut.tl.get("kind"), name=cut.tl.get("name", ""))
              if cut.tl else None,
              analysis=dict(analyzed=bool(cut.analyzed), version=int(cut.analysis_version),
                            state=STT.effective(cut), auto=st_.get("auto"), reason=STT.reason(cut) or st_.get("reason", ""),
@@ -720,7 +720,12 @@ def build(project_path: str, out_dir: Optional[str] = None, cut_ids: Optional[Se
             break
         if progress:
             progress(i / max(1, len(cuts)), f"검수 자료 {i + 1}/{len(cuts)}: {c.name}")
-        num = f"{c.tl['index'] + 1:03d}" if c.tl and "index" in c.tl else f"{prj.cuts.index(c) + 1:03d}"
+        try:
+            # a timeline cut's place in the edit (saved as a float by some imports)
+            num = f"{int(c.tl['index']) + 1:03d}" if c.tl and c.tl.get("index") is not None else \
+                f"{prj.cuts.index(c) + 1:03d}"
+        except (TypeError, ValueError):
+            num = f"{prj.cuts.index(c) + 1:03d}"
         try:
             rev["cuts"].append(review_cut(ctx, c, num))
         except Exception as e:

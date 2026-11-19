@@ -16,7 +16,8 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 MARGIN = 3          # frames before and after a changed range matted again with it (the edges of a re-solve blend)
-MOVE = 0.004        # a prompt point that moved more than this share of the frame height changes the matte
+MOVE = 0.01         # a prompt point that moved more than this share of the frame height changes the matte
+                    # (0.004 marked 79 frames for one wrist moved on a real cut: the re-solve's few-pixel ripples)
 
 
 # ---------------------------------------------------------------------- which frames an edit changed

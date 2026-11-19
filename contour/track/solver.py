@@ -48,17 +48,33 @@ def _smooth_series(x: np.ndarray, k: int = 7) -> np.ndarray:
     return med
 
 
+BLUR_RULE = "scaled"
+"""How motion blur lowers a fused joint's trust (a frame whose sharpness dips under 0.55 of its neighbours'):
+- "scaled": always, by the sharpness (down to 0.3 x). With the models' own scores already low on a blurred frame,
+  a joint the models agree on can fall under the solver's 0.05 and be dropped (PC check 2026-11-19: fused joints
+  missing 2.8 % on blurred frames against 1.5 % for each model alone);
+- "agree": only where the models disagree (or one model alone saw it); where two or more agree closely the joint
+  keeps its trust;
+- "agree_low": as "agree", and on a blurred frame a model's point counts from a normalised score of 0.1 (not 0.2)
+  when at least two models agree on it (blur lowers every model's score: a joint all of them still place in the
+  same spot was left with no measurement at all);
+- "none": flagged only."""
+
+
 def fuse_measurements(store: TrackStore, conf_threshold: float = 0.55, frame_wh=None, alpha_at=None,
-                      alpha_scale=(1.0, 1.0)) -> None:
+                      alpha_scale=(1.0, 1.0), blur_rule: Optional[str] = None, norm: Optional[dict] = None) -> None:
     keys = [k for k in store.raw if store.raw[k].shape[2] == S.K]
     if not keys:
         return
-    norm = normalize_scores({k: store.raw[k] for k in keys})
+    blur_rule = blur_rule or BLUR_RULE
+    norm = norm or normalize_scores({k: store.raw[k] for k in keys})
     xy = np.stack([store.raw[k][..., :2] for k in keys])            # (M,P,N,K,2)
     sc = np.stack([store.raw[k][..., 2] / norm[k] for k in keys])   # (M,P,N,K)
     sc = np.clip(np.nan_to_num(sc, nan=0.0), 0, 1.2)
     is_face = np.array([k.startswith("face_") for k in keys])
-    valid = (sc > 0.2) & np.isfinite(xy).all(-1)
+    blurred_pn = np.nan_to_num(store.blur, nan=1.0) < 0.55                  # (P,N)
+    low_ok = (blur_rule == "agree_low") & blurred_pn[None, :, :, None] & ~is_face[:, None, None, None]
+    valid = ((sc > 0.2) | (low_ok & (sc > 0.1))) & np.isfinite(xy).all(-1)
     w = sc * valid
     # Face landmarks are precise for the head joints but carry no body information.
     w[is_face] *= 1.3
@@ -117,11 +133,20 @@ def fuse_measurements(store: TrackStore, conf_threshold: float = 0.55, frame_wh=
     face_in = inlier[is_face].any(0) if is_face.any() else np.zeros_like(conf, bool)
     conf = np.where(face_in, np.minimum(1.0, conf * 1.15), conf)
     conf = np.where(np.isfinite(mu).all(-1), conf, 0.0)
+    if blur_rule == "agree_low":
+        # a joint held up only by points under the usual score: kept when two or more of them agree
+        strong = (inlier & (sc > 0.2)).any(0)
+        conf = np.where(~strong & (n_in < 2), 0.0, conf)
     flags = np.zeros(conf.shape, np.uint8)
     flags |= np.where((n_valid >= 2) & ((agree < 0.67) | (spread > 0.045)), S.FLAG_DISAGREE, 0).astype(np.uint8)
     # blur
     blur_w = np.clip(store.blur, 0.3, 1.0)[..., None]
-    conf = conf * np.where(store.blur[..., None] < 0.55, blur_w, 1.0)
+    blurred = store.blur[..., None] < 0.55
+    if blur_rule in ("agree", "agree_low"):
+        sure = (n_valid >= 2) & (agree >= 0.67) & (spread <= 0.03)
+        conf = conf * np.where(blurred & ~sure, blur_w, 1.0)
+    elif blur_rule != "none":
+        conf = conf * np.where(blurred, blur_w, 1.0)
     flags |= np.where(store.blur[..., None] < 0.55, S.FLAG_BLUR, 0).astype(np.uint8)
     # bone length jumps
     for a, b in S.LIMB_BONES:
