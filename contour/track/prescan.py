@@ -3,8 +3,8 @@
 The full analysis opens several large models per cut; a cut with nobody in it needs none of them. One light person
 detector (YOLOX-m) is opened once for all the cuts of a batch, and each cut is looked at in the picture the analysis
 itself would see (the same colour view: a log original is looked at in its display view, not as flat log):
-- a short cut frame by frame (every second frame), a long one at its start, middle and end and at even steps, and
-  more frames when the first ones leave it open;
+- a short cut frame by frame (every second frame), a long one at its start, middle and end and at even steps, then
+  about every half second before it is called empty (or when the first frames leave it open);
 - three answers: someone is there (analyse), nobody is there (skip, with the reason), or not sure (analyse: a
   small person, someone seen in one frame only, a weak detection, a dark or flashing picture, frames that could not
   be read, too few frames). Only a clear 'nobody' skips a cut.
@@ -33,7 +33,8 @@ def plan(n: int, more: bool = False) -> List[int]:
         return []
     if n <= DENSE:
         return list(range(0, n, 2)) + ([n - 1] if (n - 1) % 2 else [])
-    k = 13 if not more else 37
+    # second round: about every half second (a person seen for less is not retouched), at most 160 frames
+    k = 13 if not more else int(np.clip(np.ceil(n / 12.0), 37, 160))
     ts = np.unique(np.linspace(0, n - 1, k).round().astype(int)).tolist()
     if more:
         first = set(plan(n))
@@ -95,9 +96,11 @@ class Prescan:
         for t in ts:
             self._one(frame_of, t, found, lumas)
         r = judge(found, lumas, len(ts))
-        if r["verdict"] == UNSURE and n > DENSE and r["reason"] in ("낮은 검출 신뢰도", "작은 인물", "프레임을 충분히 읽지 못함",
-                                                                   "한 프레임에서만 보인 인물"):
-            more = plan(n, more=True)               # a long cut left open: look closer before analysing it
+        if n > DENSE and (r["verdict"] == NONE or r["reason"] in ("낮은 검출 신뢰도", "작은 인물", "프레임을 충분히 읽지 못함",
+                                                                 "한 프레임에서만 보인 인물")):
+            # a long cut: never called empty from its first frames alone (someone may come in between them), and
+            # one left open is looked at closer before the large models are opened for it
+            more = plan(n, more=True)
             for t in more:
                 self._one(frame_of, t, found, lumas)
             r = judge(found, lumas, len(ts) + len(more))

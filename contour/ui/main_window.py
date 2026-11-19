@@ -294,6 +294,8 @@ class MainWindow(QMainWindow):
         self.batch.finishedCut.connect(self._batch_cut_done)
         self.batch.finishedAll.connect(self._batch_all_done)
         self.batch.warned.connect(self._batch_warned)
+        self.batch.skipped.connect(self._batch_skipped)
+        self.batch.scanProgress.connect(lambda f, m: self.tlstrip.set_running(dict(self.tlstrip.running), m))
         self._batch_preset = None
         self._batch_dlg = None
         self._batch_skin = None
@@ -1814,7 +1816,9 @@ class MainWindow(QMainWindow):
         if ids is None:
             ids = [i for i in self.cutlist.selected_ids()] if len(self.cutlist.selected_ids()) > 1 else []
         pool = self._clip_cuts(prj, ids)
-        todo = [c for c in pool if not c.analyzed and (c.status or {}).get("auto") != "none"]
+        picked = bool(ids) and len(pool) < len(self._clip_cuts(prj))
+        # cuts picked one by one are analysed even when the quick look skipped them before (1.22.2)
+        todo = [c for c in pool if not c.analyzed and (picked or (c.status or {}).get("auto") != "none")]
         if not todo:
             self.toast("분석할 컷이 없습니다 (모두 분석했거나 인물 없음)")
             return
@@ -1829,9 +1833,9 @@ class MainWindow(QMainWindow):
         self._batch_preset = None
         self._batch_dlg = None
         self._batch_skin = None
-        self._start_batch(todo, title)
+        self._start_batch(todo, title, prescan=not picked)
 
-    def _start_batch(self, todo: list, title: str = "전체 분석"):
+    def _start_batch(self, todo: list, title: str = "전체 분석", prescan: bool = False):
         prj = self.session.project
         if prj is None or not todo:
             return
@@ -1859,7 +1863,38 @@ class MainWindow(QMainWindow):
             free_gpu_memory()
         except Exception:
             pass
-        self.batch.start(prj.path, [c.id for c in todo], self.accuracy, True)
+        if not prescan:
+            for c in todo:                       # picked by hand: whatever the quick look said before, analyse it
+                if (c.status or {}).get("prescan"):
+                    c.status = {k: v for k, v in c.status.items() if k not in ("auto", "reason", "prescan", "prescan_info")}
+        self.batch.start(prj.path, [c.id for c in todo], self.accuracy, True, prescan=prescan)
+
+    def _batch_skipped(self, cid: str, info: str):
+        """The quick look found nobody in this cut: not analysed, with the reason (다시 분석 takes it in again)."""
+        prj = self.session.project
+        cut = prj.cut(cid) if prj else None
+        if cut is None:
+            return
+        try:
+            r = json.loads(info)
+        except Exception:
+            r = {}
+        figs = {k: r[k] for k in ("looked", "read", "best_score", "tallest", "seconds") if k in r}
+        cut.status = dict(cut.status or {}, auto="none", reason=r.get("reason") or "인물 없음 (빠른 검사)",
+                          prescan=True, prescan_info=figs)
+        run = dict(self.tlstrip.running)
+        run.pop(cid, None)
+        self.tlstrip.set_running(run, self.tlstrip.run_lbl.text())
+        dlg = getattr(self, "_batch_dlg", None)
+        if dlg is not None:
+            dlg.cut_done(cid, False)
+        self.session.dirty = True
+        try:
+            prj.save()
+        except Exception:
+            traceback.print_exc()
+        self.tlstrip.refresh()
+        self.cutlist.refresh(self.session.cut.id if self.session.cut else None)
 
     def _batch_pause(self, on: bool):
         dlg = getattr(self, "_batch_dlg", None)
