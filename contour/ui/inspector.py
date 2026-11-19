@@ -739,6 +739,10 @@ class TrackTab(_Tab):
         w = QWidget()
         w.setLayout(g)
         self.add(w)
+        self.reanalyse = Wd.button("구간 다시 분석…", "", "refresh-cw",
+                                   "고른 인물의 선택 구간만 다시 계산하고, 지금 결과와 비교한 뒤 적용합니다 (얼굴·목)")
+        self.reanalyse.clicked.connect(self.ctl.range_reanalyse)
+        self.add(self.reanalyse)
         self.add(Wd.Section("인물 정리"))
         m = Wd.button("인물 합치기…", "", "users")
         m.clicked.connect(self.ctl.merge_persons_dialog)
@@ -797,6 +801,7 @@ class TrackTab(_Tab):
         self.rematte.setEnabled(bool(cut.analyzed and st is not None))
         sel = self.ctl.selection
         self.sel_label.setText(f"선택: {sel[0]}~{sel[1]} 프레임 ({sel[1] - sel[0] + 1}f)" if sel else "선택된 구간 없음")
+        self.reanalyse.setEnabled(bool(sel and cut.analyzed and st is not None))
 
 
 # =========================================================================== QC

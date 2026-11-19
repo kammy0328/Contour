@@ -2265,6 +2265,62 @@ class MainWindow(QMainWindow):
 
         self.run_job("인물 매트 강제 갱신 중", work, done)
 
+    def range_reanalyse(self):
+        """구간 다시 분석 (§3): one person, the selected frames, compared before it is applied."""
+        from ..track import rangefix as RF
+        from .rangefix_dialog import CompareDialog, RangeDialog
+        s = self.session
+        cut, tr = s.cut, s.tracker
+        if cut is None or tr is None or tr.store is None:
+            self.toast("먼저 분석을 실행하세요.", kind="warn")
+            return
+        if not self.selection or self.sel_pid is None:
+            self.toast("인물을 고르고 타임라인에서 Shift+드래그로 구간을 선택하세요.", kind="warn")
+            return
+        a, b = int(self.selection[0]), int(self.selection[1]) + 1
+        pid = self.sel_pid
+        d = RangeDialog(self, cut, pid, a, b)
+        if not d.exec():
+            return
+        if d.item() != "face":
+            return
+        if not getattr(tr.store, "has_face", False):
+            self.toast("얼굴 점이 없는 분석입니다. 다시 분석한 뒤 쓰세요.", kind="warn")
+            return
+
+        def work(progress, cancelled):
+            cand = RF.candidate(tr, pid, a, b, progress, cancelled)
+            if cand is None:
+                return None
+            return cand, RF.compare(tr, cand)
+
+        def done(res):
+            if res is None:
+                self.toast("이 구간에는 다시 계산할 얼굴이 없습니다 (작거나 가려진 얼굴).", kind="warn")
+                return
+            if s.tracker is not tr:
+                return                                  # the cut was left meanwhile: nothing applied
+            cand, cmp = res
+            dlg = CompareDialog(self, tr, cut, cand, cmp)
+            if not dlg.exec():
+                self.toast("적용하지 않았습니다. 지금 결과를 그대로 씁니다.")
+                return
+
+            def apply_work(progress, cancelled):
+                RF.apply(tr, cand)
+                return True
+
+            def applied(_):
+                s._mask_cache = {}
+                s.touch("ret")
+                s.touch("geo")
+                self.viewer._img_cache.clear()
+                s.dirty = True
+                self._refresh_all()
+                self.toast(f"{cand['a']}~{cand['b'] - 1} 프레임의 얼굴·목 마스크를 바꿨습니다.", kind="ok")
+            self.run_job("구간 적용 중", apply_work, applied, cancellable=False)
+        self.run_job("구간 다시 분석 중 (얼굴·목)", work, done)
+
     def make_ai_review(self, open_folder: bool = True):
         """AI 검수 자료 (§6): read from the saved project, so it is saved first; nothing is analysed again."""
         prj = self.session.project
