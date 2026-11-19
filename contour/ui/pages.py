@@ -90,6 +90,7 @@ class QueueItem:
     cut_no: str = ""              # timeline number (001) or the cut's place in the project
     version: int = 0
     src_cs: str = ""              # the source colour space as the cut reads it
+    matte: str = ""               # "old": render with the matte as saved, though edits wait for a refresh (§4)
 
 
 STATUS_TEXT = {"wait": "대기", "running": "렌더 중", "done": "완료", "failed": "실패", "cancelled": "취소됨"}
@@ -635,7 +636,12 @@ class RenderQueuePage(QWidget):
             if self.train_after.isChecked():
                 self.main.models_page.train(auto=True)
             return
-        if self.main.before_render(nxt) is False:
+        ok = self.main.before_render(nxt)
+        if ok is None:
+            # waiting for something first (the person matte of an edited cut): the queue goes on after it
+            self.refresh()
+            return
+        if ok is False:
             nxt.status = "failed"
             nxt.message = "프로젝트를 저장하지 못해 렌더하지 않았습니다 (저장 후 다시 시작하세요)"
             self.refresh()

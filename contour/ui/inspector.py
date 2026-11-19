@@ -319,6 +319,8 @@ class ReshapeTab(_Tab):
         sec = inf.get("seconds")
         if sec:
             t += f" · {sec:.0f}초" if sec >= 10 else f" · {sec:.1f}초"
+        if inf.get("stale_ranges"):
+            t += f" · 인물 매트가 바뀐 구간 {len(inf['stale_ranges'])}곳: 다시 계산 필요"
         return t
 
     def _fill_masks(self, s):
@@ -393,7 +395,7 @@ class ReshapeTab(_Tab):
         self.parts_info = Wd.label("", "Faint", 11)
         self.parts_info.setWordWrap(True)
         self.parts_btn = Wd.button("머리 부위 인식", "", "scan")
-        self.parts_btn.setToolTip("머리카락과 얼굴을 프레임마다 따로 찾아 둡니다 (SAM 2).\n"
+        self.parts_btn.setToolTip("머리카락과 얼굴을 프레임마다 따로 찾아 둡니다 (SAM 2.1).\n"
                                   "헤어 볼륨은 머리카락에만 들어가고 얼굴·귀는 그대로 남으며,\n"
                                   "머리 크기·헤어 볼륨의 머리 윤곽에 옆에 든 손이나 팔이 섞이지 않습니다.")
         self.parts_btn.clicked.connect(lambda: self.ctl.ensure_parts(force=True))
@@ -674,6 +676,32 @@ class ReshapeTab(_Tab):
 
 # =========================================================================== 추적
 
+
+def matte_line(ctl, tracker, cut) -> str:
+    """The person matte of the open cut: which model made it and whether the frames an edit changed are made
+    again yet (§4: it follows the edits by itself)."""
+    if cut is None or not cut.analyzed:
+        return ""
+    if tracker is None or not tracker.has_seg():
+        return "이 컷의 매트: RVM (SAM으로 만들려면 고급 > 인물 매트 강제 갱신)"
+    try:
+        meta = tracker.seg_meta() or {}
+    except Exception:
+        meta = {}
+    t = f"이 컷의 매트: {meta.get('model') or 'SAM'}"
+    ref = getattr(ctl, "refresher", None)
+    stt = ref.state(cut) if ref is not None else ""
+    n = sum(b - a for a, b in ((cut.status or {}).get("matte_dirty") or []))
+    if stt == "running":
+        return t + f" · 편집한 {n}프레임 다시 만드는 중 (그동안 이전 매트로 보입니다)"
+    if stt == "waiting":
+        return t + f" · 편집한 {n}프레임 갱신 대기"
+    err = getattr(ref, "last_error", "") if ref is not None else ""
+    if err:
+        return t + f" · 마지막 자동 갱신 실패: {err[:60]}"
+    k = len(meta.get("refreshed") or [])
+    return t + (f" · 최신 (편집 뒤 자동 갱신 {k}회)" if k else " · 최신")
+
 class TrackTab(_Tab):
     def __init__(self, ctl):
         super().__init__(ctl)
@@ -692,11 +720,6 @@ class TrackTab(_Tab):
         self.seg_info = Wd.label("", "Faint", 11)
         self.seg_info.setWordWrap(True)
         self.add(self.seg_info)
-        self.rematte = Wd.button("인물 매트만 다시 만들기", "", "layers",
-                                 "지금의 추적(수정한 관절 포함)으로 SAM 2 매트를 다시 만들고 몸 폭·윤곽 점을 다시 잽니다. "
-                                 "다시 분석할 필요가 없습니다")
-        self.rematte.clicked.connect(self.ctl.rebuild_matte)
-        self.add(self.rematte)
         # learning (clip adaptation, cumulative model, re-solving from corrections) is always on and automatic
         # ranges
         self.add(Wd.Section("구간 (타임라인에서 Shift+드래그로 선택)"))
@@ -735,6 +758,15 @@ class TrackTab(_Tab):
         tips.setWordWrap(True)
         self.add(Wd.Section("관절 편집"))
         self.add(tips)
+        # the matte follows the edits by itself (분석 시작 makes it, edits refresh their frames): forcing it is
+        # for a matte that looks wrong
+        self.add(Wd.Section("고급"))
+        self.rematte = Wd.button("인물 매트 강제 갱신", "", "layers",
+                                 "관절 수정·인물 합치기 뒤 바뀐 구간의 매트는 자동으로 다시 만들어집니다. 매트가 이상할 "
+                                 "때만 쓰세요: 지금의 추적(수정한 관절 포함)으로 컷 전체의 인물 매트를 다시 만들고 몸 폭·"
+                                 "윤곽 점을 다시 잽니다. 다시 분석할 필요는 없습니다")
+        self.rematte.clicked.connect(self.ctl.rebuild_matte)
+        self.add(self.rematte)
         self.lay.addStretch(1)
 
     def refresh(self):
@@ -761,9 +793,7 @@ class TrackTab(_Tab):
             self.analyze_btn.setIcon(I.icon("scan", 15, "#FFFFFF", "#FFFFFF"))
         self.analyze_btn.style().unpolish(self.analyze_btn)
         self.analyze_btn.style().polish(self.analyze_btn)
-        has_seg = bool(s.tracker is not None and s.tracker.has_seg())
-        self.seg_info.setText("이 컷의 매트: SAM 2" if has_seg else
-                              ("이 컷의 매트: RVM (SAM 2로 바꾸려면 아래 버튼)" if cut.analyzed else ""))
+        self.seg_info.setText(matte_line(self.ctl, s.tracker, cut))
         self.rematte.setEnabled(bool(cut.analyzed and st is not None))
         sel = self.ctl.selection
         self.sel_label.setText(f"선택: {sel[0]}~{sel[1]} 프레임 ({sel[1] - sel[0] + 1}f)" if sel else "선택된 구간 없음")

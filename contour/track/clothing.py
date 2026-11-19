@@ -384,8 +384,18 @@ def info(tracker) -> dict:
     s = _state(tracker)
     model = s.get("model", "")
     want = {cloth_model()} | ({"unified"} if U.active("cloth") else set())
-    return dict(model=model, label=label(model), state=provider_state(model, want), seconds=s.get("seconds"),
-                stats=s.get("stats"))
+    out = dict(model=model, label=label(model), state=provider_state(model, want), seconds=s.get("seconds"),
+               stats=s.get("stats"))
+    # the person matte was made again in some frames after the clothes were analysed (an edit's refresh): the
+    # owners the clothes were cut with changed there
+    try:
+        made = float(s.get("made") or 0)
+        later = [r[:2] for r in (tracker.seg_meta().get("refreshed") or []) if len(r) > 2 and r[2] > made]
+        if later:
+            out["stale_ranges"] = later
+    except Exception:
+        pass
+    return out
 
 
 def _state(tracker) -> dict:

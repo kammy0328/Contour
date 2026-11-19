@@ -148,12 +148,21 @@ def resolve_task(session, pid: int, t: int = 0, frame_end: Optional[int] = None,
     def run():
         if tr is None or tr.store is None:
             return None
+        from ..track import matte_refresh as MR
+        before = MR.prompt_state(tr)
         rng = tr.resolve_all() if every else tr.resolve_local(pid, t, frame_end=frame_end)
+        marks = []
+        try:
+            # the frames whose person-matte prompts the re-solve changed (§4: matted again in the background)
+            marks = MR.changed(tr, before, None if every or rng is None else rng)
+        except Exception:
+            traceback.print_exc()
         if session.tracker is tr:
             session.touch()
         else:
             tr.save()                       # its cut was saved and closed before this ran
-        return rng
+        cut = getattr(tr, "cut", None)
+        return dict(cut=getattr(cut, "id", None), rng=rng, marks=marks)
     return run
 
 
@@ -180,6 +189,12 @@ class MainWindow(QMainWindow):
         self.edit_worker.busy.connect(self._edit_busy)
         self._build()
         self._shortcuts()
+        # the person matte follows the edits by itself (§4)
+        from .matte_refresh import MatteRefresher, TRACK_TAGS
+        self.refresher = MatteRefresher(self)
+        self.refresher.changed.connect(self._matte_state_changed)
+        self.edit_worker.submitted.connect(
+            lambda tag: self.refresher.hold() if isinstance(tag, tuple) and tag and tag[0] in TRACK_TAGS else None)
         self.play_timer = QTimer(self)
         self.play_timer.setTimerType(Qt.PreciseTimer)
         self.play_timer.timeout.connect(self._tick)
@@ -778,6 +793,7 @@ class MainWindow(QMainWindow):
         if self.session.project is not None and not self._save_or_ask("프로젝트를 닫기"):
             return False
         self.activity.set_cut("", None)
+        self.refresher.cancel()
         if self.batch.busy:
             self.batch.kill()
         self.proxy_builder.cancel()
@@ -994,6 +1010,7 @@ class MainWindow(QMainWindow):
             self.cutlist.refresh(self.session.cut.id)
             return
         self._switch_undo(cut.id)
+        self.refresher.cancel()
         # 1.22.1: no proxy-size question here any more (it came back on every unanalysed cut when closed); the size
         # is 설정 > 프록시 해상도, and the proxy is made in the background by 설정 > 프록시 만들기
         self.session.open_cut(cut)
@@ -1048,6 +1065,7 @@ class MainWindow(QMainWindow):
                            kind="warn")
             elif tr is not None and st is not None and st.has_face:
                 self._ensure_facelayer(tr)
+            self.refresher.kick()                 # marks left from the last time it was open
         self._refresh_all()
 
     def _ensure_facelayer(self, tr):
@@ -1439,6 +1457,8 @@ class MainWindow(QMainWindow):
             self.toast("다른 작업이 진행 중입니다.", kind="warn")
             return
         self.stop_play()
+        if getattr(self, "refresher", None) is not None:
+            self.refresher.before_job()
         self.busy.start(title, cancellable, est_s)
         self.job = Job(fn, self)
         self.job.progressed.connect(self.busy.progress)
@@ -2233,10 +2253,114 @@ class MainWindow(QMainWindow):
             self.viewer._img_cache.clear()
             self.save()
             self._refresh_all()
-            self.toast("SAM 2로 인물 매트를 다시 만들고 몸 윤곽 점을 다시 쟀습니다." if ok else
-                       "SAM 2를 쓸 수 없어 RVM 매트를 유지했습니다. 로그를 확인하세요.", kind="ok" if ok else "warn")
+            model = (tr.seg_meta() or {}).get("model") or "SAM"
+            self.toast(f"{model}(으)로 컷 전체의 인물 매트를 다시 만들고 몸 윤곽 점을 다시 쟀습니다." if ok else
+                       "SAM 모델을 쓸 수 없어 RVM 매트를 유지했습니다. 로그를 확인하세요.", kind="ok" if ok else "warn")
+            self.refresher.changed.emit(cut.id)
 
-        self.run_job("인물 매트 다시 만드는 중", work, done)
+        self.run_job("인물 매트 강제 갱신 중", work, done)
+
+    def _matte_state_changed(self, cid: str):
+        cut = self.session.cut
+        if cut is not None and cut.id == cid:
+            self.inspector.refresh("track")
+        self.cutlist.update_rows()
+
+    def refresh_mattes_now(self, cut_ids, then=None, project=None):
+        """Matte the marked frames of these cuts now, as a job (a render that needs the current matte waits for
+        it). then(ok, why) once it is over. project: another project than the open one (loaded for a render)."""
+        from ..track import matte_refresh as MR
+        from .matte_refresh import clear, pending
+        s = self.session
+        prj = project if project is not None else s.project
+        other = prj is not s.project
+        cuts = [c for c in (prj.cut(i) for i in cut_ids) if c is not None and pending(c)] if prj is not None else []
+        if not cuts:
+            if then:
+                then(True, "")
+            return
+        models = self.refresher.models
+        fails: dict = {}
+        if any(c is not s.cut for c in cuts):
+            self.next_prep.cancel()             # a next cut opened ahead would keep its old widths
+
+        def work(progress, cancelled):
+            from ..core.frames import frames_for
+            from ..track.analyze import CutTracker
+            done = {}
+            for i, c in enumerate(cuts):
+                if cancelled():
+                    break
+                sub = (lambda f, m="", i=i: progress((i + f) / len(cuts), f"{c.name}: 인물 매트 갱신 {m}"))
+                own = not other and s.cut is c and s.tracker is not None
+                tr = s.tracker if own else None
+                fr = None
+                try:
+                    if tr is None:
+                        fr = frames_for(prj, c)
+                        if fr is None:
+                            fails[c.id] = "원본을 찾을 수 없음"
+                            continue
+                        tr = CutTracker(prj, c, fr)
+                    if tr.store is None or not tr.has_seg():
+                        done[c.id] = pending(c)        # nothing a SAM matte would follow here
+                        continue
+                    marks = pending(c)
+                    MR.refresh_now(tr, marks, sub, cancelled, models)
+                    done[c.id] = marks
+                except Exception as e:
+                    if type(e).__name__ == "Cancelled":
+                        break
+                    fails[c.id] = f"{e}"[:200]
+                finally:
+                    if fr is not None:
+                        try:
+                            fr.close()
+                        except Exception:
+                            pass
+            return done
+
+        def finish(done):
+            for c in cuts:
+                if c.id in done:
+                    clear(c, done[c.id])
+            if other:
+                try:
+                    prj.save()
+                except Exception as e:
+                    fails["_save"] = f"프로젝트 저장 실패: {e}"
+            else:
+                s.dirty = True
+                s.touch()
+                self.viewer._img_cache.clear()
+                self.save()
+                self._refresh_all()
+            why = "; ".join(f"{prj.cut(k).name}: {v}" if prj.cut(k) is not None else v for k, v in fails.items())
+            ok = not fails and all(c.id in done for c in cuts)
+            if then:
+                then(ok, why or ("취소했습니다" if not ok else ""))
+
+        def failed_then(*_):
+            if then:
+                then(False, "인물 매트 갱신을 취소했거나 실패했습니다")
+        self.run_job("인물 매트 갱신 중", work, finish)
+        if self.job is not None and then:
+            self.job.failed.connect(failed_then)
+
+    def _ask_matte(self, names: list, adding: bool) -> str:
+        """'refresh' / 'old' / 'cancel': a render of cuts whose matte is not caught up with the edits yet."""
+        box = QMessageBox(self)
+        box.setWindowTitle("인물 매트 갱신 전")
+        shown = ", ".join(names[:4]) + (f" 외 {len(names) - 4}컷" if len(names) > 4 else "")
+        box.setText(f"{shown}: 편집한 구간의 인물 매트가 아직 다시 만들어지지 않았습니다.\n"
+                    "렌더는 저장된 매트를 씁니다. 매트를 갱신한 뒤 진행할까요?")
+        b_ref = box.addButton("매트 갱신 후 " + ("추가" if adding else "렌더"), QMessageBox.AcceptRole)
+        b_old = box.addButton("이전 매트로 " + ("추가" if adding else "렌더"), QMessageBox.DestructiveRole)
+        box.addButton("취소", QMessageBox.RejectRole)
+        box.setDefaultButton(b_ref)
+        box.exec()
+        c = box.clickedButton()
+        return "refresh" if c is b_ref else "old" if c is b_old else "cancel"
 
     def relearn_clip(self):
         s = self.session
@@ -2460,6 +2584,7 @@ class MainWindow(QMainWindow):
         cut = self.session.cut
         if cut is None:
             return
+        old = cut.work_range
         if which == "in":
             cut.in_frame = self.frame
             if cut.out_frame > 0 and cut.out_frame <= self.frame:
@@ -2471,7 +2596,20 @@ class MainWindow(QMainWindow):
         self.session.dirty = True
         self.timeline.update()
         self.inspector.refresh("output")
-        self.toast(f"작업 구간 {cut.work_range[0]}~{cut.work_range[1] - 1}  (분석 전에 정하면 분석 시간이 줄어듭니다)")
+        msg = f"작업 구간 {cut.work_range[0]}~{cut.work_range[1] - 1}  (분석 전에 정하면 분석 시간이 줄어듭니다)"
+        tr = self.session.tracker
+        if cut.analyzed and tr is not None and tr.store is not None:
+            from ..track import matte_refresh as MR
+            try:
+                to_matte, unseen = MR.extension(tr, old, cut.work_range)
+            except Exception:
+                to_matte, unseen = [], []
+            self.refresher.mark_ranges(cut, to_matte)
+            if unseen:
+                n = sum(b - a for a, b in unseen)
+                msg = (f"작업 구간 {cut.work_range[0]}~{cut.work_range[1] - 1}: 늘어난 {n}프레임에는 추적된 인물이 "
+                       "없습니다. 이 구간을 분석하지 않았다면 '분석 시작'으로 다시 분석하세요")
+        self.toast(msg)
 
     def next_issue(self, d: int):
         s = self.session
@@ -3004,12 +3142,16 @@ class MainWindow(QMainWindow):
             if a == b:
                 return
             tr = s.tracker
+            cut = s.cut
 
             def work(progress, cancelled):
+                from ..track import matte_refresh as MR
+                before = MR.prompt_state(tr)
                 tr.merge_persons(a, b)
-                return True
+                return MR.changed(tr, before)
 
-            def done(_):
+            def done(marks):
+                self.refresher.mark_ranges(cut, marks)
                 self.sel_pid = a
                 self.undo_stack.clear()
                 self.redo_stack.clear()
@@ -3033,16 +3175,21 @@ class MainWindow(QMainWindow):
         if mode == "swap" and other is None:
             return
         tr = s.tracker
+        cut = s.cut
         result = {}
 
         def work(progress, cancelled):
+            from ..track import matte_refresh as MR
+            before = MR.prompt_state(tr)
             if mode == "swap":
                 tr.swap_persons(pid, other, t0, t1)
             else:
                 result["new"] = tr.split_person(pid, t0, t1)
-            return True
+            # the owners move with the ids, nobody moves: usually nothing to matte again
+            return MR.changed(tr, before, (t0, t1))
 
-        def done(_):
+        def done(marks):
+            self.refresher.mark_ranges(cut, marks)
             # tracking data is not in the undo history: older snapshots would no longer match the people
             self.undo_stack.clear()
             self.redo_stack.clear()
@@ -3307,7 +3454,7 @@ class MainWindow(QMainWindow):
         elif attr in ("face", "second_pass", "point_tracker", "detail", "flip_tta", "reid", "members", "video_track"):
             self.toast("다음 분석부터 적용됩니다.")
         elif attr == "seg":
-            self.toast("다음 분석부터 적용됩니다. 지금 컷에 바로 쓰려면 '인물 매트만 다시 만들기'를 누르세요."
+            self.toast("다음 분석부터 적용됩니다. 지금 컷에 바로 쓰려면 고급 > '인물 매트 강제 갱신'을 누르세요."
                        if v == "sam2" else "다음 분석부터 RVM 매트를 씁니다.")
         self.inspector.refresh("track")
 
@@ -3499,6 +3646,16 @@ class MainWindow(QMainWindow):
         self.viewer.update()
 
     def _edit_done(self, tag, res):
+        kind = tag[0] if isinstance(tag, tuple) and tag else None
+        if kind in ("resolve", "resolve_h") and isinstance(res, dict) and res.get("marks"):
+            prj = self.session.project
+            cut = prj.cut(res["cut"]) if prj is not None and res.get("cut") else None
+            if cut is not None:
+                self.refresher.mark_ranges(cut, res["marks"])
+        elif kind == "matte":
+            self.refresher.committed(res)
+            if res:
+                self.viewer._img_cache.clear()
         self.session.touch()
         self.viewer.update()
         self.timeline.update()
@@ -3618,14 +3775,74 @@ class MainWindow(QMainWindow):
         errs = [q for q in cut.qc if q.severity == "error" and q.status == "open"]
         if errs and QMessageBox.question(self, "QC 오류", f"QC 오류 {len(errs)}개가 남아 있습니다. 그래도 렌더 목록에 추가할까요?") != QMessageBox.Yes:
             return
-        self.save()
-        self.queue_page.add(s.project, cut)
-        self.toast("렌더 목록에 추가했습니다. 렌더 화면에서 시작하세요.", kind="ok")
+        from .matte_refresh import pending
 
-    def before_render(self, item) -> bool:
+        def add(matte=""):
+            self.save()
+            it = self.queue_page.add(s.project, cut)
+            if matte:
+                it.matte = matte
+                self.queue_page.save()
+            self.toast("렌더 목록에 추가했습니다. 렌더 화면에서 시작하세요.", kind="ok")
+        if pending(cut) and s.tracker is not None and s.tracker.has_seg():
+            # the render reads the saved matte: edits whose frames are not matted again yet would not be in it
+            ch = self._ask_matte([cut.name], adding=True)
+            if ch == "cancel":
+                return
+            if ch == "old":
+                add("old")
+                return
+
+            def then(ok, why):
+                if ok:
+                    add()
+                elif QMessageBox.question(self, "인물 매트 갱신 실패",
+                                          f"인물 매트를 갱신하지 못했습니다: {why or '알 수 없는 이유'}\n"
+                                          "이전 매트로 렌더 목록에 추가할까요?") == QMessageBox.Yes:
+                    add("old")
+            self.refresh_mattes_now([cut.id], then)
+            return
+        add()
+
+    def before_render(self, item) -> Optional[bool]:
         """The render reads the project from disk: False when the open project could not be saved (the render would
-        use an older state than the one on screen)."""
-        if self.session.project is not None and self.session.project.path == item.project_path:
+        use an older state than the one on screen). None: not yet, the person matte of an edited cut is made
+        again first (the queue is started again after it), or the user stopped the queue."""
+        from .matte_refresh import pending
+        prj = self.session.project
+        mine = prj is not None and prj.path == item.project_path
+        if getattr(item, "matte", "") != "old":
+            src = prj if mine else None
+            if src is None:
+                try:
+                    src = Project.load(item.project_path)
+                except Exception:
+                    src = None
+            if src is not None:
+                if getattr(item, "kind", "cut") == "timeline":
+                    cuts = [c for c in src.cuts if pending(c)]
+                else:
+                    c = src.cut(item.cut_id)
+                    cuts = [c] if c is not None and pending(c) else []
+                if cuts:
+                    ch = self._ask_matte([c.name for c in cuts], adding=False)
+                    if ch == "cancel":
+                        self.toast("렌더를 멈췄습니다. 렌더 목록의 항목은 그대로 대기합니다.")
+                        return None
+                    if ch == "old":
+                        item.matte = "old"
+                    else:
+                        def then(ok, why):
+                            if not ok:
+                                if QMessageBox.question(self, "인물 매트 갱신 실패",
+                                                        f"인물 매트를 갱신하지 못했습니다: {why or '알 수 없는 이유'}\n"
+                                                        "이전 매트로 렌더할까요?") != QMessageBox.Yes:
+                                    return
+                                item.matte = "old"
+                            self.queue_page.start_queue()
+                        self.refresh_mattes_now([c.id for c in cuts], then, project=src)
+                        return None
+        if mine:
             return self.save()
         return True
 
@@ -3926,6 +4143,8 @@ class MainWindow(QMainWindow):
                 e.ignore()
                 return
             self.batch.kill()
+        self.refresher.enabled = False           # a running matte refresh is dropped: its marks are saved with the cut
+        self.refresher.cancel()
         if self.job is not None:
             self.job.cancel()
             self.job.wait(5000)
