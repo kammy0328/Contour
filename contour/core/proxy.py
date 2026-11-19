@@ -279,6 +279,40 @@ class MatteStore:
         except OSError:
             pass
 
+    # ---- rebuilt beside the one in use, swapped in only when complete (clothing masks, 1.22.1)
+    @property
+    def tmp_path(self) -> Path:
+        return self.path.with_name(self.path.name + ".tmp")
+
+    def open_tmp(self) -> np.memmap:
+        """A writable copy of the store (empty when there is none) next to it; the store in use is not touched."""
+        import shutil
+        ensure_space(self.tmp_path, self.n * self.h * self.w, "옷 영역")
+        if self.exists():
+            shutil.copyfile(self.path, self.tmp_path)
+            return np.memmap(self.tmp_path, dtype=np.uint8, mode="r+", shape=(self.n, self.h, self.w))
+        return np.memmap(self.tmp_path, dtype=np.uint8, mode="w+", shape=(self.n, self.h, self.w))
+
+    def commit_tmp(self) -> None:
+        """The finished copy replaces the store in use (retried while a reader on Windows still has it mapped)."""
+        import os
+        import time as _t
+        for i in range(60):
+            self._mm = None
+            try:
+                os.replace(self.tmp_path, self.path)
+                return
+            except PermissionError:
+                if i == 59:
+                    raise
+                _t.sleep(0.05)
+
+    def drop_tmp(self) -> None:
+        try:
+            self.tmp_path.unlink()
+        except OSError:
+            pass
+
 
 def link_shared(cut_cache_dir: Path, bake_proxy: "Proxy", offset: int) -> None:
     """Points a timeline shot at the bake's proxy (frames offset .. offset + shot length)."""

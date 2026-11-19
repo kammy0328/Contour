@@ -318,3 +318,15 @@ def test_auto_mode_wants_proxy_after_scrubbing(project):
     settings().proxy_mode = "off"
     assert not FR.wants_proxy(fr, 24.0)
     fr.close()
+
+
+def test_switching_unanalysed_cuts_never_asks_for_the_proxy_size(win, qapp, monkeypatch):
+    """An old settings file with ask_proxy on: opening unanalysed cuts one after another shows no dialog."""
+    from contour.core.settings import settings
+    from contour.ui import dialogs as D
+    settings().ask_proxy = True
+    monkeypatch.setattr(D.ProxySizeDialog, "exec", lambda self: (_ for _ in ()).throw(AssertionError("asked")))
+    for c in list(win.session.project.cuts)[:3] * 2:
+        win.open_cut(c.id)
+        _pump(qapp, 0.05)
+    assert not win.errors

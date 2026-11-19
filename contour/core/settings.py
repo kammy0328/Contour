@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 APP_NAME = "DIAP"
-APP_VERSION = "1.22.0"
+APP_VERSION = "1.22.1"
 
 
 def default_data_dir() -> Path:
@@ -57,7 +57,7 @@ class AppSettings:
     proxy_mode: str = "auto"              # auto: a proxy in the background when the original is slow / always / off
     frame_cache_mb: int = 1536            # memory for frames decoded from originals (all cuts together)
     hover_pick: bool = True               # edit tool: highlight the person under the mouse
-    ask_proxy: bool = True                # ask for the proxy resolution when footage comes in
+    ask_proxy: bool = True                # unused since 1.22.1 (the question is gone; kept so old settings load)
     autosave: bool = True
     autosave_minutes: int = 5
     autosave_keep: int = 10

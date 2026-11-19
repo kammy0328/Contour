@@ -201,6 +201,7 @@ class TimelineStrip(QWidget):
     menuRequested = Signal(list, QPoint)
     versionPicked = Signal(str, int)     # cut id, version
     stateRequested = Signal(list, QPoint)    # cut ids, global position: a status label was clicked
+    thumbsWanted = Signal(list, list)        # cut ids on screen (and just past it), every listed cut id
 
     def __init__(self, session, parent=None):
         super().__init__(parent)
@@ -277,6 +278,8 @@ class TimelineStrip(QWidget):
         self.list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._menu)
         lay.addWidget(self.list)
+        from .thumbs import VisibleWatch
+        self._watch = VisibleWatch(self.list, lambda on, every: self.thumbsWanted.emit(on, every))
         self._items: Dict[str, QListWidgetItem] = {}
 
     # ------------------------------------------------------------------ data
@@ -285,7 +288,8 @@ class TimelineStrip(QWidget):
         return prj.timeline_cuts() if prj else []
 
     def refresh(self):
-        from ..core.tlimport import load_thumb
+        # 1.22.1: no thumbnail is read here (it read every JPG again on the UI thread, after the cut list had):
+        # both views paint from one shared cache filled in the background (ui/thumbs.py)
         prj = self.s.project
         cuts = self.cuts()
         self.setVisible(bool(cuts))
@@ -296,16 +300,13 @@ class TimelineStrip(QWidget):
         if self.hide_skip.isChecked():
             cuts = [c for c in cuts if WS.state(c) != "skip" or c.id == self.current_id]
         for c in cuts:
-            if c.id not in self.thumbs:
-                rgb = load_thumb(prj, c.id)
-                if rgb is not None:
-                    self.thumbs[c.id] = np_to_qimage(np.ascontiguousarray(rgb)).copy()
             it = QListWidgetItem()
             it.setData(Qt.UserRole, c)
             it.setSizeHint(QSize(TW + 12, TH + 40))
             self.list.addItem(it)
             self._items[c.id] = it
         self.update_counts()
+        self._watch.poke()
 
     def update_counts(self):
         cuts = self.cuts()

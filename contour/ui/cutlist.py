@@ -276,6 +276,7 @@ class CutList(QWidget):
     addRequested = Signal()
     action = Signal(str, str)        # action, cut id
     menuRequested = Signal(list, QPoint)   # selected cut ids, global position
+    thumbsWanted = Signal(list, list)      # cut ids on screen (and just past it), every listed cut id
 
     def __init__(self, session, parent=None):
         super().__init__(parent)
@@ -331,6 +332,8 @@ class CutList(QWidget):
         self.list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._menu)
         lay.addWidget(self.list, 1)
+        from .thumbs import VisibleWatch
+        self._watch = VisibleWatch(self.list, lambda on, every: self.thumbsWanted.emit(on, every))
         self.empty = QLabel("영상 파일을 끌어다 놓거나\n+ 버튼으로 컷을 추가하세요.\n\nProRes, H.264, MXF, EXR·DPX 시퀀스")
         self.empty.setObjectName("Faint")
         self.empty.setAlignment(Qt.AlignCenter)
@@ -397,6 +400,7 @@ class CutList(QWidget):
         self._block = False
         if cur_it is not None:
             self.list.scrollToItem(cur_it, QAbstractItemView.PositionAtCenter)
+        self._watch.poke()                 # the thumbnails of the rows on screen first (shared with the timeline)
 
     def update_rows(self):
         self.list.viewport().update()

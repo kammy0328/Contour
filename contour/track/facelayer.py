@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Callable, Dict, Optional
 
 import cv2
+import time
+
 import numpy as np
 
 from . import faceparse as FP
@@ -161,6 +163,7 @@ def build(tracker, progress: Optional[Callable[[float, str], None]] = None,
     if not todo:
         return None
     parser = FP.make_parser()
+    t_start = time.time()
     K = FP.KEEP
     M = np.full((P, N, 2, 3), np.nan, np.float32)
     skin = np.zeros((P, N, K, K), np.float16)
@@ -315,20 +318,44 @@ def build(tracker, progress: Optional[Callable[[float, str], None]] = None,
     rel = rel_s
     out = path_for(tracker)
     out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(out, version=VERSION, pids=np.array(st.pids), M=M, skin=skin_s, neck=neck_s, tex=tex_s, rel=rel,
-                        col=col_s, have=have)
+    # which model really made these masks (a fallback shows as 'a+b'), when, how long: written with them, and the
+    # file swapped in only when complete (a cancelled or failed rebuild leaves the masks in use as they were)
+    prov = parser.provider() if hasattr(parser, "provider") else ""
+    tmp = out.with_name(out.stem + ".tmp.npz")
+    np.savez_compressed(tmp, version=VERSION, pids=np.array(st.pids), M=M, skin=skin_s, neck=neck_s, tex=tex_s, rel=rel,
+                        col=col_s, have=have, model=np.array(prov), made=np.array(time.time()),
+                        seconds=np.array(time.time() - t_start))
+    _swap_in(tmp, out, tracker)
     if progress:
         progress(1.0, "얼굴 영역 분석")
     return out
 
 
+def _swap_in(tmp: Path, out: Path, tracker=None) -> None:
+    """tmp replaces out at once (retried while a reader on Windows still has it open)."""
+    import os
+    if tracker is not None:
+        tracker._facelayer = None
+    for i in range(40):
+        try:
+            os.replace(tmp, out)
+            return
+        except PermissionError:
+            if i == 39:
+                raise
+            time.sleep(0.05)
+
+
 class FaceLayer:
     def __init__(self, path: Path):
-        d = np.load(path)
-        self.pids = [int(x) for x in d["pids"]]
-        self.M, self.skin, self.neck = d["M"], d["skin"], d["neck"]
-        self.rel, self.col, self.have = d["rel"], d["col"], d["have"]
-        self.tex = d["tex"] if "tex" in d.files else None
+        with np.load(path) as d:          # read and closed (an open file could not be replaced on Windows)
+            self.pids = [int(x) for x in d["pids"]]
+            self.M, self.skin, self.neck = d["M"], d["skin"], d["neck"]
+            self.rel, self.col, self.have = d["rel"], d["col"], d["have"]
+            self.tex = d["tex"] if "tex" in d.files else None
+            self.model = str(d["model"]) if "model" in d.files else ""
+            self.made = float(d["made"]) if "made" in d.files else None
+            self.seconds = float(d["seconds"]) if "seconds" in d.files else None
 
     def index(self, pid: int) -> Optional[int]:
         return self.pids.index(pid) if pid in self.pids else None
@@ -371,3 +398,35 @@ def load(tracker) -> Optional[FaceLayer]:
     tracker._facelayer = fl
     tracker._facelayer_mt = mt
     return fl
+
+
+def wanted_face_providers() -> set:
+    """The model families that make face masks with the present settings."""
+    from . import unified as U
+    fam = {"mp"} if FP.face_model() == "mp" else {"face_parse", "face_parse_own", "face_parse_diap"}
+    if U.active("face"):
+        fam.add("unified")
+    return fam
+
+
+def provider_state(model: str, wanted: set) -> str:
+    """'unknown' (made before it was recorded), 'fallback' (a model failed and another took over), 'current' (made
+    by what the settings ask for now) or 'other' (made by another model)."""
+    if not model:
+        return "unknown"
+    fams = {x.split("@")[0] for x in model.split("+")}
+    if len(fams) > 1:
+        return "fallback"
+    return "current" if fams <= wanted else "other"
+
+
+def info(tracker) -> dict:
+    """What the inspector shows about this cut's face and neck masks: model (provider key, '' = not recorded),
+    its words, state ('none' / 'unknown' / 'fallback' / 'current' / 'other'), seconds the last build took."""
+    f = path_for(tracker)
+    if not f.exists():
+        return dict(model="", label="없음", state="none", seconds=None)
+    fl = load(tracker)
+    model = getattr(fl, "model", "") if fl is not None else ""
+    return dict(model=model, label=FP.label(model), state=provider_state(model, wanted_face_providers()),
+                seconds=getattr(fl, "seconds", None) if fl is not None else None)
