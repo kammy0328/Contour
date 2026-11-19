@@ -177,4 +177,4 @@ def test_defaults_are_the_commercially_usable_models(monkeypatch):
     monkeypatch.delenv("DIAP_CLOTH_MODEL", raising=False)
     assert FP.face_model() == "mp" and CL.cloth_model() == "sam31"
     monkeypatch.setattr(CL, "GARMENT_FILE", CL.GARMENT_FILE.with_name("missing.npz"))
-    assert CL.cloth_model() == "parse_clothes"
+    assert CL.cloth_model() == "sam31"            # a missing file never switches to parse_clothes by itself

@@ -87,6 +87,7 @@ class ReshapeTab(_Tab):
         self.skin_detail = self.grain_size = self.blemish_size = self.skin_scope = None
         self.sculpt_btn = self.sculpt_clear = self.body_btn = self.body_clear = None
         self.face_note = self.parts_btn = self.parts_info = self.cloth_keep = None
+        self.face_mask_info = self.cloth_mask_info = None
         self.level = None
         self.switches: Dict[str, Wd.Segmented] = {}
         self.wrows: Dict[str, Wd.ParamRow] = {}
@@ -287,7 +288,62 @@ class ReshapeTab(_Tab):
         self.cloth_info = Wd.label("", "Faint", 11)
         self.cloth_info.setWordWrap(True)
         v.addWidget(self.cloth_info)
+        row, self.cloth_mask_info, b = self._mask_row("의상 마스크 다시 계산",
+                                                     "이 컷의 옷 영역만 지금 설정의 모델로 다시 찾습니다.\n"
+                                                     "관절 추적·인물·보정값·키프레임과 얼굴·목 마스크는 그대로입니다.")
+        b.clicked.connect(lambda: self.ctl.recompute_cloth_masks())
+        v.addWidget(row)
         return w
+
+    def _mask_row(self, text: str, tip: str):
+        """One line: which model made this mask now, its state, the last run's time; and a button to make it again."""
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 2, 0, 2)
+        h.setSpacing(6)
+        info = Wd.label("", "Faint", 11)
+        info.setWordWrap(True)
+        b = Wd.button(text, "", "refresh-cw")
+        b.setToolTip(tip)
+        h.addWidget(info, 1)
+        h.addWidget(b)
+        return w, info, b
+
+    @staticmethod
+    def mask_text(kind: str, inf: dict) -> str:
+        st = inf.get("state")
+        if st == "none":
+            return f"{kind}: 아직 없음"
+        words = {"unknown": "생성 모델 미확인", "fallback": "대체 모델 포함", "current": "현재 설정과 같음",
+                 "other": "다른 모델로 만듦"}.get(st, "")
+        t = f"{kind}: {inf.get('label', '')}"
+        if st != "unknown":
+            t += f" · {words}"
+        sec = inf.get("seconds")
+        if sec:
+            t += f" · {sec:.0f}초" if sec >= 10 else f" · {sec:.1f}초"
+        return t
+
+    def _fill_masks(self, s):
+        """The mask lines (face and neck in the skin group, clothing in the body group)."""
+        tr = s.tracker if s is not None else None
+        ok = tr is not None and tr.store is not None
+        for lab, kind, fn in ((self.face_mask_info, "얼굴·목 마스크", "face"), (self.cloth_mask_info, "의상 마스크", "cloth")):
+            if lab is None:
+                continue
+            if not ok:
+                lab.setText("")
+                continue
+            try:
+                if fn == "face":
+                    from ..track import facelayer as FL
+                    inf = FL.info(tr)
+                else:
+                    from ..track import clothing as CL
+                    inf = CL.info(tr)
+                lab.setText(self.mask_text(kind, inf))
+            except Exception:
+                lab.setText("")
 
     def _cloth_toggled(self, on: bool):
         if not on:
@@ -456,6 +512,11 @@ class ReshapeTab(_Tab):
         v.addWidget(Wd.label("보정 부위", "", 12))
         v.addWidget(self.skin_scope)
         v.addWidget(Wd.label("K: 피부·색 보정 영역 보기 (변형 결과를 따라 움직입니다)", "Faint", 11))
+        row, self.face_mask_info, b = self._mask_row("얼굴·목 마스크 다시 계산",
+                                                    "이 컷의 얼굴·목 영역만 지금 설정의 모델로 다시 찾습니다.\n"
+                                                    "관절 추적·인물·보정값·키프레임과 의상 마스크는 그대로입니다.")
+        b.clicked.connect(lambda: self.ctl.recompute_face_masks())
+        v.addWidget(row)
         return w
 
     def _grain_gate(self, grain: float):
@@ -560,6 +621,8 @@ class ReshapeTab(_Tab):
                 self._set_scope(pp.skin_scope)
             if self.cloth_keep is not None:
                 self._fill_cloth(pp, person, s)
+        self._fill_masks(s)
+        if pp is not None:
             if self.parts_btn is not None:
                 head_on = any(pp._active(k) for k in ("head", "crown", "hair_volume"))
                 pinfo = ""

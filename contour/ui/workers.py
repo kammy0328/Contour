@@ -320,56 +320,91 @@ class CacheWorker(QThread):
 
 class ProxyBuilder(QObject):
     """A proxy made in the background (1.18: never needed to open, analyse or render a cut; it only makes reading
-    the cut's frames faster). One at a time; cancelled when another cut's starts, the project closes or the app
-    quits. finished(cut_id, ok, message)."""
-    finished = Signal(str, bool, str)
+    the cut's frames faster). One at a time, so no two ever write the same cache file.
+
+    start() never waits (1.22.1: switching cuts waited up to 5 s for the previous cut's proxy to stop): it asks the
+    running one to stop and keeps only the latest request, which starts as soon as the running one has ended. A proxy
+    stopped this way is not marked as tried, so it is made later when that cut is opened again.
+    finished(project path, cut_id, ok, message): the receiver checks both against what is open now."""
+    finished = Signal(str, str, bool, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.cut_id: Optional[str] = None
         self._stop = threading.Event()
         self._t: Optional[threading.Thread] = None
-        self.tried: set = set()            # (project path, cut id, view): not again after it finished or failed
+        self._lock = threading.Lock()
+        self._pending = None              # (project, cut, vs, key): the latest request while one runs
+        self.tried: set = set()           # (project path, cut id, view): not again after it finished or failed
+        self.started: list = []           # keys in the order their work began (tests, diagnosis)
 
     @property
     def busy(self) -> bool:
         return self._t is not None and self._t.is_alive()
 
+    def build(self, project, cut, vs, stop) -> bool:
+        """The work itself (replaced in tests)."""
+        from ..core.colour import manager
+        from ..core.frames import proxy_for
+        from ..core.tlimport import build_bake_proxy, shares_bake
+        if shares_bake(project, cut):
+            return bool(build_bake_proxy(project, manager(), vs, None, stop.is_set))
+        return bool(proxy_for(project, cut).build(manager(), vs, None, stop.is_set))
+
     def start(self, project, cut, vs) -> bool:
         key = (str(project.path), cut.id, vs.key())
-        if key in self.tried or (self.busy and self.cut_id == cut.id):
-            return False
-        self.cancel()
+        with self._lock:
+            if key in self.tried:
+                return False
+            if self.busy:
+                if self.cut_id == cut.id and self._key == key and not self._stop.is_set():
+                    return False
+                self._stop.set()                        # never joined here: the UI goes on at once
+                self._pending = (project, cut, vs, key)
+                return True
+            self._launch(project, cut, vs, key)
+            return True
+
+    def _launch(self, project, cut, vs, key):
+        """With the lock held."""
         self.tried.add(key)
         self.cut_id = cut.id
+        self._key = key
+        self._pending = None
         stop = threading.Event()
         self._stop = stop
+        self.started.append(key)
 
         def run():
             ok, msg = False, ""
             try:
-                from ..core.colour import manager
-                from ..core.frames import proxy_for
-                from ..core.tlimport import build_bake_proxy, shares_bake
-                if shares_bake(project, cut):
-                    ok = bool(build_bake_proxy(project, manager(), vs, None, stop.is_set))
-                else:
-                    ok = bool(proxy_for(project, cut).build(manager(), vs, None, stop.is_set))
+                ok = self.build(project, cut, vs, stop)
             except Exception as e:
                 msg = str(e)
                 traceback.print_exc()
-            if not stop.is_set():
-                self.finished.emit(cut.id, ok, msg)
+            stopped = stop.is_set()
+            if stopped and not ok:
+                with self._lock:
+                    self.tried.discard(key)             # stopped by a cut switch: may be made another time
+            if not stopped:
+                self.finished.emit(key[0], cut.id, ok, msg)
+            with self._lock:
+                if self._t is threading.current_thread():
+                    self._t = None
+                    self.cut_id = None
+                    nxt = self._pending
+                    if nxt is not None:
+                        self._launch(*nxt)
 
         t = threading.Thread(target=run, name="diap-proxy", daemon=True)
         self._t = t
         t.start()
-        return True
 
-    def cancel(self, wait: float = 5.0) -> None:
-        self._stop.set()
-        t = self._t
-        if t is not None and t.is_alive() and t is not threading.current_thread():
+    def cancel(self, wait: float = 0.0) -> None:
+        """Stops the running proxy and drops the waiting request (project closed). wait > 0 only when the app quits."""
+        with self._lock:
+            self._pending = None
+            self._stop.set()
+            t = self._t
+        if wait > 0 and t is not None and t.is_alive() and t is not threading.current_thread():
             t.join(wait)
-        self._t = None
-        self.cut_id = None

@@ -122,9 +122,6 @@ class SettingsDialog(QDialog):
         self.proxy_mode.setCurrentIndex(max(0, self.proxy_mode.findData(getattr(s, "proxy_mode", "auto"))))
         self.proxy_mode.setToolTip("컷은 원본으로 바로 열립니다. 프록시는 반복해서 읽을 때 빠르게 하려고 백그라운드에서만 만듭니다.")
         form.addRow("프록시 만들기", self.proxy_mode)
-        self.ask_proxy = QCheckBox("영상을 불러올 때마다 프록시 해상도 묻기")
-        self.ask_proxy.setChecked(bool(getattr(s, "ask_proxy", True)))
-        form.addRow("", self.ask_proxy)
         # auto save
         self.autosave = QCheckBox("자동 저장")
         self.autosave.setChecked(bool(getattr(s, "autosave", True)))
@@ -271,7 +268,6 @@ class SettingsDialog(QDialog):
         s.view = self.view.currentText()
         s.proxy_long_side = int(self.proxy.currentData())
         s.proxy_mode = str(self.proxy_mode.currentData())
-        s.ask_proxy = self.ask_proxy.isChecked()
         s.autosave = self.autosave.isChecked()
         s.autosave_minutes = int(self.as_min.value())
         s.autosave_keep = int(self.as_keep.value())

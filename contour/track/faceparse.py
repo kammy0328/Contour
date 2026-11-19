@@ -71,6 +71,42 @@ def ready() -> bool:
     return U.active("face") or M.is_downloaded(MODEL_KEY)
 
 
+def file_fp(path) -> str:
+    """Short fingerprint of a model file (size and the SHA-256 of its first and last MB): which file made a mask."""
+    import hashlib
+    try:
+        p = Path(path)
+        stt = p.stat()
+        n = stt.st_size
+        ck = (str(p), n, stt.st_mtime)
+        if ck in _FP_CACHE:
+            return _FP_CACHE[ck]
+        h = hashlib.sha256(str(n).encode())
+        with open(p, "rb") as f:
+            h.update(f.read(1 << 20))
+            if n > (1 << 20):
+                f.seek(max(0, n - (1 << 20)))
+                h.update(f.read(1 << 20))
+        _FP_CACHE[ck] = h.hexdigest()[:8]
+        return _FP_CACHE[ck]
+    except OSError:
+        return ""
+
+
+_FP_CACHE: dict = {}
+
+
+def label(provider: str) -> str:
+    """A provider key in words, for the inspector."""
+    if not provider:
+        return "생성 모델 미확인"
+    names = {"mp": "MediaPipe", "face_parse": "SegFormer 얼굴(비상업)", "face_parse_own": "자체 얼굴 분할(비상업 교사)",
+             "face_parse_diap": "추가 학습 얼굴 분할(비상업)", "unified": "DIAP 통합 모델",
+             "sam31": "SAM 3.1 옷 단어", "parse_clothes": "SegFormer 옷(비상업)"}
+    parts = [names.get(x.split("@")[0], x.split("@")[0]) for x in provider.split("+")]
+    return " + ".join(parts) + (" (대체 포함)" if "+" in provider else "")
+
+
 def make_parser():
     """The face parser in use (face_model())."""
     return MPFaceParser() if face_model() == "mp" else FaceParser()
@@ -83,6 +119,7 @@ class FaceParser:
         self.tuned = False
         self.own = False
         self.s = None
+        self.used: set = set()            # the models that actually made masks with this parser
         if U.active("face"):
             # DIAP's combined model taught by this parser's classes: face_parse is neither downloaded nor loaded
             rt = U.runtime()
@@ -119,6 +156,8 @@ class FaceParser:
         if self.s is None:
             self.s = M.session(base)
         self.inp = self.s.get_inputs()[0].name
+        self._own_key = ("face_parse_own@" + file_fp(own)) if self.own else \
+            ("face_parse_diap@" + file_fp(tuned)) if self.tuned else ("face_parse@" + file_fp(base))
 
     @staticmethod
     def crop_affine(lm: np.ndarray) -> Optional[np.ndarray]:
@@ -152,6 +191,10 @@ class FaceParser:
         M[:, 2] = np.array([SIZE / 2, SIZE / 2]) - M[:, :2] @ c
         return M
 
+    def provider(self) -> str:
+        """The models that made this parser's masks so far ('+' when one fell back to another)."""
+        return "+".join(sorted(self.used))
+
     def parse(self, rgb_u8: np.ndarray, lm: np.ndarray) -> Optional[Dict[str, np.ndarray]]:
         """lm in the same px as rgb_u8. Returns dict(M=affine img->crop(SIZE), skin, neck, hair, cloth, feat)
         with class maps float16 KEEP x KEEP in crop space."""
@@ -173,6 +216,10 @@ class FaceParser:
                 self._load_own()
         if lo is None:
             lo = self.s.run(None, {self.inp: x})[0][0]                 # (19, 128, 128) logits, 1/4 size
+            self.used.add(self._own_key)
+        else:
+            from . import unified as U
+            self.used.add("unified@" + file_fp(U.path()))
         lo = lo - lo.max(0, keepdims=True)
         e = np.exp(lo)
         pr = e / e.sum(0, keepdims=True)
@@ -297,12 +344,18 @@ class MPFaceParser:
                 self.unified = rt           # DIAP's combined model, taught by this one
         self.s = M.session(MP_FILE)
         self.inp = self.s.get_inputs()[0].name
+        self.used: set = set()
+
+    def provider(self) -> str:
+        return "+".join(sorted(self.used))
 
     def probs(self, crop512: np.ndarray) -> np.ndarray:
         """(6, MP_SIZE, MP_SIZE) class probabilities of a 512 px face crop."""
         if self.unified is not None:
             try:
                 lo = self.unified.face_logits(crop512)
+                from . import unified as U
+                self.used.add("unified@" + file_fp(U.path()))
                 lo = np.stack([cv2.resize(c, (MP_SIZE, MP_SIZE), interpolation=cv2.INTER_LINEAR) for c in lo])
                 lo = lo - lo.max(0, keepdims=True)
                 e = np.exp(lo)
@@ -313,6 +366,7 @@ class MPFaceParser:
                 self.unified = None
         x = cv2.resize(crop512, (MP_SIZE, MP_SIZE), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
         lo = self.s.run(None, {self.inp: x[None]})[0][0].transpose(2, 0, 1)
+        self.used.add("mp@" + file_fp(MP_FILE))
         lo = lo - lo.max(0, keepdims=True)
         e = np.exp(lo)
         return e / e.sum(0, keepdims=True)

@@ -7,6 +7,7 @@ labels, so overlapping people never lend each other their clothes."""
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
@@ -86,10 +87,9 @@ def cloth_model() -> str:
             v = getattr(settings(), "cloth_model", "") or ""
         except Exception:
             v = ""
-    v = v if v in ("sam31", "parse_clothes") else DEFAULT_MODEL
-    if v == "sam31" and not GARMENT_FILE.is_file():
-        v = "parse_clothes"
-    return v
+    # a missing garment-word file never brings parse_clothes in by itself: run() says so and leaves the clothing
+    # undecided
+    return v if v in ("sam31", "parse_clothes") else DEFAULT_MODEL
 
 
 class GarmentFinder:
@@ -109,20 +109,38 @@ class GarmentFinder:
                 self.phr.append((cls, d[f"{k}__text"].astype(np.float32), d[f"{k}__text_pad"].astype(bool),
                                  ph == CATCH_ALL[0]))
 
-    def classes(self, rgb: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
-        """rgb uint8 (H, W, 3) -> (h, w) uint8 class map at size (w, h)."""
+    stats: dict = None
+
+    def classes(self, rgb: np.ndarray, size: Tuple[int, int], only: Optional[set] = None,
+                catch_all: str = "always") -> np.ndarray:
+        """rgb uint8 (H, W, 3) -> (h, w) uint8 class map at size (w, h).
+        only: search just the phrases of these classes (an experiment for 'keep the skirt' style modes);
+        catch_all: 'always', 'when_empty' (only when no garment word found anything) or 'never'."""
+        if self.stats is None:
+            self.stats = dict(frames=0, encode_s=0.0, find_s=0.0, find_calls=0)
         w, h = size
+        t0 = time.time()
         enc = self.seg.encode(rgb)
+        self.stats["encode_s"] += time.time() - t0
+        self.stats["frames"] += 1
         best = np.full((h, w), 0.0, np.float32)
         out = np.zeros((h, w), np.uint8)
         base = dict(self.finder.const)
         try:
-            for cls, text, pad, catch_all in self.phr:
+            for cls, text, pad, is_catch in self.phr:
+                if only is not None and cls not in only and not is_catch:
+                    continue
+                if is_catch and (catch_all == "never" or (catch_all == "when_empty" and out.any())):
+                    continue
                 self.finder.const = dict(base, text=text, text_pad=pad)
-                for d in self.finder.find(enc, GARMENT_SCORE):
+                t1 = time.time()
+                found = self.finder.find(enc, GARMENT_SCORE)
+                self.stats["find_s"] += time.time() - t1
+                self.stats["find_calls"] += 1
+                for d in found:
                     lg = cv2.resize(d["lg"], (w, h), interpolation=cv2.INTER_LINEAR)
                     sc = np.where(lg > 0, d["score"] * (1.0 / (1.0 + np.exp(-lg))), 0.0).astype(np.float32)
-                    win = (sc > 0) & (out == 0) if catch_all else sc > best
+                    win = (sc > 0) & (out == 0) if is_catch else sc > best
                     out[win] = cls
                     best[win] = sc[win]
         finally:
@@ -130,21 +148,37 @@ class GarmentFinder:
         return out
 
 
+class UnifiedFailed(RuntimeError):
+    """The combined model could not make the clothing masks (the run goes on with SAM 3.1's garment words)."""
+
+
 class Parser:
     SIZE = 512
 
-    def __init__(self, key: str = "parse_clothes"):
+    def __init__(self, key: str = "parse_clothes", unified_only: bool = False):
+        """unified_only: the combined model or nothing (UnifiedFailed): with SAM 3.1 garments as the setting, a
+        failing combined model must never bring parse_clothes (non-commercial) in."""
         from . import unified as U
         self.key = key
+        self.unified_only = unified_only
+        self.used: set = set()
         self.unified = U.runtime() if (key == "parse_clothes" and U.active("cloth")) else None
         self.sess = None
         if self.unified is None:
+            if unified_only:
+                raise UnifiedFailed("통합 모델을 불러오지 못했습니다")
             self._load_own()
 
     def _load_own(self):
         from . import models as M
-        self.sess = M.session(M.ensure_model(self.key))
+        p = M.ensure_model(self.key)
+        self.sess = M.session(p)
         self.inp = self.sess.get_inputs()[0].name
+        from .faceparse import file_fp
+        self._own_key = f"{self.key}@{file_fp(p)}"
+
+    def provider(self) -> str:
+        return "+".join(sorted(self.used))
 
     def __call__(self, crop: np.ndarray) -> np.ndarray:
         """RGB uint8 crop -> class map (h, w) uint8."""
@@ -154,14 +188,20 @@ class Parser:
         if self.unified is not None:
             try:
                 lg = self.unified.cloth_logits(c512)
+                from . import unified as U
+                from .faceparse import file_fp
+                self.used.add("unified@" + file_fp(U.path()))
             except Exception as e:
                 from . import unified as U
                 U.fail("cloth", e)
                 self.unified = None
+                if self.unified_only:
+                    raise UnifiedFailed(str(e))
                 self._load_own()
         if lg is None:
             x = ((c512.astype(np.float32) / 255.0 - MEAN) / STD).transpose(2, 0, 1)[None].astype(np.float32)
             lg = self.sess.run(None, {self.inp: x})[0][0]             # (18, 128, 128)
+            self.used.add(self._own_key)
         up = np.stack([cv2.resize(c, (w, h), interpolation=cv2.INTER_LINEAR) for c in lg])
         return up.argmax(0).astype(np.uint8)
 
@@ -190,18 +230,31 @@ def _crop_box(st, p: int, t: int, sx: float, sy: float, W: int, H: int) -> Optio
 
 def run(tracker, persons: List[int], progress: Optional[Callable[[float, str], None]] = None,
         cancel: Optional[Callable[[], bool]] = None) -> bool:
-    """Parse the given people (store indices) on every frame of the work range into the clothing store."""
+    """Parse the given people (store indices) on every frame of the work range into the clothing store. The masks
+    are written to a copy and swapped in only when every frame is done (cancelled or failed: the masks in use stay,
+    and nothing is marked ready). Which model made them is recorded with them (info())."""
+    from . import unified as U
+    t0 = time.time()
+    if cloth_model() == "sam31":
+        if U.active("cloth"):
+            try:
+                return _run_parser(tracker, persons, progress, cancel, Parser(unified_only=True), t0)
+            except UnifiedFailed as e:
+                U.fail("cloth", e)          # SAM 3.1 garment words from the start, never parse_clothes
+                tracker.cloth.drop_tmp()
+        return _run_garments(tracker, persons, progress, cancel, t0)
+    return _run_parser(tracker, persons, progress, cancel, Parser(), t0)
+
+
+def _run_parser(tracker, persons, progress, cancel, parser, t0) -> bool:
     st = tracker.store
     proxy = tracker.proxy
     a, b = tracker.cut.work_range
-    from . import unified as U
-    if cloth_model() == "sam31" and not U.active("cloth"):
-        return _run_garments(tracker, persons, progress, cancel)
-    parser = Parser()
     mw, mh = tracker.matte.w, tracker.matte.h
     W, H = proxy.w, proxy.h
     kx, ky = mw / W, mh / H
-    mm = tracker.cloth.open_rw()
+    mm = tracker.cloth.open_tmp()
+    ok = False
     try:
         for t in range(a, b):
             if cancel and cancel():
@@ -229,22 +282,32 @@ def run(tracker, persons: List[int], progress: Optional[Callable[[float, str], N
             mm[t] = frame
             if progress:
                 progress((t - a + 1) / max(1, b - a), f"옷 영역 분석 {t - a + 1}/{b - a}")
+        ok = True
     finally:
         mm.flush()
         del mm
+        if ok:
+            tracker.cloth.commit_tmp()
+        else:
+            tracker.cloth.drop_tmp()
         tracker.cloth.close()
-    _write_state(tracker, persons)
+    _write_state(tracker, persons, parser.provider(), time.time() - t0)
     return True
 
 
-def _run_garments(tracker, persons: List[int], progress=None, cancel=None) -> bool:
+def _run_garments(tracker, persons: List[int], progress=None, cancel=None, t0=None) -> bool:
     """run() with SAM 3.1's garment phrases: one class map per frame, each person's own pixels taken from it."""
     st = tracker.store
     proxy = tracker.proxy
     a, b = tracker.cut.work_range
+    t0 = time.time() if t0 is None else t0
+    if not GARMENT_FILE.is_file():
+        # never parse_clothes in its place: the clothing stays undecided and the reason is said
+        raise RuntimeError(f"옷 단어 파일이 없어 옷 영역을 분석하지 못했습니다: {GARMENT_FILE.name} (앱을 다시 설치하세요)")
     gf = GarmentFinder()
     mw, mh = tracker.matte.w, tracker.matte.h
-    mm = tracker.cloth.open_rw()
+    mm = tracker.cloth.open_tmp()
+    ok = False
     try:
         for t in range(a, b):
             if cancel and cancel():
@@ -272,11 +335,17 @@ def _run_garments(tracker, persons: List[int], progress=None, cancel=None) -> bo
             mm[t] = frame
             if progress:
                 progress((t - a + 1) / max(1, b - a), f"옷 영역 분석 {t - a + 1}/{b - a}")
+        ok = True
     finally:
         mm.flush()
         del mm
+        if ok:
+            tracker.cloth.commit_tmp()
+        else:
+            tracker.cloth.drop_tmp()
         tracker.cloth.close()
-    _write_state(tracker, persons)
+    from .faceparse import file_fp
+    _write_state(tracker, persons, "sam31@" + file_fp(GARMENT_FILE), time.time() - t0, gf.stats)
     return True
 
 
@@ -284,16 +353,63 @@ def _state_path(tracker) -> Path:
     return Path(tracker.cloth.path).with_suffix(".json")
 
 
-def _write_state(tracker, persons: List[int]) -> None:
+def _write_state(tracker, persons: List[int], model: str = "", seconds: Optional[float] = None,
+                 stats: Optional[dict] = None) -> None:
     st = tracker.store
     try:
         old = json.loads(_state_path(tracker).read_text(encoding="utf-8"))
     except Exception:
         old = {}
+    same = old.get("analysis") == tracker.cut.analysis_version and old.get("model", "") == model
     pids = sorted(set(old.get("pids", [])) | {int(st.pids[p]) for p in persons}) \
-        if old.get("analysis") == tracker.cut.analysis_version else sorted(int(st.pids[p]) for p in persons)
-    _state_path(tracker).write_text(json.dumps(dict(analysis=tracker.cut.analysis_version,
-                                                    range=list(tracker.cut.work_range), pids=pids)), encoding="utf-8")
+        if same else sorted(int(st.pids[p]) for p in persons)
+    d = dict(analysis=tracker.cut.analysis_version, range=list(tracker.cut.work_range), pids=pids, model=model,
+             made=time.time(), seconds=None if seconds is None else round(float(seconds), 2))
+    if stats:
+        d["stats"] = stats
+    tmp = _state_path(tracker).with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(d), encoding="utf-8")
+    import os
+    os.replace(tmp, _state_path(tracker))
+
+
+def info(tracker) -> dict:
+    """What the inspector shows about this cut's clothing masks: model (provider key, '' = not recorded), its
+    words, state ('none' / 'unknown' / 'fallback' / 'current' / 'other'), seconds the last run took."""
+    from .facelayer import provider_state
+    from .faceparse import label
+    from . import unified as U
+    if not tracker.cloth.exists():
+        return dict(model="", label="없음", state="none", seconds=None)
+    s = _state(tracker)
+    model = s.get("model", "")
+    want = {cloth_model()} | ({"unified"} if U.active("cloth") else set())
+    return dict(model=model, label=label(model), state=provider_state(model, want), seconds=s.get("seconds"),
+                stats=s.get("stats"))
+
+
+def _state(tracker) -> dict:
+    f = _state_path(tracker)
+    try:
+        mt = f.stat().st_mtime
+    except OSError:
+        return {}
+    c = getattr(tracker, "_cloth_state", None)
+    if c is not None and c[0] == mt:
+        return c[1]
+    try:
+        d = json.loads(f.read_text(encoding="utf-8"))
+    except Exception:
+        d = {}
+    tracker._cloth_state = (mt, d)
+    return d
+
+
+def _ready_pid(tracker, p: int) -> bool:
+    s = _state(tracker)
+    st = tracker.store
+    return bool(s) and s.get("analysis") == tracker.cut.analysis_version \
+        and list(s.get("range", [])) == list(tracker.cut.work_range) and int(st.pids[p]) in s.get("pids", [])
 
 
 def ready_for(tracker, pid: int) -> bool:
@@ -313,6 +429,8 @@ def keep_mask(tracker, t: int, p: int, mode: str) -> Optional[np.ndarray]:
     keep = keep_set(mode)
     if not keep or not tracker.cloth.exists():
         return None
+    if not _ready_pid(tracker, p):
+        return None                       # never masks of a run that did not finish (or of another analysis)
     cm = tracker.cloth.get(t)
     lab = tracker.labels(t)
     if cm is None or lab is None:

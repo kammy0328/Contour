@@ -84,10 +84,14 @@ class EditSession:
             self._new_epoch()
             if cut is None or self.project is None:
                 return
+            t0 = time.perf_counter()
             px = self.make_frames(cut)
+            t1 = time.perf_counter()
             if px is not None:
                 self.proxy = px
                 self.tracker = CutTracker(self.project, cut, px)
+            # seconds, for the project-open timing: the frames source, the tracker (with tracks.npz)
+            self.open_times = {"frames": t1 - t0, "tracker": time.perf_counter() - t1}
 
     def adopt(self, other: "EditSession") -> None:
         """Takes over a cut another session opened and pre-rendered in the background (playback going on into the

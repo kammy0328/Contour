@@ -57,28 +57,13 @@ class _ActivityFilter(QObject):
         return False
 
 
-def _load_project(path: str, long_side: int, progress) -> tuple:
-    """The project and a thumbnail per cut (numpy RGB), read off the main thread."""
-    from ..core.proxy import Proxy
-    from ..core.tlimport import load_thumb
+def _load_project(path: str, long_side: int, progress):
+    """The project (project.json), read off the main thread. 1.22.1: nothing else. It used to check every cut's
+    proxy and read every thumbnail before returning, so a big project stayed locked until all were read; the
+    thumbnails now come in the background once the project is shown (ui/thumbs.py)."""
     prj = Project.load(path)
-    thumbs = {}
-    n = len(prj.cuts)
-    progress(0.0, f"프로젝트 읽음 · 컷 {n}개")
-    for i, c in enumerate(prj.cuts):
-        try:
-            px = Proxy(prj.proxy_dir(c), c.info, long_side)
-            if px.has_frames():
-                thumbs[c.id] = px.thumbnail(c.info.frames // 2, 192)
-                px.close()
-            elif c.tl:
-                th = load_thumb(prj, c.id)
-                if th is not None:
-                    thumbs[c.id] = th
-        except Exception:
-            pass
-        progress((i + 1) / max(1, n), f"컷 미리보기 {i + 1}/{n}")
-    return prj, thumbs
+    progress(1.0, f"프로젝트 읽음 · 컷 {len(prj.cuts)}개")
+    return prj
 
 
 class _JobGuard(QObject):
@@ -147,8 +132,10 @@ class _ProjectOpen(QThread):
 
     def run(self):
         try:
-            prj, thumbs = _load_project(self.path, self.long_side, lambda f, m: self.progressed.emit(f, m))
-            self.loaded.emit(prj, thumbs)
+            t0 = time.perf_counter()
+            prj = _load_project(self.path, self.long_side, lambda f, m: self.progressed.emit(f, m))
+            prj._open_times = {"load": time.perf_counter() - t0}
+            self.loaded.emit(prj, None)
         except Exception as e:
             self.failed.emit(f"{e}\n{traceback.format_exc()}")
 
@@ -171,11 +158,11 @@ def resolve_task(session, pid: int, t: int = 0, frame_end: Optional[int] = None,
 
 
 class MainWindow(QMainWindow):
-    thumbReady = Signal(str, object)          # cut id, thumbnail (made off the UI thread)
-
     def __init__(self):
         super().__init__()
-        self.thumbReady.connect(lambda cid, th: self.cutlist.set_thumb(cid, th))
+        from .thumbs import ThumbCache
+        # one thumbnail per cut for the cut list and the timeline strip, filled in the background (1.22.1)
+        self.thumbcache = ThumbCache(self)
         self.setWindowTitle(APP_NAME)
         self.session = EditSession()
         self.frame = 0
@@ -295,6 +282,12 @@ class MainWindow(QMainWindow):
         self.tlstrip.stateRequested.connect(self._state_menu)
         self.tlstrip.versionPicked.connect(self.switch_version)
         self.tlstrip.hide()
+        tc = self.thumbcache
+        tc.vs_for = self.session.view_settings
+        self.cutlist.thumbs = self.tlstrip.thumbs = tc.images      # one decoded picture per cut for both views
+        self.cutlist.thumbsWanted.connect(self._want_thumbs)
+        self.tlstrip.thumbsWanted.connect(self._want_thumbs)
+        tc.ready.connect(lambda _cid: (self.cutlist.update_rows(), self.tlstrip.list.viewport().update()))
         cv.addWidget(self.tlstrip)
         cv.addWidget(tl_wrap)
         self.tl_wrap = tl_wrap
@@ -631,11 +624,13 @@ class MainWindow(QMainWindow):
         self._offer_recovery(path)
         if wait:
             try:
-                prj, thumbs = _load_project(path, settings().proxy_long_side, lambda f, m: None)
+                t0 = time.perf_counter()
+                prj = _load_project(path, settings().proxy_long_side, lambda f, m: None)
+                prj._open_times = {"load": time.perf_counter() - t0}
             except Exception as e:
                 self.show_error("프로젝트를 열 수 없습니다", f"{e}\n{traceback.format_exc()}")
                 return
-            self._project_loaded(prj, thumbs)
+            self._project_loaded(prj)
             return
         self._set_loading(True)
         th = _ProjectOpen(self, path, settings().proxy_long_side)
@@ -659,16 +654,17 @@ class MainWindow(QMainWindow):
         self._set_loading(False)
         self.show_error("프로젝트를 열 수 없습니다", err)
 
-    def _project_opened(self, prj, thumbs):
+    def _project_opened(self, prj, _unused=None):
         self.busy.progress(1.0, "첫 컷 여는 중")
         QApplication.processEvents()
         try:
-            self._project_loaded(prj, thumbs)
+            self._project_loaded(prj)
         finally:
             self._opening = None
             self._set_loading(False, hide=self.job is None)     # a job the cut started keeps the overlay
 
-    def _project_loaded(self, prj, thumbs: dict):
+    def _project_loaded(self, prj, thumbs: dict = None):
+        t0 = time.perf_counter()
         if not self.close_project():
             self.toast("지금 프로젝트를 저장하지 못해 새 프로젝트를 열지 않았습니다", kind="error")
             return
@@ -680,14 +676,11 @@ class MainWindow(QMainWindow):
         s.save()
         self.proj_btn.setText(prj.name)
         self.viewer.message = ""
+        self.thumbcache.reset(prj)                  # a new opening: what the last one's thumbnails bring is dropped
         self.cutlist.refresh()
-        for cid, th in thumbs.items():
-            try:
-                self.cutlist.set_thumb(cid, th)
-            except Exception:
-                pass
-        self.tlstrip.thumbs.clear()
         self.tlstrip.refresh()
+        times = dict(getattr(prj, "_open_times", None) or {})
+        times["list"] = time.perf_counter() - t0
         first = self._first_listed(prj)
         if first is not None:
             self.open_cut(first.id)
@@ -695,6 +688,9 @@ class MainWindow(QMainWindow):
         else:
             self._refresh_all()
             self.viewer.update()
+        times["first_cut"] = time.perf_counter() - t0
+        times.update({f"cut_{k}": v for k, v in (getattr(self.session, "open_times", None) or {}).items()})
+        self.open_times = times                     # seconds: project.json, list usable, first cut opened
 
     # ---- recovery: the autosave writes a recovery copy; project.json changes only when saved
     @staticmethod
@@ -766,6 +762,7 @@ class MainWindow(QMainWindow):
             self.batch.kill()
         self.proxy_builder.cancel()
         self.next_prep.cancel()
+        self.thumbcache.reset(None)
         self.session.project = None
         self._undo_by_cut.clear()
         self.session.open_cut(None)
@@ -977,8 +974,8 @@ class MainWindow(QMainWindow):
             self.cutlist.refresh(self.session.cut.id)
             return
         self._switch_undo(cut.id)
-        if not cut.analyzed:
-            self._ask_proxy_size()                  # the analysis size, once per project (no file is made for it)
+        # 1.22.1: no proxy-size question here any more (it came back on every unanalysed cut when closed); the size
+        # is 설정 > 프록시 해상도, and the proxy is made in the background by 설정 > 프록시 만들기
         self.session.open_cut(cut)
         self.viewer._img_cache.clear()            # cached pictures are per frame number, not per cut
         if hasattr(self.viewer, "_last_res"):
@@ -998,17 +995,17 @@ class MainWindow(QMainWindow):
         self.viewer.fit_view()
         self.build_proxy()
 
+    def _want_thumbs(self, on_screen: list, every: list):
+        """A view was filled or scrolled: the rows on screen first (made when missing), then every saved JPG."""
+        self.thumbcache.want(on_screen, make=True, front=True)
+        self.thumbcache.want(every)
+
     def _after_open(self):
         cut = self.session.cut
-        px = self.session.proxy
-        if px is not None:
-            # the middle frame: a seek in the original, so on a thread of its own (never on the UI thread)
-            def thumb(px=px, cid=cut.id, t=cut.info.frames // 2):
-                try:
-                    self.thumbReady.emit(cid, px.thumbnail(t, 192))
-                except Exception:
-                    pass
-            threading.Thread(target=thumb, name="diap-thumb", daemon=True).start()
+        if self.session.proxy is not None:
+            # its thumbnail through the shared queue (first in line): remade only when the saved one was made
+            # from another original, colour view or frame
+            self.thumbcache.refresh(cut.id)
         if not cut.analyzed and cut.tl and (cut.status or {}).get("auto") == "none":
             self.viewer.message = f"리터칭 불필요 컷 · {(cut.status or {}).get('reason', '')}"
         elif not cut.analyzed and self.batch.busy and cut.id in self.batch.queue:
@@ -1087,38 +1084,19 @@ class MainWindow(QMainWindow):
         if proxy_mode() == "always" or wants_proxy(s.proxy, s.cut.info.fps):
             self.proxy_builder.start(s.project, s.cut, s.view_settings(s.cut))
 
-    def _bg_proxy_done(self, cut_id: str, ok: bool, msg: str):
+    def _bg_proxy_done(self, prj_path: str, cut_id: str, ok: bool, msg: str):
         s = self.session
         if not ok:
             if msg:
                 print("background proxy:", msg, flush=True)
             return
-        if s.cut is None or s.cut.id != cut_id or s.project is None:
+        # a proxy of an earlier cut or of a project since closed never replaces what is on screen now
+        if s.cut is None or s.cut.id != cut_id or s.project is None or str(s.project.path) != prj_path:
             return
         from ..core.frames import frames_for
         new = frames_for(s.project, s.cut, s.view_settings(s.cut))
         if getattr(new, "kind", "") == "proxy" and self.job is None and s.swap_frames(cut_id, new):
             self.toast("프록시가 준비되어 이 컷을 더 빠르게 읽습니다", "ok")
-
-    def _ask_proxy_size(self) -> bool:
-        """Once per project and app session (when footage first needs a proxy): which proxy resolution."""
-        st = settings()
-        prj = self.session.project
-        key = prj.path if prj else ""
-        asked = getattr(self, "_proxy_asked", set())
-        if not getattr(st, "ask_proxy", True) or key in asked:
-            return True
-        from .dialogs import ProxySizeDialog
-        dlg = ProxySizeDialog(self, st.proxy_long_side)
-        if dlg.exec() != QDialog.Accepted:
-            return False
-        st.proxy_long_side = dlg.size()
-        if dlg.dont_ask():
-            st.ask_proxy = False
-        st.save()
-        asked.add(key)
-        self._proxy_asked = asked
-        return True
 
     # ================================================================== cut menu (cut list and timeline)
     def _sel_cut_ids(self) -> list:
@@ -1627,14 +1605,9 @@ class MainWindow(QMainWindow):
                     if c.tl.get("kind") == "clip":
                         c.retouch_ref = after
             prj.save()
-            self.tlstrip.thumbs.clear()
+            self.thumbcache.drop([c.id for c in cuts])     # the import wrote their JPGs again
             self.tlstrip.refresh()
             self.cutlist.refresh()
-            for c in cuts:
-                from ..core.tlimport import load_thumb
-                th = load_thumb(prj, c.id)
-                if th is not None:
-                    self.cutlist.set_thumb(c.id, th)
             al = res.get("align", {})
             self.toast(f"타임라인 {len(cuts)}컷 · 경계 일치 {al.get('matched', 0)}/{al.get('total', 0)}"
                        + (f" · 경고 {len(res.get('warnings', []))}개 (ⓘ에서 확인)" if res.get("warnings") else ""), "ok")
@@ -2740,6 +2713,72 @@ class MainWindow(QMainWindow):
 
         self.run_job("옷 영역 분석 중", work, done)
 
+    # ---- masks made again for this cut only (1.22.1)
+    def recompute_face_masks(self):
+        """The face and neck masks of the open cut, made again with the face model of the settings. Joints, people,
+        retouch values and keys stay; the clothing masks stay. The new masks are used only once complete."""
+        from ..track import facelayer as FL
+        s = self.session
+        tr = s.tracker
+        if tr is None or tr.store is None or not getattr(tr.store, "has_face", False):
+            self.toast("분석한 얼굴이 없는 컷입니다.", kind="warn")
+            return
+        if self.job is not None:
+            self.toast("다른 작업이 진행 중입니다.", kind="warn")
+            return
+
+        def work(progress, cancelled):
+            tr._facelayer_building = True
+            try:
+                return FL.build(tr, progress, cancelled) is not None
+            finally:
+                tr._facelayer_building = False
+
+        def done(ok):
+            tr.__dict__.pop("_steady_lru", None)
+            s._mask_cache = {}
+            s.touch("ret")
+            self.viewer._img_cache.clear()
+            self._refresh_all()
+            if ok:
+                inf = FL.info(tr)
+                self.toast(f"얼굴·목 마스크를 다시 만들었습니다 ({inf['label']})", kind="ok")
+            else:
+                self.toast("다시 만들 얼굴이 없습니다 (작거나 가려진 얼굴만 있는 컷).", kind="warn")
+
+        self.run_job("얼굴·목 마스크 다시 계산 중", work, done)
+
+    def recompute_cloth_masks(self):
+        """The clothing masks of the open cut, made again with the clothing model of the settings, for every person
+        (the protection mode can change later without another run). Face and neck masks stay."""
+        from ..track import clothing as CL
+        s = self.session
+        cut, tr = s.cut, s.tracker
+        if tr is None or tr.store is None:
+            return
+        if self.job is not None:
+            self.toast("다른 작업이 진행 중입니다.", kind="warn")
+            return
+        if not self._cloth_licence_ok():
+            return
+        pids = sorted({tr.store.index(p.id) for p in cut.persons if tr.store.has(p.id)})
+        if not pids:
+            return
+
+        def work(progress, cancelled):
+            return CL.run(tr, pids, progress, cancelled)
+
+        def done(ok):
+            tr.__dict__.pop("_cloth_state", None)
+            s.touch("geo")
+            self.viewer._img_cache.clear()
+            self._refresh_all()
+            if ok:
+                inf = CL.info(tr)
+                self.toast(f"의상 마스크를 다시 만들었습니다 ({inf['label']})", kind="ok")
+
+        self.run_job("의상 마스크 다시 계산 중", work, done)
+
     # ---- head parts (hair / face) for precise head edits
     def ensure_parts(self, force: bool = False):
         """Find hair and face of every person with head edits (in the background)."""
@@ -3542,6 +3581,7 @@ class MainWindow(QMainWindow):
         others = [c for c in (prj.cut(i) for i in self.cutlist.selected_ids()) if c is not None and c is not cut]
         for c in others:
             c.input_cs, c.cs_auto = cs, ""        # their proxies follow when they are opened next
+            self.thumbcache.refresh(c.id, front=False)
         if others:
             msg = f"{len(others) + 1}컷의 색공간을 {manager().short_name(cs)}(으)로 바꿨습니다"
             if stale:
@@ -3906,7 +3946,8 @@ class MainWindow(QMainWindow):
             self.queue_page.job.cancel()
             self.queue_page.job.wait(5000)
         try:
-            self.proxy_builder.cancel()
+            self.proxy_builder.cancel(wait=5.0)
+            self.thumbcache.stop()
         except Exception:
             pass
         if self.batch.busy:
