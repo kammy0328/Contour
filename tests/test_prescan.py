@@ -160,3 +160,14 @@ def test_picked_cuts_are_not_looked_at_first(qapp, monkeypatch):
     assert spawned[0][:3] == ["analyze", "prj", "c9"] and spawned[0][-2:] == ["--prescan", "1"]
     r.proc = None
     r.queue.clear()
+
+
+def test_a_cut_with_people_stops_looking_at_two_sure_frames():
+    """1.22.2 PC check: reading every planned frame of a 4K cut cost 2.8 s a cut (422 person cuts: 1194 s against
+    217 s before). Two sure frames settle 'someone is there'."""
+    det = _Det()
+    r = PS.Prescan(detector=det).look(_frames([200] * 300), 300)
+    assert r["verdict"] == PS.PRESENT and det.calls == 2 and r["looked"] == 2
+    det2 = _Det()
+    r2 = PS.Prescan(detector=det2).look(_frames([60] * 300), 300)
+    assert r2["verdict"] == PS.NONE and det2.calls > 13, "an empty cut is still looked at in full"

@@ -93,8 +93,13 @@ class Prescan:
         found: List[Optional[List[tuple]]] = []
         lumas: List[float] = []
         ts = plan(n)
-        for t in ts:
+        for i, t in enumerate(ts):
             self._one(frame_of, t, found, lumas)
+            # two frames with someone plainly there settle it: the rest is not looked at (most cuts have people,
+            # and reading every planned frame of a 4K original cost ~2.8 s a cut where ~0.5 s will do)
+            if sum(1 for f in found if f and any(s_ >= SURE_SCORE and h >= SURE_H for s_, h in f)) >= 2:
+                ts = ts[:i + 1]
+                break
         r = judge(found, lumas, len(ts))
         if n > DENSE and (r["verdict"] == NONE or r["reason"] in ("낮은 검출 신뢰도", "작은 인물", "프레임을 충분히 읽지 못함",
                                                                  "한 프레임에서만 보인 인물")):
