@@ -582,6 +582,9 @@ class MainWindow(QMainWindow):
         a_tl.setEnabled(self.session.project is not None)
         a_tlx = m.addAction("타임라인 내보내기…")
         a_tlx.setEnabled(self.session.project is not None and bool(self.session.project.timeline_cuts()))
+        a_review = m.addAction("AI 검수 자료 만들기")
+        a_review.setToolTip("저장된 추적·매트·QC로 컷별 보고서(report.md)·JSON·그림을 만듭니다. 모델을 다시 돌리지 않습니다")
+        a_review.setEnabled(self.session.project is not None)
         a_reveal = m.addAction("프로젝트 폴더 열기")
         a_reveal.setEnabled(self.session.project is not None)
         act = m.exec(self.proj_btn.mapToGlobal(self.proj_btn.rect().bottomLeft()))
@@ -605,6 +608,8 @@ class MainWindow(QMainWindow):
             self.import_timeline()
         elif act == a_tlx:
             self._tl_action("export", self.tlstrip.selected_ids())
+        elif act == a_review:
+            self.make_ai_review()
         elif act == a_reveal:
             QDesktopServices.openUrl(QUrl.fromLocalFile(self.session.project.path))
         elif act.data():
@@ -2259,6 +2264,31 @@ class MainWindow(QMainWindow):
             self.refresher.changed.emit(cut.id)
 
         self.run_job("인물 매트 강제 갱신 중", work, done)
+
+    def make_ai_review(self, open_folder: bool = True):
+        """AI 검수 자료 (§6): read from the saved project, so it is saved first; nothing is analysed again."""
+        prj = self.session.project
+        if prj is None:
+            return
+        if not self.save():
+            self.toast("저장하지 못해 검수 자료를 만들지 않았습니다", kind="error")
+            return
+        path = prj.path
+
+        def work(progress, cancelled):
+            from .. import review as RV
+            return str(RV.build(path, progress=progress, cancel=cancelled))
+
+        def done(out):
+            self.last_review = out
+            try:
+                shown = Path(out).relative_to(path).as_posix()
+            except ValueError:
+                shown = out
+            self.toast(f"AI 검수 자료를 만들었습니다: {shown} (report.md, review.json)", kind="ok")
+            if open_folder:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(out))
+        self.run_job("AI 검수 자료 만드는 중", work, done)
 
     def _matte_state_changed(self, cid: str):
         cut = self.session.cut
