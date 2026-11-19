@@ -39,7 +39,7 @@ SWAP_MIN = 0.10            # of the person's size: a pair this far off can be a 
 LABEL_DEGRADED = "degraded_v1"
 LABEL_FLOW = "flow_v1"
 FLOW_RT = 0.012            # round-trip error allowed, share of the person's size
-SAMPLE_W = 0.6
+SAMPLE_W = 0.4          # below 0.5: counted as self-made (not hand-checked) by the refiner's training
 
 
 # --------------------------------------------------------------------------- groups

@@ -191,3 +191,58 @@ def test_commercial_face_model_uses_the_combined_model_taught_by_it(on, monkeypa
     U.reset_session()
     _tiny_unified(U.path(), face_classes=19)
     assert FP.MPFaceParser().unified is None
+
+
+def test_teacher_samples_keep_each_teacher_and_the_silhouette_apart(tmp_path):
+    """Ballin instruction: the SegFormer teachers (when their files are here) and the tracking's coarse silhouette
+    are stored next to the commercial teachers' answers, each under its own name, with timecode and review state."""
+    from types import SimpleNamespace as NS
+    from contour.learn.unified import teach as T
+    from contour.track import faceparse as FP
+    from contour.track.store import TrackStore
+    n = 6
+    st = TrackStore(n, [3])
+    lm = _lm()
+    for t in range(n):
+        st.present[0, t] = True
+        st.boxes[0, t] = [60, 40, 260, 340]
+        st.face[0, t] = lm
+    st.has_face = True
+    rgb = np.random.default_rng(2).integers(0, 255, (360, 320, 3)).astype(np.uint8)
+    proxy = NS(frame=lambda t: rgb, sx=1.0, sy=1.0, w=320, h=360)
+    lab = np.full((90, 80), -1, np.int16)
+    lab[10:85, 15:65] = 0
+    tracker = NS(store=st, proxy=proxy, matte=NS(w=80, h=90), labels=lambda t: lab)
+    cut = NS(work_range=(0, n), name="c", id="cid", source="A_0006C009.mov")
+    prj = NS(name="Ballin")
+
+    class FaceSF:
+        def parse(self, img, lm_):
+            M_ = FP.FaceParser.crop_affine(lm_)
+            z = np.zeros((FP.KEEP, FP.KEEP), np.float16)
+            return dict(M=M_.astype(np.float32), skin=z + 1, neck=z, hair=z, cloth=z, feat=z)
+    teachers = NS(matter=NS(reset=lambda: None, __call__=None), face_probs=lambda c: np.full((6, 128, 128), 0.5, np.float32),
+                  cloth_probs=lambda c: np.zeros((18, 128, 128), np.float32), face_sf=FaceSF(),
+                  cloth_sf=lambda crop: np.full(crop.shape[:2], 4, np.uint8))
+
+    class Matter:
+        def reset(self):
+            pass
+
+        def __call__(self, img):
+            return np.full(img.shape[:2], 0.7, np.float32)
+    teachers.matter = Matter()
+    n_ = T.run_cut(prj, cut, tracker, teachers, tmp_path, frames=[2, 3], tc=lambda t: f"00:00:00:{t:02d}")
+    assert n_ == dict(face=2, person=2, frame=2)
+    with np.load(tmp_path / "Ballin" / "cid" / "face_00003_p3.npz") as d:
+        assert d["face_sf"].shape == (5, 128, 128) and d["face_sf"][0].min() == 255      # SegFormer skin, apart
+        assert d["face"].shape == (6, 128, 128)
+        m = json.loads(str(d["meta"]))
+        assert m["tc"] == "00:00:00:03" and m["review"] == "unreviewed" and m["pair_of"] == 2
+        assert "segformer_b5_face" in m["teachers"] and m["labels"] == ["face_mediapipe", "face_sf"]
+    with np.load(tmp_path / "Ballin" / "cid" / "person_00002_p3.npz") as d:
+        assert (d["cloth_sf"] == 4).all() and d["silhouette"].shape == (512, 512)
+        assert d["alpha"].min() == d["alpha"].max()           # RVM's soft alpha untouched by the silhouette
+        assert set(np.unique(d["silhouette"]).tolist()) <= {0, 255}
+    with np.load(tmp_path / "Ballin" / "cid" / "frame_00002.npz") as d:
+        assert "silhouette" in d.files and "alpha" in d.files

@@ -66,15 +66,28 @@ class Teachers:
     """Teachers that allow commercial use, as the app runs them (ONNX): MediaPipe multiclass for faces, SAM 3.1
     garment phrases for clothing, RVM for alpha (never the combined model itself: DIAP_UNIFIED is off here)."""
 
-    def __init__(self):
+    face_sf = None             # SegFormer-B5 face parser (non-commercial: a teacher only), when its file is here
+    cloth_sf = None            # SegFormer-B2 clothes parser (non-commercial: a teacher only), when its file is here
+
+    def __init__(self, segformer: bool = False):
+        """segformer: also the two SegFormer parsers as separate teachers (stored apart: face_sf, cloth_sf), only
+        when their files are already on this computer (never downloaded for this)."""
         import os
         os.environ["DIAP_UNIFIED"] = "0"
         from ...track import faceparse as FP
-        from ...track.clothing import GarmentFinder
+        from ...track import models as M
+        from ...track.clothing import GarmentFinder, Parser
         from ...track.infer import Matter
         self.face = FP.MPFaceParser()
         self.garments = GarmentFinder()
         self.matter = Matter()
+        if segformer:
+            os.environ["DIAP_NO_OWN"] = "1"           # the original parser, not one trained further here
+            os.environ["DIAP_NO_TUNED"] = "1"
+            if M.model_path("face_parse").exists():
+                self.face_sf = FP.FaceParser()
+            if M.model_path("parse_clothes").exists():
+                self.cloth_sf = Parser("parse_clothes")
 
     def face_probs(self, crop: np.ndarray) -> np.ndarray:
         """(6, 128, 128) class probabilities of a 512 px face crop."""
@@ -95,14 +108,34 @@ def _write(path: Path, **arrays):
     tmp.replace(path)
 
 
-def run_cut(prj, cut, tracker, teachers: Teachers, out: Path, cancel: Optional[Callable[[], bool]] = None) -> dict:
+def _face_sf(teachers, rgb, lm, M_) -> Optional[np.ndarray]:
+    """(5, 128, 128) skin, neck, hair, clothes, features of the SegFormer face teacher in the same crop, or None."""
+    fs = getattr(teachers, "face_sf", None)
+    if fs is None:
+        return None
+    r = fs.parse(rgb, lm)
+    if r is None or not np.allclose(np.asarray(r["M"], np.float64), M_, atol=1e-3):
+        return None
+    return np.stack([cv2.resize(np.asarray(r[k], np.float32), (128, 128), interpolation=cv2.INTER_AREA)
+                     for k in ("skin", "neck", "hair", "cloth", "feat")])
+
+
+def run_cut(prj, cut, tracker, teachers: Teachers, out: Path, cancel: Optional[Callable[[], bool]] = None,
+            frames: Optional[list] = None, tc=None) -> dict:
+    """Teacher labels of one analysed cut. frames: the frames to take (default: pairs every STEP frames from the
+    start); tc: frame -> timecode text (recorded with each sample). Besides the commercial teachers' answers, a
+    sample keeps (when there) the SegFormer teachers' (face_sf, cloth_sf) and the coarse silhouette of the
+    tracking's person labels, apart from RVM's soft alpha: a different kind of label, never mixed."""
     from ...track import faceparse as FP
     from ...track.clothing import _crop_box
     from ...track.exposure import analysis_view
     st, px = tracker.store, tracker.proxy
     a, b = cut.work_range
-    starts = list(range(a, b - 1, STEP))[:PAIRS]
-    want = sorted({t for s in starts for t in (s, s + 1) if t < b})
+    if frames:
+        want = sorted({int(t) for t in frames if a <= int(t) < b})
+    else:
+        starts = list(range(a, b - 1, STEP))[:PAIRS]
+        want = sorted({t for s in starts for t in (s, s + 1) if t < b})
     n = dict(face=0, person=0, frame=0)
     if not want or st is None:
         return n
@@ -110,7 +143,12 @@ def run_cut(prj, cut, tracker, teachers: Teachers, out: Path, cancel: Optional[C
     W, H = px.w, px.h
     fw, fh = frame_size(W, H)
     teachers.matter.reset()
-    base = dict(project=prj.name, cut=cut.name, cut_id=cut.id, source=Path(str(cut.source)).name, created=time.time())
+    teachers_used = ["mediapipe_multiclass", "sam31_garments", "rvm"] + \
+        (["segformer_b5_face"] if getattr(teachers, "face_sf", None) is not None else []) + \
+        (["segformer_b2_clothes"] if getattr(teachers, "cloth_sf", None) is not None else [])
+    base = dict(project=prj.name, cut=cut.name, cut_id=cut.id, source=Path(str(cut.source)).name, created=time.time(),
+                method="teacher", review="unreviewed", teachers=teachers_used)
+    has_lab = hasattr(tracker, "labels")
     for t in range(a, want[-1] + 1):
         if cancel and cancel():
             break
@@ -121,13 +159,17 @@ def run_cut(prj, cut, tracker, teachers: Teachers, out: Path, cancel: Optional[C
         al = teachers.matter(cv2.resize(view, (mw, mh), interpolation=cv2.INTER_AREA))
         if t not in want:
             continue
-        pair = t - 1 if (t - 1) in want and (t - a) % STEP == 1 else None
-        meta = dict(base, t=int(t), pair_of=pair)
+        pair = t - 1 if (t - 1) in want else None
+        meta = dict(base, t=int(t), pair_of=pair, tc=tc(t) if tc else None)
+        lab = tracker.labels(t) if has_lab else None
         # the whole frame
         fimg = cv2.resize(view, (fw, fh), interpolation=cv2.INTER_AREA)
         fal = cv2.resize(al, (fw, fh), interpolation=cv2.INTER_LINEAR)
+        extra = {}
+        if lab is not None:
+            extra["silhouette"] = cv2.resize((lab >= 0).astype(np.uint8) * 255, (fw, fh), interpolation=cv2.INTER_NEAREST)
         _write(out / prj.name / cut.id / f"frame_{t:05d}.npz", img=_jpg(fimg), alpha=_q(fal),
-               meta=np.array(json.dumps(dict(meta, kind="frame"))))
+               meta=np.array(json.dumps(dict(meta, kind="frame", labels=["alpha_soft_rvm"] + list(extra)))), **extra)
         n["frame"] += 1
         al_px = cv2.resize(al, (W, H), interpolation=cv2.INTER_LINEAR)
         ps = [p for p in range(len(st.pids)) if st.present[p, t]][:PERSONS]
@@ -139,9 +181,17 @@ def run_cut(prj, cut, tracker, teachers: Teachers, out: Path, cancel: Optional[C
                 c512 = cv2.resize(view[y0:y1, x0:x1], (512, 512), interpolation=cv2.INTER_LINEAR)
                 cp = teachers.cloth_probs(c512)
                 ca = cv2.resize(al_px[y0:y1, x0:x1], (512, 512), interpolation=cv2.INTER_LINEAR)
+                extra = {}
+                cs = getattr(teachers, "cloth_sf", None)
+                if cs is not None:
+                    extra["cloth_sf"] = cv2.resize(cs(view[y0:y1, x0:x1]), (128, 128), interpolation=cv2.INTER_NEAREST)
+                if lab is not None:
+                    own = cv2.resize((lab == p).astype(np.uint8) * 255, (W, H), interpolation=cv2.INTER_NEAREST)
+                    extra["silhouette"] = cv2.resize(own[y0:y1, x0:x1], (512, 512), interpolation=cv2.INTER_NEAREST)
                 _write(out / prj.name / cut.id / f"person_{t:05d}_p{pid}.npz", img=_jpg(c512), cloth=_q(cp),
                        alpha=_q(ca), box=np.array(box, np.int32),
-                       meta=np.array(json.dumps(dict(meta, kind="person", pid=pid))))
+                       meta=np.array(json.dumps(dict(meta, kind="person", pid=pid,
+                                                     labels=["cloth_sam31", "alpha_soft_rvm"] + list(extra)))), **extra)
                 n["person"] += 1
             lm = st.face[p, t].astype(np.float64).copy() if getattr(st, "has_face", False) else None
             if lm is None or not np.isfinite(lm[:, :2]).all():
@@ -156,8 +206,14 @@ def run_cut(prj, cut, tracker, teachers: Teachers, out: Path, cancel: Optional[C
             crop = cv2.warpAffine(rgb, Mx, (FP.SIZE, FP.SIZE), flags=cv2.INTER_AREA if Mx[0, 0] < 1 else cv2.INTER_LINEAR,
                                   borderMode=cv2.BORDER_REPLICATE)
             fp = teachers.face_probs(crop)
+            extra = {}
+            sf = _face_sf(teachers, rgb, lm, Mx)
+            if sf is not None:
+                extra["face_sf"] = _q(sf)
             _write(out / prj.name / cut.id / f"face_{t:05d}_p{pid}.npz", img=_jpg(crop), face=_q(fp),
-                   M=Mx.astype(np.float32), meta=np.array(json.dumps(dict(meta, kind="face", pid=pid))))
+                   M=Mx.astype(np.float32), meta=np.array(json.dumps(dict(meta, kind="face", pid=pid,
+                                                                          labels=["face_mediapipe"] + list(extra)))),
+                   **extra)
             n["face"] += 1
     return n
 
