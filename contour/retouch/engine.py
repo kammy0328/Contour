@@ -1326,7 +1326,7 @@ def _parse_now(rgb_u8: np.ndarray, lm: np.ndarray) -> Optional[dict]:
             return None
         with _FPLOCK:                           # frames are prepared on several threads: one parser, one call at a time
             if _FPARSER[0] is None:
-                _FPARSER[0] = FP.FaceParser() if FP.ready() else False
+                _FPARSER[0] = FP.make_parser() if FP.ready() else False
             if not _FPARSER[0]:
                 return None
             r = _FPARSER[0].parse(rgb_u8, np.asarray(lm, np.float32))

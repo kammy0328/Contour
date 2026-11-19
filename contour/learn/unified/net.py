@@ -1,12 +1,12 @@
 """The combined network: shared encoder, three heads (face classes, clothing classes, person alpha)."""
 from __future__ import annotations
 
-FACE_CLASSES = 19          # CelebAMask-HQ, as face_parse
-CLOTH_CLASSES = 18         # ATR, as parse_clothes
+FACE_CLASSES = 6           # MediaPipe Selfie Multiclass: background, hair, body skin, face skin, clothes, others
+CLOTH_CLASSES = 18         # the clothes classes the app stores (ATR numbering), taught by SAM 3.1's garment phrases
 OUTPUTS = ("face", "cloth", "alpha")
 
 
-def build(pretrained: bool = True, width: int = 128):
+def build(pretrained: bool = True, width: int = 128, face_classes: int = FACE_CLASSES):
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
@@ -23,7 +23,7 @@ def build(pretrained: bool = True, width: int = 128):
 
     class Unified(nn.Module):
         """image (N,3,H,W) normalised like ImageNet, H and W divisible by 32 ->
-        face logits (N,19,H/4,W/4), cloth logits (N,18,H/4,W/4), alpha (N,1,H,W) in 0..1."""
+        face logits (N,face_classes,H/4,W/4), cloth logits (N,18,H/4,W/4), alpha (N,1,H,W) in 0..1."""
 
         def __init__(self):
             super().__init__()
@@ -44,7 +44,7 @@ def build(pretrained: bool = True, width: int = 128):
             self.lat = nn.ModuleList([nn.Conv2d(c, C, 1) for c in (64, 128, 256, 512)])
             self.smooth = nn.ModuleList([nn.Sequential(nn.Conv2d(C, C, 3, padding=1), nn.GroupNorm(8, C), nn.ReLU(True))
                                          for _ in range(4)])
-            self.face = Head(4 * C, FACE_CLASSES)
+            self.face = Head(4 * C, face_classes)
             self.cloth = Head(4 * C, CLOTH_CLASSES)
             # alpha: coarse at 1/4, refined with the picture itself at 1/2 and full size (hair, motion blur)
             self.a4 = nn.Sequential(nn.Conv2d(4 * C, 64, 3, padding=1), nn.GroupNorm(8, 64), nn.ReLU(True))
@@ -93,11 +93,12 @@ def export(model, path: str, size=(512, 512)) -> dict:
         kw["dynamo"] = False
     torch.onnx.export(model, x, path, **kw)
     res = {}
+    fc = int(model.face.b[-1].out_channels)
     for name, (h, w) in (("square", size), ("frame", (288, 512))):
         xi = torch.randn(1, 3, h, w)
         with torch.no_grad():
             ref = model(xi)
-        for k, (o, sh) in enumerate(zip(ref, ((1, FACE_CLASSES, h // 4, w // 4), (1, CLOTH_CLASSES, h // 4, w // 4),
+        for k, (o, sh) in enumerate(zip(ref, ((1, fc, h // 4, w // 4), (1, CLOTH_CLASSES, h // 4, w // 4),
                                                (1, 1, h, w)))):
             r = _check_output(path, xi.numpy(), k, o.numpy(), sh)
             res[f"{name}_{OUTPUTS[k]}"] = r

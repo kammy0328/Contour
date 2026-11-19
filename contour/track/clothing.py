@@ -63,6 +63,71 @@ def detected(tracker, p: int, n: int = 12) -> list:
     return [k for k, _, _ in GARMENTS if cnt[k] > 0.01 * tot]
 MEAN = np.array([0.485, 0.456, 0.406], np.float32)
 STD = np.array([0.229, 0.224, 0.225], np.float32)
+DEFAULT_MODEL = "sam31"          # commercial use (2026-11-19, j2758); parse_clothes: non-commercial, on request
+GARMENT_FILE = Path(__file__).resolve().parent / "data" / "sam31_text_garments.npz"
+# SAM 3.1 phrases -> the clothes model's classes (so the stored map, keep_mask and detected stay as they are)
+PHRASES = [("shirt", 4), ("jacket", 4), ("coat", 4), ("sweater", 4), ("hoodie", 4), ("top", 4), ("pants", 6),
+           ("shorts", 6), ("skirt", 5), ("dress", 7), ("belt", 8), ("hat", 1), ("shoe", 9), ("bag", 16)]
+# anything else worn (2026-11-19: a denim jacket none of the garment words found): counted as a top, only where no
+# garment word claimed the pixel
+CATCH_ALL = ("clothing", 4)
+GARMENT_SCORE = 0.4
+
+
+def cloth_model() -> str:
+    """Which model finds clothing: 'sam31' (SAM 3.1's finder with garment phrases: SAM License, commercial use
+    allowed; the phrases' encodings are shipped in data/) or 'parse_clothes' (SegFormer-B2: NVIDIA licence,
+    non-commercial). settings.cloth_model, DIAP_CLOTH_MODEL overrides."""
+    import os
+    v = os.environ.get("DIAP_CLOTH_MODEL", "")
+    if not v:
+        try:
+            from ..core.settings import settings
+            v = getattr(settings(), "cloth_model", "") or ""
+        except Exception:
+            v = ""
+    v = v if v in ("sam31", "parse_clothes") else DEFAULT_MODEL
+    if v == "sam31" and not GARMENT_FILE.is_file():
+        v = "parse_clothes"
+    return v
+
+
+class GarmentFinder:
+    """Every garment in a frame with SAM 3.1: the picture encoded once, its finder run with each garment phrase.
+    Returns a class map in the clothes model's classes (0: none). Where two phrases claim a pixel, the surer one
+    (higher mask logit times score) takes it."""
+
+    def __init__(self):
+        from .infer import Finder31, Segmenter31
+        self.seg = Segmenter31()
+        self.finder = Finder31()
+        d = np.load(str(GARMENT_FILE))
+        self.phr = []
+        for ph, cls in PHRASES + [CATCH_ALL]:
+            k = ph.replace(" ", "_")
+            if f"{k}__text" in d.files:
+                self.phr.append((cls, d[f"{k}__text"].astype(np.float32), d[f"{k}__text_pad"].astype(bool),
+                                 ph == CATCH_ALL[0]))
+
+    def classes(self, rgb: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
+        """rgb uint8 (H, W, 3) -> (h, w) uint8 class map at size (w, h)."""
+        w, h = size
+        enc = self.seg.encode(rgb)
+        best = np.full((h, w), 0.0, np.float32)
+        out = np.zeros((h, w), np.uint8)
+        base = dict(self.finder.const)
+        try:
+            for cls, text, pad, catch_all in self.phr:
+                self.finder.const = dict(base, text=text, text_pad=pad)
+                for d in self.finder.find(enc, GARMENT_SCORE):
+                    lg = cv2.resize(d["lg"], (w, h), interpolation=cv2.INTER_LINEAR)
+                    sc = np.where(lg > 0, d["score"] * (1.0 / (1.0 + np.exp(-lg))), 0.0).astype(np.float32)
+                    win = (sc > 0) & (out == 0) if catch_all else sc > best
+                    out[win] = cls
+                    best[win] = sc[win]
+        finally:
+            self.finder.const = base
+        return out
 
 
 class Parser:
@@ -129,6 +194,9 @@ def run(tracker, persons: List[int], progress: Optional[Callable[[float, str], N
     st = tracker.store
     proxy = tracker.proxy
     a, b = tracker.cut.work_range
+    from . import unified as U
+    if cloth_model() == "sam31" and not U.active("cloth"):
+        return _run_garments(tracker, persons, progress, cancel)
     parser = Parser()
     mw, mh = tracker.matte.w, tracker.matte.h
     W, H = proxy.w, proxy.h
@@ -158,6 +226,49 @@ def run(tracker, persons: List[int], progress: Optional[Callable[[float, str], N
                 own = (lab[my0:my1, mx0:mx1] == p) if lab is not None else (small > 0)
                 reg = frame[my0:my1, mx0:mx1]
                 reg[own] = small[own] + 1
+            mm[t] = frame
+            if progress:
+                progress((t - a + 1) / max(1, b - a), f"옷 영역 분석 {t - a + 1}/{b - a}")
+    finally:
+        mm.flush()
+        del mm
+        tracker.cloth.close()
+    _write_state(tracker, persons)
+    return True
+
+
+def _run_garments(tracker, persons: List[int], progress=None, cancel=None) -> bool:
+    """run() with SAM 3.1's garment phrases: one class map per frame, each person's own pixels taken from it."""
+    st = tracker.store
+    proxy = tracker.proxy
+    a, b = tracker.cut.work_range
+    gf = GarmentFinder()
+    mw, mh = tracker.matte.w, tracker.matte.h
+    mm = tracker.cloth.open_rw()
+    try:
+        for t in range(a, b):
+            if cancel and cancel():
+                return False
+            pres = [p for p in persons if st.present[p, t]]
+            if not pres:
+                continue
+            rgb = analysis_view(np.asarray(proxy.frame(t)))
+            lab = tracker.labels(t)
+            frame = np.array(mm[t])
+            cmap = gf.classes(rgb, (mw, mh))
+            for p in pres:
+                if lab is not None:
+                    own = lab == p
+                else:
+                    box = _crop_box(st, p, t, proxy.sx, proxy.sy, proxy.w, proxy.h)
+                    if box is None:
+                        continue
+                    own = np.zeros((mh, mw), bool)
+                    x0, y0, x1, y1 = box
+                    own[int(y0 * mh / proxy.h):int(np.ceil(y1 * mh / proxy.h)), int(x0 * mw / proxy.w):int(np.ceil(x1 * mw / proxy.w))] = True
+                frame[own] = 1                                    # the person's own pixels: nothing kept ...
+                g = own & (cmap > 0)
+                frame[g] = cmap[g] + 1                            # ... but the garments found on them
             mm[t] = frame
             if progress:
                 progress((t - a + 1) / max(1, b - a), f"옷 영역 분석 {t - a + 1}/{b - a}")
