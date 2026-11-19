@@ -64,9 +64,23 @@ def register(project, cut, tracker, progress=None) -> str:
     if not gt_p:
         gt_p = list(range(len(st.pids)))
     raw = {k: v[gt_p, a:b] for k, v in st.raw.items()}
+    # which answers a person gave or confirmed (keyframes, confirmed ranges): the accuracy is read on these; the
+    # rest of the solved track is only the automatic answer
+    human = np.zeros((len(gt_p), b - a, S.K), bool)
+    for i, p in enumerate(gt_p):
+        pid = int(st.pids[p])
+        for j, fr in (cut.joint_keys.get(pid) or {}).items():
+            for f in fr:
+                if a <= int(f) < b:
+                    human[i, int(f) - a, int(j)] = True
+        for r0, r1 in (cut.confirmed.get(pid) or []):
+            lo, hi = max(a, int(r0)), min(b - 1, int(r1))
+            if hi >= lo:
+                human[i, lo - a:hi - a + 1, :] = True
     np.savez_compressed(d / "data.npz", present=st.present[gt_p, a:b], boxes=st.boxes[gt_p, a:b],
                         blur=st.blur[gt_p, a:b], homog=st.homog[a:b], homog_ok=st.homog_ok[a:b],
-                        gt=st.final[gt_p, a:b], **{"raw__" + k: v for k, v in raw.items()})
+                        gt=st.final[gt_p, a:b], gt_vis=st.vis[gt_p, a:b], gt_human=human,
+                        **{"raw__" + k: v for k, v in raw.items()})
     meta = dict(id=bid, project=project.name, cut=cut.name, frames=b - a, persons=len(gt_p), created=time.time(),
                 width=cut.info.width, height=cut.info.height, frame_w=bw, frame_h=bh,
                 keys=int(sum(len(fr) for pid in st.pids for fr in cut.joint_keys.get(pid, {}).values())),
@@ -96,7 +110,44 @@ def _load(bid: str):
             if k.startswith("raw__"):
                 st.raw[k[5:]] = data[k].copy()
         gt = data["gt"].copy()
+        meta["_gt_vis"] = data["gt_vis"].copy() if "gt_vis" in data.files else None
+        meta["_gt_human"] = data["gt_human"].copy() if "gt_human" in data.files else None
     return d, meta, st, gt
+
+
+METRIC_VERSION = 2       # 2 (1.22.2): pck5 over every answer that can be scored; a joint left out counts as missed
+PCK = 0.05
+CAP = 0.20               # a missed joint costs this much (of the person's size) in the score; errors are capped there
+
+
+def score(trk: np.ndarray, gt: np.ndarray, present: np.ndarray, scale: np.ndarray,
+          vis: Optional[np.ndarray] = None, only: Optional[np.ndarray] = None) -> dict:
+    """Joint accuracy of a track (P,N,K,>=2) against answers (P,N,K,>=2).
+    Scored joints: a finite answer, the person present, a usable scale, visible (when visibility is known) and,
+    with `only`, one of those joints. pck5 = hits / scored (a joint without a prediction is not a hit, so leaving
+    a wrong one out never raises it); missing = scored joints without a prediction; err_pct = mean error of the
+    predicted ones (% of the person's size); score_pct = mean of min(error, CAP) with a missed joint at CAP (what a
+    better model must lower). Nothing scored: every figure is None (not measured)."""
+    sc = np.where(np.isfinite(scale) & (scale > 0), scale, np.nan)[..., None]
+    can = np.isfinite(gt[..., :2]).all(-1) & present[..., None] & np.isfinite(sc)
+    if vis is not None:
+        can &= np.asarray(vis) == 1
+    if only is not None:
+        can &= np.asarray(only, bool)
+    n = int(can.sum())
+    if n == 0:
+        return dict(metric_version=METRIC_VERSION, n_eval=0, n=0, pck5=None, missing=None, err_pct=None,
+                    score_pct=None)
+    have = np.isfinite(trk[..., :2]).all(-1)
+    err = np.linalg.norm(trk[..., :2] - gt[..., :2], axis=-1) / sc
+    pred = can & have & np.isfinite(err)
+    e = err[pred]
+    hits = int((e < PCK).sum())
+    capped = np.full(n, CAP, np.float64)
+    capped[:e.size] = np.minimum(e, CAP)
+    return dict(metric_version=METRIC_VERSION, n_eval=n, n=int(e.size), pck5=hits / n,
+                missing=1.0 - e.size / n, err_pct=float(np.mean(e) * 100) if e.size else None,
+                score_pct=float(np.mean(capped) * 100))
 
 
 def evaluate(version: int, progress=None) -> Dict[str, dict]:
@@ -139,23 +190,36 @@ def evaluate(version: int, progress=None) -> Dict[str, dict]:
         fs = SV.FrameSource(gray, sx, sy)
         trk, _, _ = SV.solve(st, fs, range(len(st.pids)), (0, st.n), extra=extra,
                              smoothing=float(meta.get("smoothing", 0.35)))
-        ok = np.isfinite(gt[..., :2]).all(-1) & np.isfinite(trk[..., :2]).all(-1) & st.present[..., None]
-        sc = np.where(np.isfinite(st.scale), st.scale, np.nan)[..., None]
-        err = np.linalg.norm(trk[..., :2] - gt[..., :2], axis=-1) / sc
-        e = err[ok & np.isfinite(err)]
-        results[m["id"]] = dict(cut=m["cut"], project=m["project"], err_pct=float(np.mean(e) * 100) if e.size else None,
-                                pck5=float(np.mean(e < 0.05)) if e.size else None, n=int(e.size))
+        r = score(trk, gt, st.present, st.scale, meta.get("_gt_vis"))
+        hm = meta.get("_gt_human")
+        hr = score(trk, gt, st.present, st.scale, meta.get("_gt_vis"), hm) if hm is not None else None
+        results[m["id"]] = dict(cut=m["cut"], project=m["project"], **r,
+                                visibility_known=meta.get("_gt_vis") is not None,
+                                human=({k: hr[k] for k in ("n_eval", "pck5", "missing", "err_pct", "score_pct")}
+                                       if hr is not None else None))
         if progress:
             progress((bi + 1) / max(1, len(benches)), f"벤치마크 {m['cut']}")
     log = bench_dir() / "results.jsonl"
     with open(log, "a", encoding="utf-8") as f:
-        f.write(json.dumps(dict(time=time.time(), version=version, results=results), ensure_ascii=False) + "\n")
+        f.write(json.dumps(dict(time=time.time(), version=version, metric_version=METRIC_VERSION, results=results),
+                           ensure_ascii=False) + "\n")
     return results
 
 
 def summary(results: Dict[str, dict]) -> Optional[float]:
-    vals = [r["err_pct"] for r in results.values() if r.get("err_pct") is not None]
+    """One number to compare models (lower is better). Metric 2: the capped score, where a missed joint costs as
+    much as a bad one (so dropping predictions cannot win). Older results (metric 1): their mean error, comparable
+    only with each other (metric_of tells which)."""
+    if metric_of(results) >= 2:
+        vals = [r["score_pct"] for r in results.values() if r.get("score_pct") is not None]
+    else:
+        vals = [r["err_pct"] for r in results.values() if r.get("err_pct") is not None]
     return float(np.mean(vals)) if vals else None
+
+
+def metric_of(results: Dict[str, dict]) -> int:
+    v = [int(r.get("metric_version", 1)) for r in results.values()]
+    return min(v) if v else METRIC_VERSION
 
 
 def history() -> List[dict]:

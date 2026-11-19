@@ -1,5 +1,7 @@
 """Runs `python -m contour.batch analyze` for a list of cuts, one process at a time, and hands each result
-back to the main window (which owns the project)."""
+back to the main window (which owns the project). With prescan, one `python -m contour.batch prescan` process
+first looks for people in all of them with one light detector (1.22.2): a clear 'nobody' is skipped (skipped
+signal, with the reason), the rest is analysed without looking again."""
 from __future__ import annotations
 
 import sys
@@ -82,6 +84,8 @@ class BatchRunner(QObject):
     finishedCut = Signal(str, bool, str)       # cut id, ok, error text
     finishedAll = Signal(int, int)             # done, failed
     warned = Signal(str, str)                  # cut id, a warning the analysis printed (WARN ...)
+    skipped = Signal(str, str)                 # cut id, the quick look's answer (JSON): nobody there, not analysed
+    scanProgress = Signal(float, str)          # the quick look over all the cuts
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -97,17 +101,25 @@ class BatchRunner(QObject):
         self._stop = False
         self.paused = False
         self.before_start: Optional[Callable[[str], bool]] = None   # may veto / prepare a cut (returns False: skip)
+        self._scan_wanted: List[str] = []
+        self._scanning: Optional[List[str]] = None
+        self.scanned: dict = {}                                       # cut id -> the quick look's answer
 
     @property
     def busy(self) -> bool:
         return self.proc is not None or bool(self.queue)
 
-    def start(self, project_path: str, cut_ids: List[str], accuracy: str = "high", all_targets: bool = True):
+    def start(self, project_path: str, cut_ids: List[str], accuracy: str = "high", all_targets: bool = True,
+              prescan: bool = False):
+        """prescan: look for people in all of them first (cuts the user picked one by one are analysed anyway:
+        the caller passes prescan=False for those)."""
         self.project_path = project_path
         self.opts = dict(accuracy=accuracy, all_targets=all_targets)
         for c in cut_ids:
             if c not in self.queue and c != self.current:
                 self.queue.append(c)
+                if prescan and c not in self.scanned:
+                    self._scan_wanted.append(c)
         if self.proc is None:
             self.done = self.failed = 0
             self._stop = False
@@ -118,10 +130,12 @@ class BatchRunner(QObject):
         """No new cut is started; the running one finishes (stopping a half-written analysis loses it)."""
         self._stop = True
         self.queue.clear()
+        self._scan_wanted = []
 
     def kill(self):
         """Stops now: the running cut's half-done analysis is dropped (the cut stays as it was)."""
         self.queue.clear()
+        self._scan_wanted = []
         self._stop = True
         if self.proc is None:
             self.finishedAll.emit(self.done, self.failed)
@@ -148,51 +162,66 @@ class BatchRunner(QObject):
                 _suspend(pid, False)
         self.paused = False
 
+    def _spawn(self, args: List[str], logname: str) -> QProcess:
+        self._buf = b""
+        self._err = []
+        self._errline = ""
+        p = QProcess(self)
+        p.setWorkingDirectory(str(APP_DIR))
+        env = QProcessEnvironment.systemEnvironment()
+        env.insert("PYTHONIOENCODING", "utf-8")
+        env.insert("PYTHONUNBUFFERED", "1")
+        env.insert("PYTHONWARNINGS", "ignore")
+        import os as _os
+        nthr = str(max(1, (_os.cpu_count() or 4) - 2))
+        for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "OPENCV_FOR_THREADS_NUM"):
+            env.insert(k, nthr)
+        p.setProcessEnvironment(env)
+        # messages and warnings go to a file: a full stderr pipe (while the app is busy and not reading it)
+        # used to stop the analysis process in the middle of a cut
+        from ..core.settings import settings as _settings
+        logd = _settings().data_path / "logs"
+        logd.mkdir(parents=True, exist_ok=True)
+        self._errfile = logd / f"batch_{logname}.log"
+        p.setStandardErrorFile(str(self._errfile))
+        p.readyReadStandardOutput.connect(self._read)
+        p.finished.connect(self._finished)
+        exe = sys.executable
+        if not Path(exe).name.lower().startswith("python.exe"):
+            # pythonw.exe or the DIAP.exe launcher (a renamed pythonw): the console python next to it
+            cand = Path(exe).with_name("python.exe")
+            if cand.exists():
+                exe = str(cand)
+        p.setProgram(exe)
+        p.setArguments(["-m", "contour.batch"] + list(args))
+        if sys.platform == "win32":
+            try:
+                # no window, below-normal priority: the computer stays responsive while it analyses
+                p.setCreateProcessArgumentsModifier(lambda a: setattr(a, "flags", a.flags | 0x08000000 | 0x00004000))
+            except Exception:
+                pass
+        return p
+
     def _next(self):
+        if self._scan_wanted and not self._stop:
+            ids = [c for c in self._scan_wanted if c in self.queue]
+            self._scan_wanted = []
+            if ids:
+                self._scanning = ids
+                self.current = None
+                p = self._spawn(["prescan", self.project_path] + ids, "prescan")
+                self.proc = p
+                self.scanProgress.emit(0.0, "인물 빠른 확인")
+                p.start()
+                return
         while self.queue and not self._stop:
             cid = self.queue.pop(0)
             if self.before_start is not None and not self.before_start(cid):
                 continue
             self.current = cid
-            self._buf = b""
-            self._err = []
-            self._errline = ""
-            p = QProcess(self)
-            p.setWorkingDirectory(str(APP_DIR))
-            env = QProcessEnvironment.systemEnvironment()
-            env.insert("PYTHONIOENCODING", "utf-8")
-            env.insert("PYTHONUNBUFFERED", "1")
-            env.insert("PYTHONWARNINGS", "ignore")
-            import os as _os
-            nthr = str(max(1, (_os.cpu_count() or 4) - 2))
-            for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "OPENCV_FOR_THREADS_NUM"):
-                env.insert(k, nthr)
-            p.setProcessEnvironment(env)
-            # messages and warnings go to a file: a full stderr pipe (while the app is busy and not reading it)
-            # used to stop the analysis process in the middle of a cut
-            from ..core.settings import settings as _settings
-            logd = _settings().data_path / "logs"
-            logd.mkdir(parents=True, exist_ok=True)
-            self._errfile = logd / f"batch_{cid}.log"
-            p.setStandardErrorFile(str(self._errfile))
-            p.readyReadStandardOutput.connect(self._read)
-            p.finished.connect(self._finished)
-            exe = sys.executable
-            if not Path(exe).name.lower().startswith("python.exe"):
-                # pythonw.exe or the DIAP.exe launcher (a renamed pythonw): the console python next to it
-                cand = Path(exe).with_name("python.exe")
-                if cand.exists():
-                    exe = str(cand)
-            p.setProgram(exe)
-            p.setArguments(["-m", "contour.batch", "analyze", self.project_path, cid,
-                            "--accuracy", self.opts.get("accuracy", "high"),
-                            "--all-targets", "1" if self.opts.get("all_targets", True) else "0"])
-            if sys.platform == "win32":
-                try:
-                    # no window, below-normal priority: the computer stays responsive while it analyses
-                    p.setCreateProcessArgumentsModifier(lambda a: setattr(a, "flags", a.flags | 0x08000000 | 0x00004000))
-                except Exception:
-                    pass
+            p = self._spawn(["analyze", self.project_path, cid, "--accuracy", self.opts.get("accuracy", "high"),
+                             "--all-targets", "1" if self.opts.get("all_targets", True) else "0",
+                             "--prescan", "0" if cid in self.scanned else "1"], cid)
             self.proc = p
             self.progressed.emit(cid, 0.0, "시작")
             p.start()
@@ -208,20 +237,56 @@ class BatchRunner(QObject):
         *lines, self._buf = self._buf.split(b"\n")
         for ln in lines:
             t = ln.decode("utf-8", "replace").strip()
-            if t.startswith("PROGRESS "):
+            if t.startswith("PRESCAN "):
+                self._prescan_line(t)
+            elif t.startswith("PROGRESS "):
                 parts = t.split(" ", 2)
                 try:
                     f = float(parts[1])
                 except (IndexError, ValueError):
                     continue
-                self.progressed.emit(self.current or "", f, parts[2] if len(parts) > 2 else "")
+                if self._scanning is not None:
+                    self.scanProgress.emit(f, parts[2] if len(parts) > 2 else "")
+                else:
+                    self.progressed.emit(self.current or "", f, parts[2] if len(parts) > 2 else "")
             elif t.startswith("ERROR "):
                 self._errline = t[6:]
             elif t.startswith("WARN "):
                 self.warned.emit(self.current or "", t[5:])
 
+    def _prescan_line(self, t: str) -> None:
+        import json
+        parts = t.split(" ", 3)
+        if len(parts) < 3:
+            return
+        cid, verdict = parts[1], parts[2]
+        try:
+            r = json.loads(parts[3]) if len(parts) > 3 else {}
+        except Exception:
+            r = {}
+        r["verdict"] = verdict
+        self.scanned[cid] = r
+        if verdict == "none" and cid in self.queue:
+            self.queue.remove(cid)
+            self.skipped.emit(cid, json.dumps(r, ensure_ascii=False))
+
     def _finished(self, code, _status):
         self.paused = False
+        if self._scanning is not None:
+            # the quick look ended (or failed: the cuts it did not answer are looked at in their own analysis)
+            self._scanning = None
+            killed = getattr(self, "_killed", False)
+            self._killed = False
+            if self.proc is not None:
+                self.proc.deleteLater()
+            self.proc = None
+            self.scanProgress.emit(1.0, "인물 빠른 확인 끝")
+            if killed:
+                self.queue.clear()
+                self.finishedAll.emit(self.done, self.failed)
+                return
+            self._next()
+            return
         cid = self.current
         err = ""
         try:

@@ -42,6 +42,7 @@ class SerialWorker(QThread):
     done = Signal(object, object)       # tag, result
     error = Signal(str)
     busy = Signal(bool)
+    submitted = Signal(object)          # tag (emitted on the thread that submitted)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -55,6 +56,7 @@ class SerialWorker(QThread):
         with self._idle:
             self._open += 1
         self.q.put((tag, fn))
+        self.submitted.emit(tag)
         if not self.isRunning():
             self.start()
 
@@ -72,6 +74,11 @@ class SerialWorker(QThread):
 
     def pending(self) -> int:
         return self.q.qsize()
+
+    def open_tasks(self) -> int:
+        """Tasks submitted and not finished (the one running included)."""
+        with self._idle:
+            return self._open
 
     def stop(self):
         self._stop = True

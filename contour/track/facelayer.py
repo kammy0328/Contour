@@ -115,7 +115,10 @@ def _reliability(skin: np.ndarray, lm_crop: np.ndarray) -> float:
 
 
 def build(tracker, progress: Optional[Callable[[float, str], None]] = None,
-          cancel: Optional[Callable[[], bool]] = None) -> Optional[Path]:
+          cancel: Optional[Callable[[], bool]] = None, persons: Optional[set] = None, keep: bool = True):
+    """The face layer of the cut, written to its file (swapped in once complete). persons: only these store
+    indices are parsed (the rest is left empty); keep=False: nothing is written, the arrays are returned (a range
+    made again and compared before it is applied, track/rangefix.py)."""
     if not FP.available():
         return None
     st = tracker.store
@@ -131,7 +134,7 @@ def build(tracker, progress: Optional[Callable[[float, str], None]] = None,
     # faces too small to parse usefully (and to retouch with any detail) are left to the colour model
     still = {q.id for q in getattr(tracker.cut, "persons", []) if getattr(q, "still", False)}
     todo = [(p, t) for p in range(P) for t in range(N)
-            if int(st.pids[p]) not in still and st.present[p, t] and np.isfinite(st.face[p, t, :, :2]).all() and st.face_vis[p, t] >= 0.08
+            if (persons is None or p in persons) and int(st.pids[p]) not in still and st.present[p, t] and np.isfinite(st.face[p, t, :, :2]).all() and st.face_vis[p, t] >= 0.08
             and _wf(p, t) >= MIN_FACE_PX]
     # frames where the tracker lost the landmarks (hand, hair or a turn over the face) but the person is there and
     # was seen a few frames away: the face is carried over from the nearest seen frame, and the parser decides
@@ -139,7 +142,7 @@ def build(tracker, progress: Optional[Callable[[float, str], None]] = None,
     virt: Dict = {}
     have_lm = {(p, t) for p, t in todo}
     for p in range(P):
-        if int(st.pids[p]) in still:
+        if int(st.pids[p]) in still or (persons is not None and p not in persons):
             continue
         seen = np.nonzero(st.face_vis[p] >= 0.3)[0]
         if not len(seen):
@@ -316,11 +319,14 @@ def build(tracker, progress: Optional[Callable[[float, str], None]] = None,
                   if have[p, s] and conn(s, t) and (s == t or alike(s))]
             rel_s[p, t] = max(rel[p, nb]) if nb else rel[p, t]
     rel = rel_s
+    prov = parser.provider() if hasattr(parser, "provider") else ""
+    if not keep:
+        return dict(pids=np.array(st.pids), M=M, skin=skin_s, neck=neck_s, tex=tex_s, rel=rel, col=col_s, have=have,
+                    model=prov, seconds=time.time() - t_start, face=st.face)
     out = path_for(tracker)
     out.parent.mkdir(parents=True, exist_ok=True)
     # which model really made these masks (a fallback shows as 'a+b'), when, how long: written with them, and the
     # file swapped in only when complete (a cancelled or failed rebuild leaves the masks in use as they were)
-    prov = parser.provider() if hasattr(parser, "provider") else ""
     tmp = out.with_name(out.stem + ".tmp.npz")
     np.savez_compressed(tmp, version=VERSION, pids=np.array(st.pids), M=M, skin=skin_s, neck=neck_s, tex=tex_s, rel=rel,
                         col=col_s, have=have, model=np.array(prov), made=np.array(time.time()),

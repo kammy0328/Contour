@@ -1,4 +1,4 @@
-"""Image viewer: result / original / side-by-side / wipe, skeleton editing, protection drawing, overlays."""
+"""Image viewer: result / original / side-by-side / wipe, skeleton editing, overlays."""
 from __future__ import annotations
 
 from typing import List, Optional, Tuple
@@ -11,7 +11,6 @@ from PySide6.QtGui import (QBrush, QColor, QCursor, QFont, QImage, QPainter, QPa
 from PySide6.QtWidgets import QMenu, QWidget
 
 from ..track import skeleton as S
-from ..warp.protect import line_at, shape_at
 from .theme import C, font, qc
 
 HEAT_STOPS = [(0.0, (232, 176, 74, 0)), (0.06, (232, 176, 74, 40)), (0.35, (232, 176, 74, 130)),
@@ -54,10 +53,6 @@ class Viewer(QWidget):
     jointCommitted = Signal(int, int, float, float)
     jointKeyDeleted = Signal(int, int)
     personClicked = Signal(int)
-    lineAdded = Signal(list)                             # [x1,y1,x2,y2] source px
-    lineEdited = Signal(str, list)                       # id, [x1,y1,x2,y2]
-    shapeAdded = Signal(str, list)                       # kind, [cx,cy,rx,ry]
-    shapeEdited = Signal(str, list)
     interacted = Signal()
     contextAction = Signal(str, int, int)                # action, pid, joint
     personAction = Signal(str, int)                      # rename | role | delete, pid (right click on a person)
@@ -75,7 +70,6 @@ class Viewer(QWidget):
         self.show_skel = True
         self.show_heat = False
         self.show_matte = False
-        self.show_protect = True
         self.show_skin = False
         self.hover_pick = True                           # highlight the person under the mouse (edit tool)
         self.selection: Optional[Tuple[int, int]] = None   # timeline range (for joint menus)
@@ -84,7 +78,7 @@ class Viewer(QWidget):
         self._hover_body: Optional[Tuple[int, int, int]] = None
         self.playing = False
         self._play_raw = False              # showing the original because the result is not ready yet
-        self.tool = "edit"             # edit | line | ellipse | rect
+        self.tool = "edit"             # edit | sculpt | bodypts
         self.sel_pid: Optional[int] = None
         self.zoom = 1.0
         self.fit = True
@@ -93,7 +87,6 @@ class Viewer(QWidget):
         self._hover_pid: Optional[int] = None         # the tracked person under the mouse (edit tool)
         self._drag = None
         self._panning = None
-        self._draw = None
         self._wipe_drag = False
         self._img_cache = {}
         self._last_res = None            # (frame, QImage) last result shown, used while a new one renders
@@ -408,7 +401,7 @@ class Viewer(QWidget):
         if q is None:
             return
         sx, sy = r.width() / w, r.height() / h
-        name = q.name + ("  ·  보호" if q.role != "target" else "")
+        name = q.name + ("  ·  제외" if q.role != "target" else "")
         p.setFont(font(11, 600))
         fm = p.fontMetrics()
         tw = fm.horizontalAdvance(name) + 16
@@ -431,7 +424,7 @@ class Viewer(QWidget):
         m.addSeparator()
         a_sel = m.addAction("이 인물 선택")
         a_ren = m.addAction("이름 변경…")
-        a_role = m.addAction("보호로 바꾸기" if q.role == "target" else "보정 대상으로 바꾸기")
+        a_role = m.addAction("보정 대상에서 빼기" if q.role == "target" else "보정 대상으로 바꾸기")
         m.addSeparator()
         a_del = m.addAction("이 인물 삭제…")
         act = m.exec(gpos)
@@ -696,16 +689,12 @@ class Viewer(QWidget):
         if self._hover_pid is not None and self.tool == "edit" and self._drag is None and not self.playing \
                 and self._pointer_inside():
             self._paint_hover(p, r, self._hover_pid)
-        if self.show_protect:
-            self._paint_protect(p, r)
         if self.show_skel and self.tool not in ("sculpt", "bodypts"):
             self._paint_skeleton(p, r)
         if self.tool == "sculpt":
             self._paint_sculpt(p, r)
         if self.tool == "bodypts":
             self._paint_body(p, r)
-        if self._draw is not None:
-            self._paint_draft(p)
         if mode == "side":
             p.restore()
         if self.message:
@@ -1097,47 +1086,6 @@ class Viewer(QWidget):
             out[B.sculpt_key(ci, kk, side)] = nv if abs(nv) > 1e-4 else None
         self.bodyEdited.emit(out, committed)
 
-    def _paint_protect(self, p: QPainter, r: QRectF):
-        cut = self.s.cut
-        st = self.s.tracker.store if self.s.tracker else None
-        pen = QPen(QColor(120, 220, 255, 220), 1.6, Qt.DashLine)
-        for ln in cut.protect.lines:
-            v = line_at(ln, self.t, st)
-            if v is None:
-                continue
-            a, b = self.src_to_w(v[0], v[1], r), self.src_to_w(v[2], v[3], r)
-            p.setPen(pen if ln.enabled else QPen(QColor(120, 120, 120, 160), 1.2, Qt.DashLine))
-            p.drawLine(a, b)
-            p.setPen(Qt.NoPen)
-            p.setBrush(QColor(120, 220, 255, 230) if self.t in ln.keys else QColor(120, 220, 255, 120))
-            for q in (a, b):
-                p.drawRect(QRectF(q.x() - 4, q.y() - 4, 8, 8))
-        for sh in cut.protect.shapes:
-            v = shape_at(sh, self.t, st)
-            if v is None:
-                continue
-            c = self.src_to_w(v[0], v[1], r)
-            px = self.s.proxy
-            rx = v[2] * px.sx * r.width() / px.w
-            ry = v[3] * px.sy * r.width() / px.w
-            p.setPen(pen if sh.enabled else QPen(QColor(120, 120, 120, 160), 1.2, Qt.DashLine))
-            p.setBrush(QColor(120, 220, 255, 26))
-            if sh.kind == "rect":
-                p.drawRect(QRectF(c.x() - rx, c.y() - ry, 2 * rx, 2 * ry))
-            else:
-                p.drawEllipse(c, rx, ry)
-
-    def _paint_draft(self, p: QPainter):
-        kind, a, b = self._draw
-        p.setPen(QPen(QColor(120, 220, 255, 240), 1.6, Qt.DashLine))
-        p.setBrush(QColor(120, 220, 255, 30))
-        if kind == "line":
-            p.drawLine(a, b)
-        elif kind == "rect":
-            p.drawRect(QRectF(a, b).normalized())
-        else:
-            p.drawEllipse(QRectF(a, b).normalized())
-
     # ------------------------------------------------------------------ hit testing
     def _hit_joint(self, pos: QPointF) -> Optional[Tuple[int, int]]:
         if not self.show_skel or self.s.tracker is None or self.s.proxy is None:
@@ -1169,29 +1117,6 @@ class Viewer(QWidget):
         z = r.width() / px.w
         j = self.s.ghost_hit(self.sel_pid, self.t, x, y, 10 / z / px.sx)
         return (self.sel_pid, j) if j is not None else None
-
-    def _hit_protect(self, pos: QPointF):
-        """('line', id, end_index) / ('shape', id, 'move'|'size')"""
-        if not self.show_protect or self.s.cut is None:
-            return None
-        r = self._edit_rect()
-        st = self.s.tracker.store if self.s.tracker else None
-        for ln in self.s.cut.protect.lines:
-            v = line_at(ln, self.t, st)
-            if v is None:
-                continue
-            for k, (x, y) in enumerate(((v[0], v[1]), (v[2], v[3]))):
-                q = self.src_to_w(x, y, r)
-                if abs(q.x() - pos.x()) < 8 and abs(q.y() - pos.y()) < 8:
-                    return ("line", ln.id, k, v)
-        for sh in self.s.cut.protect.shapes:
-            v = shape_at(sh, self.t, st)
-            if v is None:
-                continue
-            c = self.src_to_w(v[0], v[1], r)
-            if abs(c.x() - pos.x()) < 10 and abs(c.y() - pos.y()) < 10:
-                return ("shape", sh.id, "move", v)
-        return None
 
     # ------------------------------------------------------------------ mouse
     def mousePressEvent(self, e):
@@ -1261,11 +1186,6 @@ class Viewer(QWidget):
                 self._wipe_drag = True
                 return
         if self.tool in ("edit", "sculpt", "bodypts"):
-            ph = self._hit_protect(pos)
-            if ph is not None:
-                self.editStarted.emit()
-                self._drag = ("protect",) + ph
-                return
             hit = self._hit_joint(pos)
             if hit:
                 pid, j = hit
@@ -1289,9 +1209,6 @@ class Viewer(QWidget):
                 self.sel_pid = pid
                 self.personClicked.emit(pid)
                 self.update()
-        else:
-            self._draw = (self.tool, pos, pos)
-            self.update()
 
     def mouseMoveEvent(self, e):
         pos = e.position()
@@ -1307,15 +1224,7 @@ class Viewer(QWidget):
             self.wipe = float(np.clip((pos.x() - c.left()) / max(1, c.width()), 0, 1))
             self.update()
             return
-        if self._draw is not None:
-            k, a, _ = self._draw
-            self._draw = (k, a, pos)
-            self.update()
-            return
         if self._drag is not None:
-            if self._drag[0] == "protect":
-                self._drag_protect(pos)
-                return
             if self._drag[0] == "sculpt":
                 self._drag_sculpt(pos, False)
                 return
@@ -1343,18 +1252,17 @@ class Viewer(QWidget):
         if self.tool == "edit":
             hv = self._hit_joint(pos)
             gh = self._hit_ghost(pos) if hv is None else None
-            ph = self._hit_protect(pos) if hv is None and gh is None else None
             if hv != self._hover or gh != self._hover_ghost:
                 self._hover = hv
                 self._hover_ghost = gh
                 self.update()
             hp = None
-            if self.hover_pick and hv is None and gh is None and ph is None and self.s.cut is not None and not self.playing:
+            if self.hover_pick and hv is None and gh is None and self.s.cut is not None and not self.playing:
                 hp = self.s.person_at(self.t, *self.w_to_src(pos))
             if hp != self._hover_pid:
                 self._hover_pid = hp
                 self.update()
-            if hv is not None or ph is not None or gh is not None or hp is not None:
+            if hv is not None or gh is not None or hp is not None:
                 self.setCursor(Qt.PointingHandCursor)
             elif self.mode == "wipe" and abs(pos.x() - self._wipe_x()) < 10:
                 self.setCursor(Qt.SplitHCursor)
@@ -1405,22 +1313,6 @@ class Viewer(QWidget):
         uv = fg.to_units(np.array([[x, y]]))[0] - fg.to_units(dense[i:i + 1])[0]
         self.sculptEdited.emit(i, (float(uv[0]), float(uv[1])), committed)
 
-    def _drag_protect(self, pos):
-        _, kind, oid, part, v = self._drag
-        x, y = self.w_to_src(pos)
-        if kind == "line":
-            nv = list(v)
-            if part == 0:
-                nv[0], nv[1] = x, y
-            else:
-                nv[2], nv[3] = x, y
-            self._drag = ("protect", kind, oid, part, np.array(nv))
-            self.lineEdited.emit(oid, [float(a) for a in nv])
-        else:
-            nv = [x, y, v[2], v[3]]
-            self._drag = ("protect", kind, oid, part, np.array(nv))
-            self.shapeEdited.emit(oid, [float(a) for a in nv])
-
     def mouseReleaseEvent(self, e):
         pos = e.position()
         if self._panning is not None:
@@ -1430,18 +1322,6 @@ class Viewer(QWidget):
         if self._wipe_drag:
             self._wipe_drag = False
             return
-        if self._draw is not None:
-            kind, a, b = self._draw
-            self._draw = None
-            if (b - a).manhattanLength() > 6:
-                xa, ya = self.w_to_src(a)
-                xb, yb = self.w_to_src(b)
-                if kind == "line":
-                    self.lineAdded.emit([xa, ya, xb, yb])
-                else:
-                    self.shapeAdded.emit(kind, [(xa + xb) / 2, (ya + yb) / 2, abs(xb - xa) / 2, abs(yb - ya) / 2])
-            self.update()
-            return
         if self._drag is not None:
             d = self._drag
             if d[0] == "sculpt":
@@ -1450,11 +1330,7 @@ class Viewer(QWidget):
                 self._drag_body(pos, True)
             self._drag = None
             self.setCursor(Qt.ArrowCursor)
-            if d[0] in ("protect", "sculpt", "body"):
-                if d[0] == "protect":
-                    self.s.interactive = False
-                    self.s.touch("geo")
-                    self.update()
+            if d[0] in ("sculpt", "body"):
                 return
             pid, j = d
             x, y = self.w_to_src(pos)

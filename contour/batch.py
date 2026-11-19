@@ -34,30 +34,42 @@ def result_path(project, cut) -> Path:
     return project.cut_dir(cut) / "batch_result.json"
 
 
-def prescan_people(cut, n: int = 3) -> bool:
-    """A quick look at a few frames: is anyone large enough to retouch?"""
-    import numpy as np
+def prescan_people(cut, frames) -> dict:
+    """The quick look for people (track/prescan.py): {'verdict': 'present' | 'none' | 'unsure', 'reason': ...}.
+    frames: the cut's frames as the analysis sees them (an object with frame(t), in its colour view)."""
+    from .track import prescan as PS
+    a, b = cut.work_range
+    return PS.Prescan().look(lambda t: frames.frame(a + t), max(0, b - a))
+
+
+def _skip_status(cut, r: dict) -> dict:
+    figs = {k: r[k] for k in ("looked", "read", "best_score", "tallest", "seconds") if k in r}
+    return dict(cut.status or {}, auto="none", reason=r.get("reason", "인물 없음 (빠른 검사)"), prescan=True,
+                prescan_info=figs)
+
+
+def prescan(project_path: str, cut_ids: list) -> int:
+    """One process, one detector, every listed cut (in their order on each source). Prints
+    PRESCAN <cut id> <verdict> <json> per cut and writes cuts/<id>/prescan.json; never project.json."""
+    from .core.project import Project
+    from .core.frames import frames_for
     from .core import media as M
-    from .track.infer import Detector
-    info = cut.info
-    det = Detector("det_yolox_m", score_thr=0.45, nms_thr=0.6)
-    W = 1280
-    H = max(2, int(round(info.height * W / max(1, info.width))) // 2 * 2)
-    ts = sorted({int(x) for x in np.linspace(0, max(0, info.frames - 1), n)})
-    for t in ts:
-        with M.FrameReader(info, t, 1, "rgb24", size=(W, H), rgb_convert=True, prefetch=1) as rd:
-            pl = rd.read()
-        if pl is None:
-            continue
+    from .track import prescan as PS
+    from .warp.render import _vs_for
+    M.configure_ffmpeg()
+    prj = Project.load(project_path)
+    cuts = [c for c in (prj.cut(i) for i in cut_ids) if c is not None]
+    t0 = time.time()
+    res = PS.scan(prj, cuts, progress=_say, frames_for=lambda p, c: frames_for(p, c, _vs_for(c)))
+    for c in cuts:
+        r = res.get(c.id) or dict(verdict=PS.UNSURE, reason="확인하지 못함")
         try:
-            boxes, scores = det(np.ascontiguousarray(pl[0]))
-        except Exception:
-            return True
-        for b in boxes:
-            x0, y0, x1, y1 = [float(v) for v in b[:4]]
-            if (y1 - y0) >= 0.08 * H:
-                return True
-    return False
+            (prj.cut_dir(c) / "prescan.json").write_text(json.dumps(r, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+        print(f"PRESCAN {c.id} {r['verdict']} {json.dumps(r, ensure_ascii=False)}", flush=True)
+    print(f"INFO 인물 빠른 확인 {len(cuts)}컷 {time.time() - t0:.1f}초", flush=True)
+    return 0
 
 
 def analyze(project_path: str, cut_id: str, accuracy: str = "high", all_targets: bool = True,
@@ -93,14 +105,15 @@ def analyze(project_path: str, cut_id: str, accuracy: str = "high", all_targets:
         print("ERROR 원본 파일을 찾을 수 없습니다: " + str(cut.source or cut.info.path), flush=True)
         return 3
     if prescan and cut.tl.get("kind", "clip") == "clip" and not cut.analyzed:
+        # before the large models are opened: only a clear 'nobody' skips the cut (not sure: analysed)
         _say(0.01, "인물 확인 중")
         try:
-            people = prescan_people(cut)
+            r = prescan_people(cut, px)
         except Exception:
             traceback.print_exc()
-            people = True
-        if not people:
-            cut.status = dict(cut.status or {}, auto="none", reason="인물 없음 (빠른 검사)", prescan=True)
+            r = dict(verdict="unsure")
+        if r.get("verdict") == "none":
+            cut.status = _skip_status(cut, r)
             out.write_text(json.dumps(dict(cut=cut.to_dict(), seconds=time.time() - t0, analyzed=False),
                                       ensure_ascii=False), encoding="utf-8")
             _say(1.0, "인물 없음")
@@ -180,10 +193,15 @@ def main(argv=None) -> int:
     a.add_argument("--accuracy", default="high")
     a.add_argument("--all-targets", type=int, default=1)
     a.add_argument("--prescan", type=int, default=1)
+    q = sub.add_parser("prescan")
+    q.add_argument("project")
+    q.add_argument("cuts", nargs="+")
     args = ap.parse_args(argv)
     try:
         if args.cmd == "analyze":
             return analyze(args.project, args.cut, args.accuracy, bool(args.all_targets), bool(args.prescan))
+        if args.cmd == "prescan":
+            return prescan(args.project, list(args.cuts))
     except Exception as e:
         traceback.print_exc()
         print(f"ERROR {e.__class__.__name__}: {e}", flush=True)

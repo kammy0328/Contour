@@ -664,31 +664,40 @@ def decode_frame(seg, rgb, st, t: int, sx: float, sy: float, W: int, H: int, mw:
 
 def run(st, proxy, matte, seglab, a: int, b: int, seg_key: str, use_final: bool,
         progress: Optional[Callable[[float, str], None]] = None, cancel: Optional[Callable[[], bool]] = None,
-        matter=None, repose: Optional[Callable] = None, collect: Optional[dict] = None) -> dict:
+        matter=None, repose: Optional[Callable] = None, collect: Optional[dict] = None, models: Optional[dict] = None) -> dict:
     """Fill the matte (and the person labels) for frames a..b. Returns pid -> {"find", "pair", "click", "none"}:
     on how many frames the person's mask came from the finder, from clicks inside a pair, from clicks alone, or was
     left out (a track the finder has nobody for is not a person: a shadow, a reflection).
 
     repose(t, p, rgb, record) -> bool: called for a track that carried someone else's skeleton, to estimate its
     pose again on the instance it now has (analysis only). collect: filled with "src" {t: {pid: source}} and
-    "extras" {t: [record]} (the people nobody tracks) for the caller's fixes after the matte."""
+    "extras" {t: [record]} (the people nobody tracks) for the caller's fixes after the matte.
+    models: a dict kept by a caller that runs this often (the matte refresh after edits): the segmenter and finder
+    are loaded once into it and used again; models["used"] tells which ran (SAM 3.1 / SAM 2.1)."""
     stats: dict = {}
     from .infer import make_segmenter
-    try:
-        seg = make_segmenter(seg_key)
-    except Exception as e:
-        if seg_key != "seg_sam31":
-            raise
-        import sys
-        sys.stderr.write(f"SAM 3.1 could not be loaded ({str(e)[:200]}), using SAM 2.1\n")
-        seg = make_segmenter("seg_sam2_b" if "max" in str(seg_key) else "seg_sam2_s")
-    finder = None
-    if type(seg).__name__ == "Segmenter31":
+    models = models if models is not None else {}
+    seg = models.get("seg")
+    if seg is None:
+        try:
+            seg = make_segmenter(seg_key)
+        except Exception as e:
+            if seg_key != "seg_sam31":
+                raise
+            import sys
+            sys.stderr.write(f"SAM 3.1 could not be loaded ({str(e)[:200]}), using SAM 2.1\n")
+            seg = make_segmenter("seg_sam2_b" if "max" in str(seg_key) else "seg_sam2_s")
+        models["seg"] = seg
+    models["used"] = "SAM 3.1" if type(seg).__name__ == "Segmenter31" else "SAM 2.1"
+    finder = models.get("finder")
+    if finder is None and type(seg).__name__ == "Segmenter31" and not models.get("no_finder"):
         try:
             from .infer import Finder31
             finder = Finder31()
+            models["finder"] = finder
         except Exception as e:                  # the finder is a refinement: without it, clicks as before
             import sys
+            models["no_finder"] = True
             sys.stderr.write(f"SAM 3.1 finder could not be loaded ({str(e)[:200]}): masks from tracking prompts only\n")
     mw, mh = matte.w, matte.h
     W, H = proxy.w, proxy.h

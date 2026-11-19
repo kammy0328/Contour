@@ -1425,15 +1425,19 @@ class CutTracker:
                 if not self.matte.exists():
                     self.matte.create()
                     self.matte.close()
+                used: dict = {}
                 self._seg_stats = SG.run(st, self.proxy, self.matte, self.seglab, a, b, SG.model_for(accuracy),
-                                         use_final, progress, cancel, matter, repose=repose, collect=collect)
+                                         use_final, progress, cancel, matter, repose=repose, collect=collect,
+                                         models=used)
+                self.write_seg_meta(model=used.get("used", ""), ranges=[[int(a), int(b)]], full=True)
                 self._label_cache.clear()
+                self._matte_marks_done(a, b)
                 return
             except Cancelled:
                 raise                       # cancel pressed: stop here (it was taken for a failure and the whole RVM matte followed)
             except Exception as e:          # no model / no memory: the RVM matte still works
                 import logging
-                logging.getLogger("contour").warning("SAM 2 matte failed, using RVM: %s", e)
+                logging.getLogger("contour").warning("SAM matte failed, using RVM: %s", e)
                 self.seglab.remove()
         if matter is None:
             return
@@ -1730,6 +1734,55 @@ class CutTracker:
                                                    st.flags[:, a:b])
 
     # ------------------------------------------------------------------ widths
+    # ------------------------------------------------------------------ person matte: what made it, when
+    @property
+    def _seg_meta_path(self) -> Path:
+        return self.project.cache_dir(self.cut) / "seg_meta.json"
+
+    def seg_meta(self) -> dict:
+        """{'model': 'SAM 3.1' | 'SAM 2.1' | '', 'made': time of the whole matte, 'refreshed': [[a, b, time], ...]}"""
+        import json
+        try:
+            return json.loads(self._seg_meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _matte_marks_done(self, a: int, b: int) -> None:
+        """The matte of frames a..b was just made from the current tracking: the frames an edit had marked for a
+        refresh there (ui/matte_refresh.py) are up to date."""
+        st = dict(self.cut.status or {})
+        if not st.get("matte_dirty"):
+            return
+        from .matte_refresh import subtract
+        left = subtract(st["matte_dirty"], [[int(a), int(b)]])
+        if left:
+            st["matte_dirty"] = left
+        else:
+            st.pop("matte_dirty", None)
+        self.cut.status = st
+
+    def write_seg_meta(self, model: str = "", ranges=None, full: bool = False) -> None:
+        import json
+        import time as _t
+        m = {} if full else self.seg_meta()
+        if model:
+            m["model"] = model
+        now = _t.time()
+        if full:
+            m["made"] = now
+            m["refreshed"] = []
+            if ranges:
+                m["range"] = [int(ranges[0][0]), int(ranges[0][1])]
+        else:
+            m.setdefault("refreshed", []).extend([[int(a), int(b), now] for a, b in (ranges or [])])
+            m["refreshed"] = m["refreshed"][-50:]
+        try:
+            tmp = self._seg_meta_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(m), encoding="utf-8")
+            tmp.replace(self._seg_meta_path)
+        except OSError:
+            pass
+
     def update_widths(self, persons: Optional[List[int]] = None, rng: Optional[Tuple[int, int]] = None) -> None:
         st = self.store
         if st is None:

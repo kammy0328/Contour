@@ -13,7 +13,6 @@ import numpy as np
 
 from . import body as B
 from . import face as FW
-from .protect import dist_outside_shapes, dist_to_segments, line_at, shape_at
 from ..core.params import FACE_KEYS, GEOMETRY_KEYS, HEAD_KEYS
 from ..core.project import Cut
 from ..track import skeleton as S
@@ -46,6 +45,26 @@ class PersonInput:
     parts: Optional[object] = None            # track.parts.PartMaps: hair / face+ears weights around the head
 
 
+# the warp around the retouched people, the same for every cut (the 보호 tab's values, fixed at its defaults)
+WARP_SETTINGS = dict(others=True, falloff_pct=3.0, border=True, reach=1.9)
+
+
+def legacy_protection(cut) -> List[str]:
+    """What an older cut had that is no longer applied (shown once when such a project is opened): the separate
+    mode, drawn protection lines or shapes, protection settings other than the fixed ones. Nothing is changed."""
+    out = []
+    if getattr(cut, "mode", "warp") == "separate":
+        out.append("분리 + 배경 복원 모드")
+    pr = getattr(cut, "protect", None)
+    if pr is not None:
+        if pr.lines or pr.shapes:
+            out.append("직선·영역 보호")
+        if (not pr.others or abs(pr.falloff_pct - WARP_SETTINGS["falloff_pct"]) > 1e-6 or
+                pr.border != WARP_SETTINGS["border"] or abs(pr.reach - WARP_SETTINGS["reach"]) > 1e-6):
+            out.append("보호 설정")
+    return out
+
+
 @dataclass
 class FieldInput:
     W: int
@@ -53,12 +72,13 @@ class FieldInput:
     targets: List[PersonInput]
     alpha: Optional[np.ndarray] = None      # matte (h,w) uint8
     labels: Optional[np.ndarray] = None     # (h,w) int16 person index
+    # people who are not retouched are kept out of the warp (always on since 1.22.2, no setting); the transition
+    # width, the reach beyond the body and the frame edge hold are fixed too (the 보호 tab, its drawn lines and
+    # shapes and the separate mode were removed: see warp_settings)
     protect_others: bool = True
     falloff_pct: float = 3.0
     border: bool = True
-    reach: float = 2.6
-    lines: np.ndarray = field(default_factory=lambda: np.zeros((0, 4)))
-    shapes: List[tuple] = field(default_factory=list)
+    reach: float = 1.9
     active: Optional[Tuple[float, float, float, float]] = None   # picture area inside letterbox bars (source px)
 
 
@@ -663,12 +683,8 @@ def compute_field(fi: FieldInput, out_w: int, out_h: int, grid_step: int = 4) ->
     raw_max = 0.0
     if not fi.targets:
         return FieldResult(total.astype(np.float32), out_w, out_h, 0.0, 0.0)
-    # shared protections (lines, shapes, border)
+    # the frame edge (and the people not retouched, per target below)
     base_dist = np.full((gh, gw), np.inf)
-    if len(fi.lines):
-        base_dist = np.minimum(base_dist, dist_to_segments(X, Y, fi.lines) * s)
-    if fi.shapes:
-        base_dist = np.minimum(base_dist, dist_outside_shapes(X, Y, fi.shapes) * s)
     border_w = None
     edge = None
     if fi.border:
@@ -915,8 +931,8 @@ def build_input(cut: Cut, tracker, t: int, which: str = "final") -> FieldInput:
     fi = FieldInput(W=cut.info.width, H=cut.info.height, targets=[])
     if hasattr(tracker, "active_area"):
         fi.active = tracker.active_area()
-    pr = cut.protect
-    fi.protect_others, fi.falloff_pct, fi.border, fi.reach = pr.others, pr.falloff_pct, pr.border, pr.reach
+    fi.protect_others, fi.falloff_pct, fi.border, fi.reach = (WARP_SETTINGS["others"], WARP_SETTINGS["falloff_pct"],
+                                                              WARP_SETTINGS["border"], WARP_SETTINGS["reach"])
     if st is None:
         return fi
     for person in cut.targets():
@@ -986,23 +1002,12 @@ def build_input(cut: Cut, tracker, t: int, which: str = "final") -> FieldInput:
                                       contour=st.contour[p, t] if getattr(st, "has_contour", False) else None,
                                       body_sculpt=_body_edits(kp, params, bs_on, bs_amt, au_amt, be_amt),
                                       cloth_keep=_cloth_keep(tracker, t, p, params), parts=parts))
-    if fi.targets and pr.others:
+    if fi.targets and fi.protect_others:
         a = tracker.matte.get(t)
         if a is not None:
             fi.alpha = np.asarray(a)
             fi.labels = tracker.labels(t)
-    lines = []
-    for ln in pr.lines:
-        if ln.enabled:
-            v = line_at(ln, t, st)
-            if v is not None:
-                lines.append(v)
-    fi.lines = np.array(lines, float).reshape(-1, 4)
-    for sh in pr.shapes:
-        if sh.enabled:
-            v = shape_at(sh, t, st)
-            if v is not None:
-                fi.shapes.append((sh.kind, tuple(v)))
+    # a cut's own protection settings, lines and shapes (from before 1.22.2) are kept in the project but not used
     return fi
 
 

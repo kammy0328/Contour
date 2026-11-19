@@ -18,7 +18,6 @@ from ..stats.tracker import log_event
 from ..track import skeleton as S
 from ..track.analyze import CutTracker
 from ..warp import field as F
-from ..warp.separate import fill_background
 
 
 _EPOCHS = __import__("itertools").count(1)
@@ -358,8 +357,6 @@ class EditSession:
         fr = self.field(t, False if final else None)
         if fr is None or fr.empty():
             out = img
-        elif self.cut.mode == "separate":
-            out = self._separate_preview(t, img, fr)
         else:
             out = F.warp_image(img, fr)
         self._put(key, out)
@@ -400,25 +397,6 @@ class EditSession:
         idx = [st.index(p.id) for p in self.cut.targets() if st.has(p.id)]
         m = cv2.resize(np.isin(lab, idx).astype(np.uint8), (self.proxy.w, self.proxy.h), interpolation=cv2.INTER_NEAREST)
         return np.clip(al * cv2.GaussianBlur(m.astype(np.float32), (0, 0), 1.0), 0, 1)
-
-    def _separate_preview(self, t: int, img: np.ndarray, fr: F.FieldResult) -> np.ndarray:
-        from ..warp.separate import composite
-        ta = self.target_alpha(t)
-        if ta is None:
-            return F.warp_image(img, fr)
-        st = self.tracker.store
-
-        def neighbour(f):
-            if not (0 <= f < self.proxy.n):
-                return None
-            pa = self._people_alpha(f)
-            if pa is None:
-                return None
-            return [np.asarray(self.proxy.frame(f))], cv2.dilate(pa, np.ones((5, 5), np.uint8))
-
-        out, _, _ = composite([img], [(1, 1)], fr, ta, t, neighbour, st.homography,
-                              (self.proxy.sx, self.proxy.sy), 255)
-        return out[0]
 
     # ------------------------------------------------------------------ joints
     def joint_hit(self, t: int, x_src: float, y_src: float, radius_src: float) -> Optional[Tuple[int, int]]:

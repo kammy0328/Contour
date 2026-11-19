@@ -27,9 +27,9 @@ KIND_TEXT = {
     "fold": "접힘(왜곡 겹침)",
     "jitter": "프레임 간 떨림",
     "line": "배경 직선 휨",
-    "leak": "보호 인물에 변형 번짐",
+    "leak": "보정하지 않는 인물에 변형 번짐",
     "lowconf": "추적 불확실 구간에 보정 적용",
-    "fill": "배경 복원 인페인팅 많음",
+    "fill": "배경 복원 인페인팅 많음",     # from the separate mode (removed in 1.22.2): only older saved issues
     "softened": "겹침 방지로 보정 약화",
 }
 
@@ -170,25 +170,6 @@ def run_qc(cut: Cut, tracker, progress: Optional[Callable[[float, str], None]] =
                 per_frame["line"][t + 1] = (worst, -1)
         if progress and i % 5 == 0:
             progress((i + 1) / max(1, b - a), "QC 검사 중")
-    # separation: little motion means little clean background in neighbouring frames
-    if cut.mode == "separate":
-        for pid, p in targets:
-            hips = (st.final[p, :, S.L_HIP, :2] + st.final[p, :, S.R_HIP, :2]) / 2
-            for t in range(a, b):
-                if not st.present[p, t] or not np.isfinite(hips[t]).all():
-                    continue
-                lo, hi = max(a, t - 16), min(b - 1, t + 16)
-                moves = []
-                for f in (lo, hi):
-                    if np.isfinite(hips[f]).all():
-                        Hm = st.homography(f, t)
-                        if Hm is None:
-                            continue
-                        q = np.array([hips[f][0], hips[f][1], 1.0]) @ Hm.T
-                        moves.append(np.hypot(*(q[:2] / q[2] - hips[t])))
-                sc = st.scale[p, t]
-                if moves and np.isfinite(sc) and max(moves) < 0.04 * sc:
-                    per_frame["fill"][t] = (max(moves), pid)
     issues = _group(per_frame)
     # keep user decisions for issues that still exist
     old = {(q.kind, q.start, q.end): q.status for q in cut.qc}
@@ -230,17 +211,15 @@ def _message(kind: str, v: float) -> str:
     if kind == "warp":
         return f"변형량이 인물 키의 {v:.1f}%까지 커집니다. 보정량이나 범위를 줄여 보세요."
     if kind == "fold":
-        return f"왜곡이 겹치는 지점이 있습니다 (최소 {v:.2f}). 범위 배율이나 감쇠 반경을 키우세요."
+        return f"왜곡이 겹치는 지점이 있습니다 (최소 {v:.2f}). 범위 배율을 키우거나 보정량을 줄여 보세요."
     if kind == "jitter":
         return f"추적 떨림이 결과에 약 {v:.1f}px 흔들림으로 보일 수 있습니다. 관절을 확인하거나 스무딩을 올리세요."
     if kind == "line":
-        return f"배경 직선이 최대 {v:.1f}px 휘어집니다. 직선 보호를 추가하세요."
+        return f"배경 직선이 최대 {v:.1f}px 휘어집니다. 그 부위의 보정량이나 범위 배율을 줄여 보세요."
     if kind == "leak":
-        return f"보호 대상 인물에 {v:.1f}px 변형이 닿습니다. 보호 전환 폭을 키우세요."
+        return f"보정하지 않는 인물에 {v:.1f}px 변형이 닿습니다. 인물 매트와 관절을 확인하거나 보정량을 줄여 보세요."
     if kind == "lowconf":
         return f"추적 신뢰도가 {v:.2f}까지 떨어지는 구간에 보정이 적용됩니다. 관절을 확인하세요."
     if kind == "softened":
         return f"부위가 겹쳐 접힘이 생기지 않도록 일부 영역({v:.1f}%)의 보정을 자동으로 약하게 했습니다."
-    if kind == "fill":
-        return "인물이 거의 움직이지 않아 가려진 배경을 이웃 프레임에서 찾기 어렵습니다. 워프 모드를 권장합니다."
     return KIND_TEXT.get(kind, kind)

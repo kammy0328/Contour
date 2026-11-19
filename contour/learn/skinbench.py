@@ -8,8 +8,10 @@ hard (log, dark scene, coloured light, motion blur, small or large face, skin to
 - strength: mean |change of luma| on that skin (0..255)
 - grain:    fine detail after / before in three bands (finest = grain, middle = pores, coarse = blotches); the finest
             band must stay near 1
-- leaks:    change inside the eyes, brows, lips (face parser) and in hair over the face, relative to the change on
-            the skin: should be near 0
+- leaks:    change inside the eyes, brows, lips, hair over the face, a hand or forearm over the face, the collar and
+            a prop (drawn by hand), relative to the change on the skin: should be near 0. The parts are the app's own
+            (same parser, crop, landmark rules and occluders); a part drawn by a person (manual_dir) takes their
+            place. A part that cannot be had is 'unmeasured', never a leak of 0
 - flicker:  how much the correction itself changes from frame to frame where the face does not (optical flow on
             the source), relative to its size
 - render:   the same frame retouched as the render does it (full resolution, native planes, log carried back),
@@ -78,31 +80,97 @@ def _rms(x: np.ndarray, m: np.ndarray) -> float:
     return float(np.sqrt(np.mean(x[m] ** 2))) if m.any() else float("nan")
 
 
-def parse_maps(rgb_u8: np.ndarray, lm: np.ndarray) -> Optional[Dict[str, np.ndarray]]:
-    """Per class probability maps of the face parser on the image (eyes, brows, lips with mouth, hair, skin)."""
+PARTS = ("eyes", "brows", "lips", "hair", "hand", "collar", "prop")     # what a skin retouch must not touch
+_MISSING = object()
+
+
+def _parser():
     from ..track import faceparse as FP
     if _P[0] is None:
         _P[0] = FP.make_parser() if FP.ready() else False
-    P = _P[0]
+    return _P[0]
+
+
+def manual_dir(cut) -> Path:
+    """Masks a person drew for checking (white = the part): <learning>/skin_gt/<cut id>/<frame:06d>_<part>.png."""
+    from ..core.settings import settings
+    return Path(settings().learning_path) / "skin_gt" / str(cut.id)
+
+
+def manual_maps(cut, t: int, shape) -> Dict[str, np.ndarray]:
+    out = {}
+    d = manual_dir(cut)
+    if not d.is_dir():
+        return out
+    h, w = shape
+    for part in PARTS + ("skin", "neck"):
+        f = d / f"{int(t):06d}_{part}.png"
+        if f.exists():
+            im = cv2.imread(str(f), cv2.IMREAD_GRAYSCALE)
+            if im is not None:
+                out[part] = cv2.resize(im, (w, h), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
+    return out
+
+
+def parse_maps(rgb_u8: np.ndarray, lm: np.ndarray, occ: Optional[list] = None,
+               manual: Optional[Dict[str, np.ndarray]] = None) -> Optional[Dict[str, np.ndarray]]:
+    """The protected parts on the image as the app makes them: the app's own face parser (MediaPipe by default,
+    SegFormer when that is the parser) on the same crop, with the same landmark rules for eyes, brows and lips and
+    the same hand / forearm occluders (occ: faceparse.limb_occluders of this frame). Parts: eyes, brows, lips, hair,
+    skin, neck, collar (clothes next to the neck), hand (the occluders), cover (the parsed crop). A part a person
+    drew (manual: part -> image mask 0..1) replaces the automatic one. 'source' tells where each part came from;
+    'missing' lists the parts that could not be had (never measured as no leak)."""
+    from ..track import faceparse as FP
+    P = _parser()
     if not P:
         return None
-    M = P.crop_affine(np.asarray(lm, np.float64))
-    if M is None:
+    lm = np.asarray(lm, np.float64)
+    if occ and getattr(P, "takes_occluders", False):
+        r = P.parse(rgb_u8, lm, occ)
+    else:
+        r = P.parse(rgb_u8, lm)
+    if r is None:
         return None
-    crop = cv2.warpAffine(rgb_u8, M, (FP.SIZE, FP.SIZE), flags=cv2.INTER_AREA if M[0, 0] < 1 else cv2.INTER_LINEAR,
-                          borderMode=cv2.BORDER_REPLICATE)
-    x = (crop.astype(np.float32) / 255.0 - FP.MEAN) / FP.STD
-    lo = P.s.run(None, {P.inp: np.ascontiguousarray(x.transpose(2, 0, 1)[None])})[0][0]
-    lo = lo - lo.max(0, keepdims=True)
-    e = np.exp(lo)
-    pr = e / e.sum(0, keepdims=True)
+    M = np.asarray(r["M"], np.float64)
     shape = rgb_u8.shape[:2]
-
-    def cls(ids):
-        m = cv2.resize(pr[list(ids)].sum(0), (FP.KEEP, FP.KEEP), interpolation=cv2.INTER_LINEAR)
-        return FP.to_image(m, M, shape)
-    return dict(eyes=cls((4, 5)), brows=cls((6, 7)), lips=cls((10, 11, 12)), hair=cls(FP.HAIR), skin=cls(FP.SKIN),
-                cover=FP.to_image(np.ones((FP.KEEP, FP.KEEP), np.float32), M, shape))
+    img = lambda a: FP.to_image(np.asarray(a, np.float32), M, shape)
+    keep = lambda a: cv2.resize(np.asarray(a, np.float32), (FP.KEEP, FP.KEEP), interpolation=cv2.INTER_AREA)
+    out: Dict[str, np.ndarray] = dict(skin=img(r["skin"]), neck=img(r["neck"]), hair=img(r["hair"]),
+                                      cover=img(np.ones((FP.KEEP, FP.KEEP), np.float32)))
+    src = {k: "app" for k in out}
+    lmc = np.c_[lm[:, :2], np.ones(len(lm))] @ M.T
+    if isinstance(P, FP.MPFaceParser):
+        parts = FP.feature_parts(lmc)
+        if parts is not None:
+            for k, v in parts.items():
+                out[k] = img(keep(v))
+                src[k] = "app"
+    else:                                                   # SegFormer: its own classes, as the app reads them
+        crop = cv2.warpAffine(rgb_u8, M, (FP.SIZE, FP.SIZE), flags=cv2.INTER_AREA if M[0, 0] < 1 else cv2.INTER_LINEAR,
+                              borderMode=cv2.BORDER_REPLICATE)
+        x = (crop.astype(np.float32) / 255.0 - FP.MEAN) / FP.STD
+        lo = P.s.run(None, {P.inp: np.ascontiguousarray(x.transpose(2, 0, 1)[None])})[0][0]
+        lo = lo - lo.max(0, keepdims=True)
+        e = np.exp(lo)
+        pr = e / e.sum(0, keepdims=True)
+        for k, ids in (("eyes", (4, 5)), ("brows", (6, 7)), ("lips", (10, 11, 12))):
+            out[k] = img(keep(pr[list(ids)].sum(0)))
+            src[k] = "app"
+    # the collar: clothes right next to the neck (the neck's own zone, widened)
+    zone = cv2.dilate((FP.neck_zone(lmc) > 0.3).astype(np.uint8), np.ones((25, 25), np.uint8)).astype(np.float32)
+    col = np.asarray(cv2.resize(np.asarray(r["cloth"], np.float32), (FP.SIZE, FP.SIZE)), np.float32) * zone
+    if (col > 0.5).sum() >= 40:
+        out["collar"] = img(keep(col))
+        src["collar"] = "app"
+    if occ:
+        out["hand"] = img(keep(FP.occluder_mask(occ, M)))
+        src["hand"] = "app"
+    for k, v in (manual or {}).items():
+        out[k] = np.asarray(v, np.float32)
+        src[k] = "manual"
+    out["source"] = src
+    out["missing"] = [k for k in PARTS if k not in out]
+    return out
 
 
 def measure(src: np.ndarray, out: np.ndarray, m: np.ndarray, maps: Optional[dict]) -> dict:
@@ -120,21 +188,33 @@ def measure(src: np.ndarray, out: np.ndarray, m: np.ndarray, maps: Optional[dict
              strength=round(strength, 3), skin_px=int(sk.sum()))
     for i, (s0, s1) in enumerate(BANDS):
         r[f"grain{i}"] = round(_rms(band(Y1, s0, s1), sk) / max(1e-6, _rms(band(Y0, s0, s1), sk)), 3)
-    if maps is not None:
-        er = np.ones((3, 3), np.uint8)
-        for k in ("eyes", "brows", "lips"):
-            fm = cv2.erode((maps[k] > 0.6).astype(np.uint8), er).astype(bool)
-            if fm.sum() >= 20:
-                v = float(np.abs(dY[fm]).mean())
-                r[f"leak_{k}"] = round(v / max(strength, 0.05), 3)
-                r[f"leak_{k}_abs"] = round(v, 3)
-        face = cv2.dilate((maps["skin"] > 0.5).astype(np.uint8), np.ones((15, 15), np.uint8)).astype(bool)
-        hm = (maps["hair"] > 0.7) & face & (maps["cover"] > 0.5)
-        hm = cv2.erode(hm.astype(np.uint8), er).astype(bool)
-        if hm.sum() >= 50:
-            v = float(np.abs(dY[hm]).mean())
-            r["leak_hair"] = round(v / max(strength, 0.05), 3)
-            r["leak_hair_abs"] = round(v, 3)
+    if maps is None:
+        r["unmeasured"] = list(PARTS)                      # no face parse: no leak is measured (never 0)
+        return r
+    er = np.ones((3, 3), np.uint8)
+    # over the face: the parser's face skin or the skin the retouch took, widened a little
+    face = cv2.dilate(((maps["skin"] > 0.5) | sk).astype(np.uint8), np.ones((15, 15), np.uint8)).astype(bool)
+    near_face = face & (maps["cover"] > 0.5)
+    un = []
+    for k in PARTS:
+        if k not in maps:
+            un.append(k)
+            continue
+        thr = 0.6 if k in ("eyes", "brows", "lips") else (0.7 if k == "hair" else 0.5)
+        pm = maps[k] > thr
+        if k in ("hair", "hand", "prop"):
+            pm &= near_face                                # over the face, where the retouch works
+        if k == "collar":
+            pm &= ~sk
+        pm = cv2.erode(pm.astype(np.uint8), er).astype(bool)
+        if pm.sum() < (50 if k == "hair" else 20):
+            un.append(k)                                    # too small here to tell (not a 0)
+            continue
+        v = float(np.abs(dY[pm]).mean())
+        r[f"leak_{k}"] = round(v / max(strength, 0.05), 3)
+        r[f"leak_{k}_abs"] = round(v, 3)
+        r[f"src_{k}"] = maps.get("source", {}).get(k, "app")
+    r["unmeasured"] = un
     return r
 
 
@@ -313,7 +393,12 @@ def bench_cut(cut, tr, px, levels=LEVELS, n: int = 2, run: int = 4, render: bool
                 lm = st.face[p, t0].copy()
                 lm[:, 0] *= px.sx
                 lm[:, 1] *= px.sy
-                maps = parse_maps(src, lm)
+                from ..track import faceparse as FP
+                occ = FP.limb_occluders(st, t0, px.sx, px.sy)
+                maps = parse_maps(src, lm, occ, manual_maps(cut, t0, src.shape[:2]))
+                scope = str(getattr(cut.params_for(pid), "skin_scope", "face,neck"))
+                if maps is not None and "hand" in scope.split(",") and maps.get("source", {}).get("hand") != "manual":
+                    maps.pop("hand", None)                  # hands are retouched on purpose here: not a leak
                 r = dict(base, level=level, **measure(src, out, m, maps))
                 r.update(tags(cut, st, p, t0, src, m, px))
                 fl = flicker(seq)
@@ -338,8 +423,11 @@ CHECKS = (
     ("darker skin (dL < -0.5)", lambda r: r.get("dL", 0) < -0.5),
     ("colour cast (|da| or |db| > 1)", lambda r: abs(r.get("da", 0)) > 1.0 or abs(r.get("db", 0)) > 1.0),
     ("grain lost (finest band < 0.85)", lambda r: r.get("grain0", 1) < 0.85),
-    ("eye/brow/lip leak (> 0.25)", lambda r: max(r.get("leak_eyes", 0), r.get("leak_brows", 0), r.get("leak_lips", 0)) > 0.25),
+    ("eye/brow/lip leak (> 0.25)", lambda r: max([r[k] for k in ("leak_eyes", "leak_brows", "leak_lips") if k in r],
+                                                 default=0) > 0.25),
     ("hair leak (> 0.35)", lambda r: r.get("leak_hair", 0) > 0.35),
+    ("hand / collar / prop leak (> 0.35)", lambda r: max([r[k] for k in ("leak_hand", "leak_collar", "leak_prop")
+                                                         if k in r], default=0) > 0.35),
     ("flicker (> 0.6)", lambda r: r.get("flicker_px", 0) > 0.6),
     ("render differs from preview (strength off by > 25 %)", lambda r: "strength_ratio" in r and abs(r["strength_ratio"] - 1) > 0.25),
     ("4K grain lost (finest band < 0.85)", lambda r: r.get("full_grain0", 1) < 0.85),
@@ -368,11 +456,15 @@ def summarize(rows: List[dict]) -> dict:
                 continue
             row = dict(n=len(S))
             for k in ("dE", "dL", "strength", "grain0", "grain1", "grain2", "leak_eyes", "leak_brows", "leak_lips",
-                      "leak_hair", "flicker_px", "strength_ratio", "diff", "full_grain0"):
+                      "leak_hair", "leak_hand", "leak_collar", "leak_prop", "flicker_px", "strength_ratio", "diff",
+                      "full_grain0"):
                 v = [r[k] for r in S if k in r and np.isfinite(r[k])]
                 if v:
                     row[k] = round(float(np.median(v)), 3)
             row["fails"] = {cn: sum(1 for r in S if cf(r)) for cn, cf in CHECKS if any(cf(r) for r in S)}
+            # a protection not measured is not a pass: how many samples could not check each part
+            un = {k: sum(1 for r in S if k in (r.get("unmeasured") or [])) for k in PARTS}
+            row["unmeasured"] = {k: v for k, v in un.items() if v}
             g[gname] = row
         out[lv] = g
     return out

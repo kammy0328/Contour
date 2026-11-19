@@ -13,11 +13,11 @@ from .project import Cut, PartParams
 class CopyOptions:
     amounts: bool = True       # part amounts (value at the current frame, no keyframes)
     widths: bool = True        # width multipliers
-    mode: bool = True          # warp / separate
-    protect: bool = True       # protection settings (not line/shape positions)
+    mode: bool = False         # unused since 1.22.2 (one way: the warp); kept so older saved copies still load
+    protect: bool = False      # unused since 1.22.2 (no protection settings); kept likewise
     tracking: bool = False     # smoothing / threshold
     output: bool = False       # output format settings
-    roles: bool = True         # target/protect roles and names
+    roles: bool = True         # who is retouched (target or not) and names
 
 
 def _sim(a: List[float], b: List[float]) -> float:
@@ -140,13 +140,6 @@ def apply_copy(src: Cut, dst: Cut, mapping: Dict[int, Optional[int]], frame: int
                 d_params.skin_basic = s_params.skin_basic
             if opt.widths:
                 d_params.widths = dict(s_params.widths)
-    if opt.mode:
-        dst.mode = src.mode
-    if opt.protect:
-        dst.protect.others = src.protect.others
-        dst.protect.falloff_pct = src.protect.falloff_pct
-        dst.protect.border = src.protect.border
-        dst.protect.reach = src.protect.reach
     if opt.tracking:
         dst.tracking.smoothing = src.tracking.smoothing
         dst.tracking.conf_threshold = src.tracking.conf_threshold
