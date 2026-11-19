@@ -2696,6 +2696,9 @@ class MainWindow(QMainWindow):
         """The clothing model is SegFormer fine-tuned for clothes; SegFormer's licence (NVIDIA) allows
         non-commercial use only. Said once, before the model is first downloaded."""
         from ..core.settings import settings
+        from ..track import clothing as CL
+        if CL.cloth_model() != "parse_clothes":
+            return True                    # SAM 3.1 garment words: shipped, commercial use allowed, nothing to ask
         st = settings()
         if st.cloth_model_ok:
             return True

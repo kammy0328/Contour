@@ -39,7 +39,7 @@ FEATURES = (3, 4, 5, 6, 7, 10, 11, 12)       # glasses, eyes, brows, mouth, lips
 MP_FILE = Path(__file__).resolve().parent / "data" / "mp_selfie_multiclass_256.onnx"
 MP_SIZE = 256
 MP_BG, MP_HAIR, MP_BODY, MP_FACE, MP_CLOTHES, MP_OTHERS = range(6)
-DEFAULT_MODEL = "face_parse"
+DEFAULT_MODEL = "mp"             # commercial use (2026-11-19, j2758); face_parse: non-commercial, on request
 
 
 def face_model() -> str:

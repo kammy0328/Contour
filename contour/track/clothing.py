@@ -63,11 +63,14 @@ def detected(tracker, p: int, n: int = 12) -> list:
     return [k for k, _, _ in GARMENTS if cnt[k] > 0.01 * tot]
 MEAN = np.array([0.485, 0.456, 0.406], np.float32)
 STD = np.array([0.229, 0.224, 0.225], np.float32)
-DEFAULT_MODEL = "parse_clothes"
+DEFAULT_MODEL = "sam31"          # commercial use (2026-11-19, j2758); parse_clothes: non-commercial, on request
 GARMENT_FILE = Path(__file__).resolve().parent / "data" / "sam31_text_garments.npz"
 # SAM 3.1 phrases -> the clothes model's classes (so the stored map, keep_mask and detected stay as they are)
-PHRASES = [("shirt", 4), ("jacket", 4), ("top", 4), ("pants", 6), ("shorts", 6), ("skirt", 5), ("dress", 7),
-           ("belt", 8), ("hat", 1), ("shoe", 9), ("bag", 16)]
+PHRASES = [("shirt", 4), ("jacket", 4), ("coat", 4), ("sweater", 4), ("hoodie", 4), ("top", 4), ("pants", 6),
+           ("shorts", 6), ("skirt", 5), ("dress", 7), ("belt", 8), ("hat", 1), ("shoe", 9), ("bag", 16)]
+# anything else worn (2026-11-19: a denim jacket none of the garment words found): counted as a top, only where no
+# garment word claimed the pixel
+CATCH_ALL = ("clothing", 4)
 GARMENT_SCORE = 0.4
 
 
@@ -83,9 +86,10 @@ def cloth_model() -> str:
             v = getattr(settings(), "cloth_model", "") or ""
         except Exception:
             v = ""
+    v = v if v in ("sam31", "parse_clothes") else DEFAULT_MODEL
     if v == "sam31" and not GARMENT_FILE.is_file():
-        v = ""
-    return v if v in ("sam31", "parse_clothes") else DEFAULT_MODEL
+        v = "parse_clothes"
+    return v
 
 
 class GarmentFinder:
@@ -99,10 +103,11 @@ class GarmentFinder:
         self.finder = Finder31()
         d = np.load(str(GARMENT_FILE))
         self.phr = []
-        for ph, cls in PHRASES:
+        for ph, cls in PHRASES + [CATCH_ALL]:
             k = ph.replace(" ", "_")
             if f"{k}__text" in d.files:
-                self.phr.append((cls, d[f"{k}__text"].astype(np.float32), d[f"{k}__text_pad"].astype(bool)))
+                self.phr.append((cls, d[f"{k}__text"].astype(np.float32), d[f"{k}__text_pad"].astype(bool),
+                                 ph == CATCH_ALL[0]))
 
     def classes(self, rgb: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
         """rgb uint8 (H, W, 3) -> (h, w) uint8 class map at size (w, h)."""
@@ -112,12 +117,12 @@ class GarmentFinder:
         out = np.zeros((h, w), np.uint8)
         base = dict(self.finder.const)
         try:
-            for cls, text, pad in self.phr:
+            for cls, text, pad, catch_all in self.phr:
                 self.finder.const = dict(base, text=text, text_pad=pad)
                 for d in self.finder.find(enc, GARMENT_SCORE):
                     lg = cv2.resize(d["lg"], (w, h), interpolation=cv2.INTER_LINEAR)
                     sc = np.where(lg > 0, d["score"] * (1.0 / (1.0 + np.exp(-lg))), 0.0).astype(np.float32)
-                    win = sc > best
+                    win = (sc > 0) & (out == 0) if catch_all else sc > best
                     out[win] = cls
                     best[win] = sc[win]
         finally:

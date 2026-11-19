@@ -608,7 +608,7 @@ K-pop 안무영상 여러 개로 군무 추적을 시험하고, 틀린 곳을 �
 - SegFormer-B2 옷 분할(mattmdjaga/segformer_b2_clothes, ATR 학습): NVIDIA SegFormer 라이선스, 비상업 용도 (선택 기능, 사용 시 다운로드)
 - SegFormer-B5 얼굴 분할(jonathandinu/face-parsing, CelebAMask-HQ 학습): 비상업 연구·교육 용도 (`face_model = "face_parse"`일 때만 다운로드)
 - MediaPipe Selfie Multiclass 분할: Google, Apache-2.0 (TFLite를 tf2onnx로 ONNX 변환해 `contour/track/data/mp_selfie_multiclass_256.onnx`에 포함, 라이선스 전문 `contour/track/data/MEDIAPIPE_LICENSE.txt`). 상업 사용용 얼굴 분할(`face_model = "mp"`)
-- `contour/track/data/sam31_text_garments.npz`: SAM 3.1 문구 인코더(smile-forge 변환, SAM License)가 옷 단어("skirt", "dress" 등)에 대해 낸 결과(`tools/sam31_phrases.py`로 생성). 상업 사용용 옷 분할(`cloth_model = "sam31"`)
+- `contour/track/data/sam31_text_garments.npz`: SAM 3.1 문구 인코더(smile-forge 변환, SAM License)가 옷 단어("skirt", "dress" 등)에 대해 낸 결과(`tools/sam31_phrases.py`로 생성: shirt, jacket, coat, sweater, hoodie, top, pants, shorts, skirt, dress, belt, hat, shoe, bag, clothing). 상업 사용용 옷 분할(`cloth_model = "sam31"`)
 
 ### 상업 배포 시
 

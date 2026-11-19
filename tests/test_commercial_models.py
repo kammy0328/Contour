@@ -138,3 +138,43 @@ def test_garment_phrases_make_the_clothes_classes(monkeypatch, tmp_path):
     assert cm[13, 5] == 7                     # dress (only it)
     assert cm[20, 5] == 5                     # both: skirt is surer
     assert cm[2, 5] == 0
+
+
+def test_catch_all_clothing_only_fills_what_garment_words_left(monkeypatch, tmp_path):
+    """'clothing' (a denim jacket no garment word found) counts as a top, but never over a found garment."""
+    f = tmp_path / "g.npz"
+    np.savez(f, pants__text=np.zeros((32, 1, 256), np.float32), pants__text_pad=np.zeros((1, 32), bool),
+             clothing__text=np.ones((32, 1, 256), np.float32), clothing__text_pad=np.zeros((1, 32), bool))
+    monkeypatch.setattr(CL, "GARMENT_FILE", f)
+    import contour.track.infer as INF
+
+    class Seg:
+        def __init__(self, *a):
+            pass
+
+        def encode(self, rgb):
+            return dict(emb={}, rect=(0, 0, rgb.shape[1], rgb.shape[0]))
+
+    class Find:
+        def __init__(self, *a):
+            self.const = dict(text=None, text_pad=None, box_tokens=None)
+
+        def find(self, enc, thr):
+            lg = np.full((16, 16), -5.0, np.float32)
+            if float(self.const["text"].max()) == 0.0:          # pants: lower half, not very sure
+                lg[8:] = 1.0
+                return [dict(score=0.5, lg=lg, rect=enc["rect"], box=None)]
+            lg[:] = 6.0                                            # clothing: everything, very sure
+            return [dict(score=0.99, lg=lg, rect=enc["rect"], box=None)]
+    monkeypatch.setattr(INF, "Segmenter31", Seg)
+    monkeypatch.setattr(INF, "Finder31", Find)
+    cm = CL.GarmentFinder().classes(np.zeros((64, 64, 3), np.uint8), (32, 32))
+    assert cm[28, 5] == 6 and cm[4, 5] == 4
+
+
+def test_defaults_are_the_commercially_usable_models(monkeypatch):
+    monkeypatch.delenv("DIAP_FACE_MODEL", raising=False)
+    monkeypatch.delenv("DIAP_CLOTH_MODEL", raising=False)
+    assert FP.face_model() == "mp" and CL.cloth_model() == "sam31"
+    monkeypatch.setattr(CL, "GARMENT_FILE", CL.GARMENT_FILE.with_name("missing.npz"))
+    assert CL.cloth_model() == "parse_clothes"
