@@ -1,4 +1,4 @@
-"""Right panel: 피부 · 몸매 · 추적 · 보호 · 출력."""
+"""Right panel: 피부 · 몸매 · 추적 · 출력 (the 보호 tab was removed in 1.22.2)."""
 from __future__ import annotations
 
 import time
@@ -65,10 +65,11 @@ class ReshapeTab(_Tab):
         pl = QVBoxLayout(self.person_box)
         pl.setContentsMargins(0, 6, 0, 0)
         pl.setSpacing(6)
-        self.role = Wd.Segmented([("target", "보정"), ("protect", "보호")], compact=True)
-        self.role.setToolTip("보정: 이 인물에 보정을 적용합니다\n보호: 보정하지 않고, 다른 사람의 변형도 닿지 않게 지킵니다")
-        self.role.changed.connect(self.ctl.set_role)
-        pl.addWidget(self.role)
+        # who is retouched: on or off (1.22.2: no 보호 role any more; a person not retouched is still kept out of the
+        # others' warp, always)
+        self.role = Wd.Toggle()
+        self.role.toggled.connect(lambda v: self.ctl.set_role("target" if v else "protect"))
+        pl.addWidget(Wd.FieldRow("보정 대상", self.role, "끄면 이 인물은 보정하지 않고, 다른 인물의 변형도 닿지 않습니다"))
         self.add(self.person_box)
         pr = QHBoxLayout()
         pr.setContentsMargins(0, 2, 0, 0)
@@ -83,7 +84,7 @@ class ReshapeTab(_Tab):
         pw.setLayout(pr)
         pl.addWidget(pw)
         # widgets only one of the two tabs has
-        self.mode = self.strength = self.feather = None
+        self.strength = self.feather = None
         self.skin_detail = self.grain_size = self.blemish_size = self.skin_scope = None
         self.sculpt_btn = self.sculpt_clear = self.body_btn = self.body_clear = None
         self.face_note = self.parts_btn = self.parts_info = self.cloth_keep = None
@@ -93,11 +94,7 @@ class ReshapeTab(_Tab):
         self.wrows: Dict[str, Wd.ParamRow] = {}
         add = self.add
         if part == "body":
-            self.add(Wd.Section("방식"))
-            self.mode = Wd.Segmented([("warp", "워프"), ("separate", "분리 + 배경 복원")])
-            self.mode.changed.connect(self.ctl.set_mode)
-            self.mode.setToolTip("워프: 주변 배경까지 자연스럽게 함께 변형 (기본)\n분리: 인물만 변형하고 드러난 배경은 이웃 프레임에서 복원")
-            self.add(self.mode)
+            self.add(Wd.Section("전체"))
             # overall strength
             self.strength = Wd.ParamRow("strength", "전체 강도", 0, 150, 1, "pct", 100)
             self.strength.name.setToolTip("몸·얼굴·머리 모양 변화 전체에 곱해지는 강도 (피부·색 보정은 제외)")
@@ -572,7 +569,7 @@ class ReshapeTab(_Tab):
         self._chips.clear()
         persons = [p for p in (cut.persons if cut else [])]
         for i, p in enumerate(persons):
-            badge = {"target": "", "protect": "보호", "ignore": "보호"}.get(p.role, "")
+            badge = "" if p.role == "target" else "제외"
             ch = Wd.Chip(p.name, p.color)
             ch.set_text(p.name, badge)
             ch.setChecked(p.id == self.ctl.sel_pid or p.id in (getattr(self.ctl, "sel_pids", set()) or set()))
@@ -587,9 +584,9 @@ class ReshapeTab(_Tab):
         self.person_box.setVisible(person is not None)
         enabled = person is not None and person.role == "target"
         if person is not None:
-            self.role.set_current("protect" if person.role == "ignore" else person.role)
-        if cut and self.mode is not None:
-            self.mode.set_current(cut.mode)
+            self.role.blockSignals(True)
+            self.role.setChecked(person.role == "target")
+            self.role.blockSignals(False)
         ws = list(self.rows.values()) + list(self.wrows.values()) + \
             [w_ for w_ in (self.strength, self.feather, self.skin_detail, self.grain_size, self.blemish_size,
                            self.skin_scope, self.sculpt_btn, self.sculpt_clear, self.body_btn, self.body_clear)
@@ -770,112 +767,6 @@ class TrackTab(_Tab):
         self.rematte.setEnabled(bool(cut.analyzed and st is not None))
         sel = self.ctl.selection
         self.sel_label.setText(f"선택: {sel[0]}~{sel[1]} 프레임 ({sel[1] - sel[0] + 1}f)" if sel else "선택된 구간 없음")
-
-
-# =========================================================================== 보호
-
-class ProtectTab(_Tab):
-    def __init__(self, ctl):
-        super().__init__(ctl)
-        self.add(Wd.Section("인물"))
-        self.t_others = Wd.Toggle()
-        self.t_others.toggled.connect(lambda v: self.ctl.set_protect("others", v))
-        self.add(Wd.FieldRow("보정하지 않는 인물 보호", self.t_others,
-                             "다른 멤버·엑스트라·소품 매트에는 변형이 닿지 않게 합니다"))
-        self.falloff = Wd.ParamRow("falloff", "전환 폭", 0.5, 10, 0.5, "pct1", 0.5)
-        self.falloff.keyb.hide()
-        self.falloff.val.setFixedWidth(46)
-        self.falloff.committed.connect(lambda k, v: self.ctl.set_protect("falloff_pct", v))
-        self.falloff.setToolTip("보호 영역에서 변형이 0이 되기까지의 거리 (화면 높이 %)")
-        self.add(self.falloff)
-        self.reach = Wd.ParamRow("reach", "감쇠 반경", 1.3, 4.0, 0.1, "x", 1.9)
-        self.reach.keyb.hide()
-        self.reach.committed.connect(lambda k, v: self.ctl.set_protect("reach", v))
-        self.reach.setToolTip("몸 바깥으로 변형이 퍼지는 거리. 작으면 배경 영향이 줄고, 크면 더 부드럽습니다")
-        self.add(self.reach)
-        self.t_border = Wd.Toggle()
-        self.t_border.toggled.connect(lambda v: self.ctl.set_protect("border", v))
-        self.add(Wd.FieldRow("화면 가장자리 고정", self.t_border))
-        self.add(Wd.Section("배경 직선 보호"))
-        hint = Wd.label("문틀, 기둥, 수평선처럼 휘면 티 나는 선을 따라 그리세요. "
-                        "카메라가 움직이면 자동으로 따라갑니다. 다른 프레임에서 끝점을 옮기면 위치 키가 추가됩니다.", "Faint", 11)
-        hint.setWordWrap(True)
-        self.add(hint)
-        row = QHBoxLayout()
-        self.b_line = Wd.button("직선 그리기  L", "", "ruler")
-        self.b_line.setCheckable(True)
-        self.b_line.clicked.connect(lambda on: self.ctl.set_tool("line" if on else "edit"))
-        row.addWidget(self.b_line)
-        w = QWidget()
-        w.setLayout(row)
-        self.add(w)
-        self.lines = QListWidget()
-        self.lines.setFixedHeight(104)
-        self.lines.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.lines.customContextMenuRequested.connect(lambda p: self._item_menu(self.lines, p, "line"))
-        self.add(self.lines)
-        self.add(Wd.Section("보호 영역 (마이크, 소품, 손)"))
-        row2 = QHBoxLayout()
-        self.b_ell = Wd.button("타원", "", "circle-dashed")
-        self.b_rect = Wd.button("사각형", "", "square-dashed")
-        for b, k in ((self.b_ell, "ellipse"), (self.b_rect, "rect")):
-            b.setCheckable(True)
-            b.clicked.connect(lambda on, kk=k: self.ctl.set_tool(kk if on else "edit"))
-            row2.addWidget(b)
-        w2 = QWidget()
-        w2.setLayout(row2)
-        self.add(w2)
-        self.shapes = QListWidget()
-        self.shapes.setFixedHeight(90)
-        self.shapes.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.shapes.customContextMenuRequested.connect(lambda p: self._item_menu(self.shapes, p, "shape"))
-        self.add(self.shapes)
-        self.lay.addStretch(1)
-
-    def _item_menu(self, lst, pos, kind):
-        it = lst.itemAt(pos)
-        if it is None:
-            return
-        oid = it.data(Qt.UserRole)
-        m = QMenu(self)
-        a1 = m.addAction("켜기/끄기")
-        a2 = m.addAction("이 프레임의 위치 키 삭제")
-        m.addSeparator()
-        a3 = m.addAction("삭제")
-        a = m.exec(lst.viewport().mapToGlobal(pos))
-        if a == a1:
-            self.ctl.protect_item("toggle", kind, oid)
-        elif a == a2:
-            self.ctl.protect_item("delkey", kind, oid)
-        elif a == a3:
-            self.ctl.protect_item("delete", kind, oid)
-
-    def refresh(self):
-        cut = self.ctl.session.cut
-        if cut is None:
-            return
-        pr = cut.protect
-        for tg, v in ((self.t_others, pr.others), (self.t_border, pr.border)):
-            tg.blockSignals(True)
-            tg.setChecked(v)
-            tg.blockSignals(False)
-        self.falloff.set_value(pr.falloff_pct)
-        self.reach.set_value(pr.reach)
-        tool = self.ctl.tool
-        self.b_line.setChecked(tool == "line")
-        self.b_ell.setChecked(tool == "ellipse")
-        self.b_rect.setChecked(tool == "rect")
-        self.lines.clear()
-        for i, ln in enumerate(pr.lines):
-            it = QListWidgetItem(f"직선 {i + 1}  ·  위치 키 {len(ln.keys)}개" + ("" if ln.enabled else "  (꺼짐)"))
-            it.setData(Qt.UserRole, ln.id)
-            self.lines.addItem(it)
-        self.shapes.clear()
-        for i, sh in enumerate(pr.shapes):
-            k = "타원" if sh.kind == "ellipse" else "사각형"
-            it = QListWidgetItem(f"{k} {i + 1}  ·  위치 키 {len(sh.keys)}개" + ("" if sh.enabled else "  (꺼짐)"))
-            it.setData(Qt.UserRole, sh.id)
-            self.shapes.addItem(it)
 
 
 # =========================================================================== QC
@@ -1084,8 +975,8 @@ class Inspector(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 10, 0, 0)
         lay.setSpacing(0)
-        self.tabs = Wd.Segmented([("skin", "피부"), ("body", "몸매"), ("track", "추적"), ("protect", "보호"),
-                                  ("output", "출력")], compact=True)
+        self.tabs = Wd.Segmented([("skin", "피부"), ("body", "몸매"), ("track", "추적"), ("output", "출력")],
+                                 compact=True)
         wrap = QWidget()
         wl = QHBoxLayout(wrap)
         wl.setContentsMargins(14, 0, 14, 8)
@@ -1095,7 +986,7 @@ class Inspector(QWidget):
         self.stack = QStackedWidget()
         self.pages = {
             "skin": ReshapeTab(ctl, "skin"), "body": ReshapeTab(ctl, "body"), "track": TrackTab(ctl),
-            "protect": ProtectTab(ctl), "output": OutputTab(ctl),
+            "output": OutputTab(ctl),
         }
         self._edit_tab = "skin"            # "reshape" (from the window) means the last used of 피부 and 몸매
         for k, pg in self.pages.items():

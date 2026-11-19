@@ -48,6 +48,7 @@ class AppSettings:
     last_project: str = ""
     recent_projects: list = field(default_factory=list)
     known_projects: list = field(default_factory=list)   # every project the project manager lists (no limit)
+    legacy_notified: list = field(default_factory=list)  # projects told once that their 보호/분리 settings are gone
     pm_sort: str = "modified"             # project manager order: modified | name | created (last chosen)
     play_loop: bool = False               # transport: repeat the cut (off: playback goes on into the next cut)
     open_last_on_start: bool = False      # skip the project manager at start and open the last project

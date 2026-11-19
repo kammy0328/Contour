@@ -242,25 +242,57 @@ def to_image(m: np.ndarray, M: np.ndarray, shape: Tuple[int, int]) -> np.ndarray
 
 
 # ------------------------------------------------------------------ MediaPipe Selfie Multiclass (Apache-2.0)
-def feature_mask(lmc: np.ndarray, size: int = SIZE) -> np.ndarray:
-    """Eyes, brows and lips drawn from the 68 landmarks in crop pixels (the multiclass model counts them as face
-    skin; the SegFormer parser has them as classes of their own). float32 (size, size) 0..1."""
+def _draw_features(L: np.ndarray, wf: float, size: int, part: str) -> np.ndarray:
+    """One feature drawn by the landmark rules (uint8 0/1): 'eyes' a little wider than the lids, 'brows' as thick
+    lines, 'lips' with the open mouth."""
     m = np.zeros((size, size), np.uint8)
-    L = np.asarray(lmc, np.float64)[:, :2]
-    if not np.isfinite(L[17:68]).all():
-        return m.astype(np.float32)
-    wf = float(np.hypot(*(L[16] - L[0]))) if np.isfinite(L[[0, 16]]).all() else size * 0.45
-    for a, b in ((36, 42), (42, 48)):                       # eyes, a little wider than the lids
-        c = L[a:b].mean(0)
-        poly = c + (L[a:b] - c) * 1.35
-        cv2.fillPoly(m, [np.round(poly).astype(np.int32)], 1)
-    th = max(2, int(round(0.035 * wf)))
-    for a, b in ((17, 22), (22, 27)):                       # brows as thick lines
-        cv2.polylines(m, [np.round(L[a:b]).astype(np.int32)], False, 1, thickness=th)
-    cv2.fillPoly(m, [np.round(L[48:60]).astype(np.int32)], 1)   # lips and the open mouth
+    if part == "eyes":
+        for a, b in ((36, 42), (42, 48)):
+            c = L[a:b].mean(0)
+            poly = c + (L[a:b] - c) * 1.35
+            cv2.fillPoly(m, [np.round(poly).astype(np.int32)], 1)
+    elif part == "brows":
+        th = max(2, int(round(0.035 * wf)))
+        for a, b in ((17, 22), (22, 27)):
+            cv2.polylines(m, [np.round(L[a:b]).astype(np.int32)], False, 1, thickness=th)
+    elif part == "lips":
+        cv2.fillPoly(m, [np.round(L[48:60]).astype(np.int32)], 1)
+    return m
+
+
+def _feature_soften(m: np.ndarray, wf: float) -> np.ndarray:
     k = max(1, int(round(0.01 * wf)))
     m = cv2.dilate(m, np.ones((2 * k + 1, 2 * k + 1), np.uint8))
     return np.clip(cv2.GaussianBlur(m.astype(np.float32), (0, 0), max(0.8, 0.006 * wf)), 0, 1)
+
+
+def _feature_lm(lmc: np.ndarray, size: int):
+    L = np.asarray(lmc, np.float64)[:, :2]
+    if not np.isfinite(L[17:68]).all():
+        return None, 0.0
+    wf = float(np.hypot(*(L[16] - L[0]))) if np.isfinite(L[[0, 16]]).all() else size * 0.45
+    return L, wf
+
+
+def feature_mask(lmc: np.ndarray, size: int = SIZE) -> np.ndarray:
+    """Eyes, brows and lips drawn from the 68 landmarks in crop pixels (the multiclass model counts them as face
+    skin; the SegFormer parser has them as classes of their own). float32 (size, size) 0..1."""
+    L, wf = _feature_lm(lmc, size)
+    if L is None:
+        return np.zeros((size, size), np.float32)
+    m = np.zeros((size, size), np.uint8)
+    for part in ("eyes", "brows", "lips"):
+        m |= _draw_features(L, wf, size, part)
+    return _feature_soften(m, wf)
+
+
+def feature_parts(lmc: np.ndarray, size: int = SIZE) -> Optional[Dict[str, np.ndarray]]:
+    """The same eyes, brows and lips as feature_mask (same landmark rules, widening and softening), each apart, for
+    checks that need them one by one (learn/skinbench). None when the landmarks cannot draw them."""
+    L, wf = _feature_lm(lmc, size)
+    if L is None:
+        return None
+    return {part: _feature_soften(_draw_features(L, wf, size, part), wf) for part in ("eyes", "brows", "lips")}
 
 
 def neck_zone(lmc: np.ndarray, size: int = SIZE) -> np.ndarray:

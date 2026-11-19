@@ -31,7 +31,7 @@ from .workers import Job, SerialWorker
 from ..core import media as M
 from ..core.colour import manager
 from ..core.copyset import CopyOptions, apply_copy, suggest_mapping
-from ..core.project import PART_KEYS, PERSON_COLORS, Project, ProtectLine, ProtectShape, safe_name
+from ..core.project import PART_KEYS, PERSON_COLORS, Project, safe_name
 from ..core.frames import SCRUB_SEEKS
 from ..core.settings import APP_NAME, APP_VERSION, settings
 from ..stats.tracker import ActivityClock, log_event
@@ -249,10 +249,6 @@ class MainWindow(QMainWindow):
         self.viewer.jointCommitted.connect(self._joint_commit)
         self.viewer.jointKeyDeleted.connect(self._joint_delete)
         self.viewer.personClicked.connect(self.select_person)
-        self.viewer.lineAdded.connect(self._line_added)
-        self.viewer.lineEdited.connect(self._line_edited)
-        self.viewer.shapeAdded.connect(self._shape_added)
-        self.viewer.shapeEdited.connect(self._shape_edited)
         self.viewer.contextAction.connect(self._viewer_context)
         self.viewer.personAction.connect(self._person_action)
         self.viewer.editStarted.connect(lambda: self.push_undo())
@@ -379,8 +375,8 @@ class MainWindow(QMainWindow):
         h.setContentsMargins(10, 6, 10, 6)
         h.setSpacing(4)
         self.tool_btns = {}
-        for key, ic, tip in (("edit", "mouse-pointer-2", "관절 편집·선택  V"), ("line", "ruler", "직선 보호 그리기  L"),
-                             ("ellipse", "circle-dashed", "보호 영역 (타원)"), ("rect", "square-dashed", "보호 영역 (사각형)")):
+        # 1.22.2: the protection drawing tools (line, ellipse, rectangle) were removed with the 보호 tab
+        for key, ic, tip in (("edit", "mouse-pointer-2", "관절 편집·선택  V"),):
             b = Wd.tool(ic, tip, checkable=True)
             b.clicked.connect(lambda _=False, k=key: self.set_tool(k))
             self.tool_btns[key] = b
@@ -397,7 +393,7 @@ class MainWindow(QMainWindow):
         h.addWidget(Wd.vline())
         self.ov = {}
         for key, ic, tip, on in (("skel", "bone", "스켈레톤  S", True),
-                                 ("matte", "layers", "인물 매트  M", False), ("prot", "shield", "보호 선·영역  P", True),
+                                 ("matte", "layers", "인물 매트  M", False),
                                  ("skin", "wand-sparkles", "피부 보정 영역  K", False)):
             b = Wd.tool(ic, tip, checkable=True)
             b.setChecked(on)
@@ -507,10 +503,8 @@ class MainWindow(QMainWindow):
         sc("\\", self._ab)
         sc("S", lambda: self.ov["skel"].toggle())
         sc("M", lambda: self.ov["matte"].toggle())
-        sc("P", lambda: self.ov["prot"].toggle())
         sc("K", lambda: self.ov["skin"].toggle())
         sc("V", lambda: self.set_tool("edit"))
-        sc("L", lambda: self.set_tool("line"))
         sc("Z", lambda: self.viewer.fit_view())
         sc("Ctrl+F", self.toggle_fullscreen)
         sc("Shift+F", self.toggle_focus)
@@ -691,6 +685,30 @@ class MainWindow(QMainWindow):
         times["first_cut"] = time.perf_counter() - t0
         times.update({f"cut_{k}": v for k, v in (getattr(self.session, "open_times", None) or {}).items()})
         self.open_times = times                     # seconds: project.json, list usable, first cut opened
+        self._tell_legacy(prj)
+
+    def _tell_legacy(self, prj):
+        """Once per project: what an older project had that 1.22.2 no longer applies (the separate mode, drawn
+        protection lines and shapes, other protection settings). The project is not changed by opening it."""
+        from ..warp.field import legacy_protection
+        try:
+            key = str(prj.created or prj.path)
+            s_ = settings()
+            if key in (s_.legacy_notified or []):
+                return
+            found = {}
+            for c in prj.cuts:
+                for what in legacy_protection(c):
+                    found.setdefault(what, []).append(c.name)
+            if not found:
+                return
+            parts = ", ".join(f"{k} ({len(v)}컷)" for k, v in found.items())
+            self.toast(f"이 프로젝트의 {parts}은(는) 더 이상 적용되지 않고 일반 워프로 보입니다. "
+                       "보정하지 않는 인물은 계속 자동으로 보호되고, 프로젝트 파일은 바뀌지 않았습니다.", kind="warn")
+            s_.legacy_notified = list(s_.legacy_notified or []) + [key]
+            s_.save()
+        except Exception:
+            traceback.print_exc()
 
     # ---- recovery: the autosave writes a recovery copy; project.json changes only when saved
     @staticmethod
@@ -1302,8 +1320,7 @@ class MainWindow(QMainWindow):
         for dst in dsts:
             mapping = self._map_people(src, dst)
             if keys is None:
-                apply_copy(src, dst, mapping, cp[1], CopyOptions(amounts=True, widths=True, mode=True, protect=True,
-                                                                 roles=False))
+                apply_copy(src, dst, mapping, cp[1], CopyOptions(amounts=True, widths=True, roles=False))
             else:
                 for dpid, spid in mapping.items():
                     sp = src.params_for(spid).copy_static(cp[1])
@@ -2468,12 +2485,9 @@ class MainWindow(QMainWindow):
         for k, b in self.tool_btns.items():
             b.setChecked(k == tool or (k == "edit" and tool in point_tools))
         self.viewer.setCursor(Qt.CrossCursor if tool not in ("edit",) + point_tools else Qt.ArrowCursor)
-        if tool not in ("edit",) + point_tools:
-            self.ov["prot"].setChecked(True)
         if tool in point_tools:
             self.ov["skel"].setChecked(True)
         self.viewer.update()
-        self.inspector.refresh("protect")
         if was_points or tool in point_tools:
             self.inspector.refresh("reshape")
 
@@ -2508,8 +2522,6 @@ class MainWindow(QMainWindow):
             self.viewer.show_heat = v
         elif k == "matte":
             self.viewer.show_matte = v
-        elif k == "prot":
-            self.viewer.show_protect = v
         elif k == "skin":
             self.viewer.show_skin = v
             if v and self.session.cut is not None and not any(
@@ -3012,16 +3024,6 @@ class MainWindow(QMainWindow):
         self.run_job("인물 번호 바로잡는 중", work, done, cancellable=False)
 
     # ================================================================== reshape params
-    def set_mode(self, mode: str):
-        cut = self.session.cut
-        if cut is None:
-            return
-        self.push_undo()
-        cut.mode = mode
-        self.session.touch()
-        self._refresh_all()
-        if mode == "separate":
-            self.toast("분리 모드: 인물만 변형하고 드러난 배경은 이웃 프레임에서 복원합니다. 미리보기가 조금 느려집니다.")
 
     def _params(self):
         cut = self.session.cut
@@ -3355,7 +3357,7 @@ class MainWindow(QMainWindow):
             self.toast(f"{S.JOINT_NAMES_KO[j]} 키를 지웠습니다.")
 
     def _person_action(self, action: str, pid: int):
-        """Right click on a person in the preview: rename, 보정/보호, delete."""
+        """Right click on a person in the preview: rename, 보정 대상 on / off, delete."""
         cut = self.session.cut
         q = cut.person(pid) if cut else None
         if q is None:
@@ -3469,72 +3471,6 @@ class MainWindow(QMainWindow):
 
     def _edit_busy(self, on: bool):
         self.edit_busy.setText("다시 계산 중…" if on else "")
-
-    # ================================================================== protection
-    def set_protect(self, attr, v):
-        cut = self.session.cut
-        if cut is None:
-            return
-        self.push_undo(coalesce=f"protect:{attr}")
-        setattr(cut.protect, attr, v)
-        self.session.touch()
-        self.viewer.update()
-
-    def _line_added(self, v):
-        cut = self.session.cut
-        self.push_undo()
-        import uuid
-        cut.protect.lines.append(ProtectLine(id=uuid.uuid4().hex[:8], keys={self.frame: v}))
-        self.session.touch()
-        self.set_tool("edit")
-        self._refresh_all()
-        self.toast("직선 보호를 추가했습니다. 다른 프레임에서 끝점을 옮기면 위치 키가 생깁니다.")
-
-    def _line_edited(self, oid, v):
-        cut = self.session.cut
-        ln = next((l for l in cut.protect.lines if l.id == oid), None)
-        if ln is None:
-            return
-        ln.keys[self.frame] = v
-        self.session.interactive = True
-        self.session.touch("geo")
-        self.viewer.update()
-
-    def _shape_added(self, kind, v):
-        cut = self.session.cut
-        self.push_undo()
-        import uuid
-        cut.protect.shapes.append(ProtectShape(id=uuid.uuid4().hex[:8], kind=kind, keys={self.frame: v}))
-        self.session.touch()
-        self.set_tool("edit")
-        self._refresh_all()
-
-    def _shape_edited(self, oid, v):
-        cut = self.session.cut
-        sh = next((s for s in cut.protect.shapes if s.id == oid), None)
-        if sh is None:
-            return
-        sh.keys[self.frame] = v
-        self.session.interactive = True
-        self.session.touch("geo")
-        self.viewer.update()
-
-    def protect_item(self, op, kind, oid):
-        cut = self.session.cut
-        lst = cut.protect.lines if kind == "line" else cut.protect.shapes
-        it = next((x for x in lst if x.id == oid), None)
-        if it is None:
-            return
-        self.push_undo()
-        if op == "toggle":
-            it.enabled = not it.enabled
-        elif op == "delkey":
-            if self.frame in it.keys and len(it.keys) > 1:
-                del it.keys[self.frame]
-        elif op == "delete":
-            lst.remove(it)
-        self.session.touch()
-        self._refresh_all()
 
     # ================================================================== QC / output
     def qc_changed(self):

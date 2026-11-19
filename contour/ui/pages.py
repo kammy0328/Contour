@@ -925,7 +925,11 @@ class DashboardPage(QWidget):
         # benchmark trend: latest score per version
         hist = BM.history()
         best = {}
+        # one measure in the trend: results of an older scoring (metric 1 left missed joints out) are not mixed in
+        cur_m = max((BM.metric_of(h["results"]) for h in hist), default=BM.METRIC_VERSION)
         for h in hist:
+            if BM.metric_of(h["results"]) != cur_m:
+                continue
             s = BM.summary(h["results"])
             if s is not None:
                 best[h["version"]] = s
@@ -1244,4 +1248,5 @@ class ModelsPage(QWidget):
             return score
 
         self._run(work, "벤치마크 측정 중",
-                  lambda s: self.status.setText(f"현재 모델 벤치마크 오차 {s:.2f}% (인물 키 대비)" if s is not None else ""))
+                  lambda s: self.status.setText(f"현재 모델 벤치마크 점수 {s:.2f}% (인물 키 대비, 빠진 관절 포함)" if s is not None
+                                            else "벤치마크: 채점할 관절이 없어 측정하지 못했습니다"))

@@ -1,4 +1,4 @@
-"""Full-resolution render: native-plane decode -> warp/separate -> ProRes/EXR encode (+ mattes)."""
+"""Full-resolution render: native-plane decode -> warp -> ProRes/EXR encode (+ mattes)."""
 from __future__ import annotations
 
 import time
@@ -11,7 +11,6 @@ import cv2
 import numpy as np
 
 from . import field as F
-from .separate import composite
 from ..retouch import engine as RE
 from ..core import media as M
 from ..core.colour import PASSTHROUGH, manager
@@ -26,7 +25,6 @@ class RenderReport:
     matte_paths: List[str] = field(default_factory=list)
     frames: int = 0
     seconds: float = 0.0
-    inpaint_frames: List[Tuple[int, int]] = field(default_factory=list)   # (frame, pixels)
     warnings: List[str] = field(default_factory=list)
     cancelled: bool = False
     accel: str = ""                       # how the warp ran (GPU / CPU, and why)
@@ -142,8 +140,9 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
     subs = layout.subsample
     maxv = layout.max_value
     grid_step = max(2, int(round(W / 480)))
-    separate = cut.mode == "separate"
-    need_alpha = separate or out.matte_person
+    # one way since 1.22.2: the warp (an older cut's 'separate' mode, its background fill from the neighbouring
+    # frames included, was removed; such a cut renders with the warp)
+    need_alpha = out.matte_person
     cm = manager()
     in_cs = cut.input_cs or PASSTHROUGH
     convert_cs = bool(out.output_cs) and in_cs != PASSTHROUGH and out.output_cs != in_cs
@@ -190,7 +189,7 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
 
     # ---------------- reading
     reader = M.FrameReader(info, a, n, pf, prefetch=4)
-    look = _Lookahead(reader, a, b, behind=26 if separate else 0, ahead=26 if separate else 0)
+    look = _Lookahead(reader, a, b, behind=0, ahead=0)
     matter = None
     if need_alpha:
         try:
@@ -200,7 +199,6 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
             rep.warnings.append(f"매트 모델을 불러오지 못해 분석용 매트를 사용합니다: {e}")
     matte_scale = (tracker.matte.w / W, tracker.matte.h / H)
     store = tracker.store
-    homog = (lambda f0, f1: store.homography(f0, f1)) if store is not None else (lambda f0, f1: np.eye(3))
     mtx = _matrix_name(info)
 
     alpha_cache: "OrderedDict[int, np.ndarray]" = OrderedDict()
@@ -216,16 +214,6 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
         while len(alpha_cache) > 60:
             alpha_cache.popitem(last=False)
         return res
-
-    def neighbour(f: int):
-        pl = look.get(f)
-        if pl is None:
-            return None
-        pa = people_alpha_full(f)
-        if pa is None:
-            return None
-        pa = cv2.dilate(pa, np.ones((7, 7), np.uint8))
-        return pl, pa
 
     def to_rgb_small(planes, max_side=1920):
         s = min(1.0, max_side / max(W, H))
@@ -261,7 +249,7 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
     import threading
     from collections import deque
     from concurrent.futures import ThreadPoolExecutor
-    parallel = not separate and not out.matte_person
+    parallel = not out.matte_person
     n_workers = max(1, min(4, (os.cpu_count() or 2) // 2)) if parallel else 1
     if parallel and os.environ.get("CONTOUR_RENDER_THREADS", "").isdigit():
         n_workers = max(1, int(os.environ["CONTOUR_RENDER_THREADS"]))
@@ -375,21 +363,15 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
             fi = F.build_input(cut, tracker, t)
             fr = F.compute_field(fi, W, H, grid_step)
             alpha_out = None
-            if separate and not fr.empty():
+            if not warper[1] and not fr.empty():
+                from .gpu import choose
+                warper[0], line = choose(planes, subs, fr, maxv)
+                rep.accel = line
+                warper[1] = True
+            outp = do_warp(planes, fr)
+            if out.matte_person:
                 ta = target_alpha(t, planes)
-                outp, alpha_out, missing = composite(planes, subs, fr, ta, t, neighbour, homog, (1.0, 1.0), maxv)
-                if missing:
-                    rep.inpaint_frames.append((t, missing))
-            else:
-                if not warper[1] and not fr.empty():
-                    from .gpu import choose
-                    warper[0], line = choose(planes, subs, fr, maxv)
-                    rep.accel = line
-                    warper[1] = True
-                outp = do_warp(planes, fr)
-                if out.matte_person:
-                    ta = target_alpha(t, planes)
-                    alpha_out = np.clip(F.warp_planes([ta], [(1, 1)], fr, 1.0)[0], 0, 1) if not fr.empty() else ta
+                alpha_out = np.clip(F.warp_planes([ta], [(1, 1)], fr, 1.0)[0], 0, 1) if not fr.empty() else ta
             write_frame(t, outp, fr, alpha_out)
     except Exception:
         reader.close()
@@ -420,8 +402,6 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
     rep.seconds = time.time() - t_start
     if parallel and n_workers > 1:
         rep.accel = (rep.accel + " · " if rep.accel else "") + f"프레임 {n_workers}개 동시 처리"
-    if rep.inpaint_frames:
-        rep.warnings.append(f"{len(rep.inpaint_frames)}개 프레임에서 배경 일부를 공간 인페인팅으로 채웠습니다.")
     return rep
 
 

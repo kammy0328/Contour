@@ -165,7 +165,7 @@ class Timeline(QWidget):
                 p.drawEllipse(QPointF(14, y + LANE_H / 2 - 2), 3.5, 3.5)
                 p.setPen(qc("text") if sel else qc("text2"))
                 p.drawText(QRectF(24, y, LEFT - 28, LANE_H - 4), Qt.AlignVCenter | Qt.AlignLeft,
-                           text + ("" if data.role == "target" else " ·보호"))
+                           text + ("" if data.role == "target" else " ·제외"))
             elif kind == "params":
                 has = bool(self._keyed())
                 c = QPointF(14, y + LANE_H / 2 - 2)

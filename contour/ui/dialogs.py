@@ -293,13 +293,12 @@ class CopyDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(22, 18, 22, 16)
         lay.setSpacing(10)
-        lay.addWidget(Wd.label(f"'{src_cut.name}'의 {frame}프레임 값을 복사합니다. 컷마다 구도가 달라 관절 키와 보호 선 위치는 복사하지 않습니다.",
+        lay.addWidget(Wd.label(f"'{src_cut.name}'의 {frame}프레임 값을 복사합니다. 컷마다 구도가 달라 관절 키는 복사하지 않습니다.",
                                "Muted"))
         opts = QGridLayout()
         self.o = {}
         for i, (k, t, d) in enumerate((("amounts", "부위별 보정값", True), ("widths", "범위 배율", True),
-                                       ("roles", "인물 역할·이름", True), ("mode", "워프/분리 방식", True),
-                                       ("protect", "보호 설정", True), ("tracking", "추적 설정", False),
+                                       ("roles", "보정 대상·이름", True), ("tracking", "추적 설정", False),
                                        ("output", "출력 설정", False))):
             cb = QCheckBox(t)
             cb.setChecked(d)
