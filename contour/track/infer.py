@@ -153,6 +153,11 @@ class PoseEstimator:
         self.padding = padding
         shp = self.sess.get_inputs()[0].shape
         self.batchable = not isinstance(shp[0], int) or shp[0] != 1
+        if self.batchable:
+            try:
+                self.sess.batch_input = self.inp        # with no GPU memory left the crops are run in halves
+            except Exception:
+                pass
         self.flip = flip and self.kpts in (17, 133)
         self.perm = _flip_pairs(self.kpts)
 

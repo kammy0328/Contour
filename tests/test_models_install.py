@@ -2,6 +2,7 @@
 6. An empty, cut off or broken model file must not count as downloaded, a cut off download must not be kept, and a
 failed model download must not end the setup as a success."""
 import io
+import json
 import sys
 from pathlib import Path
 
@@ -110,3 +111,100 @@ def test_setup_reports_model_failure(monkeypatch):
     import setup_env as SE
     assert SE.models_step(lambda args: 1) is False
     assert SE.models_step(lambda args: 0) is True
+
+
+# ------------------------------------------------------------------ the GPU runtime at install (instruction 2026-11-20 §5)
+class _Pip:
+    """Stands in for the installer's pip and its GPU check: what is installed, what the checks answer."""
+
+    def __init__(self, check, alt_check="DML", download_ok=True, install_ok=True, installed=("onnxruntime-gpu",)):
+        self.installed = set(installed)
+        self.check, self.alt_check, self.download_ok, self.install_ok = check, alt_check, download_ok, install_ok
+        self.calls = []
+        self.said = []
+
+    def run(self, args):
+        a = [str(x) for x in args]
+        self.calls.append(a)
+        if "download" in a:
+            return 0 if self.download_ok else 1
+        if "uninstall" in a:
+            for n in list(self.installed):
+                if n in a:
+                    self.installed.discard(n)
+            return 0
+        if "install" in a:
+            if "--target" in a:
+                return 0
+            what = "onnxruntime-directml" if any("directml" in x for x in a) else "onnxruntime-gpu"
+            if what == "onnxruntime-directml" and not self.install_ok:
+                return 1
+            self.installed.add(what)
+            return 0
+        return 0
+
+    def gpu(self, path=None):
+        if path is not None:
+            return self.alt_check
+        if not self.installed:
+            return "NONE"
+        if "onnxruntime-directml" in self.installed and "onnxruntime-gpu" not in self.installed:
+            return "DML"
+        return self.check
+
+    def step(self, tmp_path):
+        import setup_env as SE
+        return SE.gpu_step(run=self.run, gpu=self.gpu, runtimes=lambda: sorted(self.installed), say=self.said.append,
+                           alt_dir=tmp_path / "alt")
+
+
+def test_the_working_runtime_is_not_removed_for_one_that_was_not_tried(tmp_path):
+    """1.22.2 uninstalled onnxruntime-gpu as soon as the GPU check did not say CUDA (also when the check itself
+    failed, e.g. without a connection: it downloaded its test model) and then tried to download DirectML: with no
+    connection the app was left without any runtime."""
+    sys.path.insert(0, str(ROOT / "tools"))
+    # CUDA works: nothing is touched
+    p = _Pip("CUDA")
+    assert p.step(tmp_path) == "CUDA" and p.calls == [] and p.installed == {"onnxruntime-gpu"}
+    # no CUDA and no connection: the runtime stays, the CPU runs it
+    p = _Pip("CPU", download_ok=False)
+    assert p.step(tmp_path) == "CPU" and p.installed == {"onnxruntime-gpu"}
+    assert not any("uninstall" in c for c in p.calls) and any("바꾸지 않았습니다" in s for s in p.said)
+    # DirectML downloaded but not working on this PC: stays
+    p = _Pip("CPU", alt_check="CPU")
+    assert p.step(tmp_path) == "CPU" and p.installed == {"onnxruntime-gpu"} and not any("uninstall" in c for c in p.calls)
+    # DirectML seen to run a model in its own folder: changed, from the files already here, and only one runtime
+    p = _Pip("CPU")
+    assert p.step(tmp_path) == "DML" and p.installed == {"onnxruntime-directml"}
+    order = [next(w for w in ("download", "uninstall", "install") if w in c) for c in p.calls]
+    assert order == ["download", "install", "uninstall", "install"], "tried before the old one is removed"
+    assert "--target" in p.calls[1] and "--no-index" in p.calls[3], "the change itself needs no connection"
+    # the change fails after the trial worked: the runtime that worked is put back
+    p = _Pip("CPU", install_ok=False)
+    assert p.step(tmp_path) == "CPU" and p.installed == {"onnxruntime-gpu"} and any("되돌립니다" in s for s in p.said)
+    # two runtimes left by an interrupted change: cleaned up to the pinned one
+    p = _Pip("CUDA", installed=("onnxruntime-gpu", "onnxruntime-directml"))
+    assert p.step(tmp_path) == "CUDA" and p.installed == {"onnxruntime-gpu"}
+    assert not (tmp_path / "alt").exists()
+
+
+def test_the_gpu_check_runs_a_model_that_comes_with_the_app_and_needs_no_connection(monkeypatch, capsys):
+    import importlib
+    import urllib.request
+    sys.path.insert(0, str(ROOT / "tools"))
+    import check_gpu as CG
+    importlib.reload(CG)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: (_ for _ in ()).throw(AssertionError("a download")))
+    assert CG.MODEL.is_file(), "the test model is part of the app"
+    assert CG.main(["--json"]) == 0
+    out = capsys.readouterr().out.strip().splitlines()
+    assert out[-1] in ("CUDA", "DML", "COREML", "CPU")
+    info = json.loads(out[-2])
+    assert info["answer"] == out[-1] and info["version"] and "CPUExecutionProvider" in info["available"]
+    # the answer is an accelerator only when operators ran on it: a provider that is listed and ran nothing is not
+    import onnxruntime as ort
+    monkeypatch.setattr(ort, "get_available_providers", lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"])
+    monkeypatch.setattr(CG, "run_on", lambda ort_, prov: dict(listed=True, nodes=0, cpu=111))
+    assert CG.main([]) == 0 and capsys.readouterr().out.strip().splitlines()[-1] == "CPU"
+    monkeypatch.setattr(CG, "run_on", lambda ort_, prov: dict(listed=True, nodes=98, cpu=13))
+    assert CG.main([]) == 0 and capsys.readouterr().out.strip().splitlines()[-1] == "CUDA"

@@ -42,16 +42,31 @@ def configure_ffmpeg(path_hint: Optional[str] = None) -> Tuple[Optional[str], Op
     # installed build: {app}\app is the code, {app}\ffmpeg\bin the ffmpeg packed into the installer
     dirs: List[str] = [str(here.parent / "ffmpeg" / "bin"), str(here / "ffmpeg" / "bin")]
     installed = (here.parent / "python").is_dir()
+    frozen = bool(getattr(sys, "frozen", False))
+    if frozen:
+        # a packed app (the Mac .app): the copies inside the bundle, wherever the packer put its data
+        base = Path(getattr(sys, "_MEIPASS", "") or Path(sys.executable).resolve().parent)
+        exe_dir = Path(sys.executable).resolve().parent
+        dirs = [str(base / "ffmpeg" / "bin"), str(exe_dir / "ffmpeg" / "bin"),
+                str(exe_dir.parent / "Resources" / "ffmpeg" / "bin"), str(exe_dir.parent / "Frameworks" / "ffmpeg" / "bin"),
+                str(exe_dir)] + dirs
     found = {}
     for tool in ("ffmpeg", "ffprobe"):
         hit = None
         for d in dirs:
             cand = Path(d) / f"{tool}{exe}"
-            if cand.is_file():
+            if cand.is_file() and (sys.platform == "win32" or os.access(cand, os.X_OK)):
                 hit = str(cand)
                 break
-        if hit is None and not installed:
+        if hit is None and not installed and not frozen:
+            # a development checkout: the one on PATH, and where a Mac's package managers put it (an app started
+            # from the Finder has a short PATH without them)
             hit = shutil.which(tool)
+            if hit is None and sys.platform == "darwin":
+                for d in ("/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"):
+                    if os.access(os.path.join(d, tool), os.X_OK):
+                        hit = os.path.join(d, tool)
+                        break
         found[tool] = hit
     _tool_paths.update(found)
     return found["ffmpeg"], found["ffprobe"]
@@ -652,12 +667,35 @@ PRORES_PROFILES = {
 }
 VIDEO_PROFILES = dict(PRORES_PROFILES, hevc_mp4=(-1, "yuv420p10le", "H.265 MP4 10bit"))
 _NVENC: dict = {}
+_VTB: dict = {}
+
+
+def videotoolbox_ok() -> bool:
+    """The Mac's hardware H.265 encoder makes a 10-bit picture here (checked once by encoding one)."""
+    if "ok" not in _VTB:
+        if sys.platform != "darwin":
+            _VTB["ok"] = False
+        else:
+            try:
+                r = subprocess.run([ffmpeg_bin(), "-hide_banner", "-v", "error", "-f", "lavfi", "-i",
+                                    "color=black:s=256x256:r=24:d=0.1", "-c:v", "hevc_videotoolbox", "-profile:v",
+                                    "main10", "-pix_fmt", "p010le", "-f", "null", "-"], capture_output=True, timeout=30)
+                _VTB["ok"] = r.returncode == 0
+            except Exception:
+                _VTB["ok"] = False
+    return bool(_VTB["ok"])
 
 
 def hevc_encoder(prefer: str = "auto") -> str:
-    """hevc_nvenc when the GPU encoder works here (checked once), else libx265."""
+    """hevc_nvenc when the GPU encoder works here (checked once), else libx265. The Mac's hardware encoder
+    (hevc_videotoolbox) only when it is asked for by name and makes a 10-bit picture here: 'auto' on a Mac is
+    libx265, the encoder both systems share, until the hardware one's pictures were compared on a real Mac."""
     if prefer == "x265":
         return "libx265"
+    if prefer == "videotoolbox":
+        if not videotoolbox_ok():
+            raise MediaError("이 Mac에서 하드웨어 인코더(VideoToolbox)로 10비트 H.265를 만들 수 없습니다")
+        return "hevc_videotoolbox"
     if "ok" not in _NVENC:
         try:
             r = subprocess.run([ffmpeg_bin(), "-hide_banner", "-v", "error", "-f", "lavfi", "-i",
@@ -678,6 +716,9 @@ def hevc_args(encoder: str, quality: str = "high") -> List[str]:
         return ["-c:v", "hevc_nvenc", "-preset", "p7", "-tune", "hq", "-rc", "vbr", "-cq", cq, "-b:v", "0",
                 "-multipass", "fullres", "-spatial-aq", "1", "-temporal-aq", "1", "-profile:v", "main10",
                 "-pix_fmt", "p010le", "-tag:v", "hvc1"]
+    if encoder == "hevc_videotoolbox":
+        q = {"max": "80", "high": "70", "normal": "58"}.get(quality, "70")          # constant quality (Apple Silicon)
+        return ["-c:v", "hevc_videotoolbox", "-q:v", q, "-profile:v", "main10", "-pix_fmt", "p010le", "-tag:v", "hvc1"]
     crf = {"max": "12", "high": "15", "normal": "19"}.get(quality, "15")
     return ["-c:v", "libx265", "-preset", "slow" if quality != "normal" else "medium", "-crf", crf,
             "-pix_fmt", "yuv420p10le", "-profile:v", "main10", "-x265-params", "aq-mode=3:no-sao=1:log-level=error",

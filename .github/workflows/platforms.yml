@@ -1,0 +1,126 @@
+name: platforms
+# The same short run on Windows, macOS (Apple Silicon) and Linux (instruction 2026-11-20 §5): a project opened, a
+# proxy made, the models that come with the app run (and held against the CPU where an accelerator ran them), one
+# cut exported, the child job started; then every regression test, and each model on each backend against the CPU.
+# And the Mac app: DIAP.app and its disk image built, with the built app's own short run.
+#
+# By hand only (Actions > platforms > Run workflow): a macOS runner counts ten times and a Windows runner twice
+# against a private repository's minutes. release.yml can call it before a release (workflow_call).
+on:
+  workflow_dispatch:
+    inputs:
+      mac_app:
+        description: "Mac 앱(.app, .dmg)도 빌드"
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      mac_app:
+        type: boolean
+        default: true
+
+env:
+  FFMPEG_VER: "7.1"
+
+jobs:
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-14]       # macos-14: Apple Silicon (arm64)
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: ffmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3
+      - name: ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew list ffmpeg >/dev/null 2>&1 || brew install ffmpeg
+      - name: ffmpeg (Windows, the build the installer packs)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://github.com/GyanD/codexffmpeg/releases/download/$env:FFMPEG_VER/ffmpeg-$env:FFMPEG_VER-essentials_build.zip" -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffx -Force
+          New-Item -ItemType Directory -Force ffmpeg\bin | Out-Null
+          Get-ChildItem ffx -Recurse -Include ffmpeg.exe, ffprobe.exe | Copy-Item -Destination ffmpeg\bin
+          Get-ChildItem ffmpeg\bin
+
+      - name: Python packages (one runtime package; the hosted runners have no NVIDIA GPU)
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            python -m pip install -r requirements-mac.txt pytest
+          else
+            grep -v -i "onnxruntime" requirements.txt > req.txt
+            python -m pip install -r req.txt onnxruntime==1.24.4 pytest
+          fi
+          python -c "import platform, onnxruntime as o; print(platform.platform(), platform.machine(), o.__version__, o.get_available_providers())"
+
+      - name: Short run (project, proxy, inference, export, child job)
+        shell: bash
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python tools/ci_smoke.py --json smoke_${{ matrix.os }}.json
+
+      - name: Every model that comes with the app on every backend of this system, against the CPU
+        shell: bash
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python tools/compare_backends.py --runs 3 --json backends_${{ matrix.os }}.json
+
+      - name: Tests
+        shell: bash
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q tests
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: platform-${{ matrix.os }}
+          path: |
+            smoke_*.json
+            backends_*.json
+
+  mac-app:
+    if: inputs.mac_app
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build DIAP.app and the disk image (ad hoc signed unless the signing secrets are set)
+        env:
+          PYTHON: python
+          DIAP_CODESIGN_ID: ${{ secrets.MACOS_CODESIGN_ID }}
+        run: installer/macos/build.sh
+      - name: Install from the disk image and run the installed app's short run
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          DMG=$(ls dist/DIAP_*_macos_arm64.dmg)
+          shasum -a 256 -c <(awk '{print $1"  dist/"$2}' "$DMG.sha256")
+          hdiutil attach "$DMG" -nobrowse -mountpoint /Volumes/DIAP_ci
+          cp -R /Volumes/DIAP_ci/DIAP.app "$RUNNER_TEMP/DIAP 설치본.app"
+          hdiutil detach /Volumes/DIAP_ci
+          "$RUNNER_TEMP/DIAP 설치본.app/Contents/MacOS/DIAP" --worker smoke --json "$GITHUB_WORKSPACE/dist/smoke_installed_macos.json"
+          "$RUNNER_TEMP/DIAP 설치본.app/Contents/MacOS/DIAP" --worker batch --help
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: DIAP-macos-arm64
+          path: |
+            dist/DIAP_*_macos_arm64.dmg
+            dist/DIAP_*_macos_arm64.dmg.sha256
+            dist/smoke_*.json

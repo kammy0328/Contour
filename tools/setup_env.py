@@ -61,10 +61,78 @@ def req_key(learn: bool) -> str:
     return h.hexdigest()
 
 
-def gpu() -> str:
-    p = subprocess.run([str(PY), str(APP / "tools" / "check_gpu.py")], capture_output=True, text=True)
+ORT_VER = "1.24.4"                    # the runtime requirements.txt pins (onnxruntime-gpu[cuda,cudnn]==1.24.4)
+
+
+def gpu(path=None) -> str:
+    """What a model really ran on here (tools/check_gpu.py: CUDA / DML / CPU / NONE). path: a folder with another
+    runtime to try instead of the installed one."""
+    args = [str(PY), str(APP / "tools" / "check_gpu.py")] + (["--path", str(path)] if path else [])
+    p = subprocess.run(args, capture_output=True, text=True)
     lines = [l for l in (p.stdout or "").splitlines() if l.strip()]
     return lines[-1].split()[0] if lines else "NONE"
+
+
+def runtimes() -> list:
+    """The onnxruntime packages installed in this Python (one is right; two break each other)."""
+    code = ("from importlib import metadata as m; print(' '.join(sorted({(d.metadata.get('Name') or '').lower().replace('_', '-') "
+            "for d in m.distributions() if (d.metadata.get('Name') or '').lower().replace('_', '-') in "
+            "('onnxruntime', 'onnxruntime-gpu', 'onnxruntime-directml')})))")
+    p = subprocess.run([str(PY), "-c", code], capture_output=True, text=True)
+    return (p.stdout or "").split()
+
+
+def gpu_step(run=None, gpu=None, runtimes=None, say=None, alt_dir=None) -> str:
+    """CUDA when it works. When it does not: DirectML is tried in a folder of its own first, and only when a model
+    really ran on it there is the installed runtime changed for it (from the files already downloaded for the
+    trial). Anything else (no connection, DirectML not working here, the change failing) leaves or puts back the
+    runtime that works, which then runs on the CPU. Never two runtimes at once. Returns what models run on."""
+    import shutil as _sh
+    run = run or globals()["run"]
+    gpu = gpu or globals()["gpu"]
+    runtimes = runtimes or globals()["runtimes"]
+    say = say or globals()["say"]
+    alt = Path(alt_dir) if alt_dir else ROOT / "ort_alt"
+    have = runtimes()
+    if len(have) > 1:
+        # left by an interrupted change: both removed, the pinned one installed again
+        say(f"[3/5] ONNX Runtime 패키지가 겹쳐 설치되어 있어 정리합니다: {', '.join(have)}")
+        run([PY, "-m", "pip", "uninstall", "-y"] + have)
+        run([PY, "-m", "pip", "install", "--no-warn-script-location", f"onnxruntime-gpu[cuda,cudnn]=={ORT_VER}"])
+    g = gpu()
+    if g in ("CUDA", "DML"):
+        return g
+    if g == "NONE":
+        say("[3/5] ONNX Runtime을 불러오지 못했습니다. 설치 파일을 다시 실행하세요")
+        return g
+    if "onnxruntime-directml" in runtimes():
+        say("[3/5] DirectML 런타임이 설치되어 있지만 GPU를 쓰지 못했습니다. CPU로 실행됩니다")
+        return g
+    say("[3/5] CUDA를 쓸 수 없습니다. DirectML이 이 PC에서 되는지 먼저 확인합니다 (지금 런타임은 그대로 둡니다)")
+    try:
+        _sh.rmtree(alt, ignore_errors=True)
+        wheels, probe = alt / "wheels", alt / "probe"
+        ok = run([PY, "-m", "pip", "download", "--no-deps", "-d", wheels, f"onnxruntime-directml=={ORT_VER}"]) == 0 \
+            and run([PY, "-m", "pip", "install", "--no-deps", "--no-index", "--find-links", wheels, "--target", probe,
+                     f"onnxruntime-directml=={ORT_VER}"]) == 0 \
+            and gpu(probe) == "DML"
+        if not ok:
+            say("[3/5] DirectML을 확인하지 못해 런타임을 바꾸지 않았습니다. 지금은 CPU로 실행됩니다 "
+                "(NVIDIA 드라이버를 업데이트하고 설치 파일을 다시 실행하면 CUDA로 돌아갑니다)")
+            return g
+        say("[3/5] DirectML이 확인되어 런타임을 바꿉니다 (NVIDIA 드라이버를 업데이트하면 다시 설치할 때 CUDA로 돌아갑니다)")
+        run([PY, "-m", "pip", "uninstall", "-y", "onnxruntime-gpu"])
+        rc = run([PY, "-m", "pip", "install", "--no-deps", "--no-index", "--find-links", wheels,
+                  f"onnxruntime-directml=={ORT_VER}"])
+        g2 = gpu()
+        if rc != 0 or g2 == "NONE":
+            say("[3/5] 바꾸지 못해 이전 런타임으로 되돌립니다")
+            run([PY, "-m", "pip", "uninstall", "-y", "onnxruntime-directml"])
+            run([PY, "-m", "pip", "install", "--no-warn-script-location", f"onnxruntime-gpu[cuda,cudnn]=={ORT_VER}"])
+            g2 = gpu()
+        return g2
+    finally:
+        _sh.rmtree(alt, ignore_errors=True)
 
 
 def ffmpeg_found() -> bool:
@@ -127,14 +195,10 @@ def main():
     else:
         say("[2/5] 패키지 변경 없음")
 
-    # 3. GPU runtime: CUDA, else DirectML
+    # 3. GPU runtime: CUDA, else DirectML when it is seen to work here (the runtime that works is never taken
+    #    out for one that was not tried)
     if not ci:
-        g = gpu()
-        if g not in ("CUDA", "DML"):
-            say("[3/5] CUDA를 쓸 수 없어 DirectML로 바꿉니다 (NVIDIA 드라이버를 업데이트하면 CUDA로 돌아갑니다)")
-            run([PY, "-m", "pip", "uninstall", "-y", "onnxruntime-gpu"])
-            run([PY, "-m", "pip", "install", "onnxruntime-directml==1.24.4"])
-            g = gpu()
+        g = gpu_step()
         say(f"[3/5] 추론 장치: {g}")
 
     # 4. ffmpeg: packed into the installer ({app}\ffmpeg\bin); only checked here

@@ -22,8 +22,11 @@ class GpuWarper:
         if not _ASSET.exists():
             raise FileNotFoundError(str(_ASSET))
         self.sess = M.session(_ASSET)
-        prov = self.sess.get_providers()
-        self.device = "CUDA" if "CUDAExecutionProvider" in prov else ("DirectML" if "DmlExecutionProvider" in prov else "CPU")
+        from ..track import backend as BK
+        acc = [BK.BACKEND[p] for p in self.sess.get_providers() if BK.BACKEND.get(p, "cpu") != "cpu"]
+        # the device the session was opened for (CUDA, DirectML, Core ML); whether it is used is decided below by
+        # running it against the CPU warp on a real frame (choose), not by this name
+        self.device = BK.LABEL[acc[0]] if acc else "CPU"
 
     def warp_planes(self, planes: List[np.ndarray], subsample: List[Tuple[int, int]], fr: F.FieldResult,
                     max_value: float) -> List[np.ndarray]:

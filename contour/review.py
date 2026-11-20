@@ -784,6 +784,18 @@ def _settings_used(prj) -> dict:
         d["model_packages"] = MP.store().active_versions()
     except Exception:
         d["model_packages"] = {}
+    try:
+        from .track import backend as BK
+        g = BK.diagnostics()
+        d["device"] = dict(gpu=g.get("gpu") or {}, driver=g.get("driver"), offered=g.get("offered"),
+                           setting=g.get("setting"), packages=[list(x) for x in g.get("packages") or []],
+                           pinned=g.get("pinned"), warnings=g.get("warnings"),
+                           # the models opened in the process that made this report (none when only the report
+                           # was made: it runs no model): asked, the session's providers, what really ran, why
+                           models=[{k: r.get(k) for k in ("model", "file", "asked", "session", "backend", "ran",
+                                                          "cpu_share", "first_ms", "reasons")} for r in g.get("models") or []])
+    except Exception:
+        d["device"] = {}
     return d
 
 
@@ -1021,6 +1033,17 @@ def _summary_lines(rev: dict) -> List[str]:
               + ("" if lr.get("chosen") else " (선택한 적 없음)")]
         if st.get("model_packages"):
             L.append("- 사용 중인 모델 패키지: " + ", ".join(f"{k} {v}" for k, v in sorted(st["model_packages"].items())))
+        dv = st.get("device") or {}
+        g = dv.get("gpu") or {}
+        if g.get("vendor") == "nvidia":
+            L.append(f"- GPU: {g.get('name')} · VRAM {g.get('memory_mb', 0)} MB · 드라이버 {g.get('driver')}")
+        elif g.get("vendor") == "apple":
+            L.append(f"- 칩: {g.get('name')} · 메모리 {g.get('memory_mb', 0)} MB · macOS {g.get('driver')}")
+        for w in dv.get("warnings") or []:
+            L.append(f"- 주의: {w}")
+        for r in dv.get("models") or []:
+            L.append(f"- 모델 {r.get('model')}: 요청 {'→'.join(r.get('asked') or [])} · 실제 {r.get('backend') or '확인 전'}"
+                     + (" · " + "; ".join(r["reasons"]) if r.get("reasons") else ""))
     return L
 
 

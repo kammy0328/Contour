@@ -601,6 +601,10 @@ class MainWindow(QMainWindow):
         a_review_img.setToolTip("위 리포트에, 문제가 큰 프레임의 화면 그림(추적 뼈대·인물 영역 표시)을 더합니다. "
                                 "영상 프레임이 리포트 폴더에 들어가므로 밖으로 내보낼 때 주의하세요")
         a_review_img.setEnabled(self.session.project is not None)
+        a_relink = m.addAction("원본 다시 연결…")
+        a_relink.setToolTip("원본 영상·LUT의 위치가 바뀌었을 때(다른 컴퓨터, 다른 드라이브, Windows ↔ Mac) 폴더를 골라 같은 이름의 "
+                            "파일을 찾아 연결합니다. 크기·프레임 속도·프레임 수가 같은 파일만 연결하고, 분석 결과와 보정값은 그대로 둡니다")
+        a_relink.setEnabled(self.session.project is not None)
         a_reveal = m.addAction("프로젝트 폴더 열기")
         a_reveal.setEnabled(self.session.project is not None)
         act = m.exec(self.proj_btn.mapToGlobal(self.proj_btn.rect().bottomLeft()))
@@ -630,6 +634,8 @@ class MainWindow(QMainWindow):
             self.make_ai_review()
         elif act == a_review_img:
             self.make_ai_review(images=True)
+        elif act == a_relink:
+            self.relink_media()
         elif act == a_reveal:
             QDesktopServices.openUrl(QUrl.fromLocalFile(self.session.project.path))
         elif act.data():
@@ -729,6 +735,54 @@ class MainWindow(QMainWindow):
         self.open_times = times                     # seconds: project.json, list usable, first cut opened
         self._tell_legacy(prj)
         self._tell_learning(prj)
+        self._tell_missing(prj)
+
+    def relink_media(self, folder: str = ""):
+        """원본 다시 연결: the media this computer does not find, looked for by name under a folder and connected
+        when it is the same footage (core/relink.py). The analysis and the edits stay with the cuts."""
+        from ..core import relink as RL
+        prj = self.session.project
+        if prj is None:
+            return
+        if self.job is not None or self.batch.busy:
+            self.toast("진행 중인 작업이 끝난 뒤 원본을 다시 연결할 수 있습니다.", kind="warn")
+            return
+        if not RL.missing(prj):
+            self.toast("연결할 것이 없습니다 (모든 원본이 제자리에 있습니다)", "ok")
+            return
+        if not folder:
+            folder = QFileDialog.getExistingDirectory(self, "원본이 있는 폴더", str(Path(prj.path).parent))
+        if not folder:
+            return
+        if not self.save():
+            self.toast("저장하지 못해 원본을 연결하지 않았습니다", kind="error")
+            return
+
+        def work(progress, cancelled):
+            return RL.relink(prj, folder, progress=progress, cancel=cancelled)
+
+        def done(res):
+            if res["linked"]:
+                self.session.dirty = True
+                self.save()
+                self.cutlist.refresh(self.session.cut.id if self.session.cut else None)
+                self.tlstrip.refresh()
+                if self.session.cut is not None:
+                    self._reopen_cut()
+            self.toast(RL.summary(res), "ok" if res["linked"] and not (res["different"] or res["not_found"]) else "warn")
+        self.run_job("원본 찾는 중", work, done)
+
+    def _tell_missing(self, prj):
+        """On opening: how many cuts have no original here, and where to connect them (once per opening)."""
+        try:
+            from ..core import relink as RL
+            miss = [m for m in RL.missing(prj) if m["kind"] == "source"]
+            if miss:
+                n = sum(len(m["cuts"]) for m in miss)
+                self.toast(f"원본을 찾을 수 없는 컷 {n}개가 있습니다. 프로젝트 메뉴의 '원본 다시 연결'에서 파일이 있는 폴더를 "
+                           "고르면 다시 이어집니다 (분석 결과와 보정값은 그대로입니다).", kind="warn")
+        except Exception:
+            traceback.print_exc()
 
     def _tell_learning(self, prj):
         """Once per project made before 1.23 whose file said (or left out, which meant) that it is in the learning
@@ -1146,7 +1200,8 @@ class MainWindow(QMainWindow):
         from ..core.frames import source_present
         if s.proxy is None:
             self.viewer.message = ("원본 파일을 찾을 수 없습니다: " + str(cut.source or cut.info.path)
-                                   + "\n파일을 원래 자리에 두거나 다시 연결하세요.")
+                                   + "\n파일을 원래 자리에 두거나, 프로젝트 메뉴의 '원본 다시 연결'에서 파일이 있는 폴더를 "
+                                     "고르세요.")
             self.viewer.update()
             self._refresh_all()
             return
@@ -1670,6 +1725,11 @@ class MainWindow(QMainWindow):
             fb = take_cpu_fallbacks()
         except Exception:
             return
+        try:
+            from ..track.models import device_label
+            self.dev_lbl.setText(f"추론: {device_label()}")     # by what the models really ran on
+        except Exception:
+            pass
         if fb:
             names = ", ".join(sorted({n for n, _ in fb}))[:120]
             why = "GPU 메모리가 부족해" if any(w == "GPU 메모리 부족" for _, w in fb) else "GPU에서 열지 못해"

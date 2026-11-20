@@ -56,7 +56,7 @@ def latest() -> Optional[Release]:
     d = json.loads(_get(API).decode("utf-8"))
     tag = d.get("tag_name", "")
     assets = {a["name"]: a for a in d.get("assets", [])}
-    setup = next((a for n, a in assets.items() if n.lower().endswith(".exe") and "setup" in n.lower()), None)
+    setup = pick_asset(assets)
     if setup is None:
         return None
     sha = ""
@@ -68,6 +68,22 @@ def latest() -> Optional[Release]:
         sha = m.group(1).lower() if m else ""
     return Release(version=tag.lstrip("vV"), notes=d.get("body") or "", setup_url=setup["browser_download_url"],
                    setup_name=setup["name"], sha256=sha, size=int(setup.get("size") or 0))
+
+
+def pick_asset(assets: dict, platform: Optional[str] = None, machine: Optional[str] = None) -> Optional[dict]:
+    """The file of a release this system installs: Windows the Setup .exe (as always); a Mac the disk image made
+    for its chip (…macos…arm64….dmg). None when the release has nothing for this system (then no update is
+    offered: a Mac is never handed the Windows installer)."""
+    import platform as _pf
+    plat = platform or sys.platform
+    if plat == "darwin":
+        arch = (machine or _pf.machine() or "").lower()
+        mine = ("arm64", "aarch64") if arch in ("arm64", "aarch64") else ("x86_64", "x64", "intel")
+        dm = [a for n, a in assets.items() if n.lower().endswith(".dmg") and ("mac" in n.lower() or "darwin" in n.lower())]
+        return next((a for a in dm if any(m in a["name"].lower() for m in mine)), None)
+    if plat == "win32":
+        return next((a for n, a in assets.items() if n.lower().endswith(".exe") and "setup" in n.lower()), None)
+    return None
 
 
 def check() -> Optional[Release]:
@@ -130,7 +146,8 @@ def _sha(p: Path) -> str:
 
 
 def _prune():
-    files = sorted(updates_dir().glob("*.exe"), key=lambda p: p.stat().st_mtime, reverse=True)
+    files = sorted(list(updates_dir().glob("*.exe")) + list(updates_dir().glob("*.dmg")),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
     for p in files[KEEP:]:
         try:
             p.unlink()
@@ -144,11 +161,21 @@ def installed_dir() -> Optional[Path]:
     root = here.parent
     if (root / "python" / "python.exe").exists() and here.name == "app":
         return root
+    if sys.platform == "darwin" and getattr(sys, "frozen", False):
+        # DIAP.app/Contents/MacOS/DIAP -> the .app itself
+        exe = Path(sys.executable).resolve()
+        if exe.parent.name == "MacOS" and exe.parent.parent.name == "Contents":
+            return exe.parent.parent.parent
     return None
 
 
 def launch_installer(setup: Path) -> None:
     """Runs the installer silently once this app has closed; it starts Contour again when it is done."""
+    if sys.platform == "darwin":
+        # the disk image (checked against the release's SHA-256 by download()) is opened: the new DIAP.app is
+        # dragged to Applications by the person, as with any Mac app. Nothing is replaced behind their back.
+        subprocess.Popen(["open", str(setup)], close_fds=True)
+        return
     args = [str(setup), "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS", "/UPDATE=1"]
     # no /DIR: the installer keeps an earlier DIAP install's folder, and moves a 1.8 per-user install to
     # Program Files\Diap
