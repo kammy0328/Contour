@@ -13,6 +13,8 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+from . import bodyskin as BS
+from . import bodyspots as BP
 from . import detect as DT
 from . import skin as SK
 from ..core.params import RETOUCH_KEYS
@@ -38,6 +40,14 @@ class Job:
     # where the skin's flaws are (detect.py), found once per frame and held steady through time (1.19):
     # {"box": (x0, y0, x1, y1) in proxy px, "maps": {kind: uint8 (h, w)}, "thumb": uint8 luma (for the alignment check)}
     det: Optional[dict] = None
+    # body skin (1.23, retouch.bodyskin): {"ref": the face width a body of this size has (source px), "model": the
+    # body skin's colour model of this frame, "parsed": the body parser was used, "box": the person's piece,
+    # "mask": where the body skin effects go (bodyskin.pack_mask: the piece of the analysis picture that is not empty)}
+    body: Optional[dict] = None
+    body_keep: float = 0.6                 # 결 보존: share of the fine texture the body smoothing gives back
+    body_size: float = 0.4                 # 0..1 largest spot taken by the body blemish removal
+    bdet: Optional[dict] = None            # the body's spot candidates of this frame (retouch.bodyspots)
+    bmarks: Optional[list] = None          # the operator's body spot marks as they lie on this frame
 
 
 @dataclass
@@ -57,7 +67,16 @@ class RetouchFrame:
                 if k == "excl" or (names is not None and k not in names):
                     continue
                 out = m.copy() if out is None else np.maximum(out, m)
+            if names is None or "body" in names:
+                b = self.body_area(j)
+                if b is not None:
+                    out = b if out is None else np.maximum(out, b)
         return out
+
+    def body_area(self, j) -> Optional[np.ndarray]:
+        """A job's body skin area at the analysis picture's size (float32), or None."""
+        pm = (j.body or {}).get("mask") if getattr(j, "body", None) else None
+        return BS.unpack_mask(pm) if pm is not None else None
 
 
 # --------------------------------------------------------------------------- masks
@@ -1134,6 +1153,9 @@ def prepare(cut, tracker, t: int, cache: Optional[dict] = None, steady: bool = T
             jj.keep = float(np.clip(pp.skin_detail / 100.0, 0, 1))
             jj.grain_size = float(pp.grain_size)
             jj.blemish_size = float(np.clip(getattr(pp, "blemish_size", 50.0) / 100.0, 0, 1))
+            jj.body_keep = float(np.clip(getattr(pp, "body_detail", 60.0) / 100.0, 0, 1))
+            jj.body_size = float(np.clip(getattr(pp, "body_blemish_size", 40.0) / 100.0, 0, 1))
+            jj.bmarks = _body_marks(st, j.p, t, pp, jj.v)
             if j.skin is not None:
                 jj.skin = _copy.copy(j.skin)
                 jj.skin.strength = float(np.clip(jj.v["skin"], 0, 1))
@@ -1158,7 +1180,8 @@ def _sig(cut, tracker) -> tuple:
             if c_ is not None and (abs(c_.base) > 1e-4 or any(abs(v_) > 1e-4 for v_ in c_.keys.values())):
                 on.append(k_)
         vals.append((person.id, pp.skin_scope, round(float(fth), 3), tuple(on),
-                     round(float(getattr(pp, "blemish_size", 50.0)), 1)))     # the spot sizes the flaws are looked for at
+                     round(float(getattr(pp, "blemish_size", 50.0)), 1),      # the spot sizes the flaws are looked for at
+                     getattr(pp, "body_scope", "all"), round(float(getattr(pp, "body_blemish_size", 40.0)), 1)))
     return (id(tracker.store), getattr(cut, "analysis_version", 0), tuple(vals))
 
 
@@ -1170,6 +1193,7 @@ def _raw_cached(cut, tracker, s: int, cache):
     if lru is None or tracker.__dict__.get("_steady_sig") != sig or (cache is not None and len(cache) == 0):
         lru = tracker.__dict__["_steady_lru"] = OrderedDict()
         tracker.__dict__["_steady_sig"] = sig
+        tracker.__dict__.pop("_bflow", None)        # (the body's motion between frames: measured with the owners of then)
     if s in lru:
         lru.move_to_end(s)
         return lru[s]
@@ -1193,6 +1217,19 @@ def _steady(cut, tracker, st, rf: RetouchFrame, cache) -> RetouchFrame:
     N = st.final.shape[1]
     k = np.array([px.sx, px.sy])
     for j in rf.jobs:
+        # the body's mask has no face to follow: it is held steady along the picture's own motion (_steady_bskin)
+        if j.body and j.body.get("mask") is not None:
+            try:
+                j.body = dict(j.body, mask=_steady_bskin(cut, tracker, st, rf, j, cache))
+            except Exception:
+                import traceback
+                traceback.print_exc()
+        if getattr(j, "bdet", None) is not None:
+            try:
+                j.bdet = _steady_bdet(cut, tracker, st, rf, j, cache)
+            except Exception:
+                import traceback
+                traceback.print_exc()
         if j.face is None or not j.masks:
             continue
         Lt = j.face[:, :2] * k
@@ -1284,6 +1321,301 @@ def _steady(cut, tracker, st, rf: RetouchFrame, cache) -> RetouchFrame:
                 import traceback
                 traceback.print_exc()
     return rf
+
+
+BODY_STEADY_HOLD = 2.5      # a neighbour's skin counts where this frame's own mask (softened) times this reaches 1
+
+
+def _gray(px, t: int) -> np.ndarray:
+    return cv2.cvtColor(np.asarray(px.frame(t)), cv2.COLOR_RGB2GRAY)
+
+
+def _body_marks(st, p: int, t: int, pp, v) -> Optional[list]:
+    """The person's body spot marks as they lie on frame t (None: no marks, or 몸 잡티 제거 is off)."""
+    marks = getattr(pp, "body_marks", None)
+    if not marks or v.get("body_blemish", 0) <= 1e-4:
+        return None
+    try:
+        return BS.marks_at(st, p, t, marks) or None
+    except Exception:
+        return None
+
+
+BDET_NOW = True            # a job that came without its spots (a single frame, a test) has them found on the plane
+
+
+def _bdet_raw(cut, px, t: int, job, rgb_u8: np.ndarray) -> Optional[dict]:
+    """One frame's body spot candidates for a job, on the best picture there is of the body: the original where it
+    has clearly more pixels than the analysis picture (never more than the body's size asks for: bodyspots.DET_REF),
+    else the analysis picture. One piece of the original is read for the whole body and looked at tile by tile."""
+    info = job.body
+    bm = BS.unpack_mask(info.get("mask")) if info else None
+    if not info or bm is None or not info.get("box"):
+        return None
+    ref_src = float(info["ref"])
+    x0, y0, x1, y1 = info["box"]
+    W, H = int(px.info.width), int(px.info.height)
+    box_src = (max(0, int(x0 / px.sx) // 2 * 2), max(0, int(y0 / px.sy) // 2 * 2),
+               min(W, -(-int(np.ceil(x1 / px.sx)) // 2) * 2), min(H, -(-int(np.ceil(y1 / px.sy)) // 2) * 2))
+    want = min(1.0, BP.DET_REF / max(ref_src, 1.0))                # picture px per source px
+    img, scale, from_src = None, min(px.sx, want), False
+    if DET_SRC and want > px.sx * BP.DET_GAIN:
+        try:
+            from ..core import frames as FRM
+            from ..warp.render import _vs_for
+            sc = FRM.source_crops(px, vs=_vs_for(cut))
+            if sc is not None:
+                sc_scale = float(np.clip(round(want * 8.0) / 8.0, 0.125, 1.0))
+                img = sc.piece(t, box_src, sc_scale)
+                scale, from_src = sc_scale, True
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            img = None
+    if img is None:
+        ax0, ay0 = int(box_src[0] * px.sx), int(box_src[1] * px.sy)
+        ax1, ay1 = min(rgb_u8.shape[1], int(np.ceil(box_src[2] * px.sx))), min(rgb_u8.shape[0], int(np.ceil(box_src[3] * px.sy)))
+        img = rgb_u8[ay0:ay1, ax0:ax1]
+        box_src = (ax0 / px.sx, ay0 / px.sy, ax1 / px.sx, ay1 / px.sy)
+        scale, from_src = px.sx, False
+        if want < px.sx * 0.9:
+            f_ = want / px.sx
+            img = cv2.resize(img, (max(8, int(round(img.shape[1] * f_))), max(8, int(round(img.shape[0] * f_)))),
+                             interpolation=cv2.INTER_AREA)
+            scale = want
+    if img is None or img.shape[0] < 8 or img.shape[1] < 8:
+        return None
+    ih, iw = img.shape[:2]
+    fx, fy = iw / max(box_src[2] - box_src[0], 1e-6), ih / max(box_src[3] - box_src[1], 1e-6)
+    bmf = bm
+
+    def pieces(sx0, sy0, sx1, sy1):
+        u0, v0 = int(round((sx0 - box_src[0]) * fx)), int(round((sy0 - box_src[1]) * fy))
+        u1, v1 = int(round((sx1 - box_src[0]) * fx)), int(round((sy1 - box_src[1]) * fy))
+        u0, v0, u1, v1 = max(0, u0), max(0, v0), min(iw, u1), min(ih, v1)
+        if u1 - u0 < 8 or v1 - v0 < 8:
+            return None
+        return img[v0:v1, u0:u1]
+
+    def region_at(sx0, sy0, sx1, sy1, shp):
+        # analysis px -> this piece's px
+        u0, v0 = max(0, int(round((sx0 - box_src[0]) * fx))), max(0, int(round((sy0 - box_src[1]) * fy)))
+        A = np.array([[fx / px.sx, 0, -box_src[0] * fx - u0 + 0.5 * fx / px.sx - 0.5],
+                      [0, fy / px.sy, -box_src[1] * fy - v0 + 0.5 * fy / px.sy - 0.5]], np.float32)
+        return cv2.warpAffine(bmf, A, (shp[1], shp[0]), flags=cv2.INTER_LINEAR, borderValue=0)
+
+    net_for = None
+    if BP.SPOTNET:
+        from . import spotnet_run as SR
+        if SR.available():
+            net_for = lambda im, ref_: (lambda region, size: SR.run(im.astype(np.float32) / 255.0, region, ref_, max_size=size))
+    det = BP.detect(pieces, region_at, info.get("model"), ref_src, job.body_size, 0.5 * (fx + fy), box_src, net_for)
+    det["src"] = from_src
+    return det
+
+
+def _bdet_now(job, Y, Cb, Cr, bmY, y_per_src: float) -> Optional[dict]:
+    """The body's spots of a job found on this very picture (no candidates came with the job)."""
+    info = job.body
+    if not info or not info.get("box"):
+        return None
+    hY, wY = Y.shape
+    cbY = Cb if Cb.shape == Y.shape else cv2.resize(Cb, (wY, hY), interpolation=cv2.INTER_LINEAR)
+    crY = Cr if Cr.shape == Y.shape else cv2.resize(Cr, (wY, hY), interpolation=cv2.INTER_LINEAR)
+    ys = np.nonzero(bmY.max(1) > 0.3)[0]
+    xs = np.nonzero(bmY.max(0) > 0.3)[0]
+    if not len(ys) or not len(xs):
+        return None
+    k = y_per_src
+    box_src = (int(xs[0] / k) // 2 * 2, int(ys[0] / k) // 2 * 2, -(-int(np.ceil((xs[-1] + 1) / k)) // 2) * 2,
+               -(-int(np.ceil((ys[-1] + 1) / k)) // 2) * 2)
+
+    def cut_(a, sx0, sy0, sx1, sy1):
+        u0, v0 = max(0, int(round(sx0 * k))), max(0, int(round(sy0 * k)))
+        u1, v1 = min(wY, int(round(sx1 * k))), min(hY, int(round(sy1 * k)))
+        return a[v0:v1, u0:u1] if (u1 - u0 >= 8 and v1 - v0 >= 8) else None
+
+    def pieces(sx0, sy0, sx1, sy1):
+        y_ = cut_(Y, sx0, sy0, sx1, sy1)
+        return None if y_ is None else (y_, cut_(cbY, sx0, sy0, sx1, sy1), cut_(crY, sx0, sy0, sx1, sy1))
+
+    def region_at(sx0, sy0, sx1, sy1, shp):
+        r_ = cut_(bmY, sx0, sy0, sx1, sy1)
+        return r_ if (r_ is not None and r_.shape == tuple(shp)) else None
+    return BP.detect(pieces, region_at, None, float(info["ref"]), job.body_size, k, box_src)
+
+
+def _steady_bskin(cut, tracker, st, rf: RetouchFrame, j, cache) -> Optional[dict]:
+    """The body skin mask of job j held steady through time (float32, the analysis picture's size).
+
+    As with the face's masks: the same person's masks of the frames round it (STEADY_R each side, same shot, both
+    sides or neither), each carried onto this frame, pulled to their median and averaged. A body has no landmarks,
+    so each neighbour is carried along the picture's own motion (bodyskin.motion); where the carried picture is not
+    this frame's picture (something came in front, another person, a jump) that neighbour has no say. And whatever
+    the neighbours say, skin is only where this frame's own mask has it close by: nothing is carried onto a cover,
+    across a cut, or onto a person who took the place."""
+    t = rf.t
+    raw = j.body["mask"]
+    box = j.body.get("box")
+    if box is None or STEADY_R < 1:
+        return raw
+    # it does not depend on the sliders: kept with the frame's other masks (a slider being dragged asks for it again
+    # and again, and the motion of four neighbours is not measured each time)
+    key = (t, j.pid, "bskin+", "")
+    if cache is not None and key in cache:
+        return cache[key]["pm"]
+    out = BS.pack_mask(_steady_bskin_make(cut, tracker, st, rf, j, cache, BS.unpack_mask(raw), box))
+    if out is None:
+        out = raw
+    if cache is not None and len(cache) > 0:
+        cache[key] = dict(maps={"m": out["m"]}, thumb=None, pm=out)
+        cache["__bytes__"] = cache.get("__bytes__", 0) + _nbytes(cache[key])
+    return out
+
+
+def _body_neighbours(cut, tracker, st, rf: RetouchFrame, j, cache, both: bool = True) -> list:
+    """The frames round rf.t that can say something about job j's body on this frame: [(weight, frame, that frame's
+    job of the same person or None, the motion of this frame onto it)], nearest first. Same shot, the person there.
+    both: a distance counts only with both of its frames (the masks: one side alone pulls an edge its way); else
+    whichever are there (the spots: at a shot's first and last frames one side is better than none). Measured once
+    for a frame and job (the mask and the spots ask for the same)."""
+    memo = rf.__dict__.setdefault("_bnb", {})
+    key = (j.pid, both)
+    if key in memo:
+        return memo[key]
+    t = rf.t
+    px = tracker.proxy
+    N = st.final.shape[1]
+    box = (j.body or {}).get("box")
+    out = []
+    memo[key] = out
+    if box is None:
+        return out
+    full = memo.get((j.pid, False)) if both else None
+
+    def usable(s):
+        return 0 <= s < N and bool(st.present[j.p, s]) and st.connected(s, t)
+    for d in range(1, STEADY_R + 1):
+        ok = [s_ for s_ in (t - d, t + d) if usable(s_)]
+        if both and len(ok) < 2:
+            break
+        w = float(np.exp(-0.5 * (d / STEADY_SIGMA) ** 2))
+        got = []
+        for s_ in ok:
+            hit = next((e for e in (full or []) if e[1] == s_), None)
+            if hit is not None:
+                got.append(hit)
+                continue
+            rs = _raw_cached(cut, tracker, s_, cache)
+            js = next((x for x in rs.jobs if x.pid == j.pid), None) if rs is not None else None
+            mo = _body_motion(tracker, j, t, s_, box, (js.body or {}).get("box") if js is not None else None)
+            if mo is None:
+                if both:
+                    got = None
+                    break
+                continue
+            got.append((w, s_, js, mo))
+        if got is None:
+            break
+        out += got
+    return out
+
+
+BFLOW_LRU = 10          # pairs of frames a person's motion is kept for (a frame asks for four: two each side)
+import threading as _threading_mod
+_BFLOW_LOCK = _threading_mod.Lock()
+
+
+def _body_motion(tracker, j, t: int, s: int, box_t, box_s) -> Optional[dict]:
+    """The motion of person j's piece of frame t onto frame s (bodyskin.motion_pair). A pair of frames is measured
+    once, both ways (each way checks the other): frame s asks for the other way when its turn comes. Kept on the
+    tracker beside the frames of _raw_cached and dropped with them."""
+    from collections import OrderedDict
+    lru = tracker.__dict__.get("_bflow")
+    sig = tracker.__dict__.get("_steady_sig")
+    if lru is None or tracker.__dict__.get("_bflow_sig") != sig:
+        lru = tracker.__dict__["_bflow"] = OrderedDict()
+        tracker.__dict__["_bflow_sig"] = sig
+    lo, hi = (t, s) if t < s else (s, t)
+    key = (j.pid, lo, hi)
+    with _BFLOW_LOCK:
+        got = lru.get(key)
+        if got is not None:
+            lru.move_to_end(key)
+    if got is None:
+        px = tracker.proxy
+        size = (px.w, px.h)
+        try:
+            w_t = BS.ownership(tracker, t, j.p, size)[0]
+            w_s = BS.ownership(tracker, s, j.p, size)[0]
+        except Exception:
+            w_t = w_s = None
+        a, b = BS.motion_pair(_gray(px, t), _gray(px, s), box_t, box_s, w_t, w_s)
+        got = (a, b) if t < s else (b, a)
+        with _BFLOW_LOCK:
+            lru[key] = got
+            n = BFLOW_LRU * max(1, len({k[0] for k in lru}))
+            while len(lru) > n:
+                lru.popitem(last=False)
+    return got[0] if t < s else got[1]
+
+
+def _steady_bdet(cut, tracker, st, rf: RetouchFrame, j, cache) -> dict:
+    """The body's spots of job j held through time (bodyspots.fuse), kept with the frame's masks: they do not
+    depend on the sliders' strengths."""
+    t = rf.t
+    px = tracker.proxy
+    own = j.bdet
+    if STEADY_R < 1 or not j.body:
+        return own
+    key = (t, j.pid, "bdet+", f"{j.body_size:.3f}")
+    if cache is not None and key in cache:
+        return cache[key]
+    nb = _body_neighbours(cut, tracker, st, rf, j, cache, both=False)
+    others = [(w, getattr(js, "bdet", None) if js is not None else BP.empty(own["scale"]), mo) for w, _s, js, mo in nb]
+    out = BP.fuse(own, others, float(j.body["ref"]), px.sx, px.sy)
+    if cache is not None and len(cache) > 0:
+        cache[key] = out
+        cache["__bytes__"] = cache.get("__bytes__", 0) + _nbytes(out)
+    return out
+
+
+def _steady_bskin_make(cut, tracker, st, rf: RetouchFrame, j, cache, own: np.ndarray, box) -> np.ndarray:
+    shp = own.shape
+    frames = [(1.0, own)]
+    for w, _s, js, mo in _body_neighbours(cut, tracker, st, rf, j, cache, both=True):
+        ms = BS.unpack_mask(js.body.get("mask")) if (js is not None and js.body) else None
+        carried, conf = BS.carry(mo, ms if (ms is not None and ms.shape == shp) else np.zeros(shp, np.float32), shp)
+        # where the neighbour's picture is not this one, it says what this frame says
+        frames.append((w, conf * carried + (1.0 - conf) * own))
+    if len(frames) < 3:
+        return own
+    any_ = np.zeros(shp, bool)
+    for _, m in frames:
+        any_ |= m > 0.004
+    ys, xs = np.nonzero(any_.any(1))[0], np.nonzero(any_.any(0))[0]
+    if not len(ys) or not len(xs):
+        return own
+    y0, y1, x0, x1 = int(ys[0]), int(ys[-1]) + 1, int(xs[0]), int(xs[-1]) + 1
+    stk = np.stack([m[y0:y1, x0:x1] for _, m in frames])
+    med = np.median(stk, axis=0)
+    stk = np.clip(stk, med - STEADY_WIN, med + STEADY_WIN)
+    wv = np.array([w for w, _ in frames], np.float32)[:, None, None]
+    avg = (stk * wv).sum(0) / float(wv.sum())
+    o_ = own[y0:y1, x0:x1]
+    ref_px = float((j.body or {}).get("ref", 0.0)) * tracker.proxy.sx
+    near = np.clip(cv2.GaussianBlur(o_, (0, 0), max(1.0, 0.02 * ref_px)) * BODY_STEADY_HOLD, 0, 1)
+    # what the frames round it add comes only beside this frame's own area, and never onto what this frame itself
+    # rules out: something that lies over the skin here (a sleeve, hair, a prop, another person) is not retouched
+    # because the skin under it was seen a frame ago
+    allow = BS.unpack_allow((j.body or {}).get("allow"))
+    if allow is not None and allow.shape == shp:
+        near = near * allow[y0:y1, x0:x1]
+    else:
+        near = near * 0.0
+    out = own.copy()
+    out[y0:y1, x0:x1] = o_ + (avg - o_).clip(None, 0) + (avg - o_).clip(0, None) * near
+    return out
 
 
 def person_masks(cut, tracker, t: int, pid: int) -> Optional[RetouchFrame]:
@@ -1447,7 +1779,9 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
         sc = float(st.scale[p, t]) if np.isfinite(st.scale[p, t]) else 0.0
         job = Job(p, person.id, v, float(np.clip(pp.skin_detail / 100.0, 0, 1)), pp.skin_scope,
                   float(pp.grain_size), face, fw, sc,
-                  blemish_size=float(np.clip(getattr(pp, "blemish_size", 50.0) / 100.0, 0, 1)))
+                  blemish_size=float(np.clip(getattr(pp, "blemish_size", 50.0) / 100.0, 0, 1)),
+                  body_keep=float(np.clip(getattr(pp, "body_detail", 60.0) / 100.0, 0, 1)),
+                  body_size=float(np.clip(getattr(pp, "body_blemish_size", 40.0) / 100.0, 0, 1)))
         fth = pp.feather_factor() if hasattr(pp, "feather_factor") else 1.5
         if face is not None:
             job.wf_src = float(np.hypot(*(face[16, :2] - face[0, :2])))
@@ -1710,6 +2044,33 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 job.masks["teeth"] = get("teeth", lambda: teeth_mask(lm, base()["rgbf"])) * fw
             if v["eye_white"] > 1e-4:
                 job.masks["eyew"] = get("eyew", lambda: eye_white_mask(lm, base()["rgbf"])) * fw
+        if v.get("body_skin", 0) > 1e-4 or v.get("body_blemish", 0) > 1e-4:
+            # body skin (1.23): its own area, apart from the face's regions (retouch.bodyskin)
+            try:
+                from ..core.project import body_scope_set, norm_body_scope
+                bscope = norm_body_scope(getattr(pp, "body_scope", "all"))
+
+                def mk_body():
+                    b = base()
+                    m_, info_ = BS.body_mask(tracker, p, t, b["rgb"], body_scope_set(bscope), b.get("model"))
+                    pm_ = BS.pack_mask(m_) if m_ is not None else None
+                    pa_ = BS.pack_allow(info_.allow) if pm_ is not None else None
+                    maps_ = {"m": pm_["m"]} if pm_ is not None else {}
+                    if pa_ is not None:
+                        maps_["a"] = pa_["m"]
+                    return dict(maps=maps_, thumb=None, pm=pm_,
+                                info=dict(ref=float(info_.ref), model=info_.model, parsed=bool(info_.parsed),
+                                          box=info_.box, allow=pa_))
+                bd = get("bskin", mk_body, bscope)
+                if bd["pm"] is not None and tuple(bd["pm"]["shape"]) == tuple(shape) and bd["info"]["ref"] > 0:
+                    job.body = dict(bd["info"], mask=bd["pm"])
+                    if v.get("body_blemish", 0) > 1e-4:
+                        job.bdet = get("bdet", lambda: _bdet_raw(cut, px, t, job, base()["rgb"]),
+                                       f"{bscope}:{job.body_size:.3f}:sn{int(BP.SPOTNET)}")
+                        job.bmarks = _body_marks(st, p, t, pp, v)
+            except Exception:
+                import traceback
+                traceback.print_exc()
         if v["knee_dark"] > 1e-4:
             kp = st.final[p, t]
 
@@ -1728,7 +2089,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 import traceback
                 traceback.print_exc()
                 job.det = None
-        if job.masks:
+        if job.masks or job.body:
             if "prob" in state:
                 # this frame's own view of what is skin (colour, parser, texture): the steadied masks may not
                 # carry a neighbour's mask onto something that covers the face here (a hand, a sleeve)
@@ -2368,7 +2729,7 @@ def _det_place(job, rf, shape) -> dict:
 SPOT_CHROMA_CAP = 0.12
 
 
-def _spot_fill(Y, Cb, Cr, mY, S, Sred, k: float, size: float, cs: float):
+def _spot_fill(Y, Cb, Cr, mY, S, Sred, k: float, size: float, cs: float, plane_h: Optional[int] = None):
     """Fill what detect.py found from the skin around it: S (dark spots and raised bumps, with their dark side) in
     brightness and colour, Sred (red spots) in colour and brightness. The spot is replaced by the level of the
     skin beside it (the spots themselves left out of that level), whichever way it differs: a dark spot is lifted,
@@ -2389,7 +2750,8 @@ def _spot_fill(Y, Cb, Cr, mY, S, Sred, k: float, size: float, cs: float):
     # what stays of the picture's fine detail inside a fill: the whole grain band (the one the skin smoothing gives
     # back, _keep_fine) where the flaw is only likely; where it is sure, only what is finer than DET_FINE, because
     # a small spot's sharp core is in that band and stayed as a dot. Nothing is put in its place
-    sig_g = float(np.clip(GRAIN_SIGMA * Y.shape[0] / 1080.0, 0.8, 2.4))
+    # (plane_h: the plane's height when Y is only a piece of it: the grain band follows the plane, not the piece)
+    sig_g = float(np.clip(GRAIN_SIGMA * (plane_h or Y.shape[0]) / 1080.0, 0.8, 2.4))
     Ys = cv2.GaussianBlur(roi, (0, 0), sig_f)
     if sig_g > sig_f * 1.2:
         sure = _ss(DET_SURE[0], DET_SURE[1], sp)
@@ -3211,6 +3573,112 @@ def _redness(Cb, Cr, Y, mC, mY, k: float, wf: float, cs: float):
     return Yo, Cbo, Cro
 
 
+BODY_FINE = 0.0048         # of the size (BodyInfo.ref): what is finer than this is the fine texture 결 보존 gives back
+BODY_HOLD = True           # things lying on the skin, moles and ink are left out of the body smoothing
+
+
+BODY_INSET = 0.05          # of the size: the smoothing stays this far inside the skin's edge (a limb's outline, a hem)
+                           # and away from whatever is held (about 2.5 times its widest band)
+
+
+def body_inner(m: np.ndarray, ref: float) -> np.ndarray:
+    """m kept away from its own edge by BODY_INSET. The smoothing thins bands of detail up to 2 % of the size wide;
+    at the outline of an arm or a leg (skin against the background, against cloth) those bands hold the edge itself,
+    and thinning them there softened the body's outline. The rim left out is where the skin turns away from the
+    camera."""
+    r_ = _roi(m, 2)
+    if r_ is None:
+        return m
+    y0, y1, x0, x1 = r_
+    re_ = max(2, int(round(BODY_INSET * ref)))
+    roi = m[y0:y1, x0:x1]
+    core = cv2.erode((roi > 0.5).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * re_ + 1, 2 * re_ + 1)),
+                     borderType=cv2.BORDER_CONSTANT, borderValue=1)
+    soft = np.clip(cv2.GaussianBlur(core.astype(np.float32), (0, 0), max(1.0, 0.5 * re_)) * 1.25, 0, 1)
+    out = np.zeros_like(m)
+    out[y0:y1, x0:x1] = np.minimum(roi, soft)
+    return out
+
+
+def body_hold(Y, Cb, Cr, mY, ref: float) -> Optional[np.ndarray]:
+    """What on the body is not skin texture and stays as it is under the smoothing (0..1 at Y's size): straps,
+    chains, cords and hair lying on the skin, lace, glints (thin, far darker or brighter than the skin, or of
+    another colour); moles and other compact dark marks; ink and paint (another hue); hard edges."""
+    hY, wY = Y.shape
+    out = None
+    th_ = _things(Y, mY, ref, Cb, Cr)
+    if th_ is not None:
+        out = th_
+    hd_ = _hold_maps(Y, None, None, mY, ref, None, 1.0)[0]
+    if hd_ is not None:
+        out = hd_ if out is None else np.maximum(out, hd_)
+    cbY = Cb if Cb.shape == Y.shape else cv2.resize(Cb, (wY, hY), interpolation=cv2.INTER_LINEAR)
+    crY = Cr if Cr.shape == Y.shape else cv2.resize(Cr, (wY, hY), interpolation=cv2.INTER_LINEAR)
+    pr_ = DT.protect(Y, cbY, crY, mY, ref)
+    out = pr_ if out is None else np.maximum(out, pr_)
+    return out
+
+
+def _body_smooth(Y, Cb, Cr, mY, job, y_per_src: float, cs: float, src: Optional[dict] = None):
+    """The skin smoothing of the face (skin.smooth_channel: the texture's bands thinned, nothing wider than a few
+    pores changed, the picture's grain given back) on the body's area mY, its bands following the body's size.
+    Light and shade, the body's outline and whatever lies on the skin are wider than the bands or held (body_hold).
+    job.body_keep (결 보존) gives the finest band (pores, fine hair) back by that share."""
+    hY, wY = Y.shape
+    hC, wC = Cb.shape
+    k = float(np.clip(job.v.get("body_skin", 0.0), 0, 1))
+    ref = float(job.body["ref"]) * y_per_src
+    if k < 1e-4 or ref < 4 or float(mY.max()) < 0.01:
+        return Y, Cb, Cr
+    if BODY_HOLD:
+        hold = body_hold(Y, Cb, Cr, mY, ref)
+        if hold is not None:
+            mY = mY * (1.0 - np.clip(hold, 0, 1))
+    # away from the skin's own edge and from what is held: the bands (and the colour smoothing's radius) reach that far
+    mY = body_inner(mY, ref)
+    if float(mY.max()) < 0.01:
+        return Y, Cb, Cr
+    mC = mY if (hC, wC) == (hY, wY) else cv2.resize(mY, (wC, hC), interpolation=cv2.INTER_AREA)
+    r = int(max(1, round(0.022 * ref)))
+    if hasattr(SK, "_TLS"):
+        SK._TLS.wf = float(ref)
+        SK._TLS.sq = 1.0
+        SK._TLS.shape = None
+        SK._TLS.pitm = None
+    sig_f = max(1.0, BODY_FINE * ref)
+    keep = float(np.clip(getattr(job, "body_keep", 0.6), 0, 1))
+
+    def smooth(P):
+        P1 = SK.smooth_channel(P, mY, k, keep, r, relative=True)
+        if GRAIN_KEEP:
+            P1 = _keep_fine(P, P1, mY)
+        if keep > 1e-3:
+            d_ = P - P1                                   # what was taken: its finest part comes back
+            r_ = _roi(mY, int(3 * sig_f) + 2)
+            if r_ is not None:
+                y0, y1, x0, x1 = r_
+                dd = d_[y0:y1, x0:x1]
+                P1 = P1.copy()
+                P1[y0:y1, x0:x1] += keep * (dd - cv2.GaussianBlur(dd, (0, 0), sig_f))
+        return P1
+    if src is not None and src["Y"].shape == Y.shape:
+        Ys0 = src["Y"]
+        Ys1 = smooth(Ys0)
+        dS = Ys1 - Ys0
+        src["Y"] = Ys1
+        src["dY"] += dS
+        Y = Y + src["Jy"] * dS
+        if Cb.shape == dS.shape:
+            Cb = Cb + src["Jcb"] * dS
+            Cr = Cr + src["Jcr"] * dS
+    else:
+        Y = smooth(Y)
+    rc = max(1, int(round(r * cs)))
+    Cb = SK.smooth_channel(Cb, mC, k * SKIN_CHROMA, 0.0, rc, eps=0.0004)
+    Cr = SK.smooth_channel(Cr, mC, k * SKIN_CHROMA, 0.0, rc, eps=0.0004)
+    return Y, Cb, Cr
+
+
 def _target_chroma(rgb, hue_deg: float = 0.0):
     r, g, b = rgb
     y = _K[0] * r + _K[1] * g + _K[2] * b
@@ -3272,6 +3740,38 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                 traceback.print_exc()
                 det = {}
         prot_ = det.get("protect")
+        # body skin (1.23): its area on this picture, laid at this picture's own pixels, found before anything changes
+        bmY = None
+        if job.body and job.body.get("mask") is not None and (v.get("body_skin", 0) > 1e-4 or v.get("body_blemish", 0) > 1e-4):
+            try:
+                bmY = BS.refine(job.body["mask"], job.body.get("model"), Y, Cb, Cr)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                bmY = None
+        # 0b. body blemishes: before the face's own (what the face's area holds is the face's: the body's spots are
+        # filled only inside the rest of the body's area) and before any smoothing
+        if bmY is not None and v.get("body_blemish", 0) > 1e-4:
+            try:
+                regB = bmY
+                if v.get("blemish", 0) > 1e-4:
+                    for nm_ in ("skinx", "neck"):
+                        if nm_ in job.masks:
+                            regB = regB * (1.0 - np.clip(M(job.masks[nm_], (hY, wY)), 0, 1))
+                bd_ = getattr(job, "bdet", None)
+                if bd_ is None and BDET_NOW:
+                    bd_ = _bdet_now(job, Y, Cb, Cr, regB, y_per_src)
+                if bd_ is None and getattr(job, "bmarks", None):
+                    bd_ = BP.empty(y_per_src)
+                if bd_ is not None:
+                    if getattr(job, "bmarks", None):
+                        bd_ = BP.apply_marks(bd_, job.bmarks, bd_["scale"])
+                    Y, Cb, Cr = BP.fill(Y, Cb, Cr, regB, bd_, float(np.clip(v["body_blemish"], 0, 1)), job.body_size,
+                                        float(job.body["ref"]) * y_per_src, y_per_src, cs,
+                                        lambda *a_: _spot_fill(*a_, plane_h=hY))
+            except Exception:
+                import traceback
+                traceback.print_exc()
         # 0. blemishes (first, so smoothing never smears a spot around)
         if v.get("blemish", 0) > 1e-4 and det and ("skinx" in job.masks or "neck" in job.masks):
             k = float(np.clip(v["blemish"], 0, 1))
@@ -3399,6 +3899,18 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
             rc = max(1, int(round(r * cs)))
             Cb = SK.smooth_channel(Cb, mC, job.skin.strength * SKIN_CHROMA, 0.0, rc, eps=0.0004)
             Cr = SK.smooth_channel(Cr, mC, job.skin.strength * SKIN_CHROMA, 0.0, rc, eps=0.0004)
+        # 1b. body skin: the same smoothing on the body's own area, at the body's own size. Where the face's area
+        # (its neck, an older project's body regions) already took a pixel, the body takes only what is left of it:
+        # the two never add up to more than one retouch
+        if bmY is not None and v.get("body_skin", 0) > 1e-4:
+            try:
+                mB = bmY
+                if "skin" in job.masks and v["skin"] > 1e-4 and job.skin is not None:
+                    mB = mB * (1.0 - np.clip(M(job.masks["skin"], (hY, wY)), 0, 1))
+                Y, Cb, Cr = _body_smooth(Y, Cb, Cr, mB, job, y_per_src, cs, src)
+            except Exception:
+                import traceback
+                traceback.print_exc()
         # 2. wrinkles
         ex = job.masks.get("excl")
         exY = M(ex, (hY, wY)) if ex is not None else None

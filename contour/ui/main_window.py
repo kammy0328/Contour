@@ -32,6 +32,7 @@ from ..core import media as M
 from ..core.colour import manager
 from ..core.copyset import CopyOptions, apply_copy, suggest_mapping
 from ..core.project import PART_KEYS, PERSON_COLORS, Project, safe_name
+from ..core.params import BODY_SKIN_KEYS
 from ..core.frames import SCRUB_SEEKS
 from ..core.settings import APP_NAME, APP_VERSION, settings
 from ..stats.tracker import ActivityClock, log_event
@@ -272,6 +273,8 @@ class MainWindow(QMainWindow):
         self.viewer.editStarted.connect(lambda: self.push_undo())
         self.viewer.sculptEdited.connect(self._sculpt_edit)
         self.viewer.bodyEdited.connect(self._body_edit)
+        self.viewer.bodyMarked.connect(self._body_mark)
+        self.viewer.bodyMarkDeleted.connect(self._body_mark_delete)
         cv.addWidget(self.viewer, 1)
         cv.addWidget(self._transport())
         vs = QSplitter(Qt.Vertical)
@@ -1428,7 +1431,7 @@ class MainWindow(QMainWindow):
                         elif hasattr(sp, k):
                             setattr(dp, k, getattr(sp, k))
                     from ..core.params import RETOUCH_KEYS, SKIN_BASIC_KEYS
-                    if any(k in RETOUCH_KEYS for k in keys):
+                    if any(k in RETOUCH_KEYS and k not in BODY_SKIN_KEYS for k in keys):
                         dp.skin_basic = dict(sp.skin_basic) if set(SKIN_BASIC_KEYS) <= set(keys) else {}
             n_people += len(mapping)
             if not dst.analyzed:
@@ -2835,16 +2838,17 @@ class MainWindow(QMainWindow):
     # ================================================================== viewer options
     def set_tool(self, tool: str):
         point_tools = ("sculpt", "bodypts")
-        was_points = self.viewer.tool in point_tools
+        side_tools = point_tools + ("bodymark",)        # tools started from the right panel (the edit tool stays lit)
+        was_points = self.viewer.tool in side_tools
         self.tool = tool
         self.viewer.tool = tool
         for k, b in self.tool_btns.items():
-            b.setChecked(k == tool or (k == "edit" and tool in point_tools))
+            b.setChecked(k == tool or (k == "edit" and tool in side_tools))
         self.viewer.setCursor(Qt.CrossCursor if tool not in ("edit",) + point_tools else Qt.ArrowCursor)
         if tool in point_tools:
             self.ov["skel"].setChecked(True)
         self.viewer.update()
-        if was_points or tool in point_tools:
+        if was_points or tool in side_tools:
             self.inspector.refresh("reshape")
 
     def _compare(self, mode: str):
@@ -2882,7 +2886,7 @@ class MainWindow(QMainWindow):
             self.viewer.show_skin = v
             if v and self.session.cut is not None and not any(
                     pp.skin_active() for pp in self.session.cut.params.values()):
-                self.toast("피부결 보정을 올리면 적용 영역이 표시됩니다. 눈·눈썹·입술은 항상 빠집니다.")
+                self.toast("피부결 보정이나 몸 피부 보정을 켜면 적용 영역이 표시됩니다. 눈·눈썹·입술은 항상 빠집니다.")
         self.viewer.update()
 
     # ================================================================== people
@@ -2928,6 +2932,7 @@ class MainWindow(QMainWindow):
                 dst = cut.params_for(pid)
                 for k in ("amounts", "strength", "skin_detail", "skin_scope", "grain_size", "blemish_size", "feather"):
                     setattr(dst, k, getattr(src, k) if k != "amounts" else {kk: c for kk, c in src.amounts.items()})
+                dst.copy_body_from(src)
                 q = cut.person(pid)
                 if q is not None and q.role != "target":
                     q.role = "target"
@@ -3432,7 +3437,7 @@ class MainWindow(QMainWindow):
         c.set_at(self.frame, v)
         for op in self._others():
             (op.strength if part == "__strength__" else op.amounts[part]).set_at(self.frame, v)
-        if part != "__strength__" and self._kind_of(part) == "ret":
+        if part != "__strength__" and self._kind_of(part) == "ret" and part not in BODY_SKIN_KEYS:
             self._skin_hand_set(pp)
         self.session.interactive = not committed
         self.session.touch(self._kind_of(part))
@@ -3451,7 +3456,7 @@ class MainWindow(QMainWindow):
             c.remove_key(self.frame)
         else:
             c.add_key(self.frame)
-        if part != "__strength__" and self._kind_of(part) == "ret":
+        if part != "__strength__" and self._kind_of(part) == "ret" and part not in BODY_SKIN_KEYS:
             self._skin_hand_set(pp)
         self.session.touch(self._kind_of(part))
         self._refresh_all()
@@ -3502,6 +3507,114 @@ class MainWindow(QMainWindow):
         if committed:
             self.inspector.refresh("reshape")
 
+    # ---- body skin (1.23): 몸 피부 보정, 몸 잡티 제거
+    def set_body_on(self, key: str, on: bool):
+        """Switch a body skin effect of the selected people on or off (off keeps its values to come back to)."""
+        pp = self._params()
+        if pp is None:
+            self.inspector.refresh("reshape")
+            return
+        self.push_undo()
+        for q in [pp] + self._others():
+            q.set_body_on(key, bool(on))
+        if not on and key == "body_blemish" and self.viewer.tool == "bodymark":
+            self.set_tool("edit")
+        self.session.interactive = False
+        self.session.touch("ret")
+        self.viewer.update()
+        self.timeline.update()
+        self.inspector.refresh("reshape")
+
+    def set_body(self, what: str, v, committed: bool):
+        """The body skin settings that are not sliders with keys: detail (결 보존), blemish_size (최대 잡티 크기),
+        scope (전신 or regions)."""
+        pp = self._params()
+        if pp is None:
+            return
+        if committed:
+            self.push_undo(coalesce=f"body:{self.sel_pid}:{what}")
+        from ..core.project import norm_body_scope
+        for q in [pp] + self._others():
+            if what == "detail":
+                q.body_detail = float(v)
+            elif what == "blemish_size":
+                q.body_blemish_size = float(v)
+            elif what == "scope":
+                q.body_scope = norm_body_scope(v)
+        self.session.interactive = not committed
+        self.session.touch("ret")
+        self.viewer.update()
+        if committed:
+            self.inspector.refresh("reshape")
+
+    def set_body_mark_mode(self, kind: str):
+        """The body spot marking tool: 'remove' (this spot goes) or 'exclude' (nothing is removed here); '' ends it."""
+        if not kind:
+            if self.viewer.tool == "bodymark":
+                self.set_tool("edit")
+            return
+        pp = self._params()
+        tr = self.session.tracker
+        if pp is None or tr is None or tr.store is None:
+            self.toast("먼저 분석된 컷에서 인물을 선택하세요.", kind="warn")
+            self.inspector.refresh("reshape")
+            return
+        if not pp.body_on("body_blemish"):
+            self.toast("몸 잡티 제거를 먼저 켜세요.", kind="warn")
+            self.inspector.refresh("reshape")
+            return
+        self.viewer.mark_kind = kind
+        self.set_tool("bodymark")
+        if not self.ov["skin"].isChecked():
+            self.ov["skin"].setChecked(True)             # the marks and what the detection found are shown on the area
+        self.toast("잡티를 찍거나 끌어서 표시하세요 (지금: " + ("제거" if kind == "remove" else "자동 제거 제외")
+                   + "). 표시는 몸을 따라 컷 전체에 적용됩니다. 오른쪽 클릭: 표시 지우기 · Esc: 끝내기")
+
+    def set_body_mark_radius(self, r: float):
+        self.viewer.mark_r = float(max(2.0, min(60.0, r)))
+        self.viewer.update()
+
+    def _body_mark(self, pts, r: float):
+        """The viewer drew a mark for the selected person on this frame (points and radius in source px)."""
+        pp = self._params()
+        tr = self.session.tracker
+        if pp is None or tr is None or tr.store is None or not tr.store.has(self.sel_pid) or not pts:
+            return
+        import uuid
+        from ..retouch import bodyskin as BS
+        self.push_undo()
+        kind = getattr(self.viewer, "mark_kind", "remove")
+        m = BS.anchor_mark(tr.store, tr.store.index(self.sel_pid), int(self.frame),
+                           dict(id=uuid.uuid4().hex[:8], kind=kind, t=int(self.frame),
+                                pts=[[float(x), float(y)] for x, y in pts], r=float(r)))
+        pp.body_marks = list(pp.body_marks) + [m]
+        self.session.interactive = False
+        self.session.touch("ret")
+        self.viewer.update()
+        self.inspector.refresh("reshape")
+        if not m.get("part"):
+            self.toast("가까운 몸 부위를 찾지 못해 이 표시는 화면의 같은 자리에 고정됩니다.", kind="warn")
+
+    def _body_mark_delete(self, mark_id: str):
+        pp = self._params()
+        if pp is None or not any(m.get("id") == mark_id for m in pp.body_marks):
+            return
+        self.push_undo()
+        pp.body_marks = [m for m in pp.body_marks if m.get("id") != mark_id]
+        self.session.touch("ret")
+        self.viewer.update()
+        self.inspector.refresh("reshape")
+
+    def clear_body_marks(self):
+        pp = self._params()
+        if pp is None or not pp.body_marks:
+            return
+        self.push_undo()
+        pp.body_marks = []
+        self.session.touch("ret")
+        self.viewer.update()
+        self.inspector.refresh("reshape")
+
     def _curves_for(self, key: str):
         pp = self._params()
         if pp is None:
@@ -3551,6 +3664,7 @@ class MainWindow(QMainWindow):
             pp.skin_detail, pp.skin_scope = fresh.skin_detail, fresh.skin_scope
             pp.grain_size, pp.blemish_size = fresh.grain_size, fresh.blemish_size
             pp.skin_basic = {}
+            pp.copy_body_from(fresh, marks=True)          # body skin: off, as a new person has it; the hand marks go too
             self.session.touch("ret")
         elif part == "body":
             for k in RETOUCH_KEYS:
@@ -3558,6 +3672,7 @@ class MainWindow(QMainWindow):
             fresh.skin_detail, fresh.skin_scope = pp.skin_detail, pp.skin_scope
             fresh.grain_size, fresh.blemish_size = pp.grain_size, pp.blemish_size
             fresh.skin_basic = pp.skin_basic
+            fresh.copy_body_from(pp, marks=True)
             self.session.cut.params[self.sel_pid] = fresh
             self.session.touch("geo")
         else:

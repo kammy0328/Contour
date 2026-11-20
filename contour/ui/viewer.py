@@ -30,7 +30,10 @@ HEAT_LUT = _heat_lut()
 DET_COLOURS = {"dark": (40, 60, 230), "red": (255, 60, 60), "bump": (60, 220, 90), "line": (255, 225, 40),
                "fold": (255, 140, 30), "protect": (230, 60, 230)}
 DET_LEGEND = (("dark", "어두운 잡티"), ("red", "붉은 여드름"), ("bump", "돌출·오돌토돌"), ("line", "목주름 (선)"),
-              ("fold", "목주름 (넓은 접힘)"), ("protect", "보호 (털·장신구·경계)"))
+              ("fold", "목주름 (넓은 접힘)"), ("protect", "보호 (털·장신구·경계)"),
+              ("body", "몸 피부 영역"), ("bspot", "몸 잡티: 제거"), ("bheld", "몸 잡티: 남겨 둠 (점·문신·경계 등)"))
+DET_COLOURS.update({"body": (40, 200, 190), "bspot": (255, 70, 70), "bheld": (170, 170, 170)})
+MARK_COLOURS = {"remove": (255, 80, 80), "exclude": (90, 220, 120)}
 HAND_BONES = [(0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8), (0, 9), (9, 10), (10, 11), (11, 12),
               (0, 13), (13, 14), (14, 15), (15, 16), (0, 17), (17, 18), (18, 19), (19, 20), (5, 9), (9, 13), (13, 17)]
 
@@ -59,6 +62,8 @@ class Viewer(QWidget):
     editStarted = Signal()                               # a drag that changes the project begins (undo point)
     sculptEdited = Signal(int, object, bool)             # dense face point, offset (face units) or None, committed
     bodyEdited = Signal(object, bool)                    # {body point key: edge change or None}, committed
+    bodyMarked = Signal(object, float)                   # a body spot mark was drawn: [(x, y) source px], radius
+    bodyMarkDeleted = Signal(str)                        # mark id (right click on a mark)
 
     def __init__(self, session, parent=None):
         super().__init__(parent)
@@ -78,7 +83,10 @@ class Viewer(QWidget):
         self._hover_body: Optional[Tuple[int, int, int]] = None
         self.playing = False
         self._play_raw = False              # showing the original because the result is not ready yet
-        self.tool = "edit"             # edit | sculpt | bodypts
+        self.tool = "edit"             # edit | sculpt | bodypts | bodymark
+        self.mark_kind = "remove"      # bodymark: remove | exclude
+        self.mark_r = 8.0              # and the mark's radius, source px
+        self._mark_pts = None          # the mark being drawn: [(x, y) source px]
         self.sel_pid: Optional[int] = None
         self.zoom = 1.0
         self.fit = True
@@ -524,6 +532,11 @@ class Viewer(QWidget):
         rgba[..., 3] = np.clip(m * 170, 0, 255)
         kinds = set()
         try:
+            self._body_overlay(rf, t, sel_pid, fr, rgba, kinds)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+        try:
             # 1.19: what was found in the area, each kind in its own colour, and what is kept out whatever was found
             from ..retouch import engine as RE
             for j in rf.jobs:
@@ -566,6 +579,135 @@ class Viewer(QWidget):
             traceback.print_exc()
         self._det_kinds = (t, tuple(k for k in DET_LEGEND if k[0] in kinds))
         return (key, t, np.clip(rgba, 0, 255).astype(np.uint8))
+
+    def _body_overlay(self, rf, t: int, sel_pid, fr, rgba: np.ndarray, kinds: set) -> None:
+        """1.23: the body skin area in its own colour and the body's spots on it: what will be removed and what was
+        found and left (moles, ink, marks at an edge). The spots are those of the frame as it is retouched (held
+        through time, the hand marks applied) when the session has it, else this frame's own."""
+        from ..retouch import bodyspots as BP
+        from ..warp.field import warp_image
+        px = self.s.proxy
+        done = None
+        try:
+            done = self.s.retouch(t)
+        except Exception:
+            done = None
+        for j in rf.jobs:
+            body = rf.body_area(j)
+            if body is None:
+                continue
+            if fr is not None and not fr.empty():
+                body = warp_image(body, fr, cv2.INTER_LINEAR)
+            kinds.add("body")
+            a = np.clip(body, 0, 1)[..., None]
+            rgba[..., :3] = rgba[..., :3] * (1 - a) + np.array(DET_COLOURS["body"], np.float32) * a
+            jd = next((x for x in done.jobs if x.pid == j.pid), None) if done is not None else None
+            det = getattr(jd, "bdet", None) if jd is not None else None
+            marks = getattr(jd, "bmarks", None) if jd is not None else None
+            if det is None:
+                det = getattr(j, "bdet", None)
+            if det is None and not marks:
+                continue
+            if det is None:
+                det = BP.empty(1.0)
+            if marks:
+                det = BP.apply_marks(det, marks, det["scale"])
+            c = det["cands"]
+            if not len(c):
+                continue
+            tk = BP.taken(det)
+            show = {"bspot": np.zeros(body.shape, np.float32), "bheld": np.zeros(body.shape, np.float32)}
+            for i in range(len(c)):
+                held = not tk[i]
+                if held and c["hold"][i] == BP.HOLD_WEAK:
+                    continue
+                x, y = int(round(float(c["x"][i]) * px.sx)), int(round(float(c["y"][i]) * px.sy))
+                r = max(2, int(round(0.5 * float(c["d"][i]) * px.sx)) + 1)
+                cv2.circle(show["bheld" if held else "bspot"], (x, y), r, 1.0, 1 if held else -1, cv2.LINE_AA)
+            for k_, sc in show.items():
+                if float(sc.max()) <= 0:
+                    continue
+                if fr is not None and not fr.empty():
+                    sc = warp_image(sc, fr, cv2.INTER_LINEAR)
+                kinds.add(k_)
+                a = np.clip(sc, 0, 1)[..., None]
+                rgba[..., :3] = rgba[..., :3] * (1 - a) + np.array(DET_COLOURS[k_], np.float32) * a
+                rgba[..., 3] = np.maximum(rgba[..., 3], a[..., 0] * 235)
+
+    # ------------------------------------------------------------------ body spot marks (1.23)
+    def _unwarped(self, x: float, y: float) -> Tuple[float, float]:
+        """A point of the picture shown (source px) as a point of the frame before the shape changes: the marks are
+        kept on the frame itself."""
+        try:
+            fr = self.s.peek_field(self.t)
+            if fr is None or fr.empty():
+                return x, y
+            from ..warp import field as F
+            px = self.s.proxy
+            xi = int(np.clip(round(x * px.sx), 0, px.w - 1))
+            yi = int(np.clip(round(y * px.sy), 0, px.h - 1))
+            D = F.upsample(fr, (xi, yi, xi + 1, yi + 1))
+            return x + float(D[0, 0, 0]) / px.sx, y + float(D[0, 0, 1]) / px.sy
+        except Exception:
+            return x, y
+
+    def _warped(self, x: float, y: float) -> Tuple[float, float]:
+        """The other way (to first order): where a point of the frame is shown."""
+        ux, uy = self._unwarped(x, y)
+        return x - (ux - x), y - (uy - y)
+
+    def _marks_now(self) -> list:
+        """The selected person's marks as they lie on this frame: [(mark, points (n, 2) source px, radius)]."""
+        cut, tr = self.s.cut, self.s.tracker
+        if cut is None or tr is None or tr.store is None or self.sel_pid is None or not tr.store.has(self.sel_pid):
+            return []
+        marks = cut.params_for(self.sel_pid).body_marks
+        if not marks:
+            return []
+        from ..retouch import bodyskin as BS
+        out = []
+        p_ = tr.store.index(self.sel_pid)
+        for m in marks:
+            got = BS.marks_at(tr.store, p_, self.t, [m])
+            if got:
+                out.append((m, got[0][1], got[0][2]))
+        return out
+
+    def _hit_mark(self, pos: QPointF) -> Optional[str]:
+        x, y = self._unwarped(*self.w_to_src(pos))
+        for m, pts, r in self._marks_now():
+            d = np.hypot(pts[:, 0] - x, pts[:, 1] - y).min()
+            if d <= r + 4.0 / max(self._edit_rect().width() / max(1.0, self.s.proxy.w) * self.s.proxy.sx, 1e-6):
+                return m.get("id")
+        return None
+
+    def _paint_marks(self, p: QPainter, r: QRectF):
+        px = self.s.proxy
+        z = r.width() / px.w * px.sx                       # widget px per source px
+        p.save()
+        p.setBrush(Qt.NoBrush)
+        items = [(m.get("kind"), pts, rad) for m, pts, rad in self._marks_now()]
+        if self._mark_pts:
+            items.append((self.mark_kind, np.asarray(self._mark_pts, np.float64), self.mark_r))
+        for kind, pts, rad in items:
+            col = QColor(*MARK_COLOURS.get(kind, (255, 255, 255)))
+            pen = QPen(col, 1.6)
+            if kind == "exclude":
+                pen.setStyle(Qt.DashLine)
+            p.setPen(pen)
+            w_ = [self.src_to_w(*self._warped(float(q[0]), float(q[1])), r) for q in pts]
+            rr = max(3.0, rad * z)
+            if len(w_) == 1:
+                p.drawEllipse(w_[0], rr, rr)
+            else:
+                thick = QPen(QColor(col.red(), col.green(), col.blue(), 90), 2 * rr, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+                p.setPen(thick)
+                for a_, b_ in zip(w_[:-1], w_[1:]):
+                    p.drawLine(a_, b_)
+                p.setPen(pen)
+                for a_, b_ in zip(w_[:-1], w_[1:]):
+                    p.drawLine(a_, b_)
+        p.restore()
 
     def _paint_det_legend(self, p: QPainter):
         """Which colour is which in the skin area view (only the kinds found on this frame)."""
@@ -693,6 +835,8 @@ class Viewer(QWidget):
             self._paint_sculpt(p, r)
         if self.tool == "bodypts":
             self._paint_body(p, r)
+        if self.tool == "bodymark" or (self.show_skin and not self.playing):
+            self._paint_marks(p, r)
         if mode == "side":
             p.restore()
         if self.message:
@@ -1128,6 +1272,17 @@ class Viewer(QWidget):
             self._panning = (pos, QPointF(self.pan))
             self.setCursor(Qt.ClosedHandCursor)
             return
+        if self.tool == "bodymark":
+            if e.button() == Qt.RightButton:
+                mid = self._hit_mark(pos)
+                if mid:
+                    self.bodyMarkDeleted.emit(mid)
+                return
+            if e.button() == Qt.LeftButton and self.sel_pid is not None:
+                if self._edit_rect().contains(pos):          # (side by side: the original's pane is not drawn on)
+                    self._mark_pts = [self._unwarped(*self.w_to_src(pos))]
+                    self.update()
+                return
         if self.tool == "sculpt":
             i = self._hit_sculpt(pos)
             if i is not None:
@@ -1221,6 +1376,13 @@ class Viewer(QWidget):
             c = self._cells()[0]
             self.wipe = float(np.clip((pos.x() - c.left()) / max(1, c.width()), 0, 1))
             self.update()
+            return
+        if self._mark_pts is not None:
+            q = self._unwarped(*self.w_to_src(pos))
+            if np.hypot(q[0] - self._mark_pts[-1][0], q[1] - self._mark_pts[-1][1]) >= max(1.5, 0.4 * self.mark_r) \
+                    and len(self._mark_pts) < 200:
+                self._mark_pts.append(q)
+                self.update()
             return
         if self._drag is not None:
             if self._drag[0] == "sculpt":
@@ -1319,6 +1481,12 @@ class Viewer(QWidget):
             return
         if self._wipe_drag:
             self._wipe_drag = False
+            return
+        if self._mark_pts is not None:
+            pts, self._mark_pts = self._mark_pts, None
+            self.update()
+            if e.button() == Qt.LeftButton and pts:
+                self.bodyMarked.emit(pts, float(self.mark_r))
             return
         if self._drag is not None:
             d = self._drag

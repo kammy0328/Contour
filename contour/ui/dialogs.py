@@ -494,7 +494,9 @@ class PastePickDialog(QDialog):
     """Alt+V: which of the copied cut's values to paste. Only values that were changed are listed."""
 
     EXTRA = [("skin_detail", "질감 유지", 45.0), ("grain_size", "그레인 크기", 1.0), ("blemish_size", "잡티 크기", 50.0),
-             ("skin_scope", "보정 부위", "face,neck"), ("cloth", "옷 그대로", "include"), ("feather", "경계 부드러움", 50.0)]
+             ("skin_scope", "보정 부위", "face,neck"), ("cloth", "옷 그대로", "include"), ("feather", "경계 부드러움", 50.0),
+             ("body_detail", "몸 결 보존", 60.0), ("body_blemish_size", "몸 잡티 최대 크기", 40.0),
+             ("body_scope", "몸 보정 부위", "all")]
 
     def __init__(self, parent, src_cut, frame: int):
         super().__init__(parent)
