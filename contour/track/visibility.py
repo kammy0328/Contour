@@ -25,6 +25,19 @@ SCORE_EDGE = 0.60        # near the frame edge a joint needs at least this
 SCORE_SURE = 0.88        # this sure, the matte is not consulted (thin wrists, fast blur)
 MATTE_MIN = 0.35
 
+# A limb smeared by motion gets low scores for a few frames and was hidden like a limb behind something
+# (instruction 2026-11-20 §1-4). hold_blur() keeps such a joint when the frames around it and the picture itself
+# say it is still there. Off until it is measured on footage: how many joints lost to motion blur it brings back,
+# and how many joints it shows that are really hidden (PC job j2785); it is not taken for bringing joints back in
+# this function alone.
+BLUR_HOLD = False
+HOLD_MAX = 8             # frames: the longest run of low scores taken for a blur dip
+HOLD_REACH = 6           # frames: how far before and after the joint must have been seen
+HOLD_SLOW = 0.012        # of the person's size a frame: slower than this, only a blurred picture counts as motion blur
+HOLD_FAST = 0.16         # ... faster than this between the frames before and after is not one limb (another person)
+HOLD_NEAR = 0.20         # of the person's size: how far the low-score estimate may be from the path between them
+HOLD_OWN = 0.25          # of the spot around the joint that must be this person's own pixels
+
 
 def body_score(store: TrackStore, norm: Dict[str, float]) -> np.ndarray:
     """(P,N,K) mean normalised score over the body models (face sources excluded)."""
@@ -41,10 +54,15 @@ def body_score(store: TrackStore, norm: Dict[str, float]) -> np.ndarray:
 
 def measure(store: TrackStore, norm: Dict[str, float], frame_wh: Tuple[int, int],
             alpha_at: Optional[Callable[[int], Optional[np.ndarray]]] = None,
-            alpha_scale: Tuple[float, float] = (1.0, 1.0)) -> np.ndarray:
+            alpha_scale: Tuple[float, float] = (1.0, 1.0),
+            owner_at: Optional[Callable[[int], Optional[np.ndarray]]] = None,
+            hold: Optional[bool] = None) -> np.ndarray:
+    """owner_at(t): who owns each matte pixel (person id + 1, 0 nobody, 255 someone not tracked), for hold_blur.
+    hold: hold_blur on or off (None: BLUR_HOLD)."""
     W, H = frame_wh
     P, N = store.present.shape
     vis = np.zeros((P, N, S.K), np.uint8)
+    low = np.zeros((P, N, S.K), bool)          # hidden for its low score and nothing else
     score = body_score(store, norm)
     xy = store.meas[..., :2]
     margin = 0.012 * min(W, H)
@@ -65,6 +83,7 @@ def measure(store: TrackStore, norm: Dict[str, float], frame_wh: Tuple[int, int]
             v[fin & ~inside] = VIS_OUTSIDE
             v[inside & (s < SCORE_HIDE)] = VIS_HIDDEN
             v[edge & (s < SCORE_EDGE)] = VIS_HIDDEN
+            low[p, t] = inside & ~edge & (s < SCORE_HIDE)
             if alpha is not None:
                 sc_ = store.scale[p, t] if np.isfinite(store.scale[p, t]) else 300.0
                 r = max(2, int(0.025 * sc_ * alpha_scale[0]))
@@ -80,8 +99,127 @@ def measure(store: TrackStore, norm: Dict[str, float], frame_wh: Tuple[int, int]
                     if support < MATTE_MIN:
                         v[j] = VIS_HIDDEN
             vis[p, t] = v
+    if BLUR_HOLD if hold is None else hold:
+        vis = hold_blur(store, vis, low, (W, H), alpha_at, alpha_scale, owner_at)
     limb_check(store, vis, score, (W, H))
     return clean(vis, store.present)
+
+
+def hold_blur(store: TrackStore, vis: np.ndarray, low: np.ndarray, frame_wh: Tuple[int, int],
+              alpha_at=None, alpha_scale: Tuple[float, float] = (1.0, 1.0), owner_at=None,
+              report: Optional[dict] = None) -> np.ndarray:
+    """Body joints hidden for a few frames by their low score alone are kept when everything else says the limb is
+    there and only smeared by its motion:
+
+    - before and after (within HOLD_REACH frames, no cut between) the joint was seen by its own measurement, and
+      what lies between those two sightings is one limb moving: not faster than a limb moves (a jump from one
+      person to another is), and either moving at all or in a picture that is blurred for this person;
+    - the low-score estimate itself, where the models gave one, is near the path between the two sightings;
+    - on every frame of the run the spot on that path belongs to this person in the frame's own matte: enough of
+      its pixels are this person's and no more of them are somebody else's. A joint behind another person, behind
+      a thing (nobody's pixels) or gone from the frame does not pass.
+
+    One run is held whole or not at all. report: counts by what stopped a run."""
+    W, H = frame_wh
+    P, N, K = vis.shape
+    out = vis.copy()
+    xy = store.meas[..., :2]
+    blur = np.nan_to_num(store.blur, nan=1.0)
+    rep = report if report is not None else {}
+
+    def note(k):
+        rep[k] = rep.get(k, 0) + 1
+    for p in range(P):
+        pid = int(store.pids[p])
+        sc_p = store.scale[p]
+        for j in range(5, K):
+            cand = low[p, :, j] & store.present[p]
+            if not cand.any():
+                continue
+            seen = (vis[p, :, j] == VIS_VISIBLE) & np.isfinite(xy[p, :, j]).all(1)
+            edges = np.flatnonzero(np.diff(np.r_[False, cand, False].astype(np.int8)))
+            for a, b in zip(edges[::2], edges[1::2]):
+                if b - a > HOLD_MAX:
+                    note("long")
+                    continue
+                before = np.flatnonzero(seen[max(0, a - HOLD_REACH):a])
+                after = np.flatnonzero(seen[b:b + HOLD_REACH])
+                if not len(before) or not len(after):
+                    note("no_sighting")
+                    continue
+                t0 = max(0, a - HOLD_REACH) + int(before[-1])
+                t1 = b + int(after[0])
+                if store.jump[t0:t1].any():
+                    note("cut_between")
+                    continue
+                ss = sc_p[t0:t1 + 1]
+                ss = ss[np.isfinite(ss)]
+                size = float(np.median(ss)) if len(ss) else 0.0
+                if size < 8:
+                    note("no_size")
+                    continue
+                x0, x1 = xy[p, t0, j].astype(np.float64), xy[p, t1, j].astype(np.float64)
+                speed = float(np.hypot(*(x1 - x0))) / (t1 - t0) / size
+                if speed > HOLD_FAST:
+                    note("too_fast")
+                    continue
+                if speed < HOLD_SLOW and not (blur[p, a:b] < 0.55).any():
+                    note("no_motion")
+                    continue
+                ok = True
+                for t in range(a, b):
+                    q = x0 + (x1 - x0) * ((t - t0) / (t1 - t0))
+                    m = xy[p, t, j]
+                    if np.isfinite(m).all() and float(np.hypot(*(m - q))) > HOLD_NEAR * size:
+                        note("estimate_elsewhere")
+                        ok = False
+                        break
+                    if not (0 <= q[0] < W and 0 <= q[1] < H):
+                        note("out_of_frame")
+                        ok = False
+                        break
+                    if not _own_spot(q, pid, size, t, alpha_at, alpha_scale, owner_at, note):
+                        ok = False
+                        break
+                if ok:
+                    out[p, a:b, j] = VIS_VISIBLE
+                    note("held_runs")
+                    rep["held_joints"] = rep.get("held_joints", 0) + int(b - a)
+    return out
+
+
+def _own_spot(q, pid: int, size: float, t: int, alpha_at, alpha_scale, owner_at, note) -> bool:
+    """Is the spot around q this person's own in frame t's matte?"""
+    own = owner_at(t) if owner_at is not None else None
+    alpha = alpha_at(t) if alpha_at is not None else None
+    if own is None and alpha is None:
+        note("no_matte")
+        return False
+    ref = own if own is not None else alpha
+    ah, aw = ref.shape[:2]
+    r = max(2, int(0.035 * size * alpha_scale[0]))
+    cx, cy = int(q[0] * alpha_scale[0]), int(q[1] * alpha_scale[1])
+    x0, x1 = max(0, cx - r), min(aw, cx + r + 1)
+    y0, y1 = max(0, cy - r), min(ah, cy + r + 1)
+    if x1 <= x0 or y1 <= y0:
+        note("out_of_frame")
+        return False
+    if own is None:
+        # a matte without owners (RVM): somebody is there, not who
+        if float(np.asarray(alpha[y0:y1, x0:x1]).max()) / 255.0 < MATTE_MIN:
+            note("not_in_matte")
+            return False
+        return True
+    reg = np.asarray(own[y0:y1, x0:x1])
+    mine = float((reg == pid + 1).mean())
+    other = float(((reg > 0) & (reg != pid + 1)).mean())
+    if other > mine:
+        note("others_pixels")
+        return False
+    if mine < HOLD_OWN:
+        note("not_own_pixels")
+        return False
+    return True
 
 
 # --------------------------------------------------------------------------- cut-off limbs

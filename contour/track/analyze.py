@@ -583,7 +583,8 @@ class CutTracker:
         # ---------------- fuse + first solve
         p_s1 = step(0.58, 0.66)
         fuse_kw = dict(frame_wh=(W, H), alpha_at=self.matte.get,
-                       alpha_scale=(self.matte.w / W, self.matte.h / H))
+                       alpha_scale=(self.matte.w / W, self.matte.h / H),
+                       owner_at=(self.seglab.get if self.seglab.exists() else None))
         # people turning around: one left/right labelling across models and through the shot
         from .orient import fix_left_right
         fix_left_right(st, (a, b))
