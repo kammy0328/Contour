@@ -64,8 +64,10 @@ SPOTNET = False             # the learned spot detector of large faces on the bo
 DEBUG = None                # a list: what was measured round each mark is appended (diagnosis only)
 
 HOLD_NONE, HOLD_THING, HOLD_MOLE, HOLD_CROWD, HOLD_LONG, HOLD_USER, HOLD_WEAK, HOLD_EDGE = 0, 1, 2, 3, 4, 5, 6, 7
-HOLD_TEXT = {HOLD_THING: "옷·장신구·문신 등", HOLD_MOLE: "점", HOLD_CROWD: "주근깨·무늬", HOLD_LONG: "흉터·선",
-             HOLD_USER: "제외 표시", HOLD_WEAK: "불확실", HOLD_EDGE: "피부 가장자리·주름"}
+HOLD_ALONE = 8              # seen on this frame only: no frame beside it shows the same mark at that place (fuse)
+HOLD_TEXT = {HOLD_NONE: "제거", HOLD_THING: "옷·장신구·문신 등", HOLD_MOLE: "점", HOLD_CROWD: "주근깨·무늬",
+             HOLD_LONG: "흉터·선", HOLD_USER: "제외 표시", HOLD_WEAK: "불확실", HOLD_EDGE: "피부 가장자리·주름",
+             HOLD_ALONE: "한 프레임에만 보임"}
 KIND_DARK, KIND_RED, KIND_BUMP, KIND_USER = 0, 1, 2, 3
 
 CAND = np.dtype([("x", "f4"), ("y", "f4"),              # centre, source px
@@ -343,6 +345,10 @@ def detect(pieces, region_at, model, ref_src: float, body_size: float, scale: fl
 
 
 # ------------------------------------------------------------------------------------------------- through time
+ALONE_HELD = True           # a spot no neighbouring frame confirms is held (False: it stands on its own frame's word)
+ANCHOR_TOL = 0.06           # of the body's size: how far a neighbour's spot may sit from the place the joints carry this
+                            # frame's spot to and be the same (the joints place a point coarser than the picture's motion)
+ANCHOR_SKIN = 0.25          # the neighbour's own skin area at that place from which the place is to be seen there
 TOL = 0.012                 # of the body's size: how far a neighbour's spot may sit from this frame's and be the same
 CONFIRM = (0.10, 0.40)      # the neighbours' score from which a spot found here counts .. counts in full
 SAME_MIN = 0.5              # how alike the pictures must be at a spot for a neighbour to have a say there
@@ -404,9 +410,20 @@ def fuse(own: dict, others: list, ref_src: float, sx: float, sy: float) -> dict:
     - a spot found here and on the frames round it is filled over the same patch on all of them: this frame's own
       and its best neighbour's laid on it (a spot that is fainter on one frame is else filled less there, and
       what is left of it blinks);
-    - a mark any frame holds (a thing, a mole, a pattern, a line) is held here too.
-    With no neighbour that has a say the frame's own spots stand."""
-    others = [(w, d, mo) for w, d, mo in others if d is not None and mo is not None]
+    - a mark any frame holds (a thing, a mole, a pattern, a line) is held here too;
+    - a spot is removed only when a frame beside this one shows the same spot at that place on the body: by the
+      picture's own motion where that has a say, else by the body part the spot lies on (others' fourth entry,
+      `where`: the joints carry the place to the neighbour, and the neighbour's own skin area tells whether the
+      place is to be seen there). A neighbour that sees the place and has no such spot speaks against it; one on
+      which the place is covered or out of the picture cannot say. A spot some neighbour could have confirmed and
+      none did is held (HOLD_ALONE). On real footage (j2790, 2026-11-21: fast dance, 4K) the picture's motion had
+      nothing to say on most frames, the spots then stood on their own frame's word, and every one of them was
+      gone again on the next frame (0 of 9 seen again): grain or a streak taken for a spot, and a retouch that
+      blinks. The operator's own mark removes such a spot all the same (apply_marks).
+    A spot no neighbour can say anything about (a cut of one frame; the place covered on every frame beside this
+    one) stands on its own frame's word."""
+    where_of = {id(o[1]): (o[3] if len(o) > 3 else None) for o in others if o[1] is not None and o[2] is not None}
+    others = [(o[0], o[1], o[2]) for o in others if o[1] is not None and o[2] is not None]
     if not others:
         return own
     co = own["cands"]
@@ -458,6 +475,35 @@ def fuse(own: dict, others: list, ref_src: float, sx: float, sy: float) -> dict:
         fused[i] = f
         if hold[i] == HOLD_WEAK and f >= TAKE_MIN:
             hold[i] = HOLD_NONE                  # faint here, sure on the frames round it
+    if ALONE_HELD:
+        tol_a = ANCHOR_TOL * ref_src
+        for i in range(n0):
+            if hold[i] != HOLD_NONE or i in best:
+                continue
+            said = acc_w[i] > 0                  # a neighbour saw the place by the picture's motion: nothing there
+            ok = False
+            x, y = float(co["x"][i]), float(co["y"][i])
+            for _w, ds, _mo in others:
+                wh = where_of.get(id(ds))
+                q = wh(x, y) if wh is not None else None
+                if q is None or q[2] < ANCHOR_SKIN:
+                    continue                     # the place is not to be seen on that frame: it cannot say
+                said = True
+                cs = ds["cands"]
+                if not len(cs):
+                    continue
+                d = np.hypot(cs["x"] - q[0], cs["y"] - q[1])
+                jn = int(np.argmin(d))
+                if d[jn] > max(tol_a, 0.6 * float(co["d"][i])):
+                    continue
+                if cs["hold"][jn] in (HOLD_THING, HOLD_MOLE, HOLD_CROWD, HOLD_LONG):
+                    hold[i] = cs["hold"][jn]     # what that frame keeps there is kept here
+                    ok = True
+                    break
+                if cs["hold"][jn] in (HOLD_NONE, HOLD_WEAK) and max(cs["s"][jn], cs["r"][jn]) >= CAND_MIN:
+                    ok = True                    # the same spot at the same place of the body: it stands
+            if said and not ok:
+                hold[i] = HOLD_ALONE             # a frame beside this one could have shown it and none did
     out_c["hold"] = hold
     out_c["s"] = np.clip(co["s"] * scale_o, 0, 1)
     out_c["r"] = np.clip(co["r"] * scale_o, 0, 1)

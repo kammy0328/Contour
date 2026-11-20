@@ -619,8 +619,8 @@ class Viewer(QWidget):
             show = {"bspot": np.zeros(body.shape, np.float32), "bheld": np.zeros(body.shape, np.float32)}
             for i in range(len(c)):
                 held = not tk[i]
-                if held and c["hold"][i] == BP.HOLD_WEAK:
-                    continue
+                if held and c["hold"][i] in (BP.HOLD_WEAK, BP.HOLD_ALONE):
+                    continue                     # (unsure, or seen on one frame only: not a mark the person keeps)
                 x, y = int(round(float(c["x"][i]) * px.sx)), int(round(float(c["y"][i]) * px.sy))
                 r = max(2, int(round(0.5 * float(c["d"][i]) * px.sx)) + 1)
                 cv2.circle(show["bheld" if held else "bspot"], (x, y), r, 1.0, 1 if held else -1, cv2.LINE_AA)

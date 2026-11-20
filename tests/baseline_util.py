@@ -190,12 +190,29 @@ class NoModels:
         def none(*a, **k):
             raise RuntimeError("no model in the baseline")
         MOD.session = none
+        # a parser another test of this process already loaded would still be used (it is kept by the engine once
+        # made): set aside for the time of the baseline, which is made and compared without any model
+        self._kept = []
+        try:
+            import contour.retouch.engine as RE
+            self._kept.append((RE._FPARSER, RE._FPARSER[0]))
+            RE._FPARSER[0] = False
+        except Exception:
+            pass
+        try:
+            import contour.retouch.bodyskin as BS
+            self._kept.append((BS._PARSER, BS._PARSER[0]))
+            BS._PARSER[0] = False
+        except Exception:
+            pass
         return self
 
     def __exit__(self, *exc):
         self._fp.available = self._old[0]
         if self._old[1] is not None:
             self._mod.session = self._old[1]
+        for box, was in self._kept:
+            box[0] = was
         return False
 
 

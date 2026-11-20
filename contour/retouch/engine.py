@@ -1572,7 +1572,28 @@ def _steady_bdet(cut, tracker, st, rf: RetouchFrame, j, cache) -> dict:
     if cache is not None and key in cache:
         return cache[key]
     nb = _body_neighbours(cut, tracker, st, rf, j, cache, both=False)
-    others = [(w, getattr(js, "bdet", None) if js is not None else BP.empty(own["scale"]), mo) for w, _s, js, mo in nb]
+
+    def where_on(s_, js):
+        """A place of this frame on frame s_ by the body part it lies on, with that frame's own skin area there."""
+        if js is None or not js.body:
+            return None
+        box = {}
+
+        def where(x, y):
+            q = BS.carry_point(st, j.p, t, s_, (x, y))
+            if q is None:
+                return None
+            if "m" not in box:
+                box["m"] = BS.unpack_mask(js.body.get("mask"))
+            ms = box["m"]
+            if ms is None:
+                return None
+            u, v = int(round(q[0] * px.sx)), int(round(q[1] * px.sy))
+            vis = float(ms[v, u]) if (0 <= v < ms.shape[0] and 0 <= u < ms.shape[1]) else 0.0
+            return q[0], q[1], vis
+        return where
+    others = [(w, getattr(js, "bdet", None) if js is not None else BP.empty(own["scale"]), mo, where_on(s_, js))
+              for w, s_, js, mo in nb]
     out = BP.fuse(own, others, float(j.body["ref"]), px.sx, px.sy)
     if cache is not None and len(cache) > 0:
         cache[key] = out

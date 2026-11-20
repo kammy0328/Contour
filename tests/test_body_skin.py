@@ -384,6 +384,76 @@ def test_a_spot_that_flickers_is_removed_on_every_frame(body):
     assert max(left) - min(left) < 0.006, f"the retouch changes from frame to frame: {left}"
 
 
+def _det(spots, scale=1.0):
+    """A frame's spots as the caches keep them: [(x, y, score, hold)] in source px, a 5 px patch each."""
+    from contour.retouch import bodyspots as BP
+    c = np.zeros(len(spots), BP.CAND)
+    ps = []
+    for i, (x, y, sc, hold) in enumerate(spots):
+        c[i] = (x, y, 5.0, sc, 0.0, BP.KIND_DARK, hold, 0.5, x - 2, y - 2, 0, 5, 5)
+        ps.append(np.full((5, 5), int(sc * 255), np.uint8))
+    return BP.pack(c, ps, [np.zeros((5, 5), np.uint8) for _ in spots], scale)
+
+
+def _still(same: float, size=64):
+    """The motion of a frame onto a neighbour where nothing moved, and how far the neighbour has a say (0..1)."""
+    yy, xx = np.mgrid[0:size, 0:size].astype(np.float32)
+    return dict(box=(0, 0, size, size), map=np.stack([xx, yy], -1), same=np.full((size, size), same, np.float32))
+
+
+def test_a_spot_seen_on_one_frame_only_is_not_removed():
+    """A spot is removed where a frame beside it shows the same spot at the same place. One that stands on its own
+    frame's word alone is held: where the neighbours can say nothing (fast motion, blur: on real footage every
+    such removal was gone again on the next frame, j2790) as where they say there is nothing. 1.23's first build
+    removed it on that one frame, and the retouch blinked."""
+    from contour.retouch import bodyspots as BP
+    spot = (30.0, 30.0, 0.8, BP.HOLD_NONE)
+    own = _det([spot])
+    none = BP.empty(1.0)
+    assert BP.taken(own).tolist() == [True]
+    # no frame beside it at all (a cut of one frame): its own word stands
+    assert BP.taken(BP.fuse(own, [], 100.0, 1.0, 1.0)).tolist() == [True]
+    assert BP.HOLD_TEXT[BP.HOLD_ALONE] == "한 프레임에만 보임"
+    # neighbours that see the place and have nothing there: not removed either
+    out = BP.fuse(own, [(1.0, none, _still(1.0)), (1.0, none, _still(1.0))], 100.0, 1.0, 1.0)
+    assert BP.taken(out).tolist() == [False]
+    # one neighbour shows the same spot there: removed, on this frame and (seen from there) on that one
+    there = _det([(30.6, 29.7, 0.7, BP.HOLD_NONE)])
+    out = BP.fuse(own, [(1.0, there, _still(1.0)), (1.0, none, _still(0.0))], 100.0, 1.0, 1.0)
+    assert BP.taken(out).tolist() == [True]
+    back = BP.fuse(there, [(1.0, own, _still(1.0))], 100.0, 1.0, 1.0)
+    assert BP.taken(back).tolist() == [True], "and so it does not blink between the two"
+    # the neighbour's mark is one it keeps (a mole there): kept here too, as before
+    mole = _det([(30.0, 30.0, 0.7, BP.HOLD_MOLE)])
+    out = BP.fuse(own, [(1.0, mole, _still(1.0))], 100.0, 1.0, 1.0)
+    assert BP.taken(out).tolist() == [False] and int(out["cands"]["hold"][0]) == BP.HOLD_MOLE
+    # the picture's motion has nothing to say (fast movement), the joints carry the place to the neighbour:
+    seen = lambda dx, dy, vis: (lambda x, y: (x + dx, y + dy, vis))
+    #   the neighbour shows the same spot at that place of the body (a few px off: the joints are coarse): it stands
+    moved = _det([(133.0, 28.0, 0.7, BP.HOLD_NONE)])
+    out = BP.fuse(own, [(1.0, moved, _still(0.0), seen(100.0, 0.0, 1.0))], 100.0, 1.0, 1.0)
+    assert BP.taken(out).tolist() == [True]
+    #   the place is to be seen there and no such spot is: held
+    out = BP.fuse(own, [(1.0, none, _still(0.0), seen(100.0, 0.0, 1.0))], 100.0, 1.0, 1.0)
+    assert int(out["cands"]["hold"][0]) == BP.HOLD_ALONE
+    far = _det([(160.0, 30.0, 0.7, BP.HOLD_NONE)])
+    out = BP.fuse(own, [(1.0, far, _still(0.0), seen(100.0, 0.0, 1.0))], 100.0, 1.0, 1.0)
+    assert int(out["cands"]["hold"][0]) == BP.HOLD_ALONE, "another spot far from that place does not confirm it"
+    #   the place is covered or out of the picture on every frame beside this one: nobody can say, its own word stands
+    out = BP.fuse(own, [(1.0, none, _still(0.0), seen(100.0, 0.0, 0.0)), (1.0, none, _still(0.0), lambda x, y: None)],
+                  100.0, 1.0, 1.0)
+    assert BP.taken(out).tolist() == [True]
+    #   what the neighbour keeps at that place (ink) is kept here
+    ink = _det([(131.0, 30.0, 0.7, BP.HOLD_THING)])
+    out = BP.fuse(own, [(1.0, ink, _still(0.0), seen(100.0, 0.0, 1.0))], 100.0, 1.0, 1.0)
+    assert int(out["cands"]["hold"][0]) == BP.HOLD_THING
+    # the operator's own mark removes a spot that was held for standing alone
+    alone = BP.fuse(own, [(1.0, none, _still(1.0))], 100.0, 1.0, 1.0)
+    assert int(alone["cands"]["hold"][0]) == BP.HOLD_ALONE
+    marked = BP.apply_marks(alone, [("remove", np.array([[30.0, 30.0]]), 4.0)], 1.0)
+    assert BP.taken(marked).any(), "a hand mark is the person's word: the marked place is filled"
+
+
 def test_nothing_is_filled_on_a_cover_and_nothing_is_carried_over_it(body):
     """A prop passes over the forearm on two frames. On those frames the spots under it are not filled (the cover's
     pixels do not change), and on the frames beside them the spots are filled as ever."""
