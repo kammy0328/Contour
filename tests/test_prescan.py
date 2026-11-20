@@ -264,4 +264,36 @@ def test_a_cut_with_people_stops_looking_at_two_sure_frames():
     assert r["verdict"] == PS.PRESENT and det.calls == 2 and r["looked"] == 2
     det2 = _Det()
     r2 = PS.Prescan(detector=det2).look(_frames([60] * 300), 300)
-    assert r2["verdict"] == PS.NONE and det2.calls > 13, "an empty cut is still looked at in full"
+    assert r2["verdict"] == PS.NONE and det2.calls == 300, "an empty cut is looked at in full"
+
+
+def test_long_cut_is_looked_at_frame_by_frame_before_it_is_called_empty():
+    """§1-1, long cuts (PC j2785b): someone there for one or two frames between the samples of both rounds was
+    called 'nobody' and the cut skipped (3.6 % of such cuts on real footage). Every frame is read before 'nobody'."""
+    n = 200
+    sampled = set(PS.plan(n)) | set(PS.plan(n, more=True))
+    gaps = [t for t in range(n - 1) if t not in sampled and t + 1 not in sampled]
+    assert gaps, "the rounds leave frames out (else this test says nothing)"
+    hit = gaps[len(gaps) // 2]
+    vals = [60] * n
+    vals[hit] = 200
+    r = PS.Prescan(detector=_Det()).look(_frames(vals), n)
+    assert r["verdict"] == PS.UNSURE and r["reason"] == "한 프레임에서만 보인 인물", r
+    # two frames in a row between the samples: someone is there, and the look ends at the second of them
+    vals[hit + 1] = 200
+    det = _Det()
+    r = PS.Prescan(detector=det).look(_frames(vals), n)
+    assert r["verdict"] == PS.PRESENT and det.calls < n
+    # a small person on one frame between the samples: not 'nobody' either
+    vals = [60] * n
+    vals[hit] = 120
+    assert PS.Prescan(detector=_Det()).look(_frames(vals), n)["verdict"] == PS.UNSURE
+    # empty: all 200 frames, and the answer says how many it stands on
+    det = _Det()
+    r = PS.Prescan(detector=det).look(_frames([60] * n), n)
+    assert r["verdict"] == PS.NONE and det.calls == n and r["looked"] == n and "200프레임" in r["reason"]
+    # frames that cannot be read among the last ones: not 'nobody'
+    vals = [60] * n
+    for t in gaps[::2]:
+        vals[t] = None
+    assert PS.Prescan(detector=_Det()).look(_frames(vals), n)["verdict"] == PS.UNSURE

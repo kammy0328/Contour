@@ -4,12 +4,25 @@ The full analysis opens several large models per cut; a cut with nobody in it ne
 detector (YOLOX-m) is opened once for all the cuts of a batch, and each cut is looked at in the picture the analysis
 itself would see (the same colour view: a log original is looked at in its display view, not as flat log):
 - a short cut every second frame first and, before it is called empty (or when those leave it open), every frame;
-  a long one at its start, middle and end and at even steps, then about every half second before it is called
-  empty (or when the first frames leave it open); two frames with someone plainly there end the look at once;
+  a long one at its start, middle and end and at even steps, then about every half second (or when the first
+  frames leave it open), and before it is called empty every frame of it too; two frames with someone plainly
+  there end the look at once;
 - three answers: someone is there (analyse), nobody is there (skip, with the reason), or not sure (analyse: a
   small person, someone seen in one frame only, a weak detection, a dark or flashing picture, frames that could not
   be read, too few frames). Only a clear 'nobody' skips a cut.
-The cuts of one source are read in their order on it, so a baked timeline is read forward."""
+The cuts of one source are read in their order on it, so a baked timeline is read forward.
+
+Why a long cut is read whole before it is called empty (PC 2026-11-21, j2785b; instruction 2026-11-20 §1-1 "긴 컷의
+속도 최적화는 역광·작은 인물·짧은 등장 표본에서 오검출을 비교한 뒤 적용"): frames of real cuts with a person (as
+shot, backlit, dark, a third of the size) were put into 581 frames of the projects' empty cuts for 1, 2, 3, 6 and 12
+frames, and each way of sampling was asked for its answer. The detector saw the person on 98-100 % of those frames
+in every condition; what missed them was the sampling: someone there for one frame was called 'nobody' in 3.6 % of
+the cuts by the two rounds above (11 % of the 96-frame cuts), in 2.1 % by every second frame, in 7.8 % by every
+twelfth; for two frames 2.8 % / 0 % / 7.7 %; only reading every frame missed none. Reading and looking at a frame
+cost 0.04-0.1 s there (decode 0.013-0.066 s, detector 0.025-0.043 s), so an empty cut of 600 frames costs about
+half a minute more; the projects' own 27 empty cuts were 7-72 frames long. Reading the frames smaller (960x540
+straight from the decoder) gave the same answers on 75 frames x 3 conditions and is 3.5 times faster for frames far
+apart (0.12-0.15 s against 0.38-0.52 s) but no faster for frames in a row, which is what an empty cut now is."""
 from __future__ import annotations
 
 import time
@@ -124,6 +137,14 @@ class Prescan:
             if more:
                 looked += run(more)
                 r = judge(found, lumas, looked)
+            if n > DENSE and r["verdict"] == NONE:
+                # still nobody: the frames between the samples, every one, before the cut is skipped (someone
+                # there for a frame or two between them was called 'nobody'; see the module's notes)
+                seen = set(plan(n)) | set(plan(n, more=True))
+                rest = [t for t in range(int(n)) if t not in seen]
+                if rest:
+                    looked += run(rest)
+                    r = judge(found, lumas, looked)
         r["seconds"] = round(time.time() - t0, 2)
         return r
 

@@ -27,9 +27,16 @@ MATTE_MIN = 0.35
 
 # A limb smeared by motion gets low scores for a few frames and was hidden like a limb behind something
 # (instruction 2026-11-20 §1-4). hold_blur() keeps such a joint when the frames around it and the picture itself
-# say it is still there. Off until it is measured on footage: how many joints lost to motion blur it brings back,
-# and how many joints it shows that are really hidden (PC job j2785); it is not taken for bringing joints back in
-# this function alone.
+# say it is still there. It is not taken for bringing joints back in this function alone: it was measured after
+# the final visibility, in the tracks and the warp (PC 2026-11-21, job j2785), and it stays OFF:
+# - three real cuts analysed four ways (as shot / motion smear laid over three 6-frame ranges, hold off / on):
+#   of 1848 joints lost to the smear the hold brought back 40 (2.2 %; 30 = 1.6 % near where the clean footage
+#   has them), while of the joints the clean footage hides it showed 11.2 % (9.2 % without it), and 3.9 % on the
+#   clean footage itself; of the joints really behind something 7.7 % (6.4 % without, 3.4 % on clean footage);
+# - two real cuts with fast motion, off / on: 4 of 5268 joints newly shown, 0 of 14964;
+# - most runs it looked at had no sighting close enough on both sides (112-115 of the runs of a cut), or the spot
+#   was another person's pixels (47-48): what blur takes away is mostly not there to be held.
+# A joint shown where the limb is hidden bends the warp there; a joint not brought back leaves it as it was.
 BLUR_HOLD = False
 HOLD_MAX = 8             # frames: the longest run of low scores taken for a blur dip
 HOLD_REACH = 6           # frames: how far before and after the joint must have been seen
