@@ -81,7 +81,8 @@ def measure(store: TrackStore, norm: Dict[str, float], frame_wh: Tuple[int, int]
                         v[j] = VIS_HIDDEN
             vis[p, t] = v
     limb_check(store, vis, score, (W, H))
-    return clean(vis, store.present)
+    vis = clean(vis, store.present)
+    return bridge_blur(vis, store)
 
 
 # --------------------------------------------------------------------------- cut-off limbs
@@ -226,6 +227,49 @@ def _toward_edge(pt, W, H):
     d = np.array([[-1, 0], [1, 0], [0, -1], [0, 1]], np.float32)
     dist = np.array([pt[0], W - pt[0], pt[1], H - pt[1]])
     return d[int(np.argmin(dist))]
+
+
+BLUR_DIP = 0.55          # a frame this much less sharp than its neighbours is motion-blurred (store.blur)
+BRIDGE_MAX = 6           # longest blurred stretch a joint is carried through
+
+
+def bridge_blur(vis: np.ndarray, store: TrackStore, max_len: int = BRIDGE_MAX) -> np.ndarray:
+    """A joint seen on the frames right before and right after a short motion-blurred stretch was there all along.
+
+    Blur lowers every model's score at once, under SCORE_HIDE, so the joint was judged hidden and left out of the
+    track for those frames (2026-11-20, five projects: 32 % of body joints missing on blurred frames against 21 %
+    on sharp ones, 90 % of them for the score alone; 14 % of the hidden ones visible both just before and just
+    after). Only stretches where every frame is blurred, no longer than max_len, within one shot and with the
+    person there throughout; the solver places the joint from the frames around it and the motion."""
+    blur = np.nan_to_num(getattr(store, "blur", None), nan=1.0) if getattr(store, "blur", None) is not None else None
+    if blur is None:
+        return vis
+    jump = np.asarray(getattr(store, "jump", np.zeros(vis.shape[1], bool)), bool)
+    out = vis.copy()
+    P, N, K = vis.shape
+    for p in range(P):
+        blurred = (blur[p] < BLUR_DIP) & store.present[p]
+        if not blurred.any():
+            continue
+        for j in range(K):
+            v = vis[p, :, j]
+            t = 0
+            while t < N:
+                if not (blurred[t] and v[t] == VIS_HIDDEN):
+                    t += 1
+                    continue
+                a = t
+                while t < N and blurred[t] and v[t] == VIS_HIDDEN:
+                    t += 1
+                b = t                                  # hidden and blurred over [a, b)
+                if b - a > max_len or a == 0 or b >= N:
+                    continue
+                if v[a - 1] != VIS_VISIBLE or v[b] != VIS_VISIBLE:
+                    continue
+                if jump[a - 1:b].any() or not store.present[p, a - 1:b + 1].all():
+                    continue
+                out[p, a:b, j] = VIS_VISIBLE
+    return out
 
 
 def clean(vis: np.ndarray, present: np.ndarray, k: int = 2) -> np.ndarray:
