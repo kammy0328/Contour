@@ -974,6 +974,20 @@ def anchor_mark(st, p: int, t: int, mark: dict) -> dict:
     return out
 
 
+def carry_point(st, p: int, t: int, s: int, xy) -> Optional[Tuple[float, float]]:
+    """A point of the person's body on frame t (source px), where the same place of the same body part is on frame
+    s, by the joints alone (as a hand mark follows its part). None where no part is near the point or the joints
+    do not place that part on frame s. Coarser than the picture's own motion, but it holds through blur and fast
+    movement, where that motion has nothing to say."""
+    m = anchor_mark(st, p, t, dict(kind="remove", t=t, pts=[[float(xy[0]), float(xy[1])]], r=1.0))
+    if not m.get("part"):
+        return None
+    got = marks_at(st, p, s, [m])
+    if not got or not len(got[0][1]) or not np.isfinite(got[0][1]).all():
+        return None
+    return float(got[0][1][0][0]), float(got[0][1][0][1])
+
+
 def marks_at(st, p: int, t: int, marks) -> list:
     """The person's hand marks as they lie on frame t: [(kind, points (n, 2) source px, radius source px)]. A mark
     fixed to a part the joints do not place on this frame is not there."""
