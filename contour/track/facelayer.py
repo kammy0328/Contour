@@ -90,8 +90,15 @@ def _crop_lm(lm, M):
     return out
 
 
-def path_for(tracker) -> Path:
-    return Path(tracker.project.cache_dir(tracker.cut)) / "facelayer.npz"
+def path_for(tracker, write: bool = False) -> Path:
+    """The cut's face layer file. While a whole new analysis is being written (matte_rev.begin) the layer made on
+    it is written beside the one in use (write=True) and read from there once it is; it is put in use with the
+    matte and tracks it was made on."""
+    live = Path(tracker.project.cache_dir(tracker.cut)) / "facelayer.npz"
+    if getattr(tracker, "_stage_extra", None) is None:
+        return live
+    from . import matte_rev as MRV
+    return MRV.stage_file(tracker, live, write=write)
 
 
 def _reliability(skin: np.ndarray, lm_crop: np.ndarray) -> float:
@@ -323,7 +330,7 @@ def build(tracker, progress: Optional[Callable[[float, str], None]] = None,
     if not keep:
         return dict(pids=np.array(st.pids), M=M, skin=skin_s, neck=neck_s, tex=tex_s, rel=rel, col=col_s, have=have,
                     model=prov, seconds=time.time() - t_start, face=st.face)
-    out = path_for(tracker)
+    out = path_for(tracker, write=True)
     out.parent.mkdir(parents=True, exist_ok=True)
     # which model really made these masks (a fallback shows as 'a+b'), when, how long: written with them, and the
     # file swapped in only when complete (a cancelled or failed rebuild leaves the masks in use as they were)

@@ -320,7 +320,8 @@ class ReshapeTab(_Tab):
         if sec:
             t += f" · {sec:.0f}초" if sec >= 10 else f" · {sec:.1f}초"
         if inf.get("stale_ranges"):
-            t += f" · 인물 매트가 바뀐 구간 {len(inf['stale_ranges'])}곳: 다시 계산 필요"
+            n = sum(b - a for a, b in inf["stale_ranges"])
+            t += f" · 인물 매트가 바뀐 {len(inf['stale_ranges'])}곳({n}프레임)은 다시 만들 때까지 쓰지 않음"
         return t
 
     def _fill_masks(self, s):

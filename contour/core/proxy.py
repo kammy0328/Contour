@@ -245,7 +245,47 @@ class MatteStore:
     def __init__(self, cache_dir: Path, n: int, w: int, h: int, prefix: str = "matte"):
         self.n, self.w, self.h = n, w, h
         self.path = Path(cache_dir) / f"{prefix}_{w}x{h}.u8"
+        self.live_path = self.path          # the file in use (path is the stage's while a new version is written)
+        self.stage_removed = False          # the new version has no such file (remove() while staged)
         self._mm = None
+
+    # ---- a whole new version written beside the one in use (1.22.3: a new analysis or a matte made again writes
+    # here; the file in use stays as it is until track.matte_rev activates the new version, and for good when the
+    # work is cancelled or fails)
+    @property
+    def stage_path(self) -> Path:
+        return self.live_path.with_name(self.live_path.name + ".stage")
+
+    @property
+    def staged(self) -> bool:
+        return self.path != self.live_path
+
+    def begin_stage(self, copy: bool = True) -> None:
+        """From here on this store reads and writes the stage: a copy of the file in use (copy=False, or no file
+        yet: nothing until create() makes it)."""
+        import shutil
+        self._mm = None
+        self.stage_removed = False
+        try:
+            self.stage_path.unlink()
+        except OSError:
+            pass
+        live = self.live_path
+        if copy and live.exists() and live.stat().st_size == self.n * self.w * self.h:
+            ensure_space(self.stage_path, self.n * self.h * self.w, "인물 매트")
+            shutil.copyfile(live, self.stage_path)
+        self.path = self.stage_path
+
+    def end_stage(self, drop: bool = True) -> None:
+        """Back on the file in use. drop: the stage file is deleted (cancelled, failed, or already activated)."""
+        self._mm = None
+        if drop:
+            try:
+                self.stage_path.unlink()
+            except OSError:
+                pass
+        self.path = self.live_path
+        self.stage_removed = False
 
     def exists(self) -> bool:
         return self.path.exists() and self.path.stat().st_size == self.n * self.w * self.h
@@ -274,6 +314,8 @@ class MatteStore:
 
     def remove(self) -> None:
         self._mm = None
+        if self.staged:
+            self.stage_removed = True       # the file in use goes only when the new version is activated
         try:
             self.path.unlink()
         except OSError:

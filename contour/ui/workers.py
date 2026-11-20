@@ -148,16 +148,21 @@ class PreviewWorker(QThread):
 
 
 def _release(own: dict) -> None:
-    """Closes a next-cut session nobody took (its decoders end). Safe to call more than once."""
+    """Closes a next-cut session nobody took (its decoders end). Safe to call more than once. The frames it
+    finished stay in the playback cache, and the cut keeps the revisions they were made with (1.22.3): opened by
+    hand a moment later, it starts with them."""
     with own["lock"]:
         if own["taken"]:
             return
         sh = own["sh"]
     if sh is not None and sh.proxy is not None:
         try:
-            sh.proxy.close()
+            sh.open_cut(None)
         except Exception:
-            pass
+            try:
+                sh.proxy.close()
+            except Exception:
+                pass
 
 
 class NextCutPrep:
@@ -206,10 +211,9 @@ class NextCutPrep:
                 for t in range(a, b):                          # then results, as far as time allows
                     if stop.is_set():
                         return
-                    key = sh.result_key(t, True)
-                    img = sh.result(t, final=True)
-                    if img is not None and not stop.is_set():
-                        sh.play_put(t, key, img, near=a)
+                    if sh.play_has(t):
+                        continue                               # kept from the last time this cut was open
+                    sh.play_render(t, near=a)
             except Exception:
                 traceback.print_exc()
                 self.failed = True
@@ -308,15 +312,13 @@ class CacheWorker(QThread):
                     break
                 if s.play_has(t):
                     continue
-                key = s.result_key(t, True)
                 try:
-                    img = s.result(t, final=True)
+                    ok = s.play_render(t, near=start)
                 except Exception:
                     traceback.print_exc()
-                    img = None
-                if img is None or key != s.result_key(t, True):
+                    ok = False
+                if not ok:
                     continue
-                s.play_put(t, key, img, near=start)
                 n_new += 1
                 if n_new % 4 == 0:
                     self.progressed.emit()
@@ -332,8 +334,11 @@ class ProxyBuilder(QObject):
     start() never waits (1.22.1: switching cuts waited up to 5 s for the previous cut's proxy to stop): it asks the
     running one to stop and keeps only the latest request, which starts as soon as the running one has ended. A proxy
     stopped this way is not marked as tried, so it is made later when that cut is opened again.
-    finished(project path, cut_id, ok, message): the receiver checks both against what is open now."""
+    finished(project path, cut_id, ok, message): the receiver checks both against what is open now.
+    progressed(project path, cut_id, 0..1): a few times a second while one is written (1.22.3: the state of the
+    open cut's proxy is shown beside the picture, and a failure is said, without anything waiting for it)."""
     finished = Signal(str, str, bool, str)
+    progressed = Signal(str, str, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -354,9 +359,22 @@ class ProxyBuilder(QObject):
         from ..core.colour import manager
         from ..core.frames import proxy_for
         from ..core.tlimport import build_bake_proxy, shares_bake
+        report = self.reporter(str(project.path), cut.id)
         if shares_bake(project, cut):
-            return bool(build_bake_proxy(project, manager(), vs, None, stop.is_set))
-        return bool(proxy_for(project, cut).build(manager(), vs, None, stop.is_set))
+            return bool(build_bake_proxy(project, manager(), vs, report, stop.is_set))
+        return bool(proxy_for(project, cut).build(manager(), vs, report, stop.is_set))
+
+    def reporter(self, prj_path: str, cut_id: str):
+        """A progress callback for one build: passes on at most a few values a second."""
+        import time as _t
+        last = [0.0]
+
+        def report(f, msg=""):
+            now = _t.monotonic()
+            if now - last[0] >= 0.3 or float(f) >= 1.0:
+                last[0] = now
+                self.progressed.emit(prj_path, cut_id, float(f))
+        return report
 
     def start(self, project, cut, vs) -> bool:
         key = (str(project.path), cut.id, vs.key())
@@ -385,6 +403,7 @@ class ProxyBuilder(QObject):
         def run():
             ok, msg = False, ""
             try:
+                self.progressed.emit(key[0], cut.id, 0.0)
                 ok = self.build(project, cut, vs, stop)
             except Exception as e:
                 msg = str(e)

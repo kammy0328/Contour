@@ -162,6 +162,100 @@ def test_picked_cuts_are_not_looked_at_first(qapp, monkeypatch):
     r.queue.clear()
 
 
+def test_a_cut_the_user_picked_is_never_skipped_by_its_own_analysis(qapp, monkeypatch):
+    """Instruction 2026-11-20 §1-1: 선택 컷 분석 passed no quick look in the runner but started the cut's analysis
+    with --prescan 1, so the analysis process looked itself and skipped the cut the user had just asked for."""
+    from contour.ui.batchrun import BatchRunner
+    spawned = []
+    r = BatchRunner()
+    monkeypatch.setattr(r, "_spawn", lambda args, name: (spawned.append(list(args)),
+                                                          NS(start=lambda: None, deleteLater=lambda: None))[1])
+    r.scanned["c9"] = dict(verdict="none")                 # an earlier quick look said nobody
+    r.start("prj", ["c9"], prescan=True, force=True)
+    assert spawned[0][:3] == ["analyze", "prj", "c9"], "no quick look process for a forced cut"
+    assert spawned[0][-2:] == ["--prescan", "0"] and "c9" not in r.scanned
+    r.proc = None
+    r.queue.clear()
+    # a forced cut answered 'none' by a look that was already running stays in the queue
+    r.queue = ["c9"]
+    r._prescan_line('PRESCAN c9 none {"reason": "x"}')
+    assert r.queue == ["c9"]
+    r.queue.clear()
+
+
+def test_short_cut_is_looked_at_frame_by_frame_before_it_is_called_empty():
+    """§1-1: 20 frames, someone on frame 5 only. Every second frame (0, 2, ... 18, 19) saw nobody and the cut was
+    skipped; now the frames in between are looked at before 'nobody'."""
+    vals = [60] * 20
+    vals[5] = 200
+    det = _Det()
+    r = PS.Prescan(detector=det).look(_frames(vals), 20)
+    assert r["verdict"] == PS.UNSURE and r["reason"] == "한 프레임에서만 보인 인물" and r["looked"] == 20
+    # an empty short cut: all 20 frames looked at, then 'nobody'
+    det = _Det()
+    r = PS.Prescan(detector=det).look(_frames([60] * 20), 20)
+    assert r["verdict"] == PS.NONE and det.calls == 20 and "20프레임" in r["reason"]
+    # people on two of the in-between frames: present
+    vals = [60] * 20
+    vals[5] = vals[7] = 200
+    assert PS.Prescan(detector=_Det()).look(_frames(vals), 20)["verdict"] == PS.PRESENT
+    # frames that cannot be read in a short cut: not 'nobody'
+    vals = [60] * 20
+    for t in range(1, 20, 2):
+        vals[t] = None
+    assert PS.Prescan(detector=_Det()).look(_frames(vals), 20)["verdict"] == PS.UNSURE
+
+
+def test_clear_skip_forgets_an_earlier_nobody(tmp_path):
+    cut = NS(status=dict(auto="none", reason="인물 없음 (빠른 검사: 13프레임 확인)", prescan=True,
+                         prescan_info=dict(looked=13), user="good"))
+    (tmp_path / "prescan.json").write_text("{}", encoding="utf-8")
+    assert PS.clear_skip(cut, tmp_path) is True
+    assert cut.status == dict(user="good") and not (tmp_path / "prescan.json").exists()
+    seen = NS(status=dict(auto="good", reason=""))
+    assert PS.clear_skip(seen) is False and seen.status == dict(auto="good", reason="")
+
+
+def test_selected_cut_analysis_clears_the_skip_and_forces(qapp, tmp_path, monkeypatch):
+    """수동 재분석: the saved project the analysis process reads no longer says 'skipped', and the runner is told
+    to force."""
+    from PySide6.QtWidgets import QMessageBox
+    from conftest import make_video
+    from contour.core import media as M
+    from contour.core.project import Project
+    from contour.core.settings import settings
+    from contour.ui import main_window as MW
+    settings().ask_proxy = False
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.No))
+    v = tmp_path / "s.mp4"
+    make_video(v)
+    prj = Project.create(str(tmp_path), "s")
+    cut = prj.add_cut(M.probe(str(v)), "c1")
+    cut.status = dict(auto="none", reason="인물 없음 (빠른 검사: 6프레임 확인)", prescan=True, prescan_info={})
+    prj.save()
+    (prj.cut_dir(cut) / "prescan.json").write_text("{}", encoding="utf-8")
+    w = MW.MainWindow()
+    try:
+        monkeypatch.setattr(w, "show_error", lambda title, text: None)
+        w.open_project(prj.path, wait=True)
+        calls = []
+        monkeypatch.setattr(w.batch, "start", lambda *a, **k: calls.append((a, k)))
+        c = w.session.project.cut(cut.id)
+        w._start_batch([c], "선택 컷 분석")
+        assert calls and calls[0][1].get("force") is True and calls[0][1].get("prescan") is False
+        saved = Project.load(prj.path).cut(cut.id)
+        assert not (saved.status or {}).get("prescan") and (saved.status or {}).get("auto") != "none"
+        assert not (prj.cut_dir(cut) / "prescan.json").exists()
+        if getattr(w, "_batch_dlg", None) is not None:
+            w._batch_dlg.finish()                          # (closing it would ask whether to stop the job)
+    finally:
+        w.proxy_builder.cancel()
+        w.thumbcache.stop()
+        w.session.dirty = False
+        w._discard_on_close = True
+        w.close()
+
+
 def test_a_cut_with_people_stops_looking_at_two_sure_frames():
     """1.22.2 PC check: reading every planned frame of a 4K cut cost 2.8 s a cut (422 person cuts: 1194 s against
     217 s before). Two sure frames settle 'someone is there'."""
@@ -170,4 +264,36 @@ def test_a_cut_with_people_stops_looking_at_two_sure_frames():
     assert r["verdict"] == PS.PRESENT and det.calls == 2 and r["looked"] == 2
     det2 = _Det()
     r2 = PS.Prescan(detector=det2).look(_frames([60] * 300), 300)
-    assert r2["verdict"] == PS.NONE and det2.calls > 13, "an empty cut is still looked at in full"
+    assert r2["verdict"] == PS.NONE and det2.calls == 300, "an empty cut is looked at in full"
+
+
+def test_long_cut_is_looked_at_frame_by_frame_before_it_is_called_empty():
+    """§1-1, long cuts (PC j2785b): someone there for one or two frames between the samples of both rounds was
+    called 'nobody' and the cut skipped (3.6 % of such cuts on real footage). Every frame is read before 'nobody'."""
+    n = 200
+    sampled = set(PS.plan(n)) | set(PS.plan(n, more=True))
+    gaps = [t for t in range(n - 1) if t not in sampled and t + 1 not in sampled]
+    assert gaps, "the rounds leave frames out (else this test says nothing)"
+    hit = gaps[len(gaps) // 2]
+    vals = [60] * n
+    vals[hit] = 200
+    r = PS.Prescan(detector=_Det()).look(_frames(vals), n)
+    assert r["verdict"] == PS.UNSURE and r["reason"] == "한 프레임에서만 보인 인물", r
+    # two frames in a row between the samples: someone is there, and the look ends at the second of them
+    vals[hit + 1] = 200
+    det = _Det()
+    r = PS.Prescan(detector=det).look(_frames(vals), n)
+    assert r["verdict"] == PS.PRESENT and det.calls < n
+    # a small person on one frame between the samples: not 'nobody' either
+    vals = [60] * n
+    vals[hit] = 120
+    assert PS.Prescan(detector=_Det()).look(_frames(vals), n)["verdict"] == PS.UNSURE
+    # empty: all 200 frames, and the answer says how many it stands on
+    det = _Det()
+    r = PS.Prescan(detector=det).look(_frames([60] * n), n)
+    assert r["verdict"] == PS.NONE and det.calls == n and r["looked"] == n and "200프레임" in r["reason"]
+    # frames that cannot be read among the last ones: not 'nobody'
+    vals = [60] * n
+    for t in gaps[::2]:
+        vals[t] = None
+    assert PS.Prescan(detector=_Det()).look(_frames(vals), n)["verdict"] == PS.UNSURE

@@ -228,6 +228,49 @@ def _crop_box(st, p: int, t: int, sx: float, sy: float, W: int, H: int) -> Optio
     return x0, y0, x1, y1
 
 
+def _parse_frame(parser, st, proxy, pres, t: int, frame: np.ndarray, lab, rgb, mw: int, mh: int) -> np.ndarray:
+    """One frame of the clothing store with the parser: each present person's crop parsed and written into the
+    pixels that person owns (lab: the owners, store index per matte pixel)."""
+    W, H = proxy.w, proxy.h
+    kx, ky = mw / W, mh / H
+    for p in pres:
+        if lab is not None:
+            frame[lab == p] = 0
+        box = _crop_box(st, p, t, proxy.sx, proxy.sy, W, H)
+        if box is None:
+            continue
+        x0, y0, x1, y1 = box
+        cm = parser(rgb[y0:y1, x0:x1])
+        mx0, my0 = int(x0 * kx), int(y0 * ky)
+        mx1, my1 = max(mx0 + 1, int(round(x1 * kx))), max(my0 + 1, int(round(y1 * ky)))
+        small = cv2.resize(cm, (mx1 - mx0, my1 - my0), interpolation=cv2.INTER_NEAREST)
+        own = (lab[my0:my1, mx0:mx1] == p) if lab is not None else (small > 0)
+        reg = frame[my0:my1, mx0:mx1]
+        reg[own] = small[own] + 1
+    return frame
+
+
+def _garment_frame(gf, st, proxy, pres, t: int, frame: np.ndarray, lab, rgb, mw: int, mh: int) -> np.ndarray:
+    """One frame of the clothing store with SAM 3.1's garment words: one class map for the picture, each present
+    person's own pixels taken from it."""
+    cmap = gf.classes(rgb, (mw, mh))
+    for p in pres:
+        if lab is not None:
+            own = lab == p
+        else:
+            box = _crop_box(st, p, t, proxy.sx, proxy.sy, proxy.w, proxy.h)
+            if box is None:
+                continue
+            own = np.zeros((mh, mw), bool)
+            x0, y0, x1, y1 = box
+            own[int(y0 * mh / proxy.h):int(np.ceil(y1 * mh / proxy.h)),
+                int(x0 * mw / proxy.w):int(np.ceil(x1 * mw / proxy.w))] = True
+        frame[own] = 1                                    # the person's own pixels: nothing kept ...
+        g = own & (cmap > 0)
+        frame[g] = cmap[g] + 1                            # ... but the garments found on them
+    return frame
+
+
 def run(tracker, persons: List[int], progress: Optional[Callable[[float, str], None]] = None,
         cancel: Optional[Callable[[], bool]] = None) -> bool:
     """Parse the given people (store indices) on every frame of the work range into the clothing store. The masks
@@ -251,8 +294,6 @@ def _run_parser(tracker, persons, progress, cancel, parser, t0) -> bool:
     proxy = tracker.proxy
     a, b = tracker.cut.work_range
     mw, mh = tracker.matte.w, tracker.matte.h
-    W, H = proxy.w, proxy.h
-    kx, ky = mw / W, mh / H
     mm = tracker.cloth.open_tmp()
     ok = False
     try:
@@ -264,22 +305,7 @@ def _run_parser(tracker, persons, progress, cancel, parser, t0) -> bool:
                 continue
             rgb = analysis_view(np.asarray(proxy.frame(t)))
             lab = tracker.labels(t)
-            frame = np.array(mm[t])
-            for p in pres:
-                if lab is not None:
-                    frame[lab == p] = 0
-                box = _crop_box(st, p, t, proxy.sx, proxy.sy, W, H)
-                if box is None:
-                    continue
-                x0, y0, x1, y1 = box
-                cm = parser(rgb[y0:y1, x0:x1])
-                mx0, my0 = int(x0 * kx), int(y0 * ky)
-                mx1, my1 = max(mx0 + 1, int(round(x1 * kx))), max(my0 + 1, int(round(y1 * ky)))
-                small = cv2.resize(cm, (mx1 - mx0, my1 - my0), interpolation=cv2.INTER_NEAREST)
-                own = (lab[my0:my1, mx0:mx1] == p) if lab is not None else (small > 0)
-                reg = frame[my0:my1, mx0:mx1]
-                reg[own] = small[own] + 1
-            mm[t] = frame
+            mm[t] = _parse_frame(parser, st, proxy, pres, t, np.array(mm[t]), lab, rgb, mw, mh)
             if progress:
                 progress((t - a + 1) / max(1, b - a), f"옷 영역 분석 {t - a + 1}/{b - a}")
         ok = True
@@ -317,22 +343,7 @@ def _run_garments(tracker, persons: List[int], progress=None, cancel=None, t0=No
                 continue
             rgb = analysis_view(np.asarray(proxy.frame(t)))
             lab = tracker.labels(t)
-            frame = np.array(mm[t])
-            cmap = gf.classes(rgb, (mw, mh))
-            for p in pres:
-                if lab is not None:
-                    own = lab == p
-                else:
-                    box = _crop_box(st, p, t, proxy.sx, proxy.sy, proxy.w, proxy.h)
-                    if box is None:
-                        continue
-                    own = np.zeros((mh, mw), bool)
-                    x0, y0, x1, y1 = box
-                    own[int(y0 * mh / proxy.h):int(np.ceil(y1 * mh / proxy.h)), int(x0 * mw / proxy.w):int(np.ceil(x1 * mw / proxy.w))] = True
-                frame[own] = 1                                    # the person's own pixels: nothing kept ...
-                g = own & (cmap > 0)
-                frame[g] = cmap[g] + 1                            # ... but the garments found on them
-            mm[t] = frame
+            mm[t] = _garment_frame(gf, st, proxy, pres, t, np.array(mm[t]), lab, rgb, mw, mh)
             if progress:
                 progress((t - a + 1) / max(1, b - a), f"옷 영역 분석 {t - a + 1}/{b - a}")
         ok = True
@@ -350,27 +361,139 @@ def _run_garments(tracker, persons: List[int], progress=None, cancel=None, t0=No
 
 
 def _state_path(tracker) -> Path:
-    return Path(tracker.cloth.path).with_suffix(".json")
+    return Path(getattr(tracker.cloth, "live_path", tracker.cloth.path)).with_suffix(".json")
 
 
 def _write_state(tracker, persons: List[int], model: str = "", seconds: Optional[float] = None,
                  stats: Optional[dict] = None) -> None:
+    """After a whole run: who was parsed, for which analysis and range, by what. Every frame was cut with the
+    owners in use now, so no range is stale."""
     st = tracker.store
-    try:
-        old = json.loads(_state_path(tracker).read_text(encoding="utf-8"))
-    except Exception:
-        old = {}
+    old = _state(tracker)
     same = old.get("analysis") == tracker.cut.analysis_version and old.get("model", "") == model
     pids = sorted(set(old.get("pids", [])) | {int(st.pids[p]) for p in persons}) \
         if same else sorted(int(st.pids[p]) for p in persons)
     d = dict(analysis=tracker.cut.analysis_version, range=list(tracker.cut.work_range), pids=pids, model=model,
-             made=time.time(), seconds=None if seconds is None else round(float(seconds), 2))
+             made=time.time(), seconds=None if seconds is None else round(float(seconds), 2), stale=[])
     if stats:
         d["stats"] = stats
+    _put_state(tracker, d)
+
+
+def _put_state(tracker, d: dict) -> None:
+    import os
     tmp = _state_path(tracker).with_suffix(".json.tmp")
     tmp.write_text(json.dumps(d), encoding="utf-8")
-    import os
     os.replace(tmp, _state_path(tracker))
+    tracker.__dict__.pop("_cloth_state", None)
+
+
+def state_text(tracker) -> Optional[str]:
+    """The state file as it is (None: there is none): kept by a matte revision to put back when it is undone."""
+    try:
+        return _state_path(tracker).read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def put_state_text(tracker, text: Optional[str]) -> None:
+    import os
+    f = _state_path(tracker)
+    if text is None:
+        try:
+            f.unlink()
+        except OSError:
+            pass
+    else:
+        tmp = f.with_suffix(".json.tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, f)
+    tracker.__dict__.pop("_cloth_state", None)
+
+
+def _state(tracker) -> dict:
+    """The one reader of the clothing state, for the preview, a render, the inspector and a matte revision alike
+    (1.22.2 had two: one kept per tracker by the file's time in seconds, one reading the file each time). Kept on
+    the tracker by the file's time (ns) and size; every writer here drops that copy."""
+    f = _state_path(tracker)
+    try:
+        fs = f.stat()
+    except OSError:
+        return {}
+    key = (fs.st_mtime_ns, fs.st_size)
+    c = tracker.__dict__.get("_cloth_state")
+    if c is not None and c[0] == key:
+        return c[1]
+    try:
+        d = json.loads(f.read_text(encoding="utf-8"))
+    except Exception:
+        d = {}
+    tracker.__dict__["_cloth_state"] = (key, d)
+    return d
+
+
+def stale_ranges(tracker) -> List[List[int]]:
+    """[a, b) ranges whose clothing was cut with owners that are no longer the ones in use (the person matte was
+    made again there since): not used until it is made again there. Written with the matte revision that changed
+    the owners (set_stale). A state from 1.22.2 or older has no such list: the ranges the matte was refreshed in
+    after the clothes were analysed are taken, as its inspector line said."""
+    s = _state(tracker)
+    if not s:
+        return []
+    if "stale" in s:
+        return [[int(a), int(b)] for a, b in (s.get("stale") or [])]
+    try:
+        made = float(s.get("made") or 0)
+        from .matte_refresh import merge
+        return merge([r[:2] for r in (tracker.seg_meta().get("refreshed") or []) if len(r) > 2 and r[2] > made], 0)
+    except Exception:
+        return []
+
+
+def stale_of_cut(project, cut) -> List[List[int]]:
+    """stale_ranges() of a cut that is not open, from its files alone (a render asking before it starts). []
+    when nobody who is retouched keeps clothes in the cut: stale clothing changes nothing then."""
+    try:
+        keeps = any(p.role == "target" and getattr(cut.params.get(p.id), "cloth", "include") != "include"
+                    for p in cut.persons)
+        if not keeps:
+            return []
+        cache = Path(project.cache_dir(cut))
+        fs = sorted(cache.glob("cloth_*.json"))
+        if not fs:
+            return []
+        s = json.loads(fs[-1].read_text(encoding="utf-8"))
+        if s.get("analysis") != cut.analysis_version or list(s.get("range", [])) != list(cut.work_range):
+            return []
+        if "stale" in s:
+            return [[int(a), int(b)] for a, b in (s.get("stale") or [])]
+        from .matte_refresh import merge
+        m = json.loads((cache / "seg_meta.json").read_text(encoding="utf-8"))
+        made = float(s.get("made") or 0)
+        return merge([r[:2] for r in (m.get("refreshed") or []) if len(r) > 2 and r[2] > made], 0)
+    except Exception:
+        return []
+
+
+def stale_at(tracker, t: int) -> bool:
+    return any(a <= t < b for a, b in stale_ranges(tracker))
+
+
+def set_stale(tracker, add=None, done=None) -> List[List[int]]:
+    """Ranges whose owners changed are added, ranges made again with the present owners taken off; written into
+    the state at once (the preview and a render read the same file)."""
+    from .matte_refresh import merge, subtract
+    s = dict(_state(tracker))
+    if not s:
+        return []
+    cur = stale_ranges(tracker)
+    if add:
+        cur = merge(cur + [[int(a), int(b)] for a, b in add], 0)
+    if done:
+        cur = subtract(cur, [[int(a), int(b)] for a, b in done])
+    s["stale"] = cur
+    _put_state(tracker, s)
+    return cur
 
 
 def info(tracker) -> dict:
@@ -386,33 +509,12 @@ def info(tracker) -> dict:
     want = {cloth_model()} | ({"unified"} if U.active("cloth") else set())
     out = dict(model=model, label=label(model), state=provider_state(model, want), seconds=s.get("seconds"),
                stats=s.get("stats"))
-    # the person matte was made again in some frames after the clothes were analysed (an edit's refresh): the
-    # owners the clothes were cut with changed there
-    try:
-        made = float(s.get("made") or 0)
-        later = [r[:2] for r in (tracker.seg_meta().get("refreshed") or []) if len(r) > 2 and r[2] > made]
-        if later:
-            out["stale_ranges"] = later
-    except Exception:
-        pass
+    # the owners the clothes were cut with changed in these frames (a matte revision since): not used there until
+    # made again
+    later = stale_ranges(tracker)
+    if later:
+        out["stale_ranges"] = later
     return out
-
-
-def _state(tracker) -> dict:
-    f = _state_path(tracker)
-    try:
-        mt = f.stat().st_mtime
-    except OSError:
-        return {}
-    c = getattr(tracker, "_cloth_state", None)
-    if c is not None and c[0] == mt:
-        return c[1]
-    try:
-        d = json.loads(f.read_text(encoding="utf-8"))
-    except Exception:
-        d = {}
-    tracker._cloth_state = (mt, d)
-    return d
 
 
 def _ready_pid(tracker, p: int) -> bool:
@@ -426,12 +528,112 @@ def ready_for(tracker, pid: int) -> bool:
     """Has this person's clothing been parsed for the current analysis and work range?"""
     if not tracker.cloth.exists():
         return False
+    s = _state(tracker)
+    return bool(s) and s.get("analysis") == tracker.cut.analysis_version \
+        and list(s.get("range", [])) == list(tracker.cut.work_range) and int(pid) in s.get("pids", [])
+
+
+def _parsed_persons(tracker) -> List[int]:
+    """Store indices of the people whose clothing is parsed for the present analysis and range."""
+    st = getattr(tracker, "store", None)
+    if st is None or not hasattr(tracker, "cloth") or not tracker.cloth.exists():
+        return []
+    s = _state(tracker)
+    if not s or s.get("analysis") != tracker.cut.analysis_version \
+            or list(s.get("range", [])) != list(tracker.cut.work_range):
+        return []
+    return [st.index(int(q)) for q in s.get("pids", []) if st.has(int(q))]
+
+
+def _frame_maker(tracker, models: Optional[dict] = None):
+    """make(pres, t, frame, lab, rgb) -> frame, with the clothing model of the settings (kept in models between
+    runs). Raises when the masks in use were made by another model than the settings give now: frames of two
+    models are never mixed in one cut (the whole cut is made again by hand then)."""
+    from . import unified as U
+    if info(tracker).get("state") != "current":
+        raise RuntimeError("옷 영역을 만든 모델이 지금 설정과 달라 일부 구간만 다시 만들지 않았습니다 (옷 마스크 다시 만들기)")
+    models = models if models is not None else {}
+    st, proxy = tracker.store, tracker.proxy
+    mw, mh = tracker.matte.w, tracker.matte.h
+    if cloth_model() == "sam31" and not U.active("cloth"):
+        if not GARMENT_FILE.is_file():
+            raise RuntimeError(f"옷 단어 파일이 없어 옷 영역을 분석하지 못했습니다: {GARMENT_FILE.name}")
+        gf = models.get("garments")
+        if gf is None:
+            gf = models["garments"] = GarmentFinder()
+        return (lambda pres, t, frame, lab, rgb: _garment_frame(gf, st, proxy, pres, t, frame, lab, rgb, mw, mh))
+    key = "cloth_parser"
+    parser = models.get(key)
+    if parser is None:
+        parser = models[key] = Parser(unified_only=cloth_model() == "sam31")
+    return (lambda pres, t, frame, lab, rgb: _parse_frame(parser, st, proxy, pres, t, frame, lab, rgb, mw, mh))
+
+
+def restage(tracker, frames, staged: dict, cancel=None, models: Optional[dict] = None) -> Optional[dict]:
+    """For a matte revision that is not in use yet (matte_rev.stage): the clothing of the frames whose owners it
+    changes, cut with the new owners, for the people whose clothing is parsed. {'frames': {t: frame}, 'stale':
+    [t, ...]} (stale: frames that could not be made again and are not used until they are), or None when the cut
+    has no clothing in use (nothing to do). Nothing is written."""
+    persons = _parsed_persons(tracker)
+    if not persons:
+        return None
+    st, proxy = tracker.store, tracker.proxy
+    frames = [int(t) for t in frames if any(st.present[p, int(t)] for p in persons)]
+    if not frames:
+        return dict(frames={}, stale=[])
     try:
-        s = json.loads(_state_path(tracker).read_text(encoding="utf-8"))
-    except Exception:
-        return False
-    return s.get("analysis") == tracker.cut.analysis_version and list(s.get("range", [])) == list(tracker.cut.work_range) \
-        and int(pid) in s.get("pids", [])
+        make = _frame_maker(tracker, models)
+    except Exception as e:
+        return dict(frames={}, stale=frames, error=str(e)[:200])
+    out: dict = {}
+    for i, t in enumerate(frames):
+        if cancel and cancel():
+            from .analyze import Cancelled
+            raise Cancelled()
+        pres = [p for p in persons if st.present[p, t]]
+        seg = staged["labels"].get(t) if t in staged.get("labels", {}) else (
+            tracker.seglab.get(t) if tracker.seglab.exists() else None)
+        al = staged["matte"].get(t) if t in staged.get("matte", {}) else tracker.matte.get(t)
+        lab = tracker.labels_from(t, seg, al)
+        cur = tracker.cloth.get(t)
+        frame = np.zeros((tracker.matte.h, tracker.matte.w), np.uint8) if cur is None else np.array(cur)
+        rgb = analysis_view(np.asarray(proxy.frame(t)))
+        out[t] = make(pres, t, frame, lab, rgb)
+    return dict(frames=out, stale=[])
+
+
+def refresh_stale(tracker, progress=None, cancel=None, models: Optional[dict] = None) -> List[List[int]]:
+    """The stale ranges made again with the owners in use (a refresh whose clothing could not be made with it, a
+    cut from 1.22.2): frame by frame, each range taken off the list once all of it is written. The ranges done."""
+    rs = stale_ranges(tracker)
+    persons = _parsed_persons(tracker)
+    if not rs or not persons:
+        return []
+    st, proxy = tracker.store, tracker.proxy
+    make = _frame_maker(tracker, models)        # raises with the reason when it cannot be done
+    total = sum(b - a for a, b in rs)
+    n = 0
+    done: List[List[int]] = []
+    for a, b in rs:
+        mm = tracker.cloth.open_rw()
+        try:
+            for t in range(a, b):
+                if cancel and cancel():
+                    return done
+                pres = [p for p in persons if st.present[p, t]]
+                if pres:
+                    rgb = analysis_view(np.asarray(proxy.frame(t)))
+                    mm[t] = make(pres, t, np.array(mm[t]), tracker.labels(t), rgb)
+                n += 1
+                if progress:
+                    progress(n / max(1, total), f"옷 영역 갱신 {n}/{total}")
+            mm.flush()
+        finally:
+            del mm
+            tracker.cloth.close()
+        set_stale(tracker, done=[[a, b]])
+        done.append([a, b])
+    return done
 
 
 def keep_mask(tracker, t: int, p: int, mode: str) -> Optional[np.ndarray]:
@@ -441,6 +643,8 @@ def keep_mask(tracker, t: int, p: int, mode: str) -> Optional[np.ndarray]:
         return None
     if not _ready_pid(tracker, p):
         return None                       # never masks of a run that did not finish (or of another analysis)
+    if stale_at(tracker, t):
+        return None                       # cut with owners that are not the ones in use any more (1.22.3)
     cm = tracker.cloth.get(t)
     lab = tracker.labels(t)
     if cm is None or lab is None:

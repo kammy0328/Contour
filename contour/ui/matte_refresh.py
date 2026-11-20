@@ -96,10 +96,39 @@ class MatteRefresher(QObject):
         return "waiting" if pending(cut) else ""
 
     def kick(self) -> None:
-        """The open cut has marks (opened again with some): refresh them soon."""
-        cut = self.win.session.cut
-        if cut is not None and pending(cut):
+        """The open cut has marks (opened again with some): refresh them soon. What no mark says (an edit whose
+        marks were never saved, a refresh that was taken back when the app ended, an edit of a kind that marks
+        nothing itself) is told from what is recorded with the matte (track/matte_rev: the joints each frame's
+        matte was made from), on the edit worker: frames that no longer match are marked like any edit's."""
+        s = self.win.session
+        cut, tr = s.cut, s.tracker
+        if cut is None:
+            return
+        if pending(cut):
             self.timer.start()
+        if not self.enabled or tr is None or tr.store is None or not getattr(cut, "analyzed", False):
+            return
+
+        def check():
+            from ..track import matte_rev as MRV
+            try:
+                if not tr.has_seg():
+                    return None
+                MRV.ensure_prompts(tr)
+                return dict(cut=cut.id, marks=MR.stale(tr), tracker=tr)
+            except Exception:
+                traceback.print_exc()
+                return None
+        self.win.edit_worker.submit(("matte_check", cut.id), check)
+
+    def checked(self, res) -> None:
+        """The edit worker compared the tracking with what the matte was made from."""
+        if not res or not res.get("marks"):
+            return
+        s = self.win.session
+        if s.cut is None or s.cut.id != res["cut"] or s.tracker is not res["tracker"]:
+            return
+        self.mark_ranges(s.cut, res["marks"])
 
     def cancel(self) -> None:
         """Leaving the cut (or the project): a running refresh is dropped, its marks stay with the cut."""
@@ -185,8 +214,15 @@ class MatteRefresher(QObject):
             try:
                 if self.gen.get(cid, 0) != gen or s.tracker is not tr:
                     return None
-                wrote = MR.commit(tr, res)
-                return dict(cut=cid, marks=marks, wrote=wrote)
+                try:
+                    wrote = MR.commit(tr, res)
+                except Exception as e:
+                    # the revision before is in use again (matte_rev.activate put it back): the marks stay
+                    traceback.print_exc()
+                    return dict(cut=cid, marks=[], wrote=[], error=f"{e}"[:200])
+                cl = (res.get("stage") or {}).get("cloth") or {}
+                return dict(cut=cid, marks=marks, wrote=wrote, cloth_stale=len(cl.get("stale") or []),
+                            cloth_error=cl.get("error", ""))
             finally:
                 with self._lock:
                     self.committing -= 1
@@ -198,12 +234,24 @@ class MatteRefresher(QObject):
         """The edit worker wrote a refresh: its frames are no longer marked (marks made since stay)."""
         self.changed.emit(res["cut"] if res else "")
         if not res:
-            self.kick()
+            cut = self.win.session.cut
+            if cut is not None and pending(cut):
+                self.timer.start()
+            return
+        if res.get("error"):
+            # not tried again by itself (it would fail the same way every second and a half): the marks stay, the
+            # next edit, opening or render takes them
+            self.last_error = res["error"]
+            self.win.toast(f"인물 매트를 적용하지 못해 이전 매트를 그대로 씁니다: {res['error'][:120]}", kind="warn")
             return
         prj = self.win.session.project
         cut = prj.cut(res["cut"]) if prj is not None else None
         if cut is None:
             return
+        if res.get("cloth_stale"):
+            self.win.toast(f"인물 매트가 바뀐 {res['cloth_stale']}프레임의 옷 영역을 다시 만들지 못했습니다. "
+                           "그 구간은 다시 만들 때까지 옷 그대로가 적용되지 않습니다"
+                           + (f" ({res['cloth_error'][:80]})" if res.get("cloth_error") else ""), kind="warn")
         clear(cut, res["marks"])
         self.win.session.dirty = True
         self.changed.emit(cut.id)

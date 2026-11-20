@@ -62,7 +62,8 @@ BLUR_RULE = "scaled"
 
 
 def fuse_measurements(store: TrackStore, conf_threshold: float = 0.55, frame_wh=None, alpha_at=None,
-                      alpha_scale=(1.0, 1.0), blur_rule: Optional[str] = None, norm: Optional[dict] = None) -> None:
+                      alpha_scale=(1.0, 1.0), blur_rule: Optional[str] = None, norm: Optional[dict] = None,
+                      owner_at=None) -> None:
     keys = [k for k in store.raw if store.raw[k].shape[2] == S.K]
     if not keys:
         return
@@ -168,7 +169,7 @@ def fuse_measurements(store: TrackStore, conf_threshold: float = 0.55, frame_wh=
     if frame_wh is not None:
         from .visibility import measure
         from .store import VIS_HIDDEN, VIS_OUTSIDE
-        vis = measure(store, norm, frame_wh, alpha_at, alpha_scale)
+        vis = measure(store, norm, frame_wh, alpha_at, alpha_scale, owner_at=owner_at)
         store.vis_meas = vis
         store.has_vis = True
         c = store.meas[..., 2]

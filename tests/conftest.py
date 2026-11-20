@@ -22,9 +22,14 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(h))
     monkeypatch.setenv("USERPROFILE", str(h))
     import contour.core.settings as S
+    import contour.core.playcache as PC
     S._settings = None
+    PC._cache = None                 # the finished frames kept for playback, and what cuts were left with
+    PC.revisions().forget()
     yield h
     S._settings = None
+    PC._cache = None
+    PC.revisions().forget()
 
 
 def make_video(path: Path, n: int = 6, w: int = 64, h: int = 48, fps: int = 24, fmt: str = "mp4") -> Path:

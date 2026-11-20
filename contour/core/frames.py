@@ -141,6 +141,39 @@ def _decode_key(info: MediaInfo) -> tuple:
                                                        "bit_depth", "fps_fraction"))
 
 
+def _owner(info: MediaInfo, n: int, w: int, h: int, view_key: str) -> tuple:
+    return (info.kind, str(info.path if info.kind == "video" else info.seq_pattern),
+            int(getattr(info, "seq_start", 0) or 0), _sig(info), int(getattr(info, "offset", 0) or 0),
+            int(n), int(w), int(h), view_key, _decode_key(info))
+
+
+def origin(px, info: MediaInfo, vs) -> tuple:
+    """What the pixels of a cut's frames come from, whoever reads them (the keys of results kept in memory are made
+    with it): the file and its version, the stretch, the size and the colour view. The same for the original and
+    for a proxy made from that version of it in this view (same pixels, so results made on one stay good when the
+    other takes over). A proxy shown because there is nothing else (the original missing, or made in another
+    view) is told by its own file."""
+    if px is None:
+        return ()
+    if getattr(px, "kind", "") == "source":
+        return px.owner
+    vk = vs.key()
+    try:
+        ok = source_present(info) and px.is_valid(vk)
+    except Exception:
+        ok = False
+    if ok:
+        return _owner(info, px.n, px.w, px.h, vk)
+    m = px.meta()
+    try:
+        st = os.stat(px.meta_path)
+        made = f"{st.st_size}:{st.st_mtime_ns}"
+    except OSError:
+        made = ""
+    return ("proxy", str(px.path), int(px.offset), int(px.n), int(px.w), int(px.h), str(m.get("view")),
+            str(m.get("sig")), made)
+
+
 class _Cursor:
     def __init__(self, reader: FrameReader, start: int, end: int):
         self.reader = reader
@@ -174,9 +207,7 @@ class SourceFrames:
         self.cm, self.vs = cm, vs
         self.view_key = vs.key()
         # what the decoded pixels depend on: the file (and its version), the stretch, the size and the view
-        self.owner = (info.kind, str(info.path if info.kind == "video" else info.seq_pattern),
-                      int(getattr(info, "seq_start", 0) or 0), _sig(info), int(getattr(info, "offset", 0) or 0),
-                      self.n, self.w, self.h, self.view_key, _decode_key(info))
+        self.owner = _owner(info, self.n, self.w, self.h, self.view_key)
         self._lock = threading.RLock()      # the readers
         self._cursors: list = []
         self._last = -1

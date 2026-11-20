@@ -207,6 +207,9 @@ class MainWindow(QMainWindow):
         self.next_prep = NextCutPrep()
         self.proxy_builder = ProxyBuilder(self)
         self.proxy_builder.finished.connect(self._bg_proxy_done)
+        self.proxy_builder.progressed.connect(self._bg_proxy_progress)
+        self._px_making = None                     # ((project path, cut id), percent) of the proxy being made
+        self._px_failed: dict = {}                 # (project path, cut id) -> why its proxy could not be made
         self.cache_worker.progressed.connect(lambda: self.timeline.update())
         self.cache_timer = QTimer(self)
         self.cache_timer.timeout.connect(lambda: self.cache_worker.kick(self.frame) if self.session.cut else None)
@@ -422,6 +425,9 @@ class MainWindow(QMainWindow):
         self.hover_btn.toggled.connect(self._hover_pick)
         h.addWidget(self.hover_btn)
         h.addStretch(1)
+        self.px_lbl = QLabel("")                 # where the open cut's frames come from; a proxy being made or failed
+        self.px_lbl.setObjectName("Faint")
+        h.addWidget(self.px_lbl)
         self.cs_lbl = QLabel("")
         self.cs_lbl.setObjectName("Faint")
         h.addWidget(self.cs_lbl)
@@ -1117,6 +1123,20 @@ class MainWindow(QMainWindow):
             self._reanalyse_after_proxy = None
             QTimer.singleShot(0, self.run_analysis)
 
+    def _reopen_cut(self) -> bool:
+        """The open cut again from its files (another colour view, LUT or setting). What was changed in memory and
+        not saved yet is saved first: opening reads the tracks from the file again (1.22.2 dropped joint edits
+        made since the last save here)."""
+        cut = self.session.cut
+        if cut is None:
+            return False
+        if self.session.dirty and not self.save():
+            self.toast("저장하지 못해 화면을 다시 만들지 않았습니다. 저장한 뒤 컷을 다시 열면 반영됩니다", kind="error")
+            return False
+        self.session.open_cut(cut)
+        self.build_proxy()
+        return True
+
     def _maybe_bg_proxy(self, first: bool = False):
         """설정 > 프록시 만들기: 'always' makes the open cut's proxy in the background; 'auto' only once reading the
         original turned out slower than it plays."""
@@ -1127,19 +1147,69 @@ class MainWindow(QMainWindow):
         if proxy_mode() == "always" or wants_proxy(s.proxy, s.cut.info.fps):
             self.proxy_builder.start(s.project, s.cut, s.view_settings(s.cut))
 
+    def _proxy_note(self) -> None:
+        """Beside the picture, never in the way (1.22.3): what the open cut's frames are read from, a proxy being
+        made in the background (with how far it is) or one that could not be made (the reason in the tooltip)."""
+        lbl = getattr(self, "px_lbl", None)
+        if lbl is None:
+            return
+        s = self.session
+        if s.cut is None or s.proxy is None or s.project is None:
+            lbl.setText("")
+            lbl.setToolTip("")
+            return
+        ck = (str(s.project.path), s.cut.id)
+        making = getattr(self, "_px_making", None)
+        failed = getattr(self, "_px_failed", {})
+        if not s.from_source():
+            text, tip = "프록시", "이 컷의 프록시 파일에서 읽습니다."
+        elif ck in failed:
+            text = "프록시 실패 · 원본으로 계속"
+            tip = "프록시를 만들지 못했습니다. 원본을 바로 읽어 계속 작업할 수 있습니다.\n" + failed[ck][:600]
+        elif making is not None and making[0] == ck and self.proxy_builder.busy:
+            text = f"프록시 만드는 중 {making[1]}%"
+            tip = "뒤에서 프록시를 만드는 중입니다. 기다리지 않고 원본으로 바로 탐색·재생할 수 있습니다."
+        else:
+            text = "원본에서 바로 읽는 중"
+            tip = "프록시 없이 원본을 그때그때 읽습니다. 탐색·재생·분석 모두 바로 할 수 있습니다."
+        lbl.setText(text + "   ")
+        lbl.setToolTip(tip)
+
+    def _bg_proxy_progress(self, prj_path: str, cut_id: str, f: float):
+        self._px_making = ((prj_path, cut_id), int(round(100 * max(0.0, min(1.0, float(f))))))
+        s = self.session
+        if s.cut is not None and s.cut.id == cut_id and s.project is not None and str(s.project.path) == prj_path:
+            self._proxy_note()
+
     def _bg_proxy_done(self, prj_path: str, cut_id: str, ok: bool, msg: str):
         s = self.session
+        # a proxy of an earlier cut or of a project since closed never replaces what is on screen now
+        here = not (s.cut is None or s.cut.id != cut_id or s.project is None or str(s.project.path) != prj_path)
+        full = hasattr(self, "px_lbl")
+        if full:
+            self._px_making = None
         if not ok:
             if msg:
                 print("background proxy:", msg, flush=True)
+            if full:
+                # said once, beside the picture, and kept there for this cut; it goes on from its original
+                # (1.22.2 only printed it)
+                self._px_failed[(prj_path, cut_id)] = msg or "원인을 알 수 없습니다"
+                if here:
+                    self._proxy_note()
+                    self.toast("프록시를 만들지 못했습니다. 원본으로 계속 볼 수 있습니다"
+                               + (": " + msg.splitlines()[0][:120] if msg else ""), "warn")
             return
-        # a proxy of an earlier cut or of a project since closed never replaces what is on screen now
-        if s.cut is None or s.cut.id != cut_id or s.project is None or str(s.project.path) != prj_path:
+        if full:
+            self._px_failed.pop((prj_path, cut_id), None)
+        if not here:
             return
         from ..core.frames import frames_for
         new = frames_for(s.project, s.cut, s.view_settings(s.cut))
         if getattr(new, "kind", "") == "proxy" and self.job is None and s.swap_frames(cut_id, new):
             self.toast("프록시가 준비되어 이 컷을 더 빠르게 읽습니다", "ok")
+        if full:
+            self._proxy_note()
 
     # ================================================================== cut menu (cut list and timeline)
     def _sel_cut_ids(self) -> list:
@@ -1549,6 +1619,11 @@ class MainWindow(QMainWindow):
         acc = self.accuracy
 
         prj = s.project
+        # 분석 시작 on the open cut is the user's own call: an earlier quick look's 'nobody, skipped' is forgotten
+        from ..track.prescan import clear_skip
+        cdir = Path(prj.path) / "cuts" / cut.id
+        if clear_skip(cut, cdir if cdir.is_dir() else None):
+            s.dirty = True
 
         def work(progress, cancelled):
             res = tr.analyze(progress, cancelled, accuracy=acc)
@@ -1860,10 +1935,19 @@ class MainWindow(QMainWindow):
         self._batch_skin = None
         self._start_batch(todo, title, prescan=not picked)
 
-    def _start_batch(self, todo: list, title: str = "전체 분석", prescan: bool = False):
+    def _start_batch(self, todo: list, title: str = "전체 분석", prescan: bool = False, force=None):
+        """force (default: when no quick look is asked for): the user picked these cuts, they are analysed whatever
+        a quick look said before or would say now."""
         prj = self.session.project
         if prj is None or not todo:
             return
+        force = (not prescan) if force is None else bool(force)
+        if force:
+            # before the project is saved for the analysis process: an earlier 'nobody, skipped' is forgotten
+            from ..track.prescan import clear_skip
+            root = Path(prj.path) / "cuts"
+            for c in todo:
+                clear_skip(c, root / c.id if (root / c.id).is_dir() else None)
         if not self.save():                     # the analysis process reads the project from disk
             return
         # 1.18: no proxy first. A bake proxy that exists is still shared by the shots; else each shot's analysis
@@ -1888,11 +1972,7 @@ class MainWindow(QMainWindow):
             free_gpu_memory()
         except Exception:
             pass
-        if not prescan:
-            for c in todo:                       # picked by hand: whatever the quick look said before, analyse it
-                if (c.status or {}).get("prescan"):
-                    c.status = {k: v for k, v in c.status.items() if k not in ("auto", "reason", "prescan", "prescan_info")}
-        self.batch.start(prj.path, [c.id for c in todo], self.accuracy, True, prescan=prescan)
+        self.batch.start(prj.path, [c.id for c in todo], self.accuracy, True, prescan=prescan, force=force)
 
     def _batch_skipped(self, cid: str, info: str):
         """The quick look found nobody in this cut: not analysed, with the reason (다시 분석 takes it in again)."""
@@ -2357,10 +2437,12 @@ class MainWindow(QMainWindow):
         it). then(ok, why) once it is over. project: another project than the open one (loaded for a render)."""
         from ..track import matte_refresh as MR
         from .matte_refresh import clear, pending
+        from ..track import clothing as CL
         s = self.session
         prj = project if project is not None else s.project
         other = prj is not s.project
-        cuts = [c for c in (prj.cut(i) for i in cut_ids) if c is not None and pending(c)] if prj is not None else []
+        cuts = [c for c in (prj.cut(i) for i in cut_ids)
+                if c is not None and (pending(c) or CL.stale_of_cut(prj, c))] if prj is not None else []
         if not cuts:
             if then:
                 then(True, "")
@@ -2392,8 +2474,16 @@ class MainWindow(QMainWindow):
                         done[c.id] = pending(c)        # nothing a SAM matte would follow here
                         continue
                     marks = pending(c)
-                    MR.refresh_now(tr, marks, sub, cancelled, models)
+                    if marks:
+                        MR.refresh_now(tr, marks, sub, cancelled, models)
                     done[c.id] = marks
+                    # clothing left out of use where the owners changed (it could not be made again with the
+                    # matte, or the cut is from 1.22.2): made again there, so the render keeps the clothes
+                    if CL.stale_ranges(tr):
+                        try:
+                            CL.refresh_stale(tr, sub, cancelled, models)
+                        except Exception as e:
+                            fails[c.id] = f"옷 영역: {e}"[:200]
                 except Exception as e:
                     if type(e).__name__ == "Cancelled":
                         break
@@ -2433,12 +2523,19 @@ class MainWindow(QMainWindow):
         if self.job is not None and then:
             self.job.failed.connect(failed_then)
 
+    def _needs_matte(self, prj, cut) -> bool:
+        """Before a render: frames an edit marked are not matted again yet, or clothing kept in the cut is out of
+        use where its owners changed."""
+        from .matte_refresh import pending
+        from ..track import clothing as CL
+        return bool(cut is not None and (pending(cut) or CL.stale_of_cut(prj, cut)))
+
     def _ask_matte(self, names: list, adding: bool) -> str:
         """'refresh' / 'old' / 'cancel': a render of cuts whose matte is not caught up with the edits yet."""
         box = QMessageBox(self)
         box.setWindowTitle("인물 매트 갱신 전")
         shown = ", ".join(names[:4]) + (f" 외 {len(names) - 4}컷" if len(names) > 4 else "")
-        box.setText(f"{shown}: 편집한 구간의 인물 매트가 아직 다시 만들어지지 않았습니다.\n"
+        box.setText(f"{shown}: 편집한 구간의 인물 매트(또는 그 구간의 옷 영역)가 아직 다시 만들어지지 않았습니다.\n"
                     "렌더는 저장된 매트를 씁니다. 매트를 갱신한 뒤 진행할까요?")
         b_ref = box.addButton("매트 갱신 후 " + ("추가" if adding else "렌더"), QMessageBox.AcceptRole)
         b_old = box.addButton("이전 매트로 " + ("추가" if adding else "렌더"), QMessageBox.DestructiveRole)
@@ -2968,6 +3065,18 @@ class MainWindow(QMainWindow):
                 if p.role == "target" and tr.store.has(p.id) and getattr(cut.params_for(p.id), "cloth", "include") != "include"
                 and not CL.ready_for(tr, p.id)]
         if not need:
+            if CL.stale_of_cut(s.project, cut):
+                # parsed, but out of use where the person matte was made again since (1.22.3): only those frames
+                def again(progress, cancelled):
+                    return CL.refresh_stale(tr, progress, cancelled, self.refresher.models)
+
+                def again_done(rs):
+                    s.touch("geo")
+                    self.viewer._img_cache.clear()
+                    self._refresh_all()
+                    if rs:
+                        self.toast(f"인물 매트가 바뀐 {len(rs)}곳의 옷 영역을 다시 만들었습니다.", kind="ok")
+                self.run_job("옷 영역 갱신 중", again, again_done)
             return
         # all people to be reshaped at once, so switching someone else later is instant
         pids = sorted(set(need) | {tr.store.index(p.id) for p in cut.targets() if tr.store.has(p.id)})
@@ -3740,8 +3849,14 @@ class MainWindow(QMainWindow):
                 self.refresher.mark_ranges(cut, res["marks"])
         elif kind == "matte":
             self.refresher.committed(res)
-            if res:
-                self.viewer._img_cache.clear()
+            if not res or res.get("error"):
+                return                      # nothing was written (dropped, or taken back): nothing to redo
+            self.viewer._img_cache.clear()
+        elif kind == "matte_check":
+            # only a comparison (the tracking with what the matte was made from): nothing a frame is made from
+            # changed, so nothing is redone
+            self.refresher.checked(res)
+            return
         self.session.touch()
         self.viewer.update()
         self.timeline.update()
@@ -3820,8 +3935,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
             if r == QMessageBox.Yes:
                 self._reanalyse_after_proxy = cut.id
-        self.session.open_cut(cut)
-        self.build_proxy()
+        self._reopen_cut()
 
     def choose_lut(self):
         cut = self.session.cut
@@ -3835,8 +3949,7 @@ class MainWindow(QMainWindow):
             if act == a2:
                 cut.lut_path = ""
                 self.session.project.save()
-                self.session.open_cut(cut)
-                self.build_proxy()
+                self._reopen_cut()
                 return
             if act != a1:
                 return
@@ -3844,8 +3957,7 @@ class MainWindow(QMainWindow):
         if f:
             cut.lut_path = f
             self.session.project.save()
-            self.session.open_cut(cut)
-            self.build_proxy()
+            self._reopen_cut()
 
     def enqueue_render(self):
         s = self.session
@@ -3870,7 +3982,7 @@ class MainWindow(QMainWindow):
                 it.matte = matte
                 self.queue_page.save()
             self.toast("렌더 목록에 추가했습니다. 렌더 화면에서 시작하세요.", kind="ok")
-        if pending(cut) and s.tracker is not None and s.tracker.has_seg():
+        if self._needs_matte(s.project, cut) and s.tracker is not None and s.tracker.has_seg():
             # the render reads the saved matte: edits whose frames are not matted again yet would not be in it
             ch = self._ask_matte([cut.name], adding=True)
             if ch == "cancel":
@@ -3906,10 +4018,10 @@ class MainWindow(QMainWindow):
                     src = None
             if src is not None:
                 if getattr(item, "kind", "cut") == "timeline":
-                    cuts = [c for c in src.cuts if pending(c)]
+                    cuts = [c for c in src.cuts if self._needs_matte(src, c)]
                 else:
                     c = src.cut(item.cut_id)
-                    cuts = [c] if c is not None and pending(c) else []
+                    cuts = [c] if self._needs_matte(src, c) else []
                 if cuts:
                     ch = self._ask_matte([c.name for c in cuts], adding=False)
                     if ch == "cancel":
@@ -4088,6 +4200,7 @@ class MainWindow(QMainWindow):
             self.cs_lbl.setText(f"입력 {cs}" + (" + LUT" if cut.lut_path else ""))
         else:
             self.cs_lbl.setText("")
+        self._proxy_note()
         if not skip_inspector:
             self.inspector.refresh()
         self.cutlist.update_rows()
@@ -4101,7 +4214,10 @@ class MainWindow(QMainWindow):
     def open_settings(self):
         d = SettingsDialog(self)
         if d.exec():
-            changed = d.apply()
+            from ..core import playcache as PC
+            before = PC.setting_values()
+            changed = d.apply() or PC.setting_values() != before     # the view, or a setting results are made with
+            PC.cache().set_limit(PC.limit_bytes())
             if d.check_update:
                 from . import update as UP
                 UP.check(self, manual=True)
@@ -4111,8 +4227,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             if changed and self.session.cut is not None:
-                self.session.open_cut(self.session.cut)
-                self.build_proxy()
+                self._reopen_cut()
 
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls():
