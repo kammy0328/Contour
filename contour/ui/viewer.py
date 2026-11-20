@@ -312,21 +312,19 @@ class Viewer(QWidget):
         t, rkey = key
         if self.s.cut is None:
             return None
-        cid = self.s.cut.id
-        rk = self.s.result_key(t)
         self.s.preview_wait += 1             # the playback cache steps aside after the frame it is on
         try:
-            a = self.s.result(t)
+            r = self.s.render(t)             # key, picture and the generation it was made in: one opening of the cut
         finally:
             self.s.preview_wait -= 1
-        return (t, rk, a, cid) if a is not None else None
+        return (t,) + tuple(r) if r is not None else None
 
     def _preview_ready(self, key, payload):
         if payload is None:
             return
-        t, rkey, a, cid = payload
-        if self.s.cut is None or cid != self.s.cut.id:
-            return                      # computed for a cut that is no longer open
+        t, rkey, a, ep = payload
+        if self.s.cut is None or ep != getattr(self.s, "epoch", ep):
+            return                      # made for a cut (or an opening of it) that is no longer the open one
         img = np_to_qimage(a)
         self._store_img(("result", rkey), img)
         if t == self.t:

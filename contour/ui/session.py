@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+from ..core import playcache as PC
 from ..core.colour import PASSTHROUGH, ViewSettings, manager
 from ..core.project import Cut, Project
 from ..core.proxy import Proxy
@@ -23,10 +24,23 @@ from ..warp import field as F
 _EPOCHS = __import__("itertools").count(1)
 
 
+def _short(x) -> str:
+    import hashlib
+    return hashlib.sha1(repr(x).encode("utf-8")).hexdigest()[:16]
+
+
 class EditSession:
-    """epoch: changes whenever another cut is opened (unique over every session of the app). The cache keys of a
-    frame's intermediate results (proxy frame, retouch masks, retouched picture, warp field) carry it, so a frame of
-    the cut that was open when its computation started can never be found as the same frame of the cut open now."""
+    """epoch: the generation of the open cut, a new number at every opening of a cut (unique over every session of
+    the app). Work notes it when it starts and its result is dropped when the number is another one by the time it
+    is done: nothing made across a change of cut is kept or shown. It is in no cache key (instruction 2026-11-20
+    §1-3; until 1.22.2 it was, so a cut opened again never found the frames made for it the last time).
+
+    The keys of results say what a result is made from instead: the cut (cut_key: project path and cut id), what
+    its frames are read from and the settings that choose colours and models (src_key), and the processing
+    revisions of the cut (vers: one number each for the shape values, the retouch values and the tracking; a new
+    number, never used before, whenever one of them changes). A cut left with everything saved keeps its
+    revisions (core.playcache.Revisions) and gets them back when it is opened again in the same state, so the
+    finished frames kept for it (core.playcache.PlayCache: all cuts, one memory budget) are found again."""
 
     def __init__(self):
         self.project: Optional[Project] = None
@@ -35,20 +49,32 @@ class EditSession:
         self.tracker: Optional[CutTracker] = None
         self.version = 0                     # bump to invalidate previews (any change)
         self.epoch = next(_EPOCHS)
-        self.vers = {"geo": 0, "ret": 0, "trk": 0}   # what changed: shape params / retouch params / tracking
+        self.vers = PC.new_revisions()       # what changed: shape params / retouch params / tracking
+        self.cut_key: tuple = ("", "")       # (project path, cut id) of the open cut
+        self.src_key = ""                    # what its frames are read from, the colour view, the model settings
+        self._origin: tuple = ()
+        self._home = None                    # (project, cut) this session speaks for when the cut is left
+        self.kept = 0                        # finished frames found again when the cut was opened (diagnosis)
         self.interactive = False             # a slider is being dragged: coarser preview field
         self._cache: "OrderedDict[tuple, object]" = OrderedDict()
         self._frames: "OrderedDict[int, np.ndarray]" = OrderedDict()
         self._mask_cache: dict = {}
+        self._last_field = None
         self._lock = threading.RLock()
         self._compute = threading.RLock()    # one heavy frame computation at a time (preview / playback cache)
-        self._play: Dict[int, Tuple[tuple, bytes]] = {}   # playback cache: frame -> (result key, jpeg)
-        self._play_bytes = 0
-        self.play_limit = 1200 * 1024 * 1024
         self.last_touch = 0.0
         self.last_seek = 0.0          # the user moved to another frame (the playback cache waits a moment)
         self.preview_wait = 0         # preview frames waiting: the playback cache gives way to them
         self.dirty = False
+
+    @property
+    def play_limit(self) -> int:
+        """Bytes the finished frames of all cuts may take together (설정: play_cache_mb)."""
+        return PC.cache().limit
+
+    @play_limit.setter
+    def play_limit(self, v: int) -> None:
+        PC.cache().set_limit(int(v))
 
     # ------------------------------------------------------------------ project / cut
     def view_settings(self, cut: Optional[Cut] = None) -> ViewSettings:
@@ -69,6 +95,8 @@ class EditSession:
 
     def open_cut(self, cut: Optional[Cut]) -> None:
         with self._lock:
+            self._new_epoch()                 # first: work started on the cut being left drops what it makes
+            self._remember()
             if self.proxy is not None:
                 self.proxy.close()
             self.cut = cut
@@ -77,11 +105,11 @@ class EditSession:
             self._cache.clear()
             self._frames.clear()
             self._mask_cache = {}
-            self._play = {}
-            self._play_bytes = 0
+            self._last_field = None
+            self.cut_key, self.src_key, self._origin = ("", ""), "", ()
             self.version += 1
-            self._new_epoch()
             if cut is None or self.project is None:
+                self.vers = PC.new_revisions()
                 return
             t0 = time.perf_counter()
             px = self.make_frames(cut)
@@ -89,13 +117,65 @@ class EditSession:
             if px is not None:
                 self.proxy = px
                 self.tracker = CutTracker(self.project, cut, px)
-            # seconds, for the project-open timing: the frames source, the tracker (with tracks.npz)
-            self.open_times = {"frames": t1 - t0, "tracker": time.perf_counter() - t1}
+            t2 = time.perf_counter()
+            self._enter(cut, px)
+            # seconds, for the project-open timing: the frames source, the tracker (with tracks.npz), the state
+            # the cut's kept frames are checked against
+            self.open_times = {"frames": t1 - t0, "tracker": t2 - t1, "state": time.perf_counter() - t2}
+
+    def _enter(self, cut: Cut, px) -> None:
+        """With the lock held, the cut just opened: its keys, and the processing revisions it had the last time it
+        was left if it is in the same state (then the finished frames kept for it are found again); else new
+        ones, and what was kept for it is given back."""
+        from ..core import frames as FR
+        prj = self.project
+        self.cut_key = (str(prj.path), cut.id)
+        try:
+            self._origin = FR.origin(px, cut.info, self.view_settings(cut))
+        except Exception:
+            self._origin = ("?", next(_EPOCHS))
+        self.src_key = _short((self._origin, PC.setting_values()))
+        self._home = (prj, cut)
+        vers = None
+        if px is not None:
+            try:
+                vers = PC.revisions().recall(self.cut_key, PC.state_digest(prj, cut, self._origin))
+            except Exception:
+                import traceback
+                traceback.print_exc()
+        if vers is None:
+            self.vers = PC.new_revisions()
+            PC.cache().drop(self.cut_key)
+            self.kept = 0
+        else:
+            self.vers = vers
+            self.kept = len(self.play_frames())
+        PC.cache().use(self.cut_key)
+
+    def _remember(self) -> None:
+        """With the lock held, before another cut takes this one's place: the cut keeps its processing revisions
+        for the next time it is opened in this state. Not with changes that were never saved: they are gone when
+        the cut is opened again, and what was made from them with them."""
+        home, self._home = self._home, None
+        if home is None:
+            return
+        ck = self.cut_key
+        if self.dirty or self.proxy is None:
+            PC.revisions().forget(ck)
+            return
+        try:
+            PC.revisions().remember(ck, PC.state_digest(home[0], home[1], self._origin), self.vers)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            PC.revisions().forget(ck)
 
     def adopt(self, other: "EditSession") -> None:
         """Takes over a cut another session opened and pre-rendered in the background (playback going on into the
-        next cut without a pause): its proxy, tracker, caches and the versions their keys were made with."""
+        next cut without a pause): its proxy, tracker, caches and the revisions their keys were made with."""
         with self._lock:
+            self._new_epoch()
+            self._remember()
             if self.proxy is not None and self.proxy is not other.proxy:
                 self.proxy.close()
             with other._lock:
@@ -103,15 +183,20 @@ class EditSession:
                 self._cache = OrderedDict(other._cache)
                 self._frames = OrderedDict(other._frames)
                 self._mask_cache = dict(other._mask_cache)
-                self._play = dict(other._play)
-                self._play_bytes = other._play_bytes
+                self._last_field = None
                 self.vers = dict(other.vers)
-                self.epoch = other.epoch          # the other session's entries were made for this cut
+                self.cut_key, self.src_key, self._origin = other.cut_key, other.src_key, other._origin
+                self._home, other._home = other._home, None     # the cut is this session's from now on
             self.version += 1
+            PC.cache().use(self.cut_key)
 
     def _new_epoch(self) -> None:
         with self._lock:
             self.epoch = next(_EPOCHS)
+
+    def generation(self) -> int:
+        with self._lock:
+            return self.epoch
 
     def proxy_ready(self) -> bool:
         """Frames can be read in the cut's current view (from a proxy or the original)."""
@@ -153,7 +238,7 @@ class EditSession:
             self.version += 1
             kinds = ("geo", "ret", "trk") if kind == "all" else (kind,)
             for k in kinds:
-                self.vers[k] += 1
+                self.vers[k] = PC.new_revision()
             if "trk" in kinds:
                 self._mask_cache = {}
             # entries keyed by stale versions simply stop being hit; drop the obviously stale ones
@@ -165,11 +250,11 @@ class EditSession:
         kind = key[0]
         v = self.vers
         if kind == "field":
-            return key[2:4] == (v["geo"], v["trk"]) and key[-1] == self.epoch
+            return key[2:4] == (v["geo"], v["trk"])
         if kind in ("retouch", "ret_img"):
-            return key[2:4] == (v["ret"], v["trk"]) and key[-1] == self.epoch
+            return key[2:4] == (v["ret"], v["trk"])
         if kind == "res":
-            return key[2:5] == (v["geo"], v["ret"], v["trk"]) and key[-1] == self.epoch
+            return key[2:5] == (v["geo"], v["ret"], v["trk"])
         return False
 
     # ------------------------------------------------------------------ preview
@@ -216,21 +301,22 @@ class EditSession:
         if self.tracker is None or self.tracker.store is None or self.cut is None:
             return None
         coarse = self.interactive if coarse is None else coarse
-        ep = self.epoch
-        key = ("field", t, self.vers["geo"], self.vers["trk"], coarse, ep)
-        fine = ("field", t, self.vers["geo"], self.vers["trk"], False, ep)
         with self._lock:
+            ep = self.epoch                # the opening this field is made in; kept only if it is still that one
+            key = ("field", t, self.vers["geo"], self.vers["trk"], coarse)
+            fine = ("field", t, self.vers["geo"], self.vers["trk"], False)
             if key in self._cache:
                 return self._cache[key]
             if coarse and fine in self._cache:
                 return self._cache[fine]
-        fi = F.build_input(self.cut, self.tracker, t)
-        px = self.proxy
-        if px is None:                     # the cut was closed while this was being computed
+            cut, tr, px = self.cut, self.tracker, self.proxy
+        if px is None or tr is None or cut is None:     # the cut was closed while this was being asked for
             return None
+        fi = F.build_input(cut, tr, t)
         div = 240 if coarse else 480
         fr = F.compute_field(fi, px.w, px.h, max(2, int(round(px.w / div))))
-        self._put(key, fr)
+        if not self._put(key, fr, ep):
+            return None                    # another cut was opened meanwhile: this is not a field of it
         self._last_field = (t, fr)
         return fr
 
@@ -240,14 +326,14 @@ class EditSession:
         with self._lock:
             best = None
             for key, val in reversed(self._cache.items()):
-                if key[0] != "field" or key[1] != t or key[-1] != self.epoch:
+                if key[0] != "field" or key[1] != t:
                     continue
                 if key[2:4] == (self.vers["geo"], self.vers["trk"]):
                     return val
                 if best is None:
                     best = val
             if best is None:
-                lf = getattr(self, "_last_field", None)
+                lf = self._last_field
                 if lf is not None and lf[0] == t:
                     best = lf[1]
             return best
@@ -255,71 +341,94 @@ class EditSession:
     # ------------------------------------------------------------------ playback cache
     def play_get(self, t: int) -> Optional[np.ndarray]:
         """Finished result of frame t from the playback cache (current settings only)."""
-        e = self._play.get(t)
-        if e is None or self.cut is None or e[0] != self.result_key(t, True):
+        if self.cut is None:
             return None
-        a = cv2.imdecode(np.frombuffer(e[1], np.uint8), cv2.IMREAD_COLOR)
+        data = PC.cache().get(self.cut_key, t, self.result_key(t, True))
+        if data is None:
+            return None
+        a = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
         return None if a is None else cv2.cvtColor(a, cv2.COLOR_BGR2RGB)
 
     def play_has(self, t: int) -> bool:
-        e = self._play.get(t)
-        return e is not None and self.cut is not None and e[0] == self.result_key(t, True)
+        return self.cut is not None and PC.cache().has(self.cut_key, t, self.result_key(t, True))
 
     def play_put(self, t: int, key: tuple, img: np.ndarray, near: int = 0) -> None:
+        """Keeps a finished frame under its key (the cut it belongs to is in the key: a frame finished for a cut
+        that is no longer the open one still goes to that cut). Over the memory budget of all cuts together:
+        see PlayCache."""
         ok, buf = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 92])
         if not ok:
             return
-        data = buf.tobytes()
+        ck = key[-2]
+        current = None
+        if ck == self.cut_key:
+            tail = self.result_key(0, True)[2:]
+            current = lambda f, k: k[2:] == tail and k[1] == f      # noqa: E731
+        PC.cache().put(ck, t, key, buf.tobytes(), near=near, current=current)
+
+    def play_render(self, t: int, near: int = 0) -> bool:
+        """Frame t's finished result into the playback cache. False: it could not be made, or the cut or its
+        values changed while it was being made (then nothing is kept: it is the picture of neither state)."""
         with self._lock:
-            old = self._play.pop(t, None)
-            if old is not None:
-                self._play_bytes -= len(old[1])
-            self._play[t] = (key, data)
-            self._play_bytes += len(data)
-            # over budget: drop stale entries first, then the frames furthest from where we are
-            if self._play_bytes > self.play_limit:
-                cur = {f for f in self._play if self._play[f][0] == self.result_key(f, True)}
-                order = sorted(self._play, key=lambda f: (f in cur, -abs(f - near)))
-                for f in order:
-                    if self._play_bytes <= self.play_limit * 0.9:
-                        break
-                    if f == t:
-                        continue
-                    self._play_bytes -= len(self._play.pop(f)[1])
+            ep = self.epoch
+            if self.cut is None:
+                return False
+            key = self.result_key(t, True)
+        img = self.result(t, final=True)
+        with self._lock:
+            if img is None or self.epoch != ep or self.cut is None or self.result_key(t, True) != key:
+                return False
+        self.play_put(t, key, img, near=near)
+        return True
 
     def play_frames(self) -> List[int]:
         if self.cut is None:
             return []
-        return [f for f, e in list(self._play.items()) if e[0] == self.result_key(f, True)]
+        tail = self.result_key(0, True)[2:]
+        return [f for f, k in PC.cache().frames(self.cut_key) if k[2:] == tail and k[1] == f]
 
-    def _put(self, key, val):
+    def play_bytes(self) -> int:
+        """Bytes the open cut's finished frames take (all cuts: PC.cache().bytes)."""
+        return PC.cache().size(self.cut_key) if self.cut is not None else 0
+
+    def _put(self, key, val, ep: Optional[int] = None) -> bool:
+        """Keeps an intermediate result of the open cut. ep: the generation the work started in; False (nothing
+        kept) when another cut was opened since."""
         with self._lock:
+            if ep is not None and self.epoch != ep:
+                return False
             self._cache[key] = val
             while len(self._cache) > 40:
                 self._cache.popitem(last=False)
+        return True
 
     def result_key(self, t: int, final: bool = False) -> tuple:
-        # the cut is part of the key: a result computed for the previous cut must never show on this one
-        # and the epoch: the same cut opened again (or its proxy made again) while an old computation was running
-        # must not get that computation's picture
+        """What frame t's result is made from: the processing revisions (shape, retouch, tracking), whether it is
+        the coarse one of a slider being dragged, the mode, the cut (project path and cut id) and what its frames
+        are read from with the settings that choose colours and models. Nothing about when it was asked for:
+        the same cut opened again in the same state has the same keys."""
         return ("res", t, self.vers["geo"], self.vers["ret"], self.vers["trk"], False if final else self.interactive,
-                self.cut.mode if self.cut else "", self.cut.id if self.cut else "", self.epoch)
+                self.cut.mode if self.cut else "", self.cut_key, self.src_key)
 
     def cached_result(self, t: int) -> Optional[np.ndarray]:
         with self._lock:
             return self._cache.get(self.result_key(t))
 
     def retouched(self, t: int) -> Optional[np.ndarray]:
-        ep = self.epoch                     # before the frame is read: the key is for the cut this frame is of
+        with self._lock:
+            ep = self.epoch                 # before the frame is read: all of it within one opening of the cut
+            px = self.proxy
         img = self.frame(t)
-        if img is None:
+        if img is None or px is None:
             return None
         live = bool(self.interactive)
-        key = ("ret_img", t, self.vers["ret"], self.vers["trk"], live, ep)
+        key = ("ret_img", t, self.vers["ret"], self.vers["trk"], live)
         with self._lock:
+            if self.epoch != ep:
+                return None
             if key in self._cache:
                 return self._cache[key]
-            full = ("ret_img", t, self.vers["ret"], self.vers["trk"], False, ep)
+            full = ("ret_img", t, self.vers["ret"], self.vers["trk"], False)
             if live and full in self._cache:
                 return self._cache[full]
         rf = self.retouch(t)
@@ -331,52 +440,80 @@ class EditSession:
                 import cv2 as _cv2
                 h, w = img.shape[:2]
                 small = _cv2.resize(img, (w // 2, h // 2), interpolation=_cv2.INTER_AREA)
-                ds = apply_rgb(small, rf, self.proxy.sx * 0.5).astype(np.int16) - small.astype(np.int16)
+                ds = apply_rgb(small, rf, px.sx * 0.5).astype(np.int16) - small.astype(np.int16)
                 d = _cv2.resize(ds, (w, h), interpolation=_cv2.INTER_LINEAR)
                 img = np.clip(img.astype(np.int16) + d, 0, 255).astype(np.uint8)
             else:
-                img = apply_rgb(img, rf, self.proxy.sx)
-        self._put(key, img)
+                img = apply_rgb(img, rf, px.sx)
+        if not self._put(key, img, ep):
+            return None
         return img
 
-    def result(self, t: int, final: bool = False) -> Optional[np.ndarray]:
+    def render(self, t: int, final: bool = False):
+        """(key, picture, generation) of frame t's result, all of it made within one opening of the cut. None
+        when there is no picture, or another cut was opened while it was being made: what was computed then is
+        partly of one cut and partly of the other, and is neither kept nor handed out."""
+        with self._lock:
+            ep = self.epoch
+            if self.cut is None or self.proxy is None:
+                return None
+            key = self.result_key(t, final)
+            img = self._cache.get(key)
+        if img is not None:
+            return key, img, ep
         if self.frame(t) is None:
             return None
-        key = self.result_key(t, final)
-        with self._lock:
-            if key in self._cache:
-                return self._cache[key]
         with self._compute:
-            return self._result(t, key, final)
-
-    def _result(self, t: int, key: tuple, final: bool) -> Optional[np.ndarray]:
+            img = self._result(t, key, final, ep)
         with self._lock:
+            if img is None or self.epoch != ep:
+                return None
+        return key, img, ep
+
+    def result(self, t: int, final: bool = False) -> Optional[np.ndarray]:
+        r = self.render(t, final)
+        return None if r is None else r[1]
+
+    def _result(self, t: int, key: tuple, final: bool, ep: int) -> Optional[np.ndarray]:
+        with self._lock:
+            if self.epoch != ep:
+                return None
             if key in self._cache:
                 return self._cache[key]
+        # each step is made within one opening of the cut (it notes the generation itself); the generation checked
+        # after each makes that the one this result was asked in
         img = self.retouched(t)
+        with self._lock:
+            if img is None or self.epoch != ep:
+                return None
         fr = self.field(t, False if final else None)
+        with self._lock:
+            if self.epoch != ep:
+                return None
         if fr is None or fr.empty():
             out = img
         else:
             out = F.warp_image(img, fr)
-        self._put(key, out)
+        if not self._put(key, out, ep):
+            return None
         return out
 
     def retouch(self, t: int):
         """Retouch masks and values for frame t (None when nothing is active)."""
-        if self.tracker is None or self.tracker.store is None or self.cut is None:
-            return None
-        key = ("retouch", t, self.vers["ret"], self.vers["trk"], self.epoch)
         with self._lock:
+            ep = self.epoch
+            cut, tr, masks = self.cut, self.tracker, self._mask_cache
+            if tr is None or tr.store is None or cut is None:
+                return None
+            key = ("retouch", t, self.vers["ret"], self.vers["trk"])
             if key in self._cache:
                 return self._cache[key]
         from ..retouch.engine import prepare
         try:
-            rf = prepare(self.cut, self.tracker, t, self._mask_cache)
+            rf = prepare(cut, tr, t, masks)
         except Exception:
             rf = None
-        self._put(key, rf)
-        return rf
+        return rf if self._put(key, rf, ep) else None
 
     def skin_masks(self, t: int):
         rf = self.retouch(t)

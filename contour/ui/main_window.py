@@ -207,6 +207,9 @@ class MainWindow(QMainWindow):
         self.next_prep = NextCutPrep()
         self.proxy_builder = ProxyBuilder(self)
         self.proxy_builder.finished.connect(self._bg_proxy_done)
+        self.proxy_builder.progressed.connect(self._bg_proxy_progress)
+        self._px_making = None                     # ((project path, cut id), percent) of the proxy being made
+        self._px_failed: dict = {}                 # (project path, cut id) -> why its proxy could not be made
         self.cache_worker.progressed.connect(lambda: self.timeline.update())
         self.cache_timer = QTimer(self)
         self.cache_timer.timeout.connect(lambda: self.cache_worker.kick(self.frame) if self.session.cut else None)
@@ -422,6 +425,9 @@ class MainWindow(QMainWindow):
         self.hover_btn.toggled.connect(self._hover_pick)
         h.addWidget(self.hover_btn)
         h.addStretch(1)
+        self.px_lbl = QLabel("")                 # where the open cut's frames come from; a proxy being made or failed
+        self.px_lbl.setObjectName("Faint")
+        h.addWidget(self.px_lbl)
         self.cs_lbl = QLabel("")
         self.cs_lbl.setObjectName("Faint")
         h.addWidget(self.cs_lbl)
@@ -1117,6 +1123,20 @@ class MainWindow(QMainWindow):
             self._reanalyse_after_proxy = None
             QTimer.singleShot(0, self.run_analysis)
 
+    def _reopen_cut(self) -> bool:
+        """The open cut again from its files (another colour view, LUT or setting). What was changed in memory and
+        not saved yet is saved first: opening reads the tracks from the file again (1.22.2 dropped joint edits
+        made since the last save here)."""
+        cut = self.session.cut
+        if cut is None:
+            return False
+        if self.session.dirty and not self.save():
+            self.toast("저장하지 못해 화면을 다시 만들지 않았습니다. 저장한 뒤 컷을 다시 열면 반영됩니다", kind="error")
+            return False
+        self.session.open_cut(cut)
+        self.build_proxy()
+        return True
+
     def _maybe_bg_proxy(self, first: bool = False):
         """설정 > 프록시 만들기: 'always' makes the open cut's proxy in the background; 'auto' only once reading the
         original turned out slower than it plays."""
@@ -1127,19 +1147,69 @@ class MainWindow(QMainWindow):
         if proxy_mode() == "always" or wants_proxy(s.proxy, s.cut.info.fps):
             self.proxy_builder.start(s.project, s.cut, s.view_settings(s.cut))
 
+    def _proxy_note(self) -> None:
+        """Beside the picture, never in the way (1.22.3): what the open cut's frames are read from, a proxy being
+        made in the background (with how far it is) or one that could not be made (the reason in the tooltip)."""
+        lbl = getattr(self, "px_lbl", None)
+        if lbl is None:
+            return
+        s = self.session
+        if s.cut is None or s.proxy is None or s.project is None:
+            lbl.setText("")
+            lbl.setToolTip("")
+            return
+        ck = (str(s.project.path), s.cut.id)
+        making = getattr(self, "_px_making", None)
+        failed = getattr(self, "_px_failed", {})
+        if not s.from_source():
+            text, tip = "프록시", "이 컷의 프록시 파일에서 읽습니다."
+        elif ck in failed:
+            text = "프록시 실패 · 원본으로 계속"
+            tip = "프록시를 만들지 못했습니다. 원본을 바로 읽어 계속 작업할 수 있습니다.\n" + failed[ck][:600]
+        elif making is not None and making[0] == ck and self.proxy_builder.busy:
+            text = f"프록시 만드는 중 {making[1]}%"
+            tip = "뒤에서 프록시를 만드는 중입니다. 기다리지 않고 원본으로 바로 탐색·재생할 수 있습니다."
+        else:
+            text = "원본에서 바로 읽는 중"
+            tip = "프록시 없이 원본을 그때그때 읽습니다. 탐색·재생·분석 모두 바로 할 수 있습니다."
+        lbl.setText(text + "   ")
+        lbl.setToolTip(tip)
+
+    def _bg_proxy_progress(self, prj_path: str, cut_id: str, f: float):
+        self._px_making = ((prj_path, cut_id), int(round(100 * max(0.0, min(1.0, float(f))))))
+        s = self.session
+        if s.cut is not None and s.cut.id == cut_id and s.project is not None and str(s.project.path) == prj_path:
+            self._proxy_note()
+
     def _bg_proxy_done(self, prj_path: str, cut_id: str, ok: bool, msg: str):
         s = self.session
+        # a proxy of an earlier cut or of a project since closed never replaces what is on screen now
+        here = not (s.cut is None or s.cut.id != cut_id or s.project is None or str(s.project.path) != prj_path)
+        full = hasattr(self, "px_lbl")
+        if full:
+            self._px_making = None
         if not ok:
             if msg:
                 print("background proxy:", msg, flush=True)
+            if full:
+                # said once, beside the picture, and kept there for this cut; it goes on from its original
+                # (1.22.2 only printed it)
+                self._px_failed[(prj_path, cut_id)] = msg or "원인을 알 수 없습니다"
+                if here:
+                    self._proxy_note()
+                    self.toast("프록시를 만들지 못했습니다. 원본으로 계속 볼 수 있습니다"
+                               + (": " + msg.splitlines()[0][:120] if msg else ""), "warn")
             return
-        # a proxy of an earlier cut or of a project since closed never replaces what is on screen now
-        if s.cut is None or s.cut.id != cut_id or s.project is None or str(s.project.path) != prj_path:
+        if full:
+            self._px_failed.pop((prj_path, cut_id), None)
+        if not here:
             return
         from ..core.frames import frames_for
         new = frames_for(s.project, s.cut, s.view_settings(s.cut))
         if getattr(new, "kind", "") == "proxy" and self.job is None and s.swap_frames(cut_id, new):
             self.toast("프록시가 준비되어 이 컷을 더 빠르게 읽습니다", "ok")
+        if full:
+            self._proxy_note()
 
     # ================================================================== cut menu (cut list and timeline)
     def _sel_cut_ids(self) -> list:
@@ -3830,8 +3900,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
             if r == QMessageBox.Yes:
                 self._reanalyse_after_proxy = cut.id
-        self.session.open_cut(cut)
-        self.build_proxy()
+        self._reopen_cut()
 
     def choose_lut(self):
         cut = self.session.cut
@@ -3845,8 +3914,7 @@ class MainWindow(QMainWindow):
             if act == a2:
                 cut.lut_path = ""
                 self.session.project.save()
-                self.session.open_cut(cut)
-                self.build_proxy()
+                self._reopen_cut()
                 return
             if act != a1:
                 return
@@ -3854,8 +3922,7 @@ class MainWindow(QMainWindow):
         if f:
             cut.lut_path = f
             self.session.project.save()
-            self.session.open_cut(cut)
-            self.build_proxy()
+            self._reopen_cut()
 
     def enqueue_render(self):
         s = self.session
@@ -4098,6 +4165,7 @@ class MainWindow(QMainWindow):
             self.cs_lbl.setText(f"입력 {cs}" + (" + LUT" if cut.lut_path else ""))
         else:
             self.cs_lbl.setText("")
+        self._proxy_note()
         if not skip_inspector:
             self.inspector.refresh()
         self.cutlist.update_rows()
@@ -4111,7 +4179,10 @@ class MainWindow(QMainWindow):
     def open_settings(self):
         d = SettingsDialog(self)
         if d.exec():
-            changed = d.apply()
+            from ..core import playcache as PC
+            before = PC.setting_values()
+            changed = d.apply() or PC.setting_values() != before     # the view, or a setting results are made with
+            PC.cache().set_limit(PC.limit_bytes())
             if d.check_update:
                 from . import update as UP
                 UP.check(self, manual=True)
@@ -4121,8 +4192,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             if changed and self.session.cut is not None:
-                self.session.open_cut(self.session.cut)
-                self.build_proxy()
+                self._reopen_cut()
 
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls():
