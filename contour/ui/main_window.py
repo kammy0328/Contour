@@ -1549,6 +1549,11 @@ class MainWindow(QMainWindow):
         acc = self.accuracy
 
         prj = s.project
+        # 분석 시작 on the open cut is the user's own call: an earlier quick look's 'nobody, skipped' is forgotten
+        from ..track.prescan import clear_skip
+        cdir = Path(prj.path) / "cuts" / cut.id
+        if clear_skip(cut, cdir if cdir.is_dir() else None):
+            s.dirty = True
 
         def work(progress, cancelled):
             res = tr.analyze(progress, cancelled, accuracy=acc)
@@ -1860,10 +1865,19 @@ class MainWindow(QMainWindow):
         self._batch_skin = None
         self._start_batch(todo, title, prescan=not picked)
 
-    def _start_batch(self, todo: list, title: str = "전체 분석", prescan: bool = False):
+    def _start_batch(self, todo: list, title: str = "전체 분석", prescan: bool = False, force=None):
+        """force (default: when no quick look is asked for): the user picked these cuts, they are analysed whatever
+        a quick look said before or would say now."""
         prj = self.session.project
         if prj is None or not todo:
             return
+        force = (not prescan) if force is None else bool(force)
+        if force:
+            # before the project is saved for the analysis process: an earlier 'nobody, skipped' is forgotten
+            from ..track.prescan import clear_skip
+            root = Path(prj.path) / "cuts"
+            for c in todo:
+                clear_skip(c, root / c.id if (root / c.id).is_dir() else None)
         if not self.save():                     # the analysis process reads the project from disk
             return
         # 1.18: no proxy first. A bake proxy that exists is still shared by the shots; else each shot's analysis
@@ -1888,11 +1902,7 @@ class MainWindow(QMainWindow):
             free_gpu_memory()
         except Exception:
             pass
-        if not prescan:
-            for c in todo:                       # picked by hand: whatever the quick look said before, analyse it
-                if (c.status or {}).get("prescan"):
-                    c.status = {k: v for k, v in c.status.items() if k not in ("auto", "reason", "prescan", "prescan_info")}
-        self.batch.start(prj.path, [c.id for c in todo], self.accuracy, True, prescan=prescan)
+        self.batch.start(prj.path, [c.id for c in todo], self.accuracy, True, prescan=prescan, force=force)
 
     def _batch_skipped(self, cid: str, info: str):
         """The quick look found nobody in this cut: not analysed, with the reason (다시 분석 takes it in again)."""

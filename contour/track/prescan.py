@@ -3,8 +3,9 @@
 The full analysis opens several large models per cut; a cut with nobody in it needs none of them. One light person
 detector (YOLOX-m) is opened once for all the cuts of a batch, and each cut is looked at in the picture the analysis
 itself would see (the same colour view: a log original is looked at in its display view, not as flat log):
-- a short cut frame by frame (every second frame), a long one at its start, middle and end and at even steps, then
-  about every half second before it is called empty (or when the first frames leave it open);
+- a short cut every second frame first and, before it is called empty (or when those leave it open), every frame;
+  a long one at its start, middle and end and at even steps, then about every half second before it is called
+  empty (or when the first frames leave it open); two frames with someone plainly there end the look at once;
 - three answers: someone is there (analyse), nobody is there (skip, with the reason), or not sure (analyse: a
   small person, someone seen in one frame only, a weak detection, a dark or flashing picture, frames that could not
   be read, too few frames). Only a clear 'nobody' skips a cut.
@@ -92,23 +93,37 @@ class Prescan:
         t0 = time.time()
         found: List[Optional[List[tuple]]] = []
         lumas: List[float] = []
-        ts = plan(n)
-        for i, t in enumerate(ts):
-            self._one(frame_of, t, found, lumas)
-            # two frames with someone plainly there settle it: the rest is not looked at (most cuts have people,
-            # and reading every planned frame of a 4K original cost ~2.8 s a cut where ~0.5 s will do)
-            if sum(1 for f in found if f and any(s_ >= SURE_SCORE and h >= SURE_H for s_, h in f)) >= 2:
-                ts = ts[:i + 1]
-                break
-        r = judge(found, lumas, len(ts))
-        if n > DENSE and (r["verdict"] == NONE or r["reason"] in ("낮은 검출 신뢰도", "작은 인물", "프레임을 충분히 읽지 못함",
-                                                                 "한 프레임에서만 보인 인물")):
-            # a long cut: never called empty from its first frames alone (someone may come in between them), and
-            # one left open is looked at closer before the large models are opened for it
-            more = plan(n, more=True)
-            for t in more:
+
+        def sure_frames() -> int:
+            return sum(1 for f in found if f and any(s_ >= SURE_SCORE and h >= SURE_H for s_, h in f))
+
+        def run(ts) -> int:
+            """Looks at ts in order; stops once two frames show someone plainly (the rest is not needed: most
+            cuts have people, and reading every planned frame of a 4K original cost ~2.8 s a cut where ~0.5 s
+            will do). The number of frames looked at."""
+            k = 0
+            for t in ts:
                 self._one(frame_of, t, found, lumas)
-            r = judge(found, lumas, len(ts) + len(more))
+                k += 1
+                if sure_frames() >= 2:
+                    break
+            return k
+        looked = run(plan(n))
+        r = judge(found, lumas, looked)
+        open_ = ("낮은 검출 신뢰도", "작은 인물", "프레임을 충분히 읽지 못함", "한 프레임에서만 보인 인물")
+        if r["verdict"] == NONE or r["reason"] in open_:
+            if n > DENSE:
+                # a long cut: never called empty from its first frames alone (someone may come in between them),
+                # and one left open is looked at closer before the large models are opened for it
+                more = plan(n, more=True)
+            else:
+                # a short cut: every frame is looked at before it is called empty (someone there on one frame
+                # between the samples was missed: 20 frames, a person on frame 5 only)
+                seen = set(plan(n))
+                more = [t for t in range(int(n)) if t not in seen]
+            if more:
+                looked += run(more)
+                r = judge(found, lumas, looked)
         r["seconds"] = round(time.time() - t0, 2)
         return r
 
@@ -172,3 +187,25 @@ def scan(project, cuts: Iterable, progress: Optional[Callable[[float, str], None
     if progress:
         progress(1.0, "인물 빠른 확인 끝")
     return out
+
+
+SKIP_KEYS = ("prescan", "prescan_info")
+
+
+def clear_skip(cut, cut_dir=None) -> bool:
+    """The user asked for this cut to be analysed: what an earlier quick look decided ('nobody, skipped') is taken
+    off the cut (and its prescan.json removed), so nothing downstream skips it again. True when there was one."""
+    st = dict(getattr(cut, "status", None) or {})
+    had = bool(st.get("prescan")) or (st.get("auto") == "none" and "빠른 검사" in str(st.get("reason", "")))
+    if had:
+        for k in SKIP_KEYS + ("auto", "reason"):
+            st.pop(k, None)
+        cut.status = st
+    if cut_dir is not None:
+        try:
+            f = cut_dir / "prescan.json"
+            if f.exists():
+                f.unlink()
+        except OSError:
+            pass
+    return had

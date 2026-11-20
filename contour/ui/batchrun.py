@@ -104,21 +104,26 @@ class BatchRunner(QObject):
         self._scan_wanted: List[str] = []
         self._scanning: Optional[List[str]] = None
         self.scanned: dict = {}                                       # cut id -> the quick look's answer
+        self.forced: set = set()                                      # cuts the user asked for: never skipped
 
     @property
     def busy(self) -> bool:
         return self.proc is not None or bool(self.queue)
 
     def start(self, project_path: str, cut_ids: List[str], accuracy: str = "high", all_targets: bool = True,
-              prescan: bool = False):
-        """prescan: look for people in all of them first (cuts the user picked one by one are analysed anyway:
-        the caller passes prescan=False for those)."""
+              prescan: bool = False, force: bool = False):
+        """prescan: look for people in all of them first. force: cuts the user picked one by one, analysed whatever
+        a quick look says: none is run for them, here or inside their own analysis (--prescan 0), and an answer
+        an earlier look gave is forgotten."""
         self.project_path = project_path
         self.opts = dict(accuracy=accuracy, all_targets=all_targets)
         for c in cut_ids:
+            if force:
+                self.forced.add(c)
+                self.scanned.pop(c, None)
             if c not in self.queue and c != self.current:
                 self.queue.append(c)
-                if prescan and c not in self.scanned:
+                if prescan and not force and c not in self.scanned and c not in self.forced:
                     self._scan_wanted.append(c)
         if self.proc is None:
             self.done = self.failed = 0
@@ -221,7 +226,7 @@ class BatchRunner(QObject):
             self.current = cid
             p = self._spawn(["analyze", self.project_path, cid, "--accuracy", self.opts.get("accuracy", "high"),
                              "--all-targets", "1" if self.opts.get("all_targets", True) else "0",
-                             "--prescan", "0" if cid in self.scanned else "1"], cid)
+                             "--prescan", "0" if (cid in self.scanned or cid in self.forced) else "1"], cid)
             self.proc = p
             self.progressed.emit(cid, 0.0, "시작")
             p.start()
@@ -266,7 +271,7 @@ class BatchRunner(QObject):
             r = {}
         r["verdict"] = verdict
         self.scanned[cid] = r
-        if verdict == "none" and cid in self.queue:
+        if verdict == "none" and cid in self.queue and cid not in self.forced:
             self.queue.remove(cid)
             self.skipped.emit(cid, json.dumps(r, ensure_ascii=False))
 
