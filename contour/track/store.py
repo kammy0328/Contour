@@ -63,6 +63,7 @@ class TrackStore:
         self.has_face = False
         self.has_hands = False
         self.has_contour = False
+        self.matte_rev = 0            # revision of the person matte the widths and outlines were measured on
         self.removed: Dict[int, np.ndarray] = {}                       # deleted person id -> boxes (n,4)
 
     # ------------------------------------------------------------------ persons
@@ -133,7 +134,7 @@ class TrackStore:
         data = dict(version=np.array(self.VERSION), n=np.array(self.n), pids=np.array(self.pids, np.int32),
                     homog=self.homog, homog_ok=self.homog_ok, jump=self.jump, has_vis=np.array(self.has_vis),
                     has_face=np.array(self.has_face), has_hands=np.array(self.has_hands),
-                    has_contour=np.array(self.has_contour))
+                    has_contour=np.array(self.has_contour), matte_rev=np.array(int(self.matte_rev)))
         for name in PER_PERSON:
             data[name] = getattr(self, name)
         for k, v in self.raw.items():
@@ -167,6 +168,7 @@ class TrackStore:
                 st.has_face = bool(d["has_face"]) if "has_face" in d.files else False
                 st.has_hands = bool(d["has_hands"]) if "has_hands" in d.files else False
                 st.has_contour = bool(d["has_contour"]) if "has_contour" in d.files else False
+                st.matte_rev = int(d["matte_rev"]) if "matte_rev" in d.files else 0
                 if "contour" in d.files and d["contour"].shape != st.contour.shape:
                     st.has_contour = False
                 for k in d.files:

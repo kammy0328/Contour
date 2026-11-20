@@ -74,25 +74,56 @@ def _differs(B, A, thr: float) -> bool:
 
 
 def changed(tracker, before: Optional[dict], rng: Optional[Sequence[int]] = None) -> List[List[int]]:
-    """[a, b) ranges, inside rng (default the work range), where the matte's prompts are no longer what they
-    were before the edit. Frames an edit left alone are not matted again."""
+    """[a, b) ranges, inside rng (default the work range), where the matte's prompts are no longer what the matte
+    of that frame was made from (matte_rev.load_prompts, recorded with every matte revision since 1.22.3). Small
+    moves add up: the third 10 px move of a wrist at 4K is 30 px from what the matte was made of, though each one
+    was under the limit against the edit before (which is all 1.22.2 looked at).
+    before: the prompts just before the edit, used for frames nothing is recorded for (a cut matted by an older
+    version, a frame still marked). Frames an edit left alone are not matted again."""
     st = getattr(tracker, "store", None)
-    if st is None or before is None:
+    if st is None:
+        return []
+    base = None
+    try:
+        from . import matte_rev as MRV
+        base = MRV.load_prompts(tracker)
+    except Exception:
+        base = None
+    if before is None and base is None:
         return []
     now = prompt_state(tracker)
     a0, b0 = tracker.cut.work_range
     a, b = (a0, b0) if rng is None else (max(a0, int(rng[0])), min(b0, int(rng[1])))
     thr = MOVE * float(getattr(tracker.cut.info, "height", 0) or 1080)
-    if before["final"].shape[1] != now["final"].shape[1]:
+    if before is not None and before["final"].shape[1] != now["final"].shape[1]:
         return [[a, b]] if b > a else []
     out: List[List[int]] = []
     for t in range(a, b):
-        if _differs(_people(before, t), _people(now, t), thr):
+        if base is not None and base["known"][t]:
+            ref = _people(base, t)
+        elif before is not None:
+            ref = _people(before, t)
+        else:
+            continue
+        if _differs(ref, _people(now, t), thr):
             if out and out[-1][1] == t:
                 out[-1][1] = t + 1
             else:
                 out.append([t, t + 1])
     return merge(out)
+
+
+def stale(tracker) -> List[List[int]]:
+    """The frames of the work range whose matte is not made from the present tracking, told from what is recorded
+    with the matte alone (no edit needed to say so): for a cut being opened, after an edit whose marks were
+    never saved or a refresh taken back. [] when nothing is recorded."""
+    try:
+        from . import matte_rev as MRV
+        if getattr(tracker, "store", None) is None or not tracker.has_seg() or MRV.load_prompts(tracker) is None:
+            return []
+    except Exception:
+        return []
+    return changed(tracker, None)
 
 
 def merge(ranges: Sequence[Sequence[int]], gap: int = 6) -> List[List[int]]:
@@ -185,40 +216,19 @@ def compute(tracker, ranges, cancel: Optional[Callable[[], bool]] = None,
         SG.run(st, tracker.proxy, mbuf, lbuf, a, b, SG.model_for("max"), True, sub, cancel, models.get("matter"),
                models=models)
         done += b - a
-    return dict(matte=mbuf.frames, labels=lbuf.frames, ranges=rs, model=models.get("used", ""))
+    res = dict(matte=mbuf.frames, labels=lbuf.frames, ranges=rs, model=models.get("used", ""))
+    # the rest of the revision, still in memory: widths and outlines measured on the new matte, the clothing of
+    # the frames whose owners change (instruction 2026-11-20 §1-2: finished first, put in use together)
+    from . import matte_rev as MRV
+    res["stage"] = MRV.stage(tracker, mbuf.frames, lbuf.frames, rs, cancel=cancel, models=models)
+    return res
 
 
 def commit(tracker, result: dict) -> List[List[int]]:
-    """Writes the new frames at once and measures everybody's widths and outlines again in those frames."""
-    if not result or not result.get("ranges"):
-        return []
-    mm = tracker.matte.open_rw()
-    lm = tracker.seglab.open_rw()
-    try:
-        # alpha and owners of a frame one right after the other (a preview read in between is redone: the
-        # caller touches the session once this returns)
-        for t in sorted(set(result["matte"]) | set(result["labels"])):
-            if t in result["matte"]:
-                mm[t] = result["matte"][t]
-            if t in result["labels"]:
-                lm[t] = result["labels"][t]
-        mm.flush()
-        lm.flush()
-    finally:
-        del mm, lm
-        tracker.matte.close()
-        tracker.seglab.close()
-    for a, b in result["ranges"]:
-        tracker.invalidate_labels(range(a, b))
-    # what was cut out of the old owners: heads (hair), outlines, skin models
-    tracker._geo_cache = {}
-    tracker._head_raw = {}
-    tracker._skin_models = {}
-    for a, b in result["ranges"]:
-        tracker.update_widths(None, (a, b))
-    tracker.write_seg_meta(model=result.get("model", ""), ranges=result["ranges"])
-    tracker.save()
-    return [list(r) for r in result["ranges"]]
+    """Puts a computed refresh in use as one revision: alpha, owners, widths, outlines and clothing of its frames
+    together (matte_rev.activate). Raises with the revision before still in use when that does not go through."""
+    from . import matte_rev as MRV
+    return MRV.activate(tracker, result)
 
 
 def refresh_now(tracker, ranges, progress=None, cancel=None, models: Optional[dict] = None) -> List[List[int]]:

@@ -36,7 +36,8 @@ DEFAULT_MB = 1200
 SKIP_CUT = ("name", "qc", "stats", "created", "benchmark_id", "learn", "pending_copy", "retouch_ref",
             "style_learned", "tl", "status", "version", "versions", "output")
 # files in a cut's folder that no finished frame depends on
-SKIP_FILES = ("prescan.json", "batch_result.json", "identity.npz")
+SKIP_FILES = ("prescan.json", "batch_result.json", "identity.npz", "matte_prompts.npz", "matte_undo.npz",
+              "matte_swap.json", "matte_stage.json")
 # settings a finished frame depends on (the colour view and the frame size are part of frames.origin as well)
 SETTING_KEYS = ("display", "view", "proxy_long_side", "face_model", "cloth_model", "unified_model", "gpu")
 
@@ -65,7 +66,7 @@ def _stamps(folder: Path) -> list:
             continue
         for e in entries:
             n = e.name
-            if n.startswith("proxy") or n in SKIP_FILES or "recovery" in n or ".tmp" in n:
+            if n.startswith("proxy") or n in SKIP_FILES or "recovery" in n or ".tmp" in n or ".stage" in n:
                 continue
             ext = os.path.splitext(n)[1].lower()
             if ext not in (".json", ".npz", ".u8"):

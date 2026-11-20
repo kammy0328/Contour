@@ -196,10 +196,27 @@ class CutTracker:
         # head parts per pixel (1 = hair, 2 = face), filled on demand for precise head edits
         self.parts = MatteStore(project.cache_dir(cut), proxy.n, mw, mh, prefix="parts")
         self._alias_path = project.cache_dir(cut) / "seglab_alias.json"
+        self._stage_extra = None             # files of a whole new matte being written (matte_rev.begin)
+        self._stage_meta = None
+        # a matte revision that was being put in use when the app ended: the cut is put back on its last complete
+        # one (matte_rev: the whole matte before the tracks are read, a refresh of some frames after)
+        self.recovered = ""
+        try:
+            from . import matte_rev as MRV
+            self.recovered = MRV.recover_files(project.cache_dir(cut), self.path, self.seg_meta)
+        except Exception:
+            import traceback
+            traceback.print_exc()
         self.store: Optional[TrackStore] = TrackStore.load(self.path)
         if self.store is not None and self.store.n != proxy.n:
             self.store = None
         self._label_cache: Dict[int, np.ndarray] = {}
+        try:
+            from . import matte_rev as MRV
+            self.recovered = MRV.recover(self) or self.recovered
+        except Exception:
+            import traceback
+            traceback.print_exc()
         self.widths_stale = False
         st = self.store
         if st is not None and st.widths.shape[2] != B.N_SEG:
@@ -263,38 +280,70 @@ class CutTracker:
         lab = self._label_cache.get(t)
         if lab is None:
             seg = self.seglab.get(t) if self.seglab.exists() else None
-            sk = None
-            if seg is None or not seg.any():
-                kps = [self.store.kp(pid, t) for pid in self.store.pids]
-                lab = B.label_map(kps, (self.matte.h, self.matte.w),
-                                  (self.matte.w / self.cut.info.width, self.matte.h / self.cut.info.height))
-            else:
-                lut = np.full(256, -1, np.int16)
-                alias = self._seg_alias()
-                for idx, pid in enumerate(self.store.pids):
-                    if 0 <= pid < 255:
-                        lut[pid + 1] = idx
-                for a_, b_ in alias.items():
-                    if 0 <= a_ < 255 and b_ in self.store.pids:
-                        lut[a_ + 1] = self.store.pids.index(b_)
-                lab = lut[seg]
-                al = self.matte.get(t)
-                if al is not None:
-                    # 255: a person nobody tracks (an extra): stays nobody's
-                    miss = (lab < 0) & (al >= 128) & (np.asarray(seg) != 255)
-                    if miss.any():
-                        kps = [self.store.kp(pid, t) for pid in self.store.pids]
-                        sk = B.label_map(kps, (self.matte.h, self.matte.w),
-                                         (self.matte.w / self.cut.info.width, self.matte.h / self.cut.info.height))
-                        lab = np.where(miss, sk, lab).astype(np.int16)
+            lab = self.labels_from(t, seg, lambda: self.matte.get(t))
             if len(self._label_cache) > 48:
                 self._label_cache.pop(next(iter(self._label_cache)))
             self._label_cache[t] = lab
         return lab
 
+    def labels_from(self, t: int, seg, alpha) -> np.ndarray:
+        """labels(t) for a given owner frame and alpha (alpha: the frame, or a function that gives it): the owners
+        in use, or those of a matte revision that is not in use yet (matte_rev.stage). Nothing is kept."""
+        if seg is None or not np.asarray(seg).any():
+            kps = [self.store.kp(pid, t) for pid in self.store.pids]
+            return B.label_map(kps, (self.matte.h, self.matte.w),
+                               (self.matte.w / self.cut.info.width, self.matte.h / self.cut.info.height))
+        lut = np.full(256, -1, np.int16)
+        alias = self._seg_alias()
+        for idx, pid in enumerate(self.store.pids):
+            if 0 <= pid < 255:
+                lut[pid + 1] = idx
+        for a_, b_ in alias.items():
+            if 0 <= a_ < 255 and b_ in self.store.pids:
+                lut[a_ + 1] = self.store.pids.index(b_)
+        lab = lut[seg]
+        al = alpha() if callable(alpha) else alpha
+        if al is not None:
+            # 255: a person nobody tracks (an extra): stays nobody's
+            miss = (lab < 0) & (np.asarray(al) >= 128) & (np.asarray(seg) != 255)
+            if miss.any():
+                kps = [self.store.kp(pid, t) for pid in self.store.pids]
+                sk = B.label_map(kps, (self.matte.h, self.matte.w),
+                                 (self.matte.w / self.cut.info.width, self.matte.h / self.cut.info.height))
+                lab = np.where(miss, sk, lab).astype(np.int16)
+        return lab
+
     # ------------------------------------------------------------------ full analysis
     def analyze(self, progress: Progress = None, cancel: Optional[Callable[[], bool]] = None,
                 accuracy: str = "high") -> TrackStore:
+        """The whole analysis as one revision (instruction 2026-11-20 §1-2): its matte, owners and face layer are
+        written beside the ones in use and put in use together with the new tracks at the very end. Cancelled or
+        failed, the files in use were never touched, and the tracker and the cut's people are what they were."""
+        import copy as _copy
+        from . import matte_rev as MRV
+        cut = self.cut
+        keep = dict(store=self.store, persons=_copy.deepcopy(cut.persons), joint_keys=dict(cut.joint_keys),
+                    analyzed=cut.analyzed, analysis_version=cut.analysis_version, cs_analysed=cut.cs_analysed,
+                    models_used=dict(cut.models_used or {}))
+        a, b = cut.work_range
+        MRV.begin(self, copy=not (a <= 0 and b >= self.proxy.n))
+        try:
+            return self._analyze(progress, cancel, accuracy)
+        except BaseException:
+            if MRV.staging(self):
+                MRV.drop(self)
+            self.store = keep["store"]
+            cut.persons, cut.joint_keys = keep["persons"], keep["joint_keys"]
+            cut.analyzed, cut.analysis_version = keep["analyzed"], keep["analysis_version"]
+            cut.cs_analysed, cut.models_used = keep["cs_analysed"], keep["models_used"]
+            self._label_cache.clear()
+            self._geo_cache = {}
+            self._head_raw = {}
+            self._skin_models = {}
+            raise
+
+    def _analyze(self, progress: Progress = None, cancel: Optional[Callable[[], bool]] = None,
+                 accuracy: str = "high") -> TrackStore:
         from .infer import Detector, FaceDetector, Matter, PoseEstimator
         from .models import POSE_MODEL_KEYS
 
@@ -681,7 +730,11 @@ class CutTracker:
             self.cut.models_used = _M.fingerprints()
         except Exception:
             pass
-        self.save()
+        from . import matte_rev as MRV
+        if MRV.staging(self):
+            MRV.commit(self, (a, b))        # matte, owners, face layer and these tracks: in use from here
+        else:
+            self.save()
         return st
 
     # ------------------------------------------------------------------ helpers for analysis
@@ -1429,8 +1482,12 @@ class CutTracker:
                 self._seg_stats = SG.run(st, self.proxy, self.matte, self.seglab, a, b, SG.model_for(accuracy),
                                          use_final, progress, cancel, matter, repose=repose, collect=collect,
                                          models=used)
-                self.write_seg_meta(model=used.get("used", ""), ranges=[[int(a), int(b)]], full=True)
                 self._label_cache.clear()
+                if self._stage_extra is not None:
+                    # written beside the matte in use: its record and the marks follow when it is put in use
+                    self._stage_meta = dict(model=used.get("used", ""))
+                    return
+                self.write_seg_meta(model=used.get("used", ""), ranges=[[int(a), int(b)]], full=True)
                 self._matte_marks_done(a, b)
                 return
             except Cancelled:
@@ -1439,6 +1496,10 @@ class CutTracker:
                 import logging
                 logging.getLogger("contour").warning("SAM matte failed, using RVM: %s", e)
                 self.seglab.remove()
+                if matter is None and self._stage_extra is not None:
+                    # neither model can make it: a matte written half way is never put in use (1.22.2 left it
+                    # in the file in use); the one before stays
+                    raise RuntimeError(f"인물 매트를 만들지 못했습니다 (SAM 실패, RVM 모델 없음): {e}") from e
         if matter is None:
             return
         self.seglab.remove()
@@ -1761,12 +1822,17 @@ class CutTracker:
             st.pop("matte_dirty", None)
         self.cut.status = st
 
-    def write_seg_meta(self, model: str = "", ranges=None, full: bool = False) -> None:
+    def write_seg_meta(self, model: str = "", ranges=None, full: bool = False,
+                       revision: Optional[int] = None) -> None:
+        """revision: the matte revision this makes the one in use (matte_rev: written last, after everything that
+        belongs to the revision). full with no model: the matte is not a SAM one (no owners)."""
         import json
         import time as _t
         m = {} if full else self.seg_meta()
+        keep_rev = int(self.seg_meta().get("revision", 0) or 0) if full else int(m.get("revision", 0) or 0)
         if model:
             m["model"] = model
+        m["revision"] = int(revision) if revision is not None else keep_rev
         now = _t.time()
         if full:
             m["made"] = now
@@ -1781,18 +1847,60 @@ class CutTracker:
             tmp.write_text(json.dumps(m), encoding="utf-8")
             tmp.replace(self._seg_meta_path)
         except OSError:
-            pass
+            if revision is not None:
+                raise                       # the revision is not in use without it: the caller takes it back
 
     def update_widths(self, persons: Optional[List[int]] = None, rng: Optional[Tuple[int, int]] = None) -> None:
+        out = self.measure_widths(persons, rng)
+        if out is None:
+            return
+        st = self.store
+        for p in out["persons"]:
+            st.widths[p], st.contour_raw[p], st.contour[p] = out["widths"][p], out["contour_raw"][p], out["contour"][p]
+        st.has_contour = True
+
+    def measure_widths(self, persons: Optional[List[int]] = None, rng: Optional[Tuple[int, int]] = None,
+                       staged: Optional[dict] = None, base: Optional[dict] = None) -> Optional[dict]:
+        """The body widths and outline points of the people over rng (default: the work range), measured and
+        smoothed, without changing the tracks: {'persons': [...], 'widths': {p: array}, 'contour_raw': {p: ...},
+        'contour': {p: ...}}. update_widths() puts them in.
+
+        staged: {'matte': {t: alpha}, 'labels': {t: owner frame}} of a matte revision that is not in use yet:
+        those frames are measured on it, every other frame on the matte in use (matte_rev.stage). base: the result
+        of an earlier call to go on from (several ranges of one revision)."""
         st = self.store
         if st is None:
-            return
+            return None
         a, b = rng or self.cut.work_range
         persons = list(range(len(st.pids))) if persons is None else persons
         mw, mh = self.matte.w, self.matte.h
         scale_xy = (mw / self.cut.info.width, mh / self.cut.info.height)
         A, Bb = self.cut.work_range
+        sm = (staged or {}).get("matte") or {}
+        sl = (staged or {}).get("labels") or {}
+        lab_cache: Dict[int, np.ndarray] = {}
+
+        def alpha_at(t):
+            return sm[t] if t in sm else self.matte.get(t)
+
+        def labels_at(t, alpha):
+            if alpha is None:
+                return None
+            if t not in sm and t not in sl:
+                return self.labels(t)
+            lab = lab_cache.get(t)
+            if lab is None:
+                seg = sl[t] if t in sl else (self.seglab.get(t) if self.seglab.exists() else None)
+                lab = lab_cache[t] = self.labels_from(t, seg, alpha)
+            return lab
+
+        out = dict(persons=list(persons), widths={}, contour_raw={}, contour={})
+        if base is not None:
+            for k in ("widths", "contour_raw", "contour"):
+                out[k].update(base[k])
+            out["persons"] = sorted(set(base["persons"]) | set(persons))
         for p in persons:
+            prev = out["widths"][p] if p in out["widths"] else st.widths[p]
             raw = np.full((st.n, B.N_SEG, 2), np.nan, np.float32)
             fb = np.full((st.n, B.N_SEG), np.nan, np.float32)
             # measure over the whole work range so smoothing has context
@@ -1802,35 +1910,35 @@ class CutTracker:
                     continue
                 ends = B.segment_endpoints(kp)
                 fb[t] = B.fallback_widths(kp, ends)
-                if a <= t < b or not np.isfinite(st.widths[p, t]).any():
-                    alpha = self.matte.get(t)
-                    lab = self.labels(t) if alpha is not None else None
+                if a <= t < b or not np.isfinite(prev[t]).any():
+                    alpha = alpha_at(t)
+                    lab = labels_at(t, alpha)
                     raw[t] = B.measure_widths(kp, None if alpha is None else np.asarray(alpha), lab, p, scale_xy)
                 else:
                     raw[t] = np.nan
             # reuse previous raw-equivalent values outside the edit window (approximate by the stored widths)
             outside = np.ones(st.n, bool)
             outside[a:b] = False
-            prev = st.widths[p]
             raw = np.where(outside[:, None, None] & np.isfinite(prev), prev, raw)
             fbf = np.where(np.isfinite(fb), fb, np.nanmedian(fb, axis=0, keepdims=True) if np.isfinite(fb).any() else 30.0)
             fbf = np.where(np.isfinite(fbf), fbf, 30.0)
-            st.widths[p] = B.smooth_widths(raw, fbf, st.present[p])
+            out["widths"][p] = B.smooth_widths(raw, fbf, st.present[p])
             # body contour points (edge distances along the limbs and torso)
-            craw = st.contour_raw[p]
+            craw = (out["contour_raw"][p] if p in out["contour_raw"] else st.contour_raw[p]).copy()
             for t in range(max(a, A), min(b, Bb)):
                 kp = st.final[p, t]
                 if not st.present[p, t] or not np.isfinite(kp[:, :2]).any():
                     craw[t] = np.nan
                     continue
-                alpha = self.matte.get(t)
-                lab = self.labels(t) if alpha is not None else None
+                alpha = alpha_at(t)
+                lab = labels_at(t, alpha)
                 gray = self.proxy.gray(t)
                 craw[t] = B.measure_contour(kp, None if alpha is None else np.asarray(alpha), lab, p, scale_xy,
                                             gray, (self.proxy.sx, self.proxy.sy))
             cfb = fbf[:, [B.SEG_INDEX[nm] for nm, _ in B.CONTOUR_SEGS]]
-            st.contour[p] = B.smooth_contour(craw, cfb, st.present[p])
-        st.has_contour = True
+            out["contour_raw"][p] = craw
+            out["contour"][p] = B.smooth_contour(craw, cfb, st.present[p])
+        return out
 
     # ------------------------------------------------------------------ hidden joints (user decisions)
     def set_hidden(self, pid: int, joints: List[int], a: int, b: int, hide: bool) -> None:
@@ -1899,6 +2007,12 @@ class CutTracker:
         cut = self.cut
         if st is not None and st.has(pid):
             p = st.index(pid)
+            try:
+                from . import matte_rev as MRV
+                MRV.forget_person(self, p)       # also out of what the matte was made from (no refresh for it)
+            except Exception:
+                import traceback
+                traceback.print_exc()
             st.removed[pid] = st.boxes[p].copy()
             st.keep_persons([q for q in st.pids if q != pid])
         cut.persons = [p for p in cut.persons if p.id != pid]
@@ -1919,17 +2033,33 @@ class CutTracker:
         st = self.store
         if st is None:
             return
+        import copy as _copy
+        from . import matte_rev as MRV
         a, b = self.cut.work_range
         acc = "max" if accuracy == "max" else "high"
         p_m = (lambda x, m="": progress(0.9 * x, m)) if progress else None
-        self._run_matte(a, b, p_m, st=st, accuracy=acc, use_final=True, cancel=cancel)
-        self._label_cache.clear()
-        self._head_raw = {}
-        self._skin_models = {}
-        if progress:
-            progress(0.92, "몸 폭·윤곽 점 다시 측정")
-        self.update_widths()
-        self.save()
+        # one revision (instruction 2026-11-20 §1-2): the new matte and owners beside the ones in use, the widths
+        # and outlines measured on them, all put in use together; cancelled or failed, what was in use stays
+        keep = (st.widths.copy(), st.contour_raw.copy(), st.contour.copy(), st.has_contour, st.matte_rev)
+        MRV.begin(self, copy=not (a <= 0 and b >= self.proxy.n))
+        try:
+            self._run_matte(a, b, p_m, st=st, accuracy=acc, use_final=True, cancel=cancel)
+            self._label_cache.clear()
+            self._head_raw = {}
+            self._skin_models = {}
+            if progress:
+                progress(0.92, "몸 폭·윤곽 점 다시 측정")
+            self.update_widths()
+            MRV.commit(self, (a, b))
+        except BaseException:
+            if MRV.staging(self):
+                MRV.drop(self)
+            st.widths, st.contour_raw, st.contour, st.has_contour, st.matte_rev = keep
+            self._label_cache.clear()
+            self._geo_cache = {}
+            self._head_raw = {}
+            self._skin_models = {}
+            raise
         if progress:
             progress(1.0, "완료")
 

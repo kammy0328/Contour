@@ -2437,10 +2437,12 @@ class MainWindow(QMainWindow):
         it). then(ok, why) once it is over. project: another project than the open one (loaded for a render)."""
         from ..track import matte_refresh as MR
         from .matte_refresh import clear, pending
+        from ..track import clothing as CL
         s = self.session
         prj = project if project is not None else s.project
         other = prj is not s.project
-        cuts = [c for c in (prj.cut(i) for i in cut_ids) if c is not None and pending(c)] if prj is not None else []
+        cuts = [c for c in (prj.cut(i) for i in cut_ids)
+                if c is not None and (pending(c) or CL.stale_of_cut(prj, c))] if prj is not None else []
         if not cuts:
             if then:
                 then(True, "")
@@ -2472,8 +2474,16 @@ class MainWindow(QMainWindow):
                         done[c.id] = pending(c)        # nothing a SAM matte would follow here
                         continue
                     marks = pending(c)
-                    MR.refresh_now(tr, marks, sub, cancelled, models)
+                    if marks:
+                        MR.refresh_now(tr, marks, sub, cancelled, models)
                     done[c.id] = marks
+                    # clothing left out of use where the owners changed (it could not be made again with the
+                    # matte, or the cut is from 1.22.2): made again there, so the render keeps the clothes
+                    if CL.stale_ranges(tr):
+                        try:
+                            CL.refresh_stale(tr, sub, cancelled, models)
+                        except Exception as e:
+                            fails[c.id] = f"옷 영역: {e}"[:200]
                 except Exception as e:
                     if type(e).__name__ == "Cancelled":
                         break
@@ -2513,12 +2523,19 @@ class MainWindow(QMainWindow):
         if self.job is not None and then:
             self.job.failed.connect(failed_then)
 
+    def _needs_matte(self, prj, cut) -> bool:
+        """Before a render: frames an edit marked are not matted again yet, or clothing kept in the cut is out of
+        use where its owners changed."""
+        from .matte_refresh import pending
+        from ..track import clothing as CL
+        return bool(cut is not None and (pending(cut) or CL.stale_of_cut(prj, cut)))
+
     def _ask_matte(self, names: list, adding: bool) -> str:
         """'refresh' / 'old' / 'cancel': a render of cuts whose matte is not caught up with the edits yet."""
         box = QMessageBox(self)
         box.setWindowTitle("인물 매트 갱신 전")
         shown = ", ".join(names[:4]) + (f" 외 {len(names) - 4}컷" if len(names) > 4 else "")
-        box.setText(f"{shown}: 편집한 구간의 인물 매트가 아직 다시 만들어지지 않았습니다.\n"
+        box.setText(f"{shown}: 편집한 구간의 인물 매트(또는 그 구간의 옷 영역)가 아직 다시 만들어지지 않았습니다.\n"
                     "렌더는 저장된 매트를 씁니다. 매트를 갱신한 뒤 진행할까요?")
         b_ref = box.addButton("매트 갱신 후 " + ("추가" if adding else "렌더"), QMessageBox.AcceptRole)
         b_old = box.addButton("이전 매트로 " + ("추가" if adding else "렌더"), QMessageBox.DestructiveRole)
@@ -3048,6 +3065,18 @@ class MainWindow(QMainWindow):
                 if p.role == "target" and tr.store.has(p.id) and getattr(cut.params_for(p.id), "cloth", "include") != "include"
                 and not CL.ready_for(tr, p.id)]
         if not need:
+            if CL.stale_of_cut(s.project, cut):
+                # parsed, but out of use where the person matte was made again since (1.22.3): only those frames
+                def again(progress, cancelled):
+                    return CL.refresh_stale(tr, progress, cancelled, self.refresher.models)
+
+                def again_done(rs):
+                    s.touch("geo")
+                    self.viewer._img_cache.clear()
+                    self._refresh_all()
+                    if rs:
+                        self.toast(f"인물 매트가 바뀐 {len(rs)}곳의 옷 영역을 다시 만들었습니다.", kind="ok")
+                self.run_job("옷 영역 갱신 중", again, again_done)
             return
         # all people to be reshaped at once, so switching someone else later is instant
         pids = sorted(set(need) | {tr.store.index(p.id) for p in cut.targets() if tr.store.has(p.id)})
@@ -3820,8 +3849,14 @@ class MainWindow(QMainWindow):
                 self.refresher.mark_ranges(cut, res["marks"])
         elif kind == "matte":
             self.refresher.committed(res)
-            if res:
-                self.viewer._img_cache.clear()
+            if not res or res.get("error"):
+                return                      # nothing was written (dropped, or taken back): nothing to redo
+            self.viewer._img_cache.clear()
+        elif kind == "matte_check":
+            # only a comparison (the tracking with what the matte was made from): nothing a frame is made from
+            # changed, so nothing is redone
+            self.refresher.checked(res)
+            return
         self.session.touch()
         self.viewer.update()
         self.timeline.update()
@@ -3947,7 +3982,7 @@ class MainWindow(QMainWindow):
                 it.matte = matte
                 self.queue_page.save()
             self.toast("렌더 목록에 추가했습니다. 렌더 화면에서 시작하세요.", kind="ok")
-        if pending(cut) and s.tracker is not None and s.tracker.has_seg():
+        if self._needs_matte(s.project, cut) and s.tracker is not None and s.tracker.has_seg():
             # the render reads the saved matte: edits whose frames are not matted again yet would not be in it
             ch = self._ask_matte([cut.name], adding=True)
             if ch == "cancel":
@@ -3983,10 +4018,10 @@ class MainWindow(QMainWindow):
                     src = None
             if src is not None:
                 if getattr(item, "kind", "cut") == "timeline":
-                    cuts = [c for c in src.cuts if pending(c)]
+                    cuts = [c for c in src.cuts if self._needs_matte(src, c)]
                 else:
                     c = src.cut(item.cut_id)
-                    cuts = [c] if c is not None and pending(c) else []
+                    cuts = [c] if self._needs_matte(src, c) else []
                 if cuts:
                     ch = self._ask_matte([c.name for c in cuts], adding=False)
                     if ch == "cancel":
