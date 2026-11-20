@@ -71,6 +71,14 @@ def main():
     app.processEvents()
     try:
         splash.wait_imports(app)
+        try:
+            # model packages: what an install that never finished left behind is cleared (what was in use stays)
+            from contour.track import modelpkg
+            left = modelpkg.store().recover()
+            if left:
+                sys.stderr.write(f"model packages: cleared {left}\n")
+        except Exception:
+            pass
         splash.set_message("화면 준비 중")
         app.processEvents()
         from contour.ui.main_window import MainWindow

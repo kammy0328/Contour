@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -96,11 +97,41 @@ MODELS: Dict[str, dict] = {
 POSE_MODEL_KEYS = ["pose_rtmpose_x", "pose_rtmw_x", "pose_rtmpose_m", "pose_dwpose_l"]
 
 
-def model_path(key: str) -> Path:
-    """Single file models: the .onnx file. Multi file models (spec 'files'): their folder."""
+def legacy_path(key: str) -> Path:
+    """Where a model downloaded by the app itself (before model packages) is. Single file models: the .onnx file.
+    Multi file models (spec 'files'): their folder."""
     if key in MODELS and MODELS[key].get("files"):
         return settings().models_path / "onnx" / key
     return settings().models_path / "onnx" / f"{key}.onnx"
+
+
+def packaged(key: str) -> Optional[Path]:
+    """The model as an installed package (modelpkg): the version this work is pinned to, else the one in use.
+    None when the model is not a package on this computer."""
+    try:
+        from . import modelpkg as MP
+        return MP.resolve(key)
+    except Exception:
+        return None
+
+
+def pinned_missing(key: str) -> str:
+    """The version this work is pinned to when that version is not installed ('' otherwise): the model is then not
+    opened from anywhere else."""
+    try:
+        from . import modelpkg as MP
+        pins = MP.current_pins()
+        if pins and key in pins and MP.store().path(key, pins[key]) is None:
+            return pins[key]
+    except Exception:
+        pass
+    return ""
+
+
+def model_path(key: str) -> Path:
+    """Where the model is opened from: its installed package (a version that never changes), else where the app
+    itself downloaded it (legacy_path)."""
+    return packaged(key) or legacy_path(key)
 
 
 # models an analysis runs with (recorded on the cut, so a result can be told apart from one made with other files)
@@ -113,7 +144,15 @@ def fingerprint(key: str) -> str:
     """First 16 hex digits of the SHA-256 of the model's file(s) ('' when not downloaded). Hashed once per file version:
     cached by name, size and modification time in models/hashes.json (a 940 MB model takes a few seconds once)."""
     import hashlib
-    p = model_path(key)
+    try:
+        from . import modelpkg as MP
+        ver = MP.version_in_use(key)
+        pkg = MP.store().package(key, ver) if ver else None
+        if pkg is not None:
+            return pkg.sha256[:16]                 # a package's content never changes: its own hash, not read again
+    except Exception:
+        pass
+    p = legacy_path(key)
     files = sorted(f for f in p.rglob("*") if f.is_file() and not f.name.endswith((".part", ".json"))
                    and ".broken" not in f.name and ".noaccess" not in f.name) if p.is_dir() else ([p] if p.is_file() else [])
     if not files:
@@ -165,7 +204,9 @@ def fingerprints(keys=ANALYSIS_KEYS) -> dict:
 
 
 def is_downloaded(key: str) -> bool:
-    p = model_path(key)
+    if packaged(key) is not None:
+        return True
+    p = legacy_path(key)
     files = MODELS.get(key, {}).get("files")
     if files:
         return all(_usable(p / Path(u).name) for u in files) and \
@@ -238,9 +279,28 @@ def _download(url: str, dst: Path, progress: Optional[Callable[[float, str], Non
 
 
 def ensure_model(key: str, progress: Optional[Callable[[float, str], None]] = None) -> Path:
-    """Download (once) and return the local ONNX path (or the folder of a multi file model)."""
-    out = model_path(key)
+    """Download (once) and return the local ONNX path (or the folder of a multi file model). A model installed as
+    a package is returned as it is (every file it needs is in the package; nothing is downloaded or made beside
+    it). Work pinned to a package version that is not on this computer gets an error that names it, never another
+    version in its place."""
+    pk = packaged(key)
+    if pk is not None:
+        return pk
+    want = pinned_missing(key)
+    if want:
+        raise RuntimeError(f"{MODELS.get(key, {}).get('label', key)}: 이 작업을 시작한 모델 버전 {want}이(가) 설치되어 있지 "
+                           f"않습니다. 모델 관리에서 그 버전을 설치하거나 다시 분석하세요.")
+    out = legacy_path(key)
     spec = MODELS[key]
+    try:
+        return _ensure_legacy(key, out, spec, progress)
+    except OSError as e:
+        # no connection, a name that does not resolve, a download cut short (URLError, timeouts and the like are
+        # all OSError): what is missing, how to get it without a connection, and what goes on working
+        raise ModelMissing(key, str(getattr(e, "reason", e))[:160]) from e
+
+
+def _ensure_legacy(key: str, out: Path, spec: dict, progress) -> Path:
     if spec.get("files"):
         out.mkdir(parents=True, exist_ok=True)
         files = spec["files"]
@@ -593,6 +653,23 @@ def session(path: Path):
             raise
         if _broken(first) and not isinstance(first, PermissionError):
             import time as _t
+            own = _package_of(p)
+            if own is not None:
+                # a file of an installed package: never renamed or fetched again on its own. When its files are
+                # no longer what the list said, the version is taken out of use (the one in use before it comes
+                # back) and the message says which package to install again
+                key, ver = own
+                from . import modelpkg as MP
+                now = None
+                bad = not MP.store().verify(key, ver)
+                if bad:
+                    now = MP.store().set_aside(key, ver)
+                sys.stderr.write(f"MODEL PACKAGE BROKEN {key} {ver} ({p.name}) verified={not bad}: {str(first)[:300]}\n")
+                raise ModelFileError(
+                    f"{MODELS.get(key, {}).get('label', key)} {ver}: 모델 파일을 열지 못했습니다 ({p.name}). "
+                    + ((f"설치된 파일이 손상되어 사용을 멈췄습니다. 이전 버전 {now}을(를) 씁니다. " if now else
+                        "설치된 파일이 손상되어 사용을 멈췄습니다. ") + "모델 관리에서 이 패키지를 다시 설치하세요."
+                       if bad else "파일은 목록과 같습니다: 이 버전의 DIAP·ONNX Runtime과 맞는 패키지인지 확인하세요.")) from first
             try:
                 p.rename(p.with_name(p.name + f".broken{int(_t.time())}"))
             except OSError:
@@ -613,6 +690,78 @@ def session(path: Path):
         except Exception as second:
             sys.stderr.write(f"MODEL FALLBACK FAILED {p.name}: {str(second)[:200]}\n")
             raise first
+
+
+def _package_of(path) -> Optional[tuple]:
+    try:
+        from . import modelpkg as MP
+        return MP.store().owns(path)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------------------------- what work needs
+# Which models a kind of work opens (the work itself asks for them with ensure_model; this is for telling the
+# person, before they start and without a connection, what is missing and what goes on working without it).
+# Retouch, preview and render run on models that are part of the app (track/data, assets/onnx): never listed here.
+TASKS = (
+    ("prescan", "빠른 검사 (인물 없는 컷 건너뛰기)", "없으면 모든 컷을 일반 분석으로 넘깁니다"),
+    ("analyze", "분석 (추적·인물 매트)", "없으면 새 분석·다시 분석·매트 갱신을 할 수 없습니다"),
+    ("clothes", "옷 영역", "없으면 옷 영역을 새로 만들 수 없습니다 (저장된 옷 영역은 그대로 씁니다)"),
+    ("face", "얼굴·목 영역", "없으면 얼굴·목 영역을 새로 만들 수 없습니다 (저장된 영역은 그대로 씁니다)"),
+)
+ALWAYS = "프로젝트 열기·컷 전환·보정값 편집·기존 분석 결과 보기·미리보기·렌더는 모델 다운로드 없이 됩니다."
+
+
+def task_models(task: str, accuracy: str = "") -> List[str]:
+    """The keys the task opens with the settings as they are (accuracy 'max' adds its extra models)."""
+    if task == "prescan":
+        return ["det_yolox_m"]
+    if task == "analyze":
+        keys = ["det_yolox_m", "pose_rtmpose_x", "pose_rtmw_x", "pose_rtmpose_m", "face_yunet", "face_rtm106",
+                "hand_rtm21", "face_sface", "matte_rvm", "seg_sam31", "seg_sam31_find"]
+        if accuracy == "max":
+            keys += ["det_yolox_x", "pose_dwpose_l"]
+        return keys + [k for k in task_models("face") if k not in keys]
+    if task == "clothes":
+        try:
+            from . import clothing as CL
+            return ["parse_clothes"] if CL.cloth_model() == "parse_clothes" else ["seg_sam31", "seg_sam31_find"]
+        except Exception:
+            return ["seg_sam31", "seg_sam31_find"]
+    if task == "face":
+        try:
+            from . import faceparse as FP
+            return [] if FP.face_model() == "mp" else [FP.MODEL_KEY]         # 'mp' is part of the app
+        except Exception:
+            return []
+    return []
+
+
+def missing(task: str, accuracy: str = "") -> List[str]:
+    return [k for k in task_models(task, accuracy) if not is_downloaded(k)]
+
+
+def availability(accuracy: str = "") -> List[dict]:
+    """For every kind of work: [{task, label, ok, missing: [{key, label, size_mb}], limit}]."""
+    out = []
+    for task, label, limit in TASKS:
+        miss = missing(task, accuracy)
+        out.append(dict(task=task, label=label, ok=not miss, limit="" if not miss else limit,
+                        missing=[dict(key=k, label=MODELS.get(k, {}).get("label", k),
+                                      size_mb=MODELS.get(k, {}).get("size_mb", 0)) for k in miss]))
+    return out
+
+
+class ModelMissing(RuntimeError):
+    """A model the work needs is not on this computer and could not be had (no connection, no package)."""
+
+    def __init__(self, key: str, why: str = ""):
+        spec = MODELS.get(key, {})
+        super().__init__(f"{spec.get('label', key)} 모델이 이 컴퓨터에 없고 받지 못했습니다"
+                         + (f" ({why})" if why else "") + ". 인터넷에 연결한 뒤 다시 하거나, 설정의 모델 관리에서 모델 패키지 "
+                         "파일을 가져오세요. " + ALWAYS)
+        self.key = key
 
 
 def gpu_report() -> str:

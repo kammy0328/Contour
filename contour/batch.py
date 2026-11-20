@@ -141,6 +141,7 @@ def analyze(project_path: str, cut_id: str, accuracy: str = "high", all_targets:
         _say(1.0, "인물 없음")
         return 0
     cut.stats.analysis_runs += 1
+    cut.stats.analysis_seconds = round(time.time() - t0, 1)
     cut.stats.auto_ok_rate = tr.auto_ok_rate(cut.tracking.conf_threshold)
     try:
         from .track.models import take_cpu_fallbacks
@@ -168,7 +169,8 @@ def analyze(project_path: str, cut_id: str, accuracy: str = "high", all_targets:
     except Exception:
         traceback.print_exc()
     # a hand retouch of this shot (or of the whole timeline) came with it: learn the style right here
-    if cut.retouch_ref and Path(cut.retouch_ref).exists() and prj.learn and cut.learn \
+    from .learn import allowed as _learn_allowed
+    if cut.retouch_ref and Path(cut.retouch_ref).exists() and _learn_allowed(prj, cut) \
             and (cut.status or {}).get("auto") in ("good", "bad"):
         try:
             from .learn import style as SL

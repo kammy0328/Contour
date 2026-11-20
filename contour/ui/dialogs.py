@@ -169,6 +169,18 @@ class SettingsDialog(QDialog):
             self.gpu.addItem(t, v)
         self.gpu.setCurrentIndex(max(0, self.gpu.findData(s.gpu)))
         form.addRow("추론 장치", self.gpu)
+        mb = QPushButton("모델 관리…")
+        mb.setToolTip("작업별로 필요한 모델과 이 컴퓨터에 있는 모델, 모델 패키지 가져오기(인터넷 없이 폴더·zip에서)")
+        mb.clicked.connect(self._models)
+        mrow = QWidget()
+        ml_ = QHBoxLayout(mrow)
+        ml_.setContentsMargins(0, 0, 0, 0)
+        self.models_info = Wd.label("", "Faint", 11)
+        ml_.addWidget(self.models_info, 1)
+        ml_.addWidget(mb)
+        form.addRow("모델", mrow)
+        self.models_changed = False
+        self._models_line()
         lg = QPushButton("로그 폴더 열기")
         lg.setToolTip("문제가 생기면 이 폴더의 errors.log, freeze.log, output.log를 보내 주세요")
         lg.clicked.connect(self._open_logs)
@@ -229,6 +241,23 @@ class SettingsDialog(QDialog):
         freed = PJ.clear_orphans(dirs)
         self._cache_usage()
         QMessageBox.information(self, "쓰지 않는 캐시 지우기", f"{PJ.human(freed)}를 비웠습니다.")
+
+    def _models_line(self):
+        try:
+            from ..track import models as M
+            av = M.availability()
+            miss = sum(len(a["missing"]) for a in av if a["task"] == "analyze")
+            self.models_info.setText("분석에 필요한 모델이 모두 있습니다" if not miss else
+                                     f"분석에 필요한 모델 {miss}개가 없습니다 (처음 분석할 때 받습니다)")
+        except Exception:
+            self.models_info.setText("")
+
+    def _models(self):
+        from .modelsdlg import ModelsDialog
+        d = ModelsDialog(self)
+        d.exec()
+        self.models_changed = self.models_changed or d.changed
+        self._models_line()
 
     def _open_logs(self):
         from PySide6.QtCore import QUrl

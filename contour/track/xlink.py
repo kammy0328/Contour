@@ -254,7 +254,9 @@ def _pair_feats(project, a: Tuple[str, int], b: Tuple[str, int]):
 
 
 def _teach(project, a, b, same: bool):
-    from ..learn import identity as ID
+    from ..learn import allowed, identity as ID
+    if not allowed(project):
+        return                       # the decision itself is saved with the project; nothing is learned from it
     for kind, fa, fb in _pair_feats(project, a, b):
         ID.add_links([(fa, fb, same)], kind)
 

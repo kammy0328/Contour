@@ -225,6 +225,11 @@ def test_saving_keeps_everything_1222_wrote(old_project, golden):
         if k == "cuts":
             for c0, c1 in zip(v, now_prj["cuts"]):
                 _holds(c0, c1, "cut")
+        elif k == "learn":
+            # the one value that is not carried over (instruction 2026-11-20 §4-4): 1.22.2 wrote true for every
+            # project (its default, never a choice); learning is now off unless switched on by hand, and the file
+            # says so for an older build that opens it too
+            assert v is True and now_prj["learn"] is False and now_prj["learn_set"] is False
         else:
             assert now_prj[k] == v, k
     with np.load(cut_dir / "tracks.npz") as d:

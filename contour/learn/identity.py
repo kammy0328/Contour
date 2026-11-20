@@ -45,7 +45,8 @@ def _key(project, cut) -> str:
 
 def collect(project, cut) -> bool:
     """Copies the cut's identity samples into the learning set (once per analysis)."""
-    if not (project.learn and cut.learn and getattr(settings(), "self_learning", True)):
+    from . import allowed
+    if not (allowed(project, cut) and getattr(settings(), "self_learning", True)):
         return False
     src = project.cut_dir(cut) / "identity.npz"
     dst = _dir() / f"{_key(project, cut)}.npz"

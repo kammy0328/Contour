@@ -83,7 +83,8 @@ def collect(project, cut, tracker, seed: int = 0) -> int:
     from ..track.solver import normalize_scores
     st = tracker.store
     f = _dir() / f"{_key(cut)}.npz"
-    if st is None or not (project.learn and cut.learn and getattr(settings(), "self_learning", True)):
+    from . import allowed
+    if st is None or not (allowed(project, cut) and getattr(settings(), "self_learning", True)):
         return 0
     keys = [k for k in st.raw if st.raw[k].shape[2] == S.K]
     if not keys:

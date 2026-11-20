@@ -19,6 +19,7 @@ import cv2
 import numpy as np
 
 from .exposure import analysis_view
+from .modelpkg import cut_models as _cut_models
 
 HAIR, FACE = 1, 2
 EAR_L, EAR_R = 3, 4          # COCO ear joints
@@ -145,6 +146,7 @@ def _write_state(tracker, persons: List[int]) -> None:
                                     encoding="utf-8")
 
 
+@_cut_models
 def run(tracker, persons: List[int], progress: Optional[Callable[[float, str], None]] = None,
         cancel: Optional[Callable[[], bool]] = None) -> bool:
     """Find hair and face of the given people (store indices) on every frame of the work range."""

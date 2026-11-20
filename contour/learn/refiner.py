@@ -47,8 +47,9 @@ def collect_cut(project, cut, tracker) -> int:
     """(Re)build the sample shard for one cut. Returns the number of samples."""
     st = tracker.store
     shard = samples_dir() / f"{project.name}__{cut.id}.npz"
-    if st is None or not (project.learn and cut.learn and settings().collect_learning_data):
-        if shard.exists():
+    from . import allowed, chosen_off
+    if st is None or not (allowed(project, cut) and settings().collect_learning_data):
+        if shard.exists() and (chosen_off(project, cut) or not settings().collect_learning_data):
             shard.unlink()
         return 0
     proxy = tracker.proxy
@@ -210,9 +211,11 @@ def collect_auto(project, cut, tracker, seed: int = 0) -> int:
     so samples with a larger teacher-measurement gap are preferred."""
     st = tracker.store
     shard = auto_shard(project, cut)
-    if st is None or not (project.learn and cut.learn and settings().collect_learning_data
+    from . import allowed, chosen_off
+    if st is None or not (allowed(project, cut) and settings().collect_learning_data
                           and getattr(settings(), "self_learning", True)):
-        if shard.exists():
+        if shard.exists() and (chosen_off(project, cut) or not settings().collect_learning_data
+                               or not getattr(settings(), "self_learning", True)):
             shard.unlink()
         return 0
     proxy = tracker.proxy

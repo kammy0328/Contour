@@ -1,15 +1,22 @@
 """AI review material for an analysed project (instruction 2026-11-19 §6).
 
-    python -m contour.review <project folder> [--out DIR] [--cuts ID,ID] [--no-images] [--max-images N]
+    python -m contour.review <project folder> [--out DIR] [--cuts ID,ID] [--images] [--max-images N]
 
-The menu item 'AI 검수 자료 만들기' (project menu) runs the same thing. It reads what the analysis already saved
+The menu item 'AI 검수 리포트 만들기' (project menu) runs the same thing. It reads what the analysis already saved
 (project.json, each cut's tracks.npz, the matte / owner / clothes / head-part stores, face layer, matte record, the
 QC results) and writes, under <project>/ai_review/<time>/ (or --out):
-- review.json: per cut its id, name, timecodes, frame range, people, analysis state, saved QC, and findings, each
-  with where (frames, timecodes, person), what it rests on, and what to do about it in DIAP;
-- report.md: the same for a person to read, linking the pictures;
-- img/: for the worst findings a picture of the frame (or, without the original, of the saved matte) with the
-  tracked skeletons and who owns which pixel drawn on it.
+- review.json: per cut its id, name, timecodes, frame range, people, the state of its analysis and of what is
+  saved for it (which stores, how large, from when), why an analysis failed, times (when it was analysed, how long
+  it took, time worked on it, renders), saved QC, and findings, each with where (frames, timecodes, person), what
+  it rests on, and what to do about it in DIAP; for the project the settings the results depend on and summary
+  figures;
+- report.md: the same for a person to read.
+
+The report made by default holds no picture of the footage, no crop, and no absolute path of a media file
+(instruction 2026-11-20 §4-4): a source is named by its file name (or its place inside the project folder), the
+project by its folder name. --images (the menu item '화면 그림 포함') is the explicit choice to also write img/:
+for the worst findings a picture of the frame (or, without the original, of the saved matte) with the tracked
+skeletons and who owns which pixel drawn on it; such a report holds frames of the footage and says so.
 
 Nothing is analysed again (no model is run), nothing in the project is changed, and nothing is sent anywhere; the
 originals are not copied. A cut whose original is gone or whose stores are missing is reviewed as far as what is
@@ -91,10 +98,43 @@ def _overlap(r, rs) -> bool:
 
 
 def _rel(p: Path, root: Path) -> str:
+    """A file by its place inside the folder; one that is elsewhere by its name alone (never an absolute path)."""
     try:
-        return p.relative_to(root).as_posix()
+        return Path(p).relative_to(root).as_posix()
     except ValueError:
-        return p.as_posix()
+        return Path(p).name
+
+
+def _media_name(src: str, root: Path) -> str:
+    """A media file as the report names it: its place inside the project folder, else its file name."""
+    s = str(src or "")
+    if not s:
+        return ""
+    try:
+        return Path(s).relative_to(root).as_posix()
+    except ValueError:
+        return re.split(r"[\\/]", s.rstrip("\\/"))[-1]
+
+
+def _when(ts) -> str:
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(float(ts))) if ts else ""
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ""
+
+
+def _mtime(f: Path) -> float:
+    try:
+        return f.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _size(f: Path) -> int:
+    try:
+        return f.stat().st_size
+    except OSError:
+        return 0
 
 
 def _slug(s: str) -> str:
@@ -150,8 +190,27 @@ def _store_file(cache: Path, prefix: str) -> Optional[dict]:
             continue
         w, h = int(m.group(1)), int(m.group(2))
         size = f.stat().st_size
-        return dict(path=f, w=w, h=h, frames=size // max(1, w * h), whole=size % max(1, w * h) == 0)
+        return dict(path=f, w=w, h=h, frames=size // max(1, w * h), whole=size % max(1, w * h) == 0, bytes=size,
+                    mtime=f.stat().st_mtime)
     return None
+
+
+def _proxy_state(cut_dir: Path) -> dict:
+    """What is on the disk of the cut's proxy (the frames for the screen, made again from the original whenever
+    missing), without opening or making anything: files and bytes in the cut's own cache, and whether it points
+    at a proxy kept elsewhere (the cache folder of the settings) that is still there."""
+    cache = cut_dir / "cache"
+    files = []
+    try:
+        files = [f for f in cache.iterdir() if f.is_file() and f.name.startswith("proxy")]
+    except OSError:
+        pass
+    link = cache / "proxy_shared.json"
+    d = dict(files=len(files), bytes=sum(_size(f) for f in files))
+    if link.exists():
+        tgt = str(_json(link).get("path", ""))
+        d["shared"] = "있음" if tgt and Path(tgt).exists() else "연결 끊김"
+    return d
 
 
 def _open(info: Optional[dict]):
@@ -521,11 +580,11 @@ def review_cut(ctx: _Ctx, cut, number: str = "") -> dict:
     wr = tuple(int(v) for v in cut.work_range)
     cut_dir = ctx.root / "cuts" / cut.id               # read where it is: nothing created for a cut without one
     caches = _caches(cut_dir)
-    src = str(cut.source or cut.info.path)
+    src = _media_name(str(cut.source or cut.info.path), ctx.root)      # never the absolute path of a media file
     found = source_present(cut.info)
     st_ = cut.status or {}
     from .track import status as STT
-    d = dict(id=cut.id, name=cut.name, number=number, source=dict(path=src, found=bool(found)),
+    d = dict(id=cut.id, name=cut.name, number=number, source=dict(name=src, found=bool(found)),
              fps=round(float(cut.info.fps), 3), size=[int(cut.info.width), int(cut.info.height)],
              frames=int(cut.info.frames), work=dict(**_where(prj, cut, *wr)),
              timeline=dict(index=int(cut.tl["index"]) if isinstance(cut.tl.get("index"), (int, float)) else None, kind=cut.tl.get("kind"), name=cut.tl.get("name", ""))
@@ -534,14 +593,32 @@ def review_cut(ctx: _Ctx, cut, number: str = "") -> dict:
                            state=STT.effective(cut), auto=st_.get("auto"), reason=STT.reason(cut) or st_.get("reason", ""),
                            user=st_.get("user"), reviewed=bool(st_.get("reviewed")), work=st_.get("work"),
                            prescan=st_.get("prescan_info") or (dict(verdict="none") if st_.get("prescan") else None),
-                           models=dict(cut.models_used or {}), colour=cut.cs_analysed or cut.input_cs or ""),
+                           failed=bool(st_.get("failed")),
+                           failure=str(st_.get("reason") or "") if st_.get("failed") else "",
+                           models=dict(cut.models_used or {}), model_versions=dict(cut.model_versions or {}),
+                           colour=cut.cs_analysed or cut.input_cs or ""),
              persons=[], caches={}, findings=[], qc=_qc(prj, cut), user=_user(prj, cut), checked=[], unchecked=[])
     cs = dict(tracks=caches["tracks"])
     for k in ("matte", "seglab", "cloth", "parts"):
         v = caches[k]
         cs[k] = None if v is None else dict(file=_rel(Path(v["path"]), ctx.root), size=[v["w"], v["h"]],
-                                            frames=v["frames"], whole=v["whole"])
+                                            frames=v["frames"], whole=v["whole"], bytes=int(v.get("bytes", 0)),
+                                            made=_when(v.get("mtime")))
     cs["facelayer"] = caches["facelayer"]
+    cs["tracks_bytes"] = _size(cut_dir / "tracks.npz") if caches["tracks"] else 0
+    cs["proxy"] = _proxy_state(cut_dir)
+    cs["matte_revision"] = (caches["seg_meta"] or {}).get("revision")
+    stt = cut.stats
+    d["times"] = dict(analysed=_when(_mtime(cut_dir / "tracks.npz")) if caches["tracks"] else "",
+                      analysis_seconds=round(float(getattr(stt, "analysis_seconds", 0.0) or 0.0), 1),
+                      analysis_runs=int(stt.analysis_runs), worked_seconds=round(float(stt.active_seconds), 1),
+                      corrections=int(stt.corrections), renders=int(stt.renders),
+                      render_seconds=round(float(stt.render_seconds), 1),
+                      matte_made=_when((caches["matte"] or {}).get("mtime")),
+                      created=_when(getattr(cut, "created", 0)))
+    d["metrics"] = dict(auto_ok_rate=round(float(stt.auto_ok_rate), 3) if stt.auto_ok_rate >= 0 else None,
+                        persons=len(cut.persons), targets=sum(1 for p in cut.persons if p.role == "target"),
+                        work_frames=max(0, wr[1] - wr[0]))
     cs["matte_model"] = (caches["seg_meta"] or {}).get("model") or ("" if caches["seglab"] else
                                                                      ("RVM" if caches["matte"] else ""))
     cs["matte_refreshed"] = len((caches["seg_meta"] or {}).get("refreshed") or [])
@@ -550,7 +627,7 @@ def review_cut(ctx: _Ctx, cut, number: str = "") -> dict:
     F = d["findings"]
     if not found:
         F.append(_f("source_missing", "warn", "auto", _where(prj, cut, *wr),
-                    evidence=f"원본을 찾을 수 없음: {src}",
+                    evidence=f"원본을 찾을 수 없음: {src}" if src else "원본을 찾을 수 없음",
                     suggest="원본 위치를 다시 연결해야 렌더 가능. 이 검수는 저장된 추적·매트로만 확인함"))
         d["unchecked"].append("원본 화면 (그림은 저장된 매트 위에 그림)")
     if not cut.analyzed:
@@ -681,8 +758,37 @@ def _finish(ctx: _Ctx, d: dict, cut, st, caches, wr) -> dict:
 
 
 # ---------------------------------------------------------------------- the whole project
+def _settings_used(prj) -> dict:
+    """The settings the saved results and the screen depend on, and where things run (no path of this computer)."""
+    from .core.settings import settings
+    s = settings()
+    d = dict(accuracy=s.accuracy, gpu=s.gpu, proxy_long_side=int(s.proxy_long_side),
+             proxy_mode=getattr(s, "proxy_mode", ""), display=s.display, view=s.view,
+             face_model=getattr(s, "face_model", "") or "기본", cloth_model=getattr(s, "cloth_model", "") or "기본",
+             unified_model=bool(getattr(s, "unified_model", False)),
+             cache_folder="따로 지정" if getattr(s, "cache_dir", "") else "기본",
+             data_folder="따로 지정" if s.data_dir else "기본",
+             learning=dict(project=bool(getattr(prj, "learn", False)), chosen=bool(getattr(prj, "learn_set", False)),
+                           collect=bool(s.collect_learning_data), self_learning=bool(getattr(s, "self_learning", True))),
+             project_input_cs=prj.input_cs or "")
+    import platform
+    d["system"] = f"{platform.system()} {platform.release()} {platform.machine()}"
+    try:
+        import onnxruntime as ort
+        d["onnxruntime"] = str(ort.__version__)
+        d["providers"] = list(ort.get_available_providers())           # what this build could use, not what ran
+    except Exception:
+        d["onnxruntime"] = ""
+    try:
+        from .track import modelpkg as MP
+        d["model_packages"] = MP.store().active_versions()
+    except Exception:
+        d["model_packages"] = {}
+    return d
+
+
 def build(project_path: str, out_dir: Optional[str] = None, cut_ids: Optional[Sequence[str]] = None,
-          images: bool = True, max_images: int = MAX_IMG,
+          images: bool = False, max_images: int = MAX_IMG,
           progress: Optional[Callable[[float, str], None]] = None,
           cancel: Optional[Callable[[], bool]] = None) -> Path:
     """Writes the review; returns its folder."""
@@ -706,14 +812,21 @@ def build(project_path: str, out_dir: Optional[str] = None, cut_ids: Optional[Se
     t0 = time.time()
     rev = dict(format=FORMAT, version=VERSION, app=APP_VERSION, made=time.strftime("%Y-%m-%dT%H:%M:%S"),
                models_run=False, project_changed=False,
-               project=dict(name=prj.name, folder=str(root), cuts=len(prj.cuts),
+               # what this report holds of the footage: nothing by default (no picture, no crop, no absolute path
+               # of a media file); pictures of frames only when asked for
+               contains=dict(pictures=bool(images), crops=False, media_paths="name"),
+               settings=_settings_used(prj),
+               project=dict(name=prj.name, folder=root.name, cuts=len(prj.cuts),
+                            created=_when(prj.created), modified=_when(prj.modified),
                             timeline=dict(name=prj.timeline.get("name", ""), fps=prj.timeline.get("fps"),
                                           start_tc=prj.timeline.get("start_tc", "")) if prj.timeline else None),
                conventions=dict(frames="컷 안의 프레임 번호 (0부터). frame_out은 포함하지 않음",
                                 tc="tc_*: 원본 타임코드, rec_tc_*: 편집 타임라인 타임코드 (tc_out은 마지막 프레임)",
                                 source="auto: 저장된 결과로 이 도구가 측정, qc: 저장된 렌더 전 QC, user: 사람이 DIAP에서 "
                                        "판정·수정한 내용",
-                                images="img/ 아래, 이 폴더 기준 상대 경로. image_base=saved_matte는 원본 대신 저장된 매트 위에 그림"),
+                                images="기본 리포트에는 그림이 없음. 그림을 포함해 만들면 img/ 아래, 이 폴더 기준 상대 경로. "
+                                       "image_base=saved_matte는 원본 대신 저장된 매트 위에 그림",
+                                paths="미디어 파일은 파일 이름(프로젝트 폴더 안이면 그 안의 상대 경로)으로만 적음"),
                cuts=[])
     for i, c in enumerate(cuts):
         if cancel and cancel():
@@ -746,11 +859,36 @@ def _summary(rev: dict) -> dict:
     for c in cs:
         for f in c.get("findings", []):
             by_kind[f["kind"]] = by_kind.get(f["kind"], 0) + 1
-    return dict(cuts=len(cs), analysed=sum(1 for c in cs if (c.get("analysis") or {}).get("analyzed")),
+    an = [c for c in cs if (c.get("analysis") or {}).get("analyzed")]
+    rates = [c["metrics"]["auto_ok_rate"] for c in an if (c.get("metrics") or {}).get("auto_ok_rate") is not None]
+    by_state: Dict[str, int] = {}
+    for c in cs:
+        k = (c.get("analysis") or {}).get("state") or ("error" if c.get("error") else "")
+        by_state[k] = by_state.get(k, 0) + 1
+    stores = {k: sum(1 for c in an if (c.get("caches") or {}).get(k)) for k in
+              ("tracks", "matte", "seglab", "cloth", "parts", "facelayer")}
+    versions: Dict[str, Dict[str, int]] = {}
+    for c in an:
+        for k, v in ((c.get("analysis") or {}).get("model_versions") or {}).items():
+            versions.setdefault(k, {})
+            versions[k][v] = versions[k].get(v, 0) + 1
+    t = lambda key: round(sum(float((c.get("times") or {}).get(key) or 0) for c in cs), 1)
+    return dict(cuts=len(cs), analysed=len(an),
+                failed=sum(1 for c in cs if (c.get("analysis") or {}).get("failed")),
+                skipped_prescan=sum(1 for c in cs for f in c.get("findings", []) if f["kind"] == "skipped_prescan"),
                 source_missing=sum(1 for c in cs if not (c.get("source") or {}).get("found", True)),
                 errors=sum((c.get("counts") or {}).get("error", 0) for c in cs),
                 warnings=sum((c.get("counts") or {}).get("warn", 0) for c in cs),
-                qc_open=sum((c.get("counts") or {}).get("qc_open", 0) for c in cs), by_kind=by_kind)
+                qc_open=sum((c.get("counts") or {}).get("qc_open", 0) for c in cs), by_kind=by_kind,
+                by_state=by_state, stores=stores, model_versions=versions,
+                persons=sum((c.get("metrics") or {}).get("persons", 0) for c in cs),
+                work_frames=sum((c.get("metrics") or {}).get("work_frames", 0) for c in cs),
+                auto_ok_rate_mean=round(float(np.mean(rates)), 3) if rates else None,
+                auto_ok_rate_min=round(float(np.min(rates)), 3) if rates else None,
+                analysis_seconds=t("analysis_seconds"), worked_seconds=t("worked_seconds"),
+                render_seconds=t("render_seconds"),
+                cache_bytes=sum(int((v or {}).get("bytes", 0)) for c in cs for k, v in (c.get("caches") or {}).items()
+                                if isinstance(v, dict)) + sum(int((c.get("caches") or {}).get("tracks_bytes", 0)) for c in cs))
 
 
 def report(rev: dict) -> str:
@@ -758,19 +896,27 @@ def report(rev: dict) -> str:
     L = [f"# AI 검수 자료: {rev['project']['name']}", "",
          f"- 만든 시각 {rev['made']} · DIAP {rev['app']} · {rev['seconds']}초",
          f"- 컷 {s['cuts']}개 (분석 {s['analysed']}) · 오류 {s['errors']} · 경고 {s['warnings']} · 열린 QC {s['qc_open']}"
+         + (f" · 분석 실패 {s['failed']}컷" if s.get("failed") else "")
          + (f" · 원본 끊김 {s['source_missing']}컷" if s["source_missing"] else ""),
          "- 모델을 다시 돌리지 않았고 프로젝트 파일은 바꾸지 않았습니다. 저장된 추적·매트·QC만 읽었습니다.",
+         ("- 이 리포트에는 **영상 프레임 그림(img/)이 들어 있습니다**. 크롭과 미디어 절대경로는 없습니다."
+          if (rev.get("contains") or {}).get("pictures") else
+          "- 이 리포트에는 영상·크롭이 없고, 미디어 파일은 이름만 적었습니다 (절대경로 없음)."),
          "- 출처: **자동 측정**은 이 도구가 저장된 결과로 잰 의심, **저장된 QC**는 DIAP의 렌더 전 검사, "
          "**사람 판정**은 사용자가 DIAP에서 지정·수정한 내용입니다.",
          "- 프레임은 컷 안의 번호(0부터), 구간 끝은 포함하지 않습니다. TC는 원본 타임코드, 편집 TC는 타임라인 기준입니다.",
-         "", "## 컷 요약", "", "| 번호 | 컷 | 원본 TC | 상태 | 오류 | 경고 | 열린 QC |", "|---|---|---|---|---|---|---|"]
+         ""]
+    L += _summary_lines(rev)
+    L += ["", "## 컷 요약", "", "| 번호 | 컷 | 원본 TC | 상태 | 분석 시간 | 오류 | 경고 | 열린 QC |",
+          "|---|---|---|---|---|---|---|---|"]
     for c in rev["cuts"]:
         a = c.get("analysis") or {}
         w = c.get("work") or {}
         n = c.get("counts") or {}
         from .track.status import LABEL as _SL
         L.append(f"| {c.get('number', '')} | {c['name']} | {w.get('tc_in', '')}–{w.get('tc_out', '')} | "
-                 f"{_SL.get(a.get('state', ''), a.get('state', '')) if not c.get('error') else '검수 실패'} | {n.get('error', 0)} | "
+                 f"{_SL.get(a.get('state', ''), a.get('state', '')) if not c.get('error') else '검수 실패'} | "
+                 f"{_secs((c.get('times') or {}).get('analysis_seconds'))} | {n.get('error', 0)} | "
                  f"{n.get('warn', 0)} | {n.get('qc_open', 0)} |")
     for c in rev["cuts"]:
         L += ["", f"## {c.get('number', '')} {c['name']} (`{c['id']}`)", ""]
@@ -785,6 +931,21 @@ def report(rev: dict) -> str:
                  + (f" ({a['reason']})" if a.get("reason") else "")
                  + f" · 원본 {'있음' if c['source']['found'] else '없음'}"
                  + (f" · 매트 {c['caches'].get('matte_model') or '-'}" if a["analyzed"] else ""))
+        if a.get("failed"):
+            L.append(f"- 분석 실패 원인: {a.get('failure') or '기록 없음'}")
+        t, cs_ = c.get("times") or {}, c.get("caches") or {}
+        if a["analyzed"]:
+            L.append(f"- 시간: 분석 {t.get('analysed') or '-'} ({_secs(t.get('analysis_seconds'))}, {t.get('analysis_runs', 0)}회)"
+                     f" · 작업 {_secs(t.get('worked_seconds'))} · 수정 {t.get('corrections', 0)}회"
+                     f" · 렌더 {t.get('renders', 0)}회 ({_secs(t.get('render_seconds'))})")
+            have = [k for k in ("matte", "seglab", "cloth", "parts") if cs_.get(k)] + (["facelayer"] if cs_.get("facelayer") else [])
+            px = cs_.get("proxy") or {}
+            L.append("- 저장된 것: 추적 " + ("있음" if cs_.get("tracks") else "없음") + " · " + (", ".join(have) or "매트 없음")
+                     + (f" · 매트 리비전 {cs_['matte_revision']}" if cs_.get("matte_revision") else "")
+                     + f" · 프록시 파일 {px.get('files', 0)}개 ({px.get('bytes', 0) / 1e6:.0f} MB)"
+                     + (f", 공용 캐시 {px['shared']}" if px.get("shared") else ""))
+            if a.get("model_versions"):
+                L.append("- 모델 패키지 버전: " + ", ".join(f"{k} {v}" for k, v in sorted(a["model_versions"].items())))
         if c["persons"]:
             L.append("- 인물: " + ", ".join(
                 f"P{p['id']} {p['name']}({'보정' if p['role'] == 'target' else '제외'}"
@@ -817,13 +978,61 @@ def report(rev: dict) -> str:
     return "\n".join(L)
 
 
+def _secs(v) -> str:
+    try:
+        v = float(v or 0)
+    except (TypeError, ValueError):
+        return "-"
+    if v <= 0:
+        return "-"
+    return f"{v:.0f}초" if v < 120 else f"{v / 60:.1f}분"
+
+
+def _summary_lines(rev: dict) -> List[str]:
+    s, st = rev["summary"], rev.get("settings") or {}
+    L = ["## 요약 지표", ""]
+    L.append(f"- 인물 {s.get('persons', 0)}명(컷별 합) · 작업 구간 {s.get('work_frames', 0)}프레임"
+             + (f" · 자동 추적 성공률 평균 {s['auto_ok_rate_mean'] * 100:.0f}% (최저 {s['auto_ok_rate_min'] * 100:.0f}%)"
+                if s.get("auto_ok_rate_mean") is not None else ""))
+    L.append(f"- 시간: 분석 합 {_secs(s.get('analysis_seconds'))} · 작업 합 {_secs(s.get('worked_seconds'))}"
+             f" · 렌더 합 {_secs(s.get('render_seconds'))}")
+    if s.get("by_state"):
+        from .track.status import LABEL as _SL
+        L.append("- 상태별 컷: " + ", ".join(f"{_SL.get(k, k or '없음')} {v}" for k, v in sorted(s["by_state"].items())))
+    if s.get("stores"):
+        L.append("- 분석된 컷 중 저장된 것: " + ", ".join(f"{k} {v}/{s['analysed']}" for k, v in s["stores"].items())
+                 + f" · 합계 {s.get('cache_bytes', 0) / 1e9:.2f} GB")
+    if s.get("by_kind"):
+        L.append("- 발견 항목: " + ", ".join(f"{KIND_KO.get(k, k)} {v}" for k, v in sorted(s["by_kind"].items(),
+                                                                                    key=lambda kv: -kv[1])))
+    if s.get("model_versions"):
+        L.append("- 분석에 쓴 모델 패키지: " + "; ".join(
+            f"{k} " + ", ".join(f"{v}({n}컷)" for v, n in sorted(vs.items())) for k, vs in sorted(s["model_versions"].items())))
+    if st:
+        lr = st.get("learning") or {}
+        L += ["", "## 설정", "",
+              f"- 정확도 {st.get('accuracy')} · 추론 장치 설정 {st.get('gpu')} · ONNX Runtime {st.get('onnxruntime') or '-'}"
+              f" ({', '.join(st.get('providers') or []) or '-'}) · {st.get('system', '')}",
+              f"- 프록시 {st.get('proxy_long_side')}px ({st.get('proxy_mode')}) · 디스플레이 {st.get('display') or '기본'}"
+              f" / 뷰 {st.get('view') or '기본'} · 프로젝트 입력 색공간 {st.get('project_input_cs') or '원본 그대로'}",
+              f"- 얼굴 영역 모델 {st.get('face_model')} · 옷 영역 모델 {st.get('cloth_model')}"
+              + (" · 통합 모델 사용" if st.get("unified_model") else ""),
+              f"- 학습 데이터 수집·자동 학습: 이 프로젝트 {'켬' if lr.get('project') else '끔'}"
+              + ("" if lr.get("chosen") else " (선택한 적 없음)")]
+        if st.get("model_packages"):
+            L.append("- 사용 중인 모델 패키지: " + ", ".join(f"{k} {v}" for k, v in sorted(st["model_packages"].items())))
+    return L
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m contour.review",
                                  description="분석된 DIAP 프로젝트의 AI 검수 자료 (모델 재실행 없음, 프로젝트 수정 없음)")
     ap.add_argument("project", help="프로젝트 폴더 (.dpprj) 또는 그 안의 project.json")
     ap.add_argument("--out", help="출력 폴더 (기본: <프로젝트>/ai_review/<시각>)")
     ap.add_argument("--cuts", help="이 컷만 (id 또는 이름, 쉼표로 구분)")
-    ap.add_argument("--no-images", action="store_true", help="그림 없이 보고서와 JSON만")
+    ap.add_argument("--images", action="store_true",
+                    help="화면 그림(img/)도 만듭니다: 영상 프레임이 리포트에 들어갑니다 (기본은 그림 없음)")
+    ap.add_argument("--no-images", action="store_true", help="(기본값과 같음: 그림 없이 보고서와 JSON만)")
     ap.add_argument("--max-images", type=int, default=MAX_IMG)
     a = ap.parse_args(argv)
     try:
@@ -831,7 +1040,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except Exception:
         pass
     out = build(a.project, a.out, [x.strip() for x in a.cuts.split(",")] if a.cuts else None,
-                images=not a.no_images, max_images=a.max_images,
+                images=bool(a.images) and not a.no_images, max_images=a.max_images,
                 progress=lambda f, m: print(f"{f * 100:5.1f}% {m}", flush=True))
     print(f"OUT {out}")
     return 0

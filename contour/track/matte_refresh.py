@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+from .modelpkg import cut_models as _cut_models
 
 MARGIN = 3          # frames before and after a changed range matted again with it (the edges of a re-solve blend)
 MOVE = 0.01         # a prompt point that moved more than this share of the frame height changes the matte
@@ -188,6 +189,7 @@ def clip_ranges(tracker, ranges) -> List[List[int]]:
     return out
 
 
+@_cut_models
 def compute(tracker, ranges, cancel: Optional[Callable[[], bool]] = None,
             progress: Optional[Callable[[float, str], None]] = None, models: Optional[dict] = None) -> Optional[dict]:
     """New matte and owners for the ranges, from the current (corrected) tracking. None when the cut has no SAM

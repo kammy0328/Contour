@@ -40,8 +40,10 @@ class AppSettings:
     proxy_long_side: int = 1920
     gpu: str = "auto"                     # auto | cuda | dml | cpu
     accuracy: str = "high"                # high | balanced | fast
+    # Both apply only inside a project where learning was switched on by hand (learn.allowed, 1.23): on their own
+    # they start nothing. Switching one off here stops it in every project.
     collect_learning_data: bool = True
-    self_learning: bool = True        # learn from every analysed cut on its own (no corrections needed)
+    self_learning: bool = True        # learn from the analysed cuts on their own (no corrections needed)
     face_model: str = ""              # '' = the default (faceparse.DEFAULT_MODEL), 'mp' (commercial use) or 'face_parse' (non-commercial)
     cloth_model: str = ""             # '' = the default (clothing.DEFAULT_MODEL), 'sam31' (commercial use) or 'parse_clothes' (non-commercial)
     unified_model: bool = False       # DIAP's combined model in place of face_parse, parse_clothes, matte_rvm (experiment)
@@ -49,6 +51,7 @@ class AppSettings:
     recent_projects: list = field(default_factory=list)
     known_projects: list = field(default_factory=list)   # every project the project manager lists (no limit)
     legacy_notified: list = field(default_factory=list)  # projects told once that their 보호/분리 settings are gone
+    learn_notified: list = field(default_factory=list)   # projects told once that learning is now off unless chosen
     pm_sort: str = "modified"             # project manager order: modified | name | created (last chosen)
     play_loop: bool = False               # transport: repeat the cut (off: playback goes on into the next cut)
     open_last_on_start: bool = False      # skip the project manager at start and open the last project
@@ -66,6 +69,8 @@ class AppSettings:
     skip_version: str = ""                # an update the user chose to skip
     auto_update_check: bool = True
     analysis_spf: float = 0.0             # seconds per frame of a whole-cut analysis on this PC (learned; 0 = unknown)
+    model_registry: str = ""              # where a signed list of model packages is read from (address or folder);
+                                          # "" = nowhere (no storage provider is decided: set by hand in 모델 관리)
 
     # ------------------------------------------------------------------ paths
     @property

@@ -79,6 +79,7 @@ QFrame#HLine {{ background: {c['line']}; max-height: 1px; min-height: 1px; borde
 QFrame#VLine {{ background: {c['line']}; max-width: 1px; min-width: 1px; border: none; }}
 QLabel#Muted {{ color: {c['text2']}; }}
 QLabel#Faint {{ color: {c['text3']}; }}
+QLabel#Warn {{ color: {c['warn']}; }}
 QLabel#Section {{ color: {c['text2']}; font-weight: 600; font-size: 11px; padding-top: 6px; }}
 QLabel#Title {{ font-size: 15px; font-weight: 600; }}
 QLabel#Big {{ font-size: 26px; font-weight: 600; }}

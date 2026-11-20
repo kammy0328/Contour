@@ -529,6 +529,7 @@ class CutStats:
     active_seconds: float = 0.0
     corrections: int = 0
     analysis_runs: int = 0
+    analysis_seconds: float = 0.0    # how long the last whole analysis of the cut took (for the review report)
     auto_ok_rate: float = -1.0       # share of person-frames tracked confidently before any correction
     renders: int = 0
     render_seconds: float = 0.0
@@ -557,6 +558,8 @@ class Cut:
     cs_auto: str = ""                # how the app chose input_cs by itself ('' = chosen by hand / not looked at)
     cs_analysed: Optional[str] = None  # input_cs when the cut was last analysed (None: before 1.16, unknown)
     models_used: dict = field(default_factory=dict)   # model key -> fingerprint of the files the last analysis ran with
+    model_versions: dict = field(default_factory=dict)   # model key -> package version it ran with (models installed
+                                                         # as packages only; written only when there are any)
     lut_path: str = ""
     mode: str = "warp"               # warp | separate
     persons: List[Person] = field(default_factory=list)
@@ -609,7 +612,7 @@ class Cut:
         return any(a <= frame <= b for a, b in self.locked.get(pid, []))
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "id": self.id, "name": self.name, "source": self.source, "info": self.info.to_dict(),
             "in_frame": self.in_frame, "out_frame": self.out_frame, "input_cs": self.input_cs, "cs_auto": self.cs_auto, "cs_analysed": self.cs_analysed, "models_used": self.models_used, "lut_path": self.lut_path,
             "mode": self.mode, "persons": [p.to_dict() for p in self.persons],
@@ -627,6 +630,9 @@ class Cut:
             "style_learned": self.style_learned, "tl": self.tl, "status": self.status,
             "version": self.version, "versions": self.versions,
         }
+        if self.model_versions:
+            d["model_versions"] = dict(self.model_versions)
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "Cut":
@@ -637,6 +643,7 @@ class Cut:
         c.cs_auto = d.get("cs_auto", "")
         c.cs_analysed = d.get("cs_analysed")
         c.models_used = dict(d.get("models_used") or {})
+        c.model_versions = {str(k): str(v) for k, v in (d.get("model_versions") or {}).items()}
         c.lut_path = d.get("lut_path", "")
         c.mode = d.get("mode", "warp")
         c.persons = [Person.from_dict(p) for p in d.get("persons", [])]
@@ -684,7 +691,12 @@ class Project:
     input_cs: str = ""                # default input colourspace for new cuts ('' = passthrough)
     created: float = field(default_factory=time.time)
     modified: float = field(default_factory=time.time)
-    learn: bool = True                # project-level switch for collecting learning data
+    # Learning from this project's footage (the crops and samples collected from its cuts, and the automatic
+    # learning that starts from them): only when it was switched on by hand for this project (set_learn). A
+    # project that never chose (made before 1.23, whose file has no 'learn' or the old default true) is off.
+    learn: bool = False
+    learn_set: bool = False           # 'learn' was chosen by hand under that rule (instruction 2026-11-20 §4-4)
+    learn_before: bool = False        # (not saved) the file said true under the old rule: said once on opening
     client: str = ""
     timeline: dict = field(default_factory=dict)   # an edited timeline the cuts come from (see core/timeline.py)
     members: dict = field(default_factory=dict)    # people across cuts: id -> {name, color, user, links}
@@ -766,10 +778,15 @@ class Project:
         self.cuts.append(c)
         return c
 
+    def set_learn(self, on: bool) -> None:
+        """The person's own choice for this project (the project menu)."""
+        self.learn, self.learn_set = bool(on), True
+
     # ------------------------------------------------------------------ io
     def to_dict(self) -> dict:
         return {"format": 1, "name": self.name, "cuts": [c.to_dict() for c in self.cuts], "input_cs": self.input_cs,
-                "created": self.created, "modified": self.modified, "learn": self.learn, "client": self.client, "timeline": self.timeline,
+                "created": self.created, "modified": self.modified, "learn": bool(self.learn and self.learn_set),
+                "learn_set": bool(self.learn_set), "client": self.client, "timeline": self.timeline,
                 "members": self.members, "member_cannot": self.member_cannot}
 
     def save(self) -> None:
@@ -797,7 +814,9 @@ class Project:
         prj.input_cs = d.get("input_cs", "")
         prj.created = float(d.get("created", time.time()))
         prj.modified = float(d.get("modified", time.time()))
-        prj.learn = bool(d.get("learn", True))
+        prj.learn_set = bool(d.get("learn_set", False))
+        prj.learn = bool(d.get("learn", False)) and prj.learn_set
+        prj.learn_before = not prj.learn_set and bool(d.get("learn", True))
         prj.client = d.get("client", "")
         prj.timeline = dict(d.get("timeline") or {})
         prj.members = dict(d.get("members") or {})

@@ -134,10 +134,11 @@ class FaceParser:
         base = M.ensure_model(MODEL_KEY)
         # the parser trained further on the user's own footage (Cloud\step_train.bat) sits next to the original;
         # delete that file (or set DIAP_NO_TUNED) to go back
-        tuned = Path(str(base)).with_name("face_parse_diap.onnx")
+        home = M.legacy_path(MODEL_KEY)          # (a packaged base model is elsewhere: what was learned here stays here)
+        tuned = home.with_name("face_parse_diap.onnx")
         # DIAP's own parser (a different network taught by the one above, Cloud\step_train.bat installs it once it
         # is good enough) comes first; DIAP_NO_OWN goes back
-        own = Path(str(base)).with_name("face_parse_own.onnx")
+        own = home.with_name("face_parse_own.onnx")
         self.tuned = False
         self.own = False
         self.s = None
