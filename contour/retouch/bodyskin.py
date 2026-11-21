@@ -560,13 +560,22 @@ def ownership(tracker, t: int, p: int, size: Tuple[int, int]) -> Tuple[Optional[
 
 
 def garments(tracker, t: int, p: int, size: Tuple[int, int]) -> Optional[np.ndarray]:
-    """Clothes, shoes, hats and bags the analysis found on this frame (float32 0..1 at size (w, h)), or None when
-    it made no clothing masks or they are of another matte (stale: not used until they are made again)."""
+    """Clothes, shoes, hats and bags found on this frame (float32 0..1 at size (w, h)), or None when nothing says
+    so. From the clothing masks of 옷 유지 where they are in use for this person on this frame (made for this
+    analysis, not of another matte); else from the look for clothing the body parser takes for skin
+    (track.skincloth), which has a map only where it found such clothing."""
     try:
         from ..track import clothing as CL
-        if not tracker.cloth.exists() or CL.stale_at(tracker, t):
-            return None
-        cm = tracker.cloth.get(t)
+        cm = None
+        if tracker.cloth.exists() and not CL.stale_at(tracker, t):
+            s_ = CL._state(tracker)
+            if s_.get("analysis") == tracker.cut.analysis_version and int(tracker.store.pids[p]) in s_.get("pids", []):
+                c0 = tracker.cloth.get(t)
+                if c0 is not None and c0.any():           # this frame of the person was parsed (0: never written)
+                    cm = c0
+        if cm is None:
+            from ..track import skincloth as SC
+            cm = SC.get(tracker, t)
         if cm is None:
             return None
         g = np.isin(np.asarray(cm).astype(np.int16) - 1, list(CL.ALL_CLOTHES)).astype(np.uint8)
@@ -583,11 +592,13 @@ def garment_token(tracker) -> str:
     ones (when they were made, what is out of use in them)."""
     try:
         from ..track import clothing as CL
-        if not tracker.cloth.exists():
-            return "c0"
-        s_ = CL._state(tracker)
-        return "c%x" % (zlib.crc32(repr((s_.get("made"), s_.get("analysis"), s_.get("pids"), s_.get("stale"),
-                                         s_.get("skin"))).encode()) & 0xffffff)
+        from ..track import skincloth as SC
+        a = "c0"
+        if tracker.cloth.exists():
+            s_ = CL._state(tracker)
+            a = "c%x" % (zlib.crc32(repr((s_.get("made"), s_.get("analysis"), s_.get("pids"),
+                                          CL.stale_ranges(tracker))).encode()) & 0xffffff)
+        return a + SC.token(tracker)
     except Exception:
         return "c0"
 

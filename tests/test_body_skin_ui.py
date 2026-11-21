@@ -365,3 +365,61 @@ def test_several_people_selected_get_the_same_switch_and_regions(win, qapp):
         assert pp.body_on("body_skin") and pp.body_scope == "leg" and pp.body_detail == 15.0
     win.set_body_on("body_skin", False)
     assert not cut.params_for(0).body_on("body_skin") and not cut.params_for(1).body_on("body_skin")
+
+
+# ------------------------------------------------------------------------------------------------- skin-coloured clothing
+def _wait_job(w, qapp, s=30.0):
+    import time
+    t0 = time.time()
+    while w.job is not None and time.time() - t0 < s:
+        qapp.processEvents()
+        time.sleep(0.01)
+    qapp.processEvents()
+    assert w.job is None
+
+
+def test_switching_a_body_effect_on_looks_at_the_cut_for_skin_coloured_clothing(win, qapp, monkeypatch):
+    """몸 피부 보정 switched on: the cut is looked at with the garment words in the job panel, and the box says what
+    came of it. (The scene's parser and the garment words agree here: nothing to leave out.)"""
+    from contour.track import clothing as CL, models as M, skincloth as SC
+    from contour.ui.inspector import body_cloth_line
+    s = win.session
+    seen = []
+
+    class Finder:
+        stats = dict(frames=0)
+
+    def one(gf, st, proxy, pres, t, frame, lab, rgb, mw, mh):
+        seen.append(int(t))
+        k = B.kind(int(t), (mw, mh))
+        for p in pres:
+            frame[lab == p] = 1
+            frame[(lab == p) & np.isin(k, (B.CLOTH, B.STRAP))] = 5
+        return frame
+    monkeypatch.setattr(CL, "GarmentFinder", Finder)
+    monkeypatch.setattr(CL, "_garment_frame", one)
+    page = win.inspector.pages["skin"]
+    page.refresh()
+    assert body_cloth_line(s.tracker, s.cut, False) == ("", False), "nothing is said while no body effect is on"
+    # SAM 3.1 is not on this computer: said once, nothing is started, the box says the look is still to come
+    page.body_toggles["body_skin"].setChecked(True)
+    assert win.job is None and any("SAM 3.1" in t for t in win.toasts)
+    page.refresh()
+    assert "확인 전" in page.body_cloth_info.text() and page.body_cloth_btn.isEnabled()
+    n_told = sum("SAM 3.1" in t for t in win.toasts)
+    page.body_toggles["body_blemish"].setChecked(True)
+    assert sum("SAM 3.1" in t for t in win.toasts) == n_told, "not said again with every switch"
+    # with the models there: the button (and the switch) start the look
+    monkeypatch.setattr(SC, "models_missing", lambda: [])
+    page.body_cloth_btn.click()
+    assert win.job is not None
+    _wait_job(win, qapp)
+    assert sorted(seen) == [0, B.N - 1] and SC.info(s.tracker)["state"] == "current"
+    assert any("피부색 옷 확인 끝" in t and "없습니다" in t for t in win.toasts)
+    page.refresh()
+    assert "확인됨" in page.body_cloth_info.text() and not page.body_cloth_btn.isEnabled()
+    # nothing more to do: switching the other effect off and on starts nothing
+    seen.clear()
+    page.body_toggles["body_blemish"].setChecked(False)
+    page.body_toggles["body_blemish"].setChecked(True)
+    assert win.job is None and seen == []

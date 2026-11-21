@@ -3243,6 +3243,7 @@ class MainWindow(QMainWindow):
         self._refresh_all()
         self.toast(f"프리셋 '{d.get('name', '')}'을(를) {'이 인물' if scope == 'person' else f'보정 인물 {len(pids)}명'}에 적용했습니다.",
                    kind="ok")
+        self.ensure_skin_cloth(quiet=True)          # a preset with a body value on (when no other job was started)
 
     def preset_save_dialog(self):
         from ..core import presets as PS
@@ -3524,6 +3525,51 @@ class MainWindow(QMainWindow):
         self.viewer.update()
         self.timeline.update()
         self.inspector.refresh("reshape")
+        if on:
+            self.ensure_skin_cloth(quiet=True)
+
+    def ensure_skin_cloth(self, quiet: bool = False):
+        """The open cut looked at for clothing the body parser takes for skin (track.skincloth), for the people
+        with a body value on, in the background job panel. quiet: nothing is said when there is nothing to do or
+        another job is running (the export looks at the cut itself when this has not been done)."""
+        from ..track import skincloth as SC
+        s = self.session
+        cut, tr = s.cut, s.tracker
+        if tr is None or tr.store is None or cut is None:
+            return
+        if self.job is not None:
+            if not quiet:
+                self.toast("다른 작업이 진행 중입니다.", kind="warn")
+            return
+        try:
+            need = SC.needed(tr, cut)
+        except Exception:
+            need = []
+        if not need:
+            if not quiet:
+                self.toast("피부색 옷 확인이 이미 되어 있습니다.", kind="ok")
+            return
+        miss = SC.models_missing()
+        if miss:
+            if not quiet or not getattr(self, "_skin_cloth_told", False):
+                self._skin_cloth_told = True
+                self.toast("피부색 옷 확인에는 SAM 3.1 모델이 필요합니다 (설정 > 모델 관리). 없으면 몸 파서의 구분만으로 "
+                           "보정합니다.", kind="warn")
+            return
+
+        def work(progress, cancelled):
+            return SC.run(tr, need, progress, cancelled, getattr(getattr(self, "refresher", None), "models", None))
+
+        def done(ok):
+            s.touch("ret")
+            self.viewer._img_cache.clear()
+            self._refresh_all()
+            if ok:
+                inf = SC.info(tr)
+                n = int(inf.get("frames", 0)) if inf.get("ranges") else 0
+                self.toast("피부색 옷 확인 끝: " + (f"{len(inf['ranges'])}개 구간에서 옷을 몸 피부에서 제외합니다."
+                                                   if n else "피부로 잘못 볼 옷이 없습니다."), kind="ok")
+        self.run_job("피부색 옷 확인 중", work, done)
 
     def set_body(self, what: str, v, committed: bool):
         """The body skin settings that are not sliders with keys: detail (결 보존), blemish_size (최대 잡티 크기),

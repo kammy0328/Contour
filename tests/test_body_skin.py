@@ -852,3 +852,226 @@ def test_what_the_parser_is_not_sure_of_is_skin_only_beside_skin_it_found(monkey
     far_below = arm & (yy >= 170)
     assert conf[just_below].min() > 0.5, "beside skin the parser found, the colour is enough"
     assert conf[far_below].max() < 0.05, "far from it, it is not"
+
+
+# ------------------------------------------------------------------------------------------------- clothing the parser takes for skin
+def _fur_parser(monkeypatch):
+    """The body parser calling the top (nearly the skin's colour) skin, as it calls a fur collar (BANANAS 056)."""
+    return B.truth_parser(monkeypatch, wrong=lambda t, k: np.where(k == B.CLOTH, B.SKIN_K, k).astype(np.uint8))
+
+
+def _garment_words(monkeypatch, seen):
+    """SAM 3.1's garment words stood in for by the scene's truth (the top and the strap are clothing). seen: the
+    frames they were asked for."""
+    from contour.track import clothing as CL
+
+    class Finder:
+        stats = dict(frames=0)
+
+    def one(gf, st, proxy, pres, t, frame, lab, rgb, mw, mh):
+        seen.append(int(t))
+        k = B.kind(int(t), (mw, mh))
+        for p in pres:
+            own = lab == p
+            frame[own] = 1
+            frame[own & np.isin(k, (B.CLOTH, B.STRAP))] = 4 + 1
+        return frame
+    monkeypatch.setattr(CL, "GarmentFinder", Finder)
+    monkeypatch.setattr(CL, "_garment_frame", one)
+    from contour.track import skincloth as SC
+    monkeypatch.setattr(SC, "models_missing", lambda: [])
+
+
+def _area(cut, tr, t):
+    from contour.retouch import engine as RE
+    rf = RE.prepare(cut, tr, t, {})
+    j = next(j for j in rf.jobs if j.pid == 0)
+    return rf.body_area(j)
+
+
+def _drop_look(tr):
+    import shutil
+    from contour.track import skincloth as SC
+    shutil.rmtree(SC._dir(tr), ignore_errors=True)
+    try:
+        SC._state_file(tr).unlink()
+    except OSError:
+        pass
+    for k in ("_skincloth_state", "_skincloth_lru", "_steady_lru"):
+        tr.__dict__.pop(k, None)
+
+
+def test_clothing_the_parser_takes_for_skin_is_found_by_a_look_and_left_out(body, monkeypatch):
+    """BANANAS 056, 118 (j2790): a fur collar and cuffs of the skin's colour. The body parser calls them skin, the
+    colour learnt from them agrees, and they were retouched. The cut is looked at with SAM 3.1's garment words
+    (track.skincloth); where they call clothing what the parser is sure is skin, the area leaves it out."""
+    from contour.track import skincloth as SC
+    cut, tr, _ = body
+    _drop_look(tr)
+    _fur_parser(monkeypatch)
+    B.body_on(cut, skin=100, blemish=100, size=B.SPOT_SIZE)
+    try:
+        top = _inside(_kinds(tr, 2) == B.CLOTH, 4)
+        skin = _inside(_kinds(tr, 2) == B.SKIN_K, 4)
+        before = _area(cut, tr, 2)
+        assert float(before[top].mean()) > 0.8, "the defect: the top is body skin"
+        src, out = _export(cut, tr, 2)
+        assert int((_changed(src, out)[_inside(B.kind(2) == B.CLOTH, 8)] > 0).sum()) > 2000, "and it is retouched"
+        assert SC.needed(tr, cut) == [0] and SC.info(tr)["state"] == "none"
+        seen = []
+        _garment_words(monkeypatch, seen)
+        said = []
+        assert SC.run(tr, SC.needed(tr, cut), lambda f, m: said.append(f)) is True
+        assert sorted(seen) == list(range(B.N)), "both looks (frames 0 and 7) found it: every frame between has its map"
+        assert said and said[-1] == 1.0 and said == sorted(said)
+        assert SC.needed(tr, cut) == [] and SC.info(tr)["state"] == "current" and SC.info(tr)["ranges"] == [[0, B.N]]
+        after = _area(cut, tr, 2)                      # (the masks made before the look are not used again)
+        assert float(after[top].max()) < 0.05, "the top is no longer body skin"
+        assert float(after[skin].mean()) > 0.9 * float(before[skin].mean()), "the skin is as before"
+        src, out = _export(cut, tr, 2)
+        d = _changed(src, out)
+        assert int(d[_inside(B.kind(2) == B.CLOTH, 4)].max()) == 0, "and nothing of it changes in the export"
+        assert int((d[_inside(B.kind(2) == B.SKIN_K, 8)] > 0).sum()) > 2000
+        # a second run has nothing to do; cancelled, the look in use stays
+        seen.clear()
+        assert SC.run(tr, [0], cancel=lambda: True) is False and SC.info(tr)["ranges"] == [[0, B.N]]
+    finally:
+        _drop_look(tr)
+
+
+def test_a_cut_without_such_clothing_costs_its_looks_only(body, monkeypatch):
+    """The parser and the garment words agree (the top is clothing to both): the looked-at frames get a map, no
+    other frame does, and the area is what it was without a look, on the looked-at frames too."""
+    from contour.track import skincloth as SC
+    cut, tr, _ = body
+    _drop_look(tr)
+    B.body_on(cut, skin=100)
+    try:
+        before = {t: _area(cut, tr, t).copy() for t in (0, 3)}
+        seen = []
+        _garment_words(monkeypatch, seen)
+        assert SC.run(tr, SC.needed(tr, cut)) is True
+        assert sorted(seen) == [0, B.N - 1], "frames 0 and 7 (every 12th and the last)"
+        inf = SC.info(tr)
+        assert inf["state"] == "current" and inf["ranges"] == [] and inf["looks"] == 2
+        assert SC.get(tr, 0) is None and SC.get(tr, 3) is None
+        assert sorted(f.name for f in SC._dir(tr).glob("*.png")) == ["000000.png", "000007.png"]
+        for t in (0, 3):
+            assert np.array_equal(_area(cut, tr, t), before[t])
+        assert SC.needed(tr, cut) == []
+    finally:
+        _drop_look(tr)
+
+
+def test_a_look_is_of_its_analysis_its_owners_and_the_people_it_saw(body, monkeypatch):
+    from contour.track import skincloth as SC
+    cut, tr, _ = body
+    _drop_look(tr)
+    _fur_parser(monkeypatch)
+    B.body_on(cut, skin=100)
+    seen = []
+    _garment_words(monkeypatch, seen)
+    meta = tr.matte.live_path.parent / "seg_meta.json" if hasattr(tr.matte, "live_path") else None
+    keep_meta = meta.read_text(encoding="utf-8") if meta is not None and meta.exists() else None
+    try:
+        assert SC.needed(tr, cut) == [0]
+        assert SC.run(tr, [0]) is True and SC.get(tr, 3) is not None
+        # nobody with a body value on: nothing to look at
+        B.body_on(cut, skin=0)
+        assert SC.needed(tr, cut) == []
+        B.body_on(cut, skin=100)
+        # in and out moved inwards: the same frames, the look stands
+        keep = (cut.in_frame, cut.out_frame)
+        cut.in_frame, cut.out_frame = 2, 6
+        assert SC.needed(tr, cut) == [] and SC.get(tr, 3) is not None
+        cut.in_frame, cut.out_frame = keep
+        # another analysis: not this look's
+        cut.analysis_version += 1
+        assert SC.needed(tr, cut) == [0] and SC.get(tr, 3) is None and SC.info(tr)["state"] == "stale"
+        cut.analysis_version -= 1
+        assert SC.needed(tr, cut) == [] and SC.get(tr, 3) is not None
+        # the person matte made again on frames 2..4 after the look: other owners there, the look is made again
+        if meta is not None and keep_meta is not None:
+            import json as _json
+            import time as _time
+            d = _json.loads(keep_meta)
+            d["refreshed"] = [[2, 5, _time.time() + 5]]
+            meta.write_text(_json.dumps(d), encoding="utf-8")
+            tr.__dict__.pop("_seg_meta", None)
+            if SC.stale_ranges(tr):
+                assert SC.stale_ranges(tr) == [[2, 5]]
+                assert SC.get(tr, 3) is None and SC.get(tr, 6) is not None and SC.needed(tr, cut) == [0]
+    finally:
+        if meta is not None and keep_meta is not None:
+            meta.write_text(keep_meta, encoding="utf-8")
+            tr.__dict__.pop("_seg_meta", None)
+        _drop_look(tr)
+
+
+def test_the_frames_round_a_look_that_found_clothing():
+    from contour.track import skincloth as SC
+    looks = [0, 12, 24, 36, 47]
+    assert SC.ranges_of(looks, [False] * 5) == []
+    assert SC.ranges_of(looks, [False, False, True, False, False]) == [[12, 37]]
+    assert SC.ranges_of(looks, [True, False, False, False, False]) == [[0, 13]]
+    assert SC.ranges_of(looks, [False, False, False, False, True]) == [[36, 48]]
+    assert SC.ranges_of(looks, [True, False, True, False, False]) == [[0, 37]], "two that touch are one"
+    assert SC.ranges_of([5], [True]) == [[5, 6]]
+    # what counts as found: a share of the skin the parser is sure of, and of the picture
+    px = 1920 * 1080
+    assert not SC._dirty({0: [50000, 300]}, px), "an edge the two draw a little apart"
+    assert not SC._dirty({0: [900, 600]}, px), "a few hundred pixels of a small figure"
+    assert SC._dirty({0: [50000, 9000]}, px) and SC._dirty({0: [50000, 300], 3: [20000, 15000]}, px)
+
+
+def test_an_export_looks_at_the_cut_first_and_says_when_it_could_not(body, tmp_path, monkeypatch):
+    """A render started before the app looked at the cut (a body value just switched on, a batch render) does it
+    itself; when SAM 3.1 is not on the computer the render still comes out, with the parser's word alone and a
+    line that says so."""
+    from contour.core.project import OutputSettings
+    from contour.track import clothing as CL
+    from contour.track import skincloth as SC
+    from contour.warp.render import render_cut
+    cut, tr, _ = body
+    _drop_look(tr)
+    _fur_parser(monkeypatch)
+    B.body_on(cut, skin=100)
+
+    class Rec:
+        path = ""
+
+        def __init__(self):
+            self.frames = []
+
+        def write(self, planes):
+            self.frames.append([np.array(p) for p in planes[:3]])
+    project = tr.project
+    out = OutputSettings(format="prores_4444", out_dir=str(tmp_path), include_audio=False)
+    try:
+        # SAM 3.1 is not on this computer (as in every test): nothing is downloaded, the render says so
+        def never():
+            raise AssertionError("a render opened (and would download) the garment models")
+        monkeypatch.setattr(CL, "GarmentFinder", never)
+        assert SC.models_missing() == list(SC.MODELS)
+        r0 = Rec()
+        rep = render_cut(project, cut, tr, out, ext_writer=r0)
+        assert len(r0.frames) == B.N and any("피부색 옷" in w and "SAM 3.1" in w for w in rep.warnings), rep.warnings
+        assert SC.info(tr)["state"] == "none"
+        with pytest.raises(RuntimeError, match="SAM 3.1"):
+            SC.run(tr, [0])
+        seen = []
+        _garment_words(monkeypatch, seen)
+        r1 = Rec()
+        rep = render_cut(project, cut, tr, out, ext_writer=r1)
+        assert not any("피부색 옷" in w for w in rep.warnings) and sorted(seen) == list(range(B.N))
+        assert SC.info(tr)["ranges"] == [[0, B.N]]
+        B.body_on(cut, skin=0)
+        plain = Rec()
+        render_cut(project, cut, tr, out, ext_writer=plain)
+        top = _inside(B.kind(3) == B.CLOTH, 4)
+        d0 = np.abs(r0.frames[3][0].astype(np.int32) - plain.frames[3][0].astype(np.int32))
+        d1 = np.abs(r1.frames[3][0].astype(np.int32) - plain.frames[3][0].astype(np.int32))
+        assert int((d0[top] > 0).sum()) > 2000, "without the look the top was retouched"
+        assert int(d1[top].max()) == 0, "with it, not a pixel of it"
+    finally:
+        _drop_look(tr)

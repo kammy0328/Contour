@@ -127,6 +127,24 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
     except Exception:
         import traceback
         traceback.print_exc()
+    # body skin (1.23): the cut looked at for clothing the body parser takes for skin, when the app has not done it
+    # yet (a render right after a body value went on, a batch render, a cut whose matte was made again since)
+    # A render never downloads a model: when SAM 3.1 is not on this computer the look is left out and said.
+    try:
+        from ..track import skincloth as SC
+        if tracker is not None and getattr(tracker, "store", None) is not None:
+            need_ = SC.needed(tracker, cut)
+            if need_:
+                miss_ = SC.models_missing()
+                if miss_:
+                    rep.warnings.append("몸 피부: SAM 3.1 모델이 없어 피부색 옷 확인을 건너뛰고 몸 파서의 구분만으로 "
+                                        "보정했습니다 (설정 > 모델 관리)")
+                else:
+                    SC.run(tracker, need_, (lambda f, m: progress(0.0, m)) if progress else None, cancel)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        rep.warnings.append("몸 피부: 피부색 옷을 확인하지 못해 몸 파서의 구분만으로 보정했습니다 (" + str(e)[:140] + ")")
     info = cut.info
     a, b = cut.work_range
     n = b - a
