@@ -283,10 +283,19 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
                 rep.warnings.append(f"GPU 워프 오류로 CPU로 전환: {e.__class__.__name__}")
         return F.warp_planes(planes_, subs, fr_, maxv)
 
+    # the knee tone through time (1.26): the pictures are prepared a few ahead, in a thread of their own, and a picture is worked on when the pictures round it
+    # have been looked at (retouch.engine.KneeLook); off, every picture is prepared by the one that works on it
+    knee_look = None
+    if parallel and n_workers > 1 and getattr(RE.BTN, "KNEE_ENV", False):
+        knee_look = RE.KneeLook(lambda t_: RE.prepare(cut, tracker, t_), lambda t_: F.build_input(cut, tracker, t_), prep_lock, a, b, tracker.proxy)
+
     def process(t_, planes_):
-        with prep_lock:                    # tracker caches are not shared between threads
-            rf_ = RE.prepare(cut, tracker, t_)
-            fi_ = F.build_input(cut, tracker, t_)
+        if knee_look is not None:
+            rf_, fi_ = knee_look.get(t_)
+        else:
+            with prep_lock:                    # tracker caches are not shared between threads
+                rf_ = RE.prepare(cut, tracker, t_)
+                fi_ = F.build_input(cut, tracker, t_)
         if rf_ is not None:
             planes_ = RE.apply_planes(planes_, subs, maxv, pf, rf_, 1.0, disp_, info.color_range)
         fr_ = F.compute_field(fi_, W, H, grid_step)
@@ -333,6 +342,8 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
     if parallel and n_workers > 1:
         pool = ThreadPoolExecutor(max_workers=n_workers)
         pending: "deque" = deque()
+        if knee_look is not None:
+            knee_look.start()
         try:
             for t in range(a, b):
                 if cancel and cancel():
@@ -353,6 +364,8 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
                 _, fr0, outp0 = fut.result()
                 write_frame(t0_, outp0, fr0)
         except Exception:
+            if knee_look is not None:
+                knee_look.stop()
             pool.shutdown(wait=False, cancel_futures=True)
             reader.close()
             if writer and ext_writer is None:
@@ -360,6 +373,8 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
             for w in matte_writers.values():
                 w.abort()
             raise
+        if knee_look is not None:
+            knee_look.stop()
         pool.shutdown(wait=True, cancel_futures=True)
         a_range = range(0)
     else:

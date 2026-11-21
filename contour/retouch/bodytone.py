@@ -37,7 +37,31 @@ NOT_SKIN = (0.45, 0.65)   # brightness over the leg's: from where a pixel is ski
 FIRM = (0.55, 1.6)        # a blotch's size over the leg's own colour variation: from where it is fully taken .. (a smaller
                           # difference is the skin's own and is taken less: never less than FIRM_MIN of it)
 FIRM_MIN = 0.55
-MAX_CHANGE = {"luma": 0.035, "chroma": 0.04}   # the most one pixel's plane may move (soft limit): the knee is evened, not repainted
+MAX_CHANGE = {"luma": 0.018, "chroma": 0.02}   # the most one pixel's plane may move (soft limit): the knee is evened, not repainted (the reference's knee moves by about 0.01 in log)
+
+# ---- the knee tone's steadiness from one picture to the next (1.26)
+# A knee is read from the picture it is in: how much of the leg's skin is to be seen round it, how much of the knee is seen at all (the
+# rest under cloth, behind another leg), how wide the leg is. When these jump from one picture to the next (a width measured
+# 75 px, then 143, a ring of 20000 skin pixels, then 180) the correction jumps with them: on, off, twice as strong. So:
+#   - the leg's width is the median of the neighbouring pictures' (person_geometry_t),
+#   - a knee is changed by as much as its read of the leg can be trusted (reliability: soft, never on or off),
+#   - the plane of the leg's light is not run along the leg out of a ring that lies on one side of the knee only,
+#   - two knees that lie on each other are not changed twice.
+KNEE_V2 = True            # False: the 1.25 knee tone as it was
+REL_RING = (0.02, 0.07)   # of the leg's skin the ring could have (the leg's strip over the ring's geometry): the share that is read: from where a knee is changed at all .. fully
+REL_AREA = (0.05, 0.20)   # the same for the knee's own area (the leg's strip over it): a sliver of a knee is left alone
+TWO_SIDED = (0.05, 0.25)  # how evenly the ring lies on both sides of the knee along the leg (0 = one side only, 1 = even): from where the plane may run along the leg .. fully
+NAT_MIN = 0.008           # the leg's own variation (luma) is never read as smaller than this: a ring of a few alike pixels says nothing of what is natural
+GEO_WIN = 4               # pictures each side whose width measures are taken with the picture's own (median)
+DEBUG_INFO = None         # a list: every knee's reliability numbers are appended (for the desk, retouch tests)
+# ... and from one picture to the next: the skin area of a person is made for every picture on its own, and a knee that is plainly there in one
+# picture has none in the next (a parser that lost the leg for a picture, a hem over it). The correction then is on, off, on, at the full size of the
+# blotch it takes away. The render looks a few pictures ahead (knee_support of each picture is made known beforehand) and the strength of a knee
+# is held to what the pictures round it allow: it is never more than the support of the picture itself, and never more than ENV_STEP over the
+# support of a picture one step further away, per step (knee_envelope). A knee with support for a long stretch is corrected fully in its
+# middle, and fades in and out at its ends; a stretch of a picture or two is hardly corrected at all.
+KNEE_ENV = False          # the render's look ahead (warp/render.py) is on for the knee tone; False: every picture on its own
+ENV_STEP = 0.2            # the most the strength of a knee may change from one picture to the next (= 1 / the pictures a fade takes)
 
 
 def _ss(e0: float, e1: float, x):
@@ -78,6 +102,34 @@ def _plane(I: np.ndarray, w: np.ndarray) -> Optional[np.ndarray]:
     h, wd = I.shape
     gy, gx = np.mgrid[0:h, 0:wd].astype(np.float32)
     return (c[0] + c[1] * (gx - x0) + c[2] * (gy - y0)).astype(np.float32)
+
+
+def _plane_keep(I: np.ndarray, w: np.ndarray, axis, keep: float) -> Optional[np.ndarray]:
+    """_plane, with the plane's slope along the leg (axis, unit x y) multiplied by keep (0..1) and the plane laid again over
+    the pixels (its level the weighted mean of what is left of them): a ring on one side of the knee only says what the leg's
+    light does over its own length there, not what it does at the knee."""
+    ys, xs = np.nonzero(w > 0.2)
+    if len(xs) < 40:
+        return None
+    if len(xs) > 6000:
+        s = np.random.default_rng(7).choice(len(xs), 6000, replace=False)
+        ys, xs = ys[s], xs[s]
+    ww = w[ys, xs].astype(np.float64)
+    x0, y0 = xs.mean(), ys.mean()
+    A = np.stack([np.ones(len(xs)), xs - x0, ys - y0], 1) * np.sqrt(ww)[:, None]
+    b = I[ys, xs].astype(np.float64) * np.sqrt(ww)
+    try:
+        c, *_ = np.linalg.lstsq(A, b, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    ax, ay = float(axis[0]), float(axis[1])
+    gu = (c[1] * ax + c[2] * ay) * float(np.clip(keep, 0.0, 1.0))        # along the leg
+    gv = -c[1] * ay + c[2] * ax                                           # across it
+    bx, by = gu * ax - gv * ay, gu * ay + gv * ax
+    lvl = float((ww * (I[ys, xs].astype(np.float64) - bx * (xs - x0) - by * (ys - y0))).sum() / max(float(ww.sum()), 1e-9))
+    h, wd = I.shape
+    gy, gx = np.mgrid[0:h, 0:wd].astype(np.float32)
+    return (lvl + bx * (gx - x0) + by * (gy - y0)).astype(np.float32)
 
 
 def knee_geometry(shape: Tuple[int, int], centre, axis, half: float):
@@ -178,13 +230,16 @@ def local_skin(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, centre, axis, half
 
 
 def tone_plane(P: np.ndarray, area: np.ndarray, ring: np.ndarray, half: float, k: float, kind: str,
-               firm: Optional[np.ndarray] = None, ring_res: Optional[np.ndarray] = None) -> np.ndarray:
+               firm: Optional[np.ndarray] = None, ring_res: Optional[np.ndarray] = None,
+               rel: float = 1.0, axis=None, keep: float = 1.0) -> np.ndarray:
     """One plane (a luma or a chroma plane) of the knee's tone work. area: 0..1 where the knee's own area is (inside the
     leg's skin), ring: 0..1 the skin the colour is read from, half: half the leg's width in this plane's pixels,
-    k: 0..1, kind: 'luma' or 'chroma'. -> the plane (a copy)."""
+    k: 0..1, kind: 'luma' or 'chroma'. rel: 0..1 how far the read of the leg can be trusted (what is changed is multiplied
+    by it, after the limit), axis, keep: the leg's direction and the share of the leg's light along it that is run over the
+    knee (a luma plane). -> the plane (a copy)."""
     out = P.astype(np.float32, copy=True)
     r = _roi(area, int(3.2 * half) + 6)
-    if r is None or k < 1e-4:
+    if r is None or k < 1e-4 or rel < 1e-4:
         return out
     y0, y1, x0, x1 = r
     I = P[y0:y1, x0:x1].astype(np.float32)
@@ -195,11 +250,16 @@ def tone_plane(P: np.ndarray, area: np.ndarray, ring: np.ndarray, half: float, k
     sig_f = max(2.0, FINE * half)
     sig_b = max(2.0, BROAD * half)
     base = cv2.GaussianBlur(I, (0, 0), sig_f)             # everything but the grain
-    pl = _plane(base, W) if kind == "luma" else None     # (colour: the ring's own, one value; the leg's light is what runs along it)
+    if kind == "luma" and axis is not None and keep < 0.999:
+        pl = _plane_keep(base, W, axis, keep)
+    else:
+        pl = _plane(base, W) if kind == "luma" else None  # (colour: the ring's own, one value; the leg's light is what runs along it)
     S = pl if pl is not None else np.full_like(base, float((base * W).sum() / max(float(W.sum()), 1e-6)))
     flat = base - S                                       # (S is the plane here: what the leg's skin does by itself, as seen from the ring)
     ringpx = W > 0.5
     nat = 1.4826 * float(np.median(np.abs(flat[ringpx] - np.median(flat[ringpx])))) if int(ringpx.sum()) > 30 else 0.0
+    if KNEE_V2 and kind == "luma":
+        nat = max(nat, NAT_MIN)
     Wr = ring_res[y0:y1, x0:x1].astype(np.float32) if ring_res is not None else W
     res_, den = _nconv(base - S, Wr, sig_b)               # what the plane misses of the leg round the knee, spread over the knee ...
     S = S + res_ * (den / (den + RES_DEN)).astype(np.float32)      # ... as far as there is leg round it near enough to say
@@ -220,6 +280,8 @@ def tone_plane(P: np.ndarray, area: np.ndarray, ring: np.ndarray, half: float, k
         c0 = 0.6 * cap                                     # soft limit: what is under 0.6 of the cap passes as it is, more is
         a = np.abs(d)                                      # squeezed towards the cap
         d = np.where(a <= c0, d, np.sign(d) * (c0 + (cap - c0) * np.tanh((a - c0) / (cap - c0)))).astype(np.float32)
+    if rel < 0.9999:
+        d = d * float(rel)
     out[y0:y1, x0:x1] = I + d
     return out
 
@@ -251,14 +313,98 @@ def _masked_skin(Yo, skin, e, area, half):
     return (area * sk_w).astype(np.float32), (ringw * _ss(0.6, 0.9, sk) * light).astype(np.float32)
 
 
-def knee_tone(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, skin: Optional[np.ndarray], knees, k: float, cs: float = 1.0):
-    """The knee tone of one person on one picture.
+def _leg_strip(shape, centre, axis, half: float):
+    """(u, leg): u the distance along the leg from the knee (px), leg 0..1 where a pixel is across the leg's own width."""
+    u, v = leg_coords(shape, centre, axis)
+    leg = (1.0 - _ss(LEG_EDGE[0], LEG_EDGE[1], np.abs(v) / half)).astype(np.float32)
+    return u, leg
 
-    Y, Cb, Cr: the picture's planes (float; Cb and Cr cs times the size of Y, in pixels, 1 = the same size),
-    skin: 0..1 the person's skin area at Y's size (retouch.bodyskin; None: there is none, read from the leg's own strip, local_skin), knees: [(centre (x, y), leg axis (unit), half the
-    leg's width)] in Y's pixels, k: 0..1. -> (Y, Cb, Cr), copies (the planes themselves where nothing changed)."""
-    if k < 1e-4 or not knees:
-        return Y, Cb, Cr
+
+def knee_reliability(e: np.ndarray, area: np.ndarray, w_area: np.ndarray, w_ring: np.ndarray, centre, axis, half: float):
+    """How far one knee's read of the leg can be trusted, from how much of the skin it could have read is there.
+
+    e, area: the knee's elliptical radius and own area, w_area, w_ring: the knee's skin weights (_masked_skin / local_skin).
+    -> (rel, keep, info): rel 0..1, the share of the knee's correction that is made (soft: nothing jumps from all to none),
+    keep 0..1, the share of the leg's light along the leg that is run over the knee (0: the ring is on one side of the knee
+    only), info: the numbers behind them."""
+    u, leg = _leg_strip(e.shape, centre, axis, half)
+    ringw = _ss(RING[0], RING[0] + 0.35, e) * (1.0 - _ss(RING[1] - 0.6, RING[1], e))
+    nom_r = float((ringw * leg).sum())
+    nom_a = float((area * leg).sum())
+    sr, sa = float(w_ring.sum()), float(w_area.sum())
+    cov_r = min(1.0, sr / max(nom_r, 1e-6))
+    cov_a = min(1.0, sa / max(nom_a, 1e-6))
+    sup = w_ring > 0.2                                    # (counted, not weighed: the leg's own strip reads the shin less on purpose)
+    up = float(sup[u < 0].sum())
+    dn = float(sup[u >= 0].sum())
+    two = 2.0 * min(up, dn) / max(up + dn, 1e-6)
+    r_ring = float(_ss(REL_RING[0], REL_RING[1], cov_r))
+    r_area = float(_ss(REL_AREA[0], REL_AREA[1], cov_a))
+    keep = float(_ss(TWO_SIDED[0], TWO_SIDED[1], two))
+    rel = r_ring * r_area
+    return rel, keep, dict(cov_ring=round(cov_r, 4), cov_area=round(cov_a, 4), two=round(two, 3), r_ring=round(r_ring, 3), r_area=round(r_area, 3),
+                           keep=round(keep, 3), rel=round(rel, 3), half=round(float(half), 1), cx=round(float(centre[0]), 1), cy=round(float(centre[1]), 1))
+
+
+def knee_support(m: np.ndarray, scale: float, knees) -> list:
+    """How much of the leg's skin one picture's skin area has round each of a person's knees: the same weighing as knee_reliability's, on the area as
+    the analysis made it (before the picture's own colour and brightness are asked: that is made when the picture is worked on).
+
+    m: the person's body skin area on the analysis picture (float32 0..1), scale: that picture's pixels per source pixel,
+    knees: person_geometry's [(cx, cy, ax, ay, half)] in source px. -> [0..1 for each knee]"""
+    out = []
+    h, w = m.shape
+    for (cx, cy, ax, ay, half) in knees:
+        hh = float(half) * float(scale)
+        if not hh > 1.5:
+            out.append(0.0)
+            continue
+        c0 = (float(cx) * scale, float(cy) * scale)
+        R = int(RING[1] * KNEE_ALONG * hh) + 2
+        x0, x1 = max(0, int(c0[0]) - R), min(w, int(c0[0]) + R + 1)
+        y0, y1 = max(0, int(c0[1]) - R), min(h, int(c0[1]) + R + 1)
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            out.append(0.0)
+            continue
+        sub = np.asarray(m[y0:y1, x0:x1], np.float32)
+        c_ = (c0[0] - x0, c0[1] - y0)
+        e = knee_geometry(sub.shape, c_, (ax, ay), hh)
+        area = 1.0 - _ss(KNEE_EDGE[0], KNEE_EDGE[1], e)
+        _, leg = _leg_strip(sub.shape, c_, (ax, ay), hh)
+        ringw = _ss(RING[0], RING[0] + 0.35, e) * (1.0 - _ss(RING[1] - 0.6, RING[1], e))
+        nom_a = float((area * leg).sum())
+        nom_r = float((ringw * leg).sum())
+        if nom_a < 1e-3 or nom_r < 1e-3:
+            out.append(0.0)
+            continue
+        cov_a = min(1.0, float((area * leg * sub).sum()) / nom_a)
+        cov_r = min(1.0, float((ringw * leg * sub).sum()) / nom_r)
+        out.append(float(_ss(REL_AREA[0], REL_AREA[1], cov_a) * _ss(REL_RING[0], REL_RING[1], cov_r)))
+    return out
+
+
+def env_reach(step: Optional[float] = None) -> int:
+    """How many pictures each side of a picture its envelope looks at (a support of 1 is no more than step per picture away from 0 after this many)."""
+    st = ENV_STEP if step is None else float(step)
+    return int(np.ceil(1.0 / max(st, 1e-3)))
+
+
+def knee_envelope(support, t: int, lo: int, hi: int, step: Optional[float] = None) -> float:
+    """The most a knee may be corrected on picture t: min over the pictures u in [lo, hi] of support[u] + step * |t - u|, 0 for a picture that has no
+    support entry. support: dict picture -> 0..1 (or any object with .get). Never more than the picture's own support; a picture the supported stretch
+    is short of (step per picture) reaches full strength only in the middle of a stretch of 2 / step pictures."""
+    st = ENV_STEP if step is None else float(step)
+    r = env_reach(st)
+    best = 1.0
+    for u in range(max(lo, t - r), min(hi, t + r) + 1):
+        v = float(support.get(u, 0.0)) + st * abs(t - u)
+        if v < best:
+            best = v
+    return float(max(0.0, min(1.0, best)))
+
+
+def _knee_tone_v1(Y, Cb, Cr, skin, knees, k, cs):
+    """The knee tone as 1.25 had it: one knee after the other, each on what the one before left."""
     hY, wY = Y.shape
     hC, wC = Cb.shape
     Yo, Cbo, Cro = Y, Cb, Cr
@@ -299,19 +445,167 @@ def knee_tone(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, skin: Optional[np.n
     return Yo, Cbo, Cro
 
 
+def _merge(d_all: Optional[np.ndarray], d: np.ndarray) -> np.ndarray:
+    """Two knees' changes of a plane laid together: where both change a pixel, the larger of the two stays (never their sum)."""
+    if d_all is None:
+        return d
+    return np.where(np.abs(d) > np.abs(d_all), d, d_all).astype(np.float32)
+
+
+def _knee_tone_v2(Y, Cb, Cr, skin, knees, k, cs, gains=None):
+    """The knee tone with its read of the leg weighed (knee_reliability): every knee reads the picture as it came (not what
+    another knee changed), changes it by as much as the read can be trusted, and where two knees change the same pixel the
+    larger change stays."""
+    hY, wY = Y.shape
+    hC, wC = Cb.shape
+    dY = dCb = dCr = None
+    for ki_, (centre, axis, half) in enumerate(knees):
+        half = float(half)
+        if not (half > 1.5):
+            continue
+        gain = 1.0
+        if gains is not None and ki_ < len(gains) and gains[ki_] is not None:
+            gain = float(np.clip(gains[ki_], 0.0, 1.0))
+            if gain < 1e-3:
+                continue
+        e = knee_geometry((hY, wY), centre, axis, half)
+        area = 1.0 - _ss(KNEE_EDGE[0], KNEE_EDGE[1], e)
+        if float(area.max()) < 0.05:
+            continue
+        got = None
+        if skin is not None:
+            got = _masked_skin(Y, skin, e, area, half)
+        else:
+            ls = local_skin(Y, Cb, Cr, centre, axis, half, e)
+            if ls is not None and int((ls[1] > 0.5).sum()) >= 60:
+                got = ((area * ls[0]).astype(np.float32), ls[1])
+        if got is None:
+            continue
+        w_area, w_ring = got
+        rel, keep, info = knee_reliability(e, area, w_area, w_ring, centre, axis, half)
+        info["gain"] = round(gain, 3)
+        if DEBUG_INFO is not None:
+            DEBUG_INFO.append(info)
+        rel *= gain
+        if rel < 1e-3:
+            continue
+        w_far = (w_ring * _ss(RES_FROM, RES_FROM + 0.4, e)).astype(np.float32)
+        Yn = tone_plane(Y, w_area, w_ring, half, k, "luma", ring_res=w_far, rel=rel, axis=axis, keep=keep)
+        dY = _merge(dY, Yn - Y)
+        for nm in ("cb", "cr"):
+            Pc = Cb if nm == "cb" else Cr
+            if Pc.shape == (hY, wY):
+                wa, wr, wf, hf = w_area, w_ring, w_far, half
+            else:
+                wa = cv2.resize(w_area, (wC, hC), interpolation=cv2.INTER_AREA)
+                wr = cv2.resize(w_ring, (wC, hC), interpolation=cv2.INTER_AREA)
+                wf = cv2.resize(w_far, (wC, hC), interpolation=cv2.INTER_AREA)
+                hf = max(1.5, half * cs)
+            Pn = tone_plane(Pc, wa, wr, hf, k, "chroma", ring_res=wf, rel=rel)
+            if nm == "cb":
+                dCb = _merge(dCb, Pn - Pc)
+            else:
+                dCr = _merge(dCr, Pn - Pc)
+    Yo = Y if dY is None else (Y + dY).astype(np.float32)
+    Cbo = Cb if dCb is None else (Cb + dCb).astype(np.float32)
+    Cro = Cr if dCr is None else (Cr + dCr).astype(np.float32)
+    return Yo, Cbo, Cro
+
+
+def knee_tone(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, skin: Optional[np.ndarray], knees, k: float, cs: float = 1.0, gains=None):
+    """The knee tone of one person on one picture.
+
+    Y, Cb, Cr: the picture's planes (float; Cb and Cr cs times the size of Y, in pixels, 1 = the same size),
+    skin: 0..1 the person's skin area at Y's size (retouch.bodyskin; None: there is none, read from the leg's own strip, local_skin), knees: [(centre (x, y), leg axis (unit), half the
+    leg's width)] in Y's pixels, k: 0..1, gains: [0..1 for each knee]: the most each may be corrected on this picture (knee_envelope; None: no limit).
+    -> (Y, Cb, Cr), copies (the planes themselves where nothing changed)."""
+    if k < 1e-4 or not knees:
+        return Y, Cb, Cr
+    if KNEE_V2:
+        return _knee_tone_v2(Y, Cb, Cr, skin, knees, k, cs, gains)
+    return _knee_tone_v1(Y, Cb, Cr, skin, knees, k, cs)
+
+
 # ---- where the knees and the belly are, from the tracks
 
-def person_geometry(kp: np.ndarray, widths: Optional[np.ndarray]) -> dict:
+def _finite(a) -> bool:
+    return a is not None and np.isfinite(np.asarray(a, np.float64)).all()
+
+
+def _knee_raw(kp: np.ndarray, widths: Optional[np.ndarray], tag: str):
+    """One knee ('l' or 'r') of one picture as the tracks have it: (cx, cy, ax, ay, half) in source pixels, or None where the
+    knee, or the line along its leg, is not there."""
+    from ..warp import body as B
+    from ..track import skeleton as S
+    kn_i, hip_i, an_i = (S.L_KN, S.L_HIP, S.L_AN) if tag == "l" else (S.R_KN, S.R_HIP, S.R_AN)
+    k = np.asarray(kp[kn_i, :2], np.float64)
+    if not _finite(k):
+        return None
+    hp = np.asarray(kp[hip_i, :2], np.float64)
+    an = np.asarray(kp[an_i, :2], np.float64)
+    v1 = (k - hp) if _finite(hp) else None
+    v2 = (an - k) if _finite(an) else None
+    parts = []
+    for v in (v1, v2):
+        if v is not None and float(np.hypot(*v)) > 4:
+            parts.append(v / float(np.hypot(*v)))
+    if not parts:
+        return None
+    ax = np.sum(parts, 0)
+    n = float(np.hypot(*ax))
+    ax = ax / n if n > 1e-3 else parts[0]
+    L = float(np.hypot(*(an - hp))) if (_finite(hp) and _finite(an)) else float(np.hypot(*(v1 if v1 is not None else v2)) * 2.0)
+    half = np.nan
+    if widths is not None:
+        ws = []
+        for nm in ("knee_t" + tag, "knee_c" + tag):
+            w = np.asarray(widths[B.SEG_INDEX[nm]], np.float64)
+            if np.isfinite(w).any():
+                ws.append(float(np.nanmean(w)))
+        if ws:
+            half = float(np.mean(ws))
+    if not np.isfinite(half) or half <= 0:
+        half = 0.055 * L
+    return (float(k[0]), float(k[1]), float(ax[0]), float(ax[1]), float(half))
+
+
+def person_geometry_t(final_p: np.ndarray, widths_p: Optional[np.ndarray], t: int, win: Optional[int] = None) -> dict:
+    """person_geometry of picture t of one person (final_p: the person's keypoints over the cut (T, 17, >= 2), widths_p: the
+    widths over the cut (T, segments, 2) or None), with each knee's half width the median of the widths measured in the pictures
+    t - win .. t + win: a leg's width does not change from one picture to the next, its measure does (75 px, then 143, then 61),
+    and everything the knee tone reads is laid out in that width. From the tracks alone: the same for a picture whatever
+    order the pictures are made in."""
+    win = GEO_WIN if win is None else int(win)
+    kp = final_p[t]
+    wd = widths_p[t] if widths_p is not None else None
+    if not KNEE_V2 or win <= 0:
+        return person_geometry(kp, wd)
+    halves = {}
+    n = len(final_p)
+    for tag in ("l", "r"):
+        vals = []
+        for s_ in range(max(0, t - win), min(n, t + win + 1)):
+            try:
+                g = _knee_raw(final_p[s_], widths_p[s_] if widths_p is not None else None, tag)
+            except Exception:
+                g = None
+            if g is not None and np.isfinite(g[4]) and g[4] > 0:
+                vals.append(g[4])
+        if len(vals) >= 3:
+            halves[tag] = float(np.median(vals))
+    return person_geometry(kp, wd, halves)
+
+
+def person_geometry(kp: np.ndarray, widths: Optional[np.ndarray], halves: Optional[dict] = None) -> dict:
     """The places the two effects work on, in source pixels, from one person's keypoints (17, >= 2) and the widths the
     tracking measured (one row of retouch's store: (segments, 2), may be None).
 
-    -> dict(knees=[(cx, cy, ax, ay, half)], belly=None | dict(c=(x, y), u=(ux, uy), along=, across=, trunk=)):
-    a knee's centre, the direction the leg runs in and half its width; the belly's centre (a little over half way down
-    the trunk, from the neck to the pelvis), the trunk's direction, half the zone's length along it and across it, and
-    the trunk's length."""
+    -> dict(knees=[(cx, cy, ax, ay, half)], sides=['l' | 'r' of each knee], belly=None | dict(c=(x, y), u=(ux, uy), along=, across=, trunk=)):
+    a knee's centre, the direction the leg runs in and half its width (halves: {'l': .., 'r': ..} replaces the measured one);
+    the belly's centre (a little over half way down the trunk, from the neck to the pelvis), the trunk's direction, half the
+    zone's length along it and across it, and the trunk's length."""
     from ..warp import body as B
-    from ..track import skeleton as S
-    out = dict(knees=[], belly=None)
+    out = dict(knees=[], sides=[], belly=None)
     try:
         ends = B.segment_endpoints(np.asarray(kp, np.float32))
     except Exception:
@@ -321,37 +615,16 @@ def person_geometry(kp: np.ndarray, widths: Optional[np.ndarray]) -> dict:
         return B.SEG_INDEX[name]
 
     def finite(a):
-        return a is not None and np.isfinite(np.asarray(a, np.float64)).all()
-    for kn_i, hip_i, an_i, tag in ((S.L_KN, S.L_HIP, S.L_AN, "l"), (S.R_KN, S.R_HIP, S.R_AN, "r")):
-        k = np.asarray(kp[kn_i, :2], np.float64)
-        if not finite(k):
+        return _finite(a)
+    for tag in ("l", "r"):
+        g = _knee_raw(kp, widths, tag)
+        if g is None:
             continue
-        hp = np.asarray(kp[hip_i, :2], np.float64)
-        an = np.asarray(kp[an_i, :2], np.float64)
-        v1 = (k - hp) if finite(hp) else None
-        v2 = (an - k) if finite(an) else None
-        parts = []
-        for v in (v1, v2):
-            if v is not None and float(np.hypot(*v)) > 4:
-                parts.append(v / float(np.hypot(*v)))
-        if not parts:
-            continue
-        ax = np.sum(parts, 0)
-        n = float(np.hypot(*ax))
-        ax = ax / n if n > 1e-3 else parts[0]
-        L = float(np.hypot(*(an - hp))) if (finite(hp) and finite(an)) else float(np.hypot(*(v1 if v1 is not None else v2)) * 2.0)
-        half = np.nan
-        if widths is not None:
-            ws = []
-            for nm in ("knee_t" + tag, "knee_c" + tag):
-                w = np.asarray(widths[seg(nm)], np.float64)
-                if np.isfinite(w).any():
-                    ws.append(float(np.nanmean(w)))
-            if ws:
-                half = float(np.mean(ws))
-        if not np.isfinite(half) or half <= 0:
-            half = 0.055 * L
-        out["knees"].append((float(k[0]), float(k[1]), float(ax[0]), float(ax[1]), float(half)))
+        half = g[4]
+        if halves and tag in halves and np.isfinite(halves[tag]) and halves[tag] > 0:
+            half = float(halves[tag])
+        out["knees"].append((g[0], g[1], g[2], g[3], float(half)))
+        out["sides"].append(tag)
     try:
         e = np.asarray(ends[seg("waist")], np.float64)
         if finite(e):

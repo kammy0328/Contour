@@ -2386,7 +2386,8 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 if v.get("knee_tone", 0) > 1e-4 or v.get("belly_fold", 0) > 1e-4:
                     # (from the tracks alone: the knee tone reads the leg's skin from the picture itself where the body
                     # skin's area is not there)
-                    job.tone = BTN.person_geometry(st.final[p, t], st.widths[p, t])
+                    # (the legs' widths are the median of the neighbouring pictures': the measure of one picture jumps, the leg does not)
+                    job.tone = BTN.person_geometry_t(st.final[p], st.widths[p] if getattr(st, "widths", None) is not None else None, int(t))
 
                 def mk_body():
                     with _tm("body.base"):
@@ -2457,6 +2458,126 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
     if not jobs:
         return None
     return RetouchFrame(t, jobs, (px.w, px.h), (cut.info.width, cut.info.height))
+
+
+# --------------------------------------------------------------------------- the knee tone through time (1.26)
+
+def knee_probe(rf: Optional["RetouchFrame"], px) -> Dict[tuple, float]:
+    """The support of each knee of a prepared picture in its person's body skin area (bodytone.knee_support): {(person id, 'l' | 'r'): 0..1}. A person
+    without an area (the knee tone then reads the leg's own strip) is not limited: 1."""
+    out: Dict[tuple, float] = {}
+    if rf is None:
+        return out
+    sc = 0.5 * (float(px.sx) + float(px.sy))
+    for job in rf.jobs:
+        tone = getattr(job, "tone", None)
+        if not tone or not tone.get("knees"):
+            continue
+        sides = tone.get("sides") or []
+        pm = (job.body or {}).get("mask") if getattr(job, "body", None) else None
+        m = None
+        if pm is not None:
+            try:
+                m = BS.unpack_mask(pm)
+            except Exception:
+                m = None
+        sup = BTN.knee_support(m, sc, tone["knees"]) if m is not None else [1.0] * len(tone["knees"])
+        for i, v_ in enumerate(sup):
+            out[(job.pid, sides[i] if i < len(sides) else str(i))] = float(v_)
+    return out
+
+
+def knee_gains_apply(rf: Optional["RetouchFrame"], gain_of) -> None:
+    """Lay the strength each knee of a prepared picture may be corrected with on it: gain_of(person id, side) -> 0..1."""
+    if rf is None:
+        return
+    for job in rf.jobs:
+        tone = getattr(job, "tone", None)
+        if not tone or not tone.get("knees"):
+            continue
+        sides = tone.get("sides") or []
+        tone["gain"] = [float(gain_of(job.pid, sides[i] if i < len(sides) else str(i))) for i in range(len(tone["knees"]))]
+
+
+class KneeLook:
+    """The render's look ahead for the knee tone. The pictures of a cut are prepared here, in order, in a thread of their own, a few ahead of the pictures
+    that are worked on (the work of preparing is the same as ever, it is only made a little earlier, and once); every prepared picture is looked at for the support
+    its knees have (knee_probe), and a picture is handed to the work only when the pictures round it have been looked at: its knees are given the strength
+    bodytone.knee_envelope allows them. get(t) -> (RetouchFrame or None, the field input) for the picture t, as prepare and build_input would give.
+
+    prepare, build_input: callables (t) -> ..., lock: the one the render holds while it prepares, a, b: the pictures [a, b) that are worked on, px: the
+    analysis picture's scale (tracker.proxy), lead: how many pictures it may be ahead of the first not yet handed on (at least reach + 1)."""
+
+    def __init__(self, prepare, build_input, lock, a: int, b: int, px, step: Optional[float] = None, lead: Optional[int] = None):
+        import threading
+        self.prepare, self.build_input, self.lock, self.a, self.b, self.px = prepare, build_input, lock, int(a), int(b), px
+        self.step = step
+        self.reach = BTN.env_reach(step)
+        self.lead = max(int(lead if lead is not None else self.reach + 12), self.reach + 2)
+        self.cv = threading.Condition()
+        self.items: Dict[int, tuple] = {}
+        self.sup: Dict[int, dict] = {}
+        self.done = self.a - 1
+        self.low = self.a
+        self.taken: set = set()
+        self.err: Optional[BaseException] = None
+        self.stopped = False
+        self.th = threading.Thread(target=self._run, name="knee-look", daemon=True)
+
+    def start(self) -> "KneeLook":
+        self.th.start()
+        return self
+
+    def stop(self) -> None:
+        with self.cv:
+            self.stopped = True
+            self.cv.notify_all()
+
+    def _run(self) -> None:
+        try:
+            for t in range(self.a, self.b):
+                with self.cv:
+                    while not self.stopped and t - self.low > self.lead:
+                        self.cv.wait(0.5)
+                    if self.stopped:
+                        return
+                with self.lock:
+                    rf = self.prepare(t)
+                    fi = self.build_input(t)
+                sup = knee_probe(rf, self.px) if rf is not None else {}
+                with self.cv:
+                    self.items[t] = (rf, fi)
+                    self.sup[t] = sup
+                    self.done = t
+                    self.cv.notify_all()
+        except BaseException as e:        # (handed to whoever is waiting: the render stops with it as it would have)
+            with self.cv:
+                self.err = e
+                self.cv.notify_all()
+
+    def get(self, t: int):
+        need = min(t + self.reach, self.b - 1)
+        with self.cv:
+            while self.done < need and self.err is None and not self.stopped:
+                self.cv.wait(0.5)
+            if self.err is not None:
+                raise self.err
+            if self.stopped:
+                raise RuntimeError("knee look stopped")
+            rf, fi = self.items.pop(t)
+            lo, hi = self.a, self.b - 1
+            window = {u: self.sup.get(u, {}) for u in range(max(lo, t - self.reach), min(hi, t + self.reach) + 1)}
+            self.taken.add(t)
+            while self.low in self.taken:
+                self.taken.discard(self.low)
+                self.sup.pop(self.low - self.reach - 1, None)
+                self.low += 1
+            self.cv.notify_all()
+        if rf is not None:
+            def gain_of(pid, side):
+                return BTN.knee_envelope({u: w.get((pid, side), 0.0) for u, w in window.items()}, t, lo, hi, self.step)
+            knee_gains_apply(rf, gain_of)
+        return rf, fi
 
 
 # --------------------------------------------------------------------------- operations
@@ -4208,7 +4329,7 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                 kn_ = [((cx * y_per_src, cy * y_per_src), (ax_, ay_), hf_ * y_per_src)
                        for (cx, cy, ax_, ay_, hf_) in job.tone["knees"]]
                 with _tm("apply.knee_tone"):
-                    Y, Cb, Cr = BTN.knee_tone(Y, Cb, Cr, regK, kn_, float(np.clip(v["knee_tone"], 0, 1)), cs)
+                    Y, Cb, Cr = BTN.knee_tone(Y, Cb, Cr, regK, kn_, float(np.clip(v["knee_tone"], 0, 1)), cs, gains=job.tone.get("gain"))
             except Exception:
                 import traceback
                 traceback.print_exc()
