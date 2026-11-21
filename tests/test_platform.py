@@ -189,9 +189,12 @@ def test_pause_and_cancel_reach_the_childs_own_children(tmp_path):
         def count():
             for _ in range(20):
                 try:
-                    return int(beat.read_text() or 0)
+                    s = beat.read_text()
+                    if s:                      # (the grandchild truncates the file just before it writes: empty is not 0)
+                        return int(s)
                 except (ValueError, OSError):
-                    time.sleep(0.005)
+                    pass
+                time.sleep(0.005)
             return -1
         assert BR._suspend(p.pid, True)
         time.sleep(0.15)
