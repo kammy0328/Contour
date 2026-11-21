@@ -39,8 +39,8 @@ def body_cloth_line(tracker, cut, on: bool):
             inf = SC.info(tracker)
             if inf.get("state") == "current":
                 if inf.get("ranges"):
-                    return f"피부색 옷 확인됨: {int(inf.get('frames', 0))}프레임에서 옷을 제외합니다.", False
-                return "피부색 옷 확인됨: 피부로 잘못 볼 옷이 없습니다.", False
+                    return f"피부색 옷 확인됨: {int(inf.get('frames', 0))}프레임에서 옷·머리카락을 제외합니다.", False
+                return "피부색 옷 확인됨: 피부로 잘못 볼 옷·머리카락이 없습니다.", False
             return "옷 영역(옷 유지) 분석을 그대로 씁니다.", False
         st_ = SC.info(tracker).get("state")
         return ("인물 매트가 바뀌어 피부색 옷을 다시 확인해야 합니다." if st_ == "stale"
@@ -312,7 +312,7 @@ class ReshapeTab(_Tab):
         self.body_cloth_info.setWordWrap(True)
         cr.addWidget(self.body_cloth_info, 1)
         self.body_cloth_btn = Wd.button("옷 확인", "ghost", "search",
-                                        "피부색 옷(퍼, 살색 상의·스타킹 등)을 SAM 3.1로 찾아 몸 피부에서 제외합니다.\n"
+                                        "피부색 옷(퍼, 살색 상의·스타킹 등)과 피부로 잘못 볼 머리카락을 SAM 3.1로 찾아 몸 피부에서 제외합니다.\n"
                                         "몸 효과를 켜면 자동으로 하고, 내보낼 때도 안 되어 있으면 먼저 합니다")
         self.body_cloth_btn.clicked.connect(lambda: self.ctl.ensure_skin_cloth(quiet=False))
         cr.addWidget(self.body_cloth_btn)

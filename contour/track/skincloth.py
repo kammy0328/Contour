@@ -13,6 +13,11 @@ on at a garment's edge, the frames from the look before to the look after get th
 skin's area leaves the clothing out there (bodyskin.garments). Elsewhere nothing more is made and the parser stands
 as it is: what a look costs a cut with nothing to find is a twelfth of the frames.
 
+Hair is looked for with the garments (the word 'hair', 1.23 after j2801): fair hair in a bun seen from behind is skin
+to the parser as well (2611 025: three quarters of that person's area lay on the hair). It is written into the same
+maps (the clothing store's hair class) and left out of the area like a garment; of the skin the parser is sure of
+only what lies outside the head the joints place counts for it (hair on the head is not the body's anyway).
+
 Kept apart from the clothing masks of 옷 유지 (clothing.py: every frame of the cut, staged and made again with the
 matte's revisions): cache/skincloth/<frame>.png (the clothing store's values at the matte's size, only the frames
 that have one) and cache/skincloth.json. Where the clothing masks are in use for a person, they are read instead.
@@ -31,6 +36,8 @@ import cv2
 import numpy as np
 
 LOOK_STEP = 12              # frames between two looks
+HAIR = 2                    # the clothing store's class for hair (clothing.CLASSES)
+LOOK_FILE = Path(__file__).resolve().parent / "data" / "sam31_text_skinlook.npz"      # 'hair' (tools/sam31_phrases.py)
 SURE = 0.80                 # the parser's skin share from which a pixel is skin it is sure of
 DIRTY_SHARE = 0.10          # of the skin the parser is sure of on a person: called clothing by the garment words ...
 DIRTY_PX = 0.0004           # ... and that much of the picture, from which the frames round the look get their maps
@@ -68,7 +75,16 @@ def state(tracker) -> dict:
 def model_key() -> str:
     from . import clothing as CL
     from .faceparse import file_fp
-    return "sam31@" + file_fp(CL.GARMENT_FILE)
+    return "sam31@" + file_fp(CL.GARMENT_FILE) + ("+" + file_fp(LOOK_FILE) if LOOK_FILE.is_file() else "")
+
+
+def more_phrases() -> tuple:
+    """The look's own words beside the garments': ((class, text, text_pad), ...). () when their file is not there."""
+    try:
+        d = np.load(str(LOOK_FILE))
+        return ((HAIR, d["hair__text"].astype(np.float32), d["hair__text_pad"].astype(bool)),)
+    except Exception:
+        return ()
 
 
 def _fresh(tracker, s: dict) -> bool:
@@ -203,7 +219,12 @@ def _write(d: Path, t: int, m: np.ndarray) -> None:
 
 
 def _dirty(row: Dict[int, list], picture_px: int) -> bool:
-    return any(k >= DIRTY_PX * picture_px and k >= DIRTY_SHARE * max(1, n) for n, k in row.values())
+    """row: person -> [skin the parser is sure of, of it called clothing, of it (off the head) called hair] px."""
+    for v in row.values():
+        n = v[0]
+        if any(k >= DIRTY_PX * picture_px and k >= DIRTY_SHARE * max(1, n) for k in v[1:3]):
+            return True
+    return False
 
 
 def ranges_of(looks: List[int], dirty: List[bool]) -> List[List[int]]:
@@ -244,6 +265,20 @@ def run(tracker, persons: List[int], progress: Optional[Callable[[float, str], N
     gf = models.get("garments")
     if gf is None:
         gf = models["garments"] = CL.GarmentFinder()
+    also_was = getattr(gf, "also", ())
+    gf.also = more_phrases()
+    try:
+        return _run(tracker, persons, progress, cancel, gf, old, t0)
+    finally:
+        gf.also = also_was
+
+
+def _run(tracker, persons, progress, cancel, gf, old, t0) -> bool:
+    from . import clothing as CL
+    from .exposure import analysis_view
+    from ..retouch import bodyskin as BS
+    st, proxy = tracker.store, tracker.proxy
+    a, b = tracker.cut.work_range
     mw, mh = tracker.matte.w, tracker.matte.h
     W, H = int(proxy.w), int(proxy.h)
     d = _dir(tracker)
@@ -270,16 +305,31 @@ def run(tracker, persons: List[int], progress: Optional[Callable[[float, str], N
         if m is not None:
             g = cv2.resize(np.isin(m.astype(np.int16) - 1, clothes).astype(np.uint8), (W, H),
                            interpolation=cv2.INTER_NEAREST) > 0
+            gh = cv2.resize((m.astype(np.int16) - 1 == HAIR).astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST) > 0
+            heads = None
             for p in pres:
                 own = BS.ownership(tracker, t, p, (W, H), others=False)[0]
                 pr = BS._parse_cached(tracker, p, t, rgb, own) if own is not None else None
                 if pr is None:
                     continue
                 sk = BS._place(pr, "skin", (H, W))
-                sure = (sk > SURE) & (own > 0.8)
                 if "face" in pr:
-                    sure &= BS._place(pr, "face", (H, W)) < 0.5
-                row[int(st.pids[p])] = [int(sure.sum()), int((sure & g).sum())]
+                    # the skin the area itself takes for the body's: the face class is a face where a head is, skin
+                    # like the body's elsewhere (bodyskin.FACE_NEAR: a trunk the parser calls face, 2611 085, 087)
+                    fc = BS._place(pr, "face", (H, W))
+                    if BS.FACE_NEAR is not None:
+                        if heads is None:
+                            heads = BS.heads_map(BS.head_spots(st, t), (0, 0, W, H), proxy.sx, proxy.sy, 2.0)
+                        fc = fc * heads
+                    sk = np.clip(sk - fc, 0, 1)
+                sure = (sk > SURE) & (own > 0.8)
+                n_hair = 0
+                if gh.any():
+                    hit = sure & gh
+                    if hit.any():
+                        head = BS.region_maps(BS.body_info(st, p, t), (H, W), proxy.sx, proxy.sy)["head"]
+                        n_hair = int((hit & (head < 0.5)).sum())
+                row[int(st.pids[p])] = [int(sure.sum()), int((sure & g).sum()), n_hair]
             _write(d, t, m)
             made.add(t)
         looked[t] = row

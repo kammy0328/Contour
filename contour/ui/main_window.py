@@ -3567,8 +3567,8 @@ class MainWindow(QMainWindow):
             if ok:
                 inf = SC.info(tr)
                 n = int(inf.get("frames", 0)) if inf.get("ranges") else 0
-                self.toast("피부색 옷 확인 끝: " + (f"{len(inf['ranges'])}개 구간에서 옷을 몸 피부에서 제외합니다."
-                                                   if n else "피부로 잘못 볼 옷이 없습니다."), kind="ok")
+                self.toast("피부색 옷 확인 끝: " + (f"{len(inf['ranges'])}개 구간에서 옷·머리카락을 몸 피부에서 제외합니다."
+                                                   if n else "피부로 잘못 볼 옷·머리카락이 없습니다."), kind="ok")
         self.run_job("피부색 옷 확인 중", work, done)
 
     def set_body(self, what: str, v, committed: bool):

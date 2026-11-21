@@ -517,7 +517,12 @@ FACE_NEAR = 1.0             # of a face's width: the parser's face class is a fa
 FACE_TEACH = "own"          # where the face class teaches the skin's colour. "own": on this person's own face, where
                             # their landmarks place it (a face that is one). "near": at any head (1.23 until j2799: the
                             # back of a head in a black cap is 'face' to the parser, it taught black, and the back of
-                            # a black hoodie was body skin: lngshot 089 P2). "never": nowhere (the body class alone)
+                            # a black hoodie was body skin: lngshot 089 P2). "never": nowhere (the body class alone:
+                            # a tenth of the area of one person in ten changes, j2801). "joined": the own face and
+                            # what of the face class is in one piece with it (tried for 2611 022, where a dark slab
+                            # beside the face lost its area with "own": the slab is hair in the shade, and is better
+                            # left as it is). j2801, 104 people: "own" against "near" changes more than a twentieth
+                            # of the area of 15, the hoodie and such among them
 FACE_ELSE = "skin"          # the face class away from every head: "skin": skin the parser found, like the body class
                             # (the colour still has to agree); "unknown": nothing by itself, skin only beside skin of
                             # the body class
@@ -593,6 +598,21 @@ def fit_model(rgb_u8: np.ndarray, weight: np.ndarray) -> Optional[tuple]:
     return X.mean(0), np.linalg.inv(cov), yref
 
 
+def _joined(on: np.ndarray, seed: np.ndarray) -> np.ndarray:
+    """The pieces of `on` (bool) that `seed` (bool) lies on, float32 0/1."""
+    n, lab = cv2.connectedComponents(on.astype(np.uint8), connectivity=8)
+    out = np.zeros(on.shape, np.float32)
+    if n <= 1:
+        return out
+    hit = np.unique(lab[seed & on])
+    hit = hit[hit > 0]
+    if len(hit):
+        lut = np.zeros(n, np.float32)
+        lut[hit] = 1.0
+        out = lut[lab]
+    return out
+
+
 def skin_conf(rgb_u8: np.ndarray, own: np.ndarray, others: Optional[np.ndarray], parse: Optional[dict],
               garment: Optional[np.ndarray], prior: Optional[tuple],
               size: float, limbs: Optional[np.ndarray] = None, origin: Tuple[int, int] = (0, 0),
@@ -636,8 +656,11 @@ def skin_conf(rgb_u8: np.ndarray, own: np.ndarray, others: Optional[np.ndarray],
                 # (FACE_TEACH) or brought along from it
                 if FACE_TEACH == "near":
                     sk_t = np.clip(sk - fc * (1.0 - heads), 0, 1)
-                elif FACE_TEACH == "own" and face_own is not None:
-                    sk_t = np.clip(sk - fc * (1.0 - np.clip(face_own, 0, 1)), 0, 1)
+                elif FACE_TEACH in ("own", "joined") and face_own is not None:
+                    mine = np.clip(face_own, 0, 1)
+                    if FACE_TEACH == "joined":
+                        mine = np.maximum(mine, _joined((fc > 0.5) & (own > 0.5), mine > 0.5))
+                    sk_t = np.clip(sk - fc * (1.0 - mine), 0, 1)
                 else:
                     sk_t = np.clip(sk - fc, 0, 1)
                 fc = fc * heads
@@ -809,8 +832,8 @@ def ownership(tracker, t: int, p: int, size: Tuple[int, int],
 def garments(tracker, t: int, p: int, size: Tuple[int, int]) -> Optional[np.ndarray]:
     """Clothes, shoes, hats and bags found on this frame (float32 0..1 at size (w, h)), or None when nothing says
     so. From the clothing masks of 옷 유지 where they are in use for this person on this frame (made for this
-    analysis, not of another matte); else from the look for clothing the body parser takes for skin
-    (track.skincloth), which has a map only where it found such clothing."""
+    analysis, not of another matte); else from the look for clothing and hair the body parser takes for skin
+    (track.skincloth), which has a map only where it found such clothing or hair."""
     try:
         from ..track import clothing as CL
         cm = None
@@ -820,12 +843,14 @@ def garments(tracker, t: int, p: int, size: Tuple[int, int]) -> Optional[np.ndar
                 c0 = tracker.cloth.get(t)
                 if c0 is not None and c0.any():           # this frame of the person was parsed (0: never written)
                     cm = c0
+        kinds = list(CL.ALL_CLOTHES)
         if cm is None:
             from ..track import skincloth as SC
             cm = SC.get(tracker, t)
+            kinds.append(SC.HAIR)                         # (the look finds hair the parser takes for skin too)
         if cm is None:
             return None
-        g = np.isin(np.asarray(cm).astype(np.int16) - 1, list(CL.ALL_CLOTHES)).astype(np.uint8)
+        g = np.isin(np.asarray(cm).astype(np.int16) - 1, kinds).astype(np.uint8)
         if not g.any():
             return None
         g = cv2.dilate(g, np.ones((3, 3), np.uint8))

@@ -1234,6 +1234,39 @@ def test_the_back_of_a_head_does_not_teach_the_skins_colour(monkeypatch):
     assert model is not None and conf[n_in].min() > 0.9 and conf[face].max() < 0.02, "the face teaches, the neck is body skin"
     conf, model, _p, _a = BS.skin_conf(rgb2, own2, None, parse2, None, None, 200.0, heads=heads, face_own=None)
     assert model is None and float(conf.max()) == 0.0, "with no landmarks on it the 'face' is not trusted with the colour"
+    # a trial (FACE_TEACH "joined", not in use): something beside the face, in the shade the face is not in, 'face' to
+    # the parser as well and in one piece with the face. Taught by the landmarked face alone it is too dark for the
+    # face's colour and is left as it is (2611 022: hair in the shade, j2801); what is in one piece with the person's
+    # own face can be made to teach as the face does
+    shoulder = (xx >= 60) & (xx < 150) & (yy >= 40) & (yy < 200)
+    lit, shade = np.array((204, 152, 128)), np.array((84, 60, 52))
+    rgb3 = np.full((h, w, 3), 150, np.uint8)
+    rgb3[face] = np.clip(lit + rng.normal(0, 3, (int(face.sum()), 3)), 0, 255).astype(np.uint8)
+    only_sh = shoulder & ~face
+    rgb3[only_sh] = np.clip(shade + rng.normal(0, 2, (int(only_sh.sum()), 3)), 0, 255).astype(np.uint8)
+    own3 = (face | shoulder).astype(np.float32)
+    parse3 = dict(box=(0, 0, w, h), skin=m(face | shoulder), face=m(face | shoulder), hair=m(np.zeros_like(cap)),
+                  cloth=m(np.zeros_like(cap)))
+    far = cv2.erode((shoulder & (np.hypot(xx - 160, yy - 50) > 60)).astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+    assert int(far.sum()) > 500
+    assert BS.FACE_TEACH == "own"
+    conf, model, _p, _a = BS.skin_conf(rgb3, own3, None, parse3, None, None, 200.0, heads=heads, face_own=own_face)
+    assert conf[far].max() < 0.5, "taught by the landmarked face alone: what is in the shade is not its colour"
+    monkeypatch.setattr(BS, "FACE_TEACH", "joined")
+    conf, model, _p, _a = BS.skin_conf(rgb3, own3, None, parse3, None, None, 200.0, heads=heads, face_own=own_face)
+    assert conf[far].min() > 0.9, "in one piece with the face it teaches its own colour: body skin away from the head"
+    assert conf[cv2.erode(face.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0].max() < 0.02, "the face itself is the face's"
+    # a piece of the face class apart from the face (somebody's, a jacket's back) teaches nothing
+    apart = (xx >= 240) & (xx < 300) & (yy >= 150) & (yy < 220)
+    rgb4 = rgb3.copy()
+    rgb4[apart] = (52, 78, 118)
+    parse4 = dict(parse3, skin=m(face | shoulder | apart), face=m(face | shoulder | apart))
+    own4 = (face | shoulder | apart).astype(np.float32)
+    conf, model, _p, _a = BS.skin_conf(rgb4, own4, None, parse4, None, None, 200.0, heads=heads, face_own=own_face)
+    assert conf[cv2.erode(apart.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0].max() < 0.02
+    monkeypatch.undo()
+    j = BS._joined(np.array([[1, 1, 0, 1], [0, 0, 0, 1]], bool), np.array([[1, 0, 0, 0], [0, 0, 0, 0]], bool))
+    assert j.tolist() == [[1, 1, 0, 0], [0, 0, 0, 0]] and j.dtype == np.float32
 
 
 def test_where_heads_are():
@@ -1719,9 +1752,10 @@ def _fur_parser(monkeypatch):
     return B.truth_parser(monkeypatch, wrong=lambda t, k: np.where(k == B.CLOTH, B.SKIN_K, k).astype(np.uint8))
 
 
-def _garment_words(monkeypatch, seen):
+def _garment_words(monkeypatch, seen, hair=False):
     """SAM 3.1's garment words stood in for by the scene's truth (the top and the strap are clothing). seen: the
-    frames they were asked for."""
+    frames they were asked for. hair: the scene's top is a mass of fair hair instead: no garment word finds it, the
+    look's own word 'hair' does (when the look asked for it: GarmentFinder.also)."""
     from contour.track import clothing as CL
 
     class Finder:
@@ -1733,7 +1767,10 @@ def _garment_words(monkeypatch, seen):
         for p in pres:
             own = lab == p
             frame[own] = 1
-            frame[own & np.isin(k, (B.CLOTH, B.STRAP))] = 4 + 1
+            if not hair:
+                frame[own & np.isin(k, (B.CLOTH, B.STRAP))] = 4 + 1
+            elif any(c == 2 for c, _t, _p in (getattr(gf, "also", None) or ())):
+                frame[own & (k == B.CLOTH)] = 2 + 1
         return frame
     monkeypatch.setattr(CL, "GarmentFinder", Finder)
     monkeypatch.setattr(CL, "_garment_frame", one)
@@ -1777,10 +1814,17 @@ def test_clothing_the_parser_takes_for_skin_is_found_by_a_look_and_left_out(body
         src, out = _export(cut, tr, 2)
         assert int((_changed(src, out)[_inside(B.kind(2) == B.CLOTH, 8)] > 0).sum()) > 2000, "and it is retouched"
         assert SC.needed(tr, cut) == [0] and SC.info(tr)["state"] == "none"
+        from contour.retouch import engine as RE
+        kept = {}                                      # the session's masks: a look ends with a retouch edit, they stay
+        rf = RE.prepare(cut, tr, 2, kept)
+        assert float(rf.body_area(next(j for j in rf.jobs if j.pid == 0))[top].mean()) > 0.8
         seen = []
         _garment_words(monkeypatch, seen)
         said = []
         assert SC.run(tr, SC.needed(tr, cut), lambda f, m: said.append(f)) is True
+        rf = RE.prepare(cut, tr, 2, kept)
+        assert float(rf.body_area(next(j for j in rf.jobs if j.pid == 0))[top].max()) < 0.05, \
+            "the steadied area kept from before the look was used again (it was kept without the look's state)"
         assert sorted(seen) == list(range(B.N)), "both looks (frames 0 and 7) found it: every frame between has its map"
         assert said and said[-1] == 1.0 and said == sorted(said)
         assert SC.needed(tr, cut) == [] and SC.info(tr)["state"] == "current" and SC.info(tr)["ranges"] == [[0, B.N]]
@@ -1794,6 +1838,127 @@ def test_clothing_the_parser_takes_for_skin_is_found_by_a_look_and_left_out(body
         # a second run has nothing to do; cancelled, the look in use stays
         seen.clear()
         assert SC.run(tr, [0], cancel=lambda: True) is False and SC.info(tr)["ranges"] == [[0, B.N]]
+    finally:
+        _drop_look(tr)
+
+
+def test_hair_the_parser_takes_for_skin_is_found_by_the_look_and_left_out(body, monkeypatch):
+    """2611 025 (j2801): fair hair in a bun, seen from behind. The body parser called it body skin, and three quarters
+    of that person's area lay on the hair. The look asks SAM 3.1 for 'hair' with the garment words; where it finds
+    hair on skin the parser is sure of, off the head the joints place, the frames round the look get their maps and
+    the area leaves the hair out as it leaves a garment."""
+    from contour.retouch import bodyskin as BS
+    from contour.track import clothing as CL
+    from contour.track import skincloth as SC
+    cut, tr, _ = body
+    _drop_look(tr)
+    px = tr.proxy
+    p0 = tr.store.index(0)
+    hair = _inside(_kinds(tr, 2) == B.CLOTH, 4)          # (the scene's top stands for the hair: nearly the skin's colour)
+    skin = _inside(_kinds(tr, 2) == B.SKIN_K, 4)
+    assert SC.more_phrases() and SC.more_phrases()[0][0] == SC.HAIR == CL.CLASSES.index("머리카락") and SC.HAIR not in CL.ALL_CLOTHES
+    _fur_parser(monkeypatch)                             # the parser calls it skin
+    B.body_on(cut, skin=100)
+    try:
+        before = _area(cut, tr, 2)
+        assert float(before[hair].mean()) > 0.8, "the defect: the hair is body skin"
+        seen = []
+        _garment_words(monkeypatch, seen, hair=True)
+        assert SC.run(tr, SC.needed(tr, cut)) is True
+        inf = SC.info(tr)
+        assert inf["ranges"] == [[0, B.N]], f"hair among the skin the parser is sure of: every frame gets its map ({inf})"
+        g = BS.garments(tr, 2, p0, (px.w, px.h))
+        assert g is not None and float(g[hair].min()) > 0.9, "the hair the look found counts as a garment does"
+        after = _area(cut, tr, 2)
+        assert float(after[hair].max()) < 0.05, "the hair is not body skin"
+        assert float(after[skin].mean()) > 0.9 * float(before[skin].mean()), "the skin is as before"
+        looked = SC.state(tr)["looked"]
+        assert all(len(v) == 3 and v[2] > 0 and v[1] == 0 for row in looked.values() for v in row.values()), looked
+        # hair on the head the joints place is not the body's anyway: it calls for no maps
+        _drop_look(tr)
+        maps0 = BS.region_maps
+
+        def all_head(info, shape, sx, sy, hands=None):
+            m = maps0(info, shape, sx, sy, hands)
+            return dict(m, head=np.ones(shape, np.float32))
+        monkeypatch.setattr(BS, "region_maps", all_head)
+        assert SC.run(tr, SC.needed(tr, cut)) is True and SC.info(tr)["ranges"] == []
+        monkeypatch.setattr(BS, "region_maps", maps0)
+        # the parser knows the hair for hair: nothing to find
+        _drop_look(tr)
+        B.truth_parser(monkeypatch)
+        assert SC.run(tr, SC.needed(tr, cut)) is True and SC.info(tr)["ranges"] == []
+        # without the look's own words (their file is not there) the garments are looked for as before
+        _drop_look(tr)
+        _fur_parser(monkeypatch)
+        monkeypatch.setattr(SC, "LOOK_FILE", SC.LOOK_FILE.with_name("not_there.npz"))
+        assert SC.more_phrases() == () and SC.model_key().count("+") == 0
+        assert SC.run(tr, SC.needed(tr, cut)) is True and SC.info(tr)["ranges"] == []
+    finally:
+        _drop_look(tr)
+
+
+def test_the_looks_own_word_takes_only_what_no_garment_word_claims():
+    """The finder itself: 'hair' is asked of the same encoded picture after the garment words, and takes the pixels
+    none of them claimed (a hood over hair is a hood)."""
+    import types
+    from contour.track import clothing as CL
+    from contour.track import skincloth as SC
+    gf = CL.GarmentFinder.__new__(CL.GarmentFinder)
+    asked = []
+
+    def find(enc, score):
+        which = gf.finder.const["text"]
+        asked.append(which)
+        lg = np.full((20, 30), -5.0, np.float32)
+        if which == "top":
+            lg[2:12, 2:16] = 5.0
+        elif which == "hair":
+            lg[8:18, 10:28] = 5.0
+        return [dict(lg=lg, score=0.9)]
+    gf.seg = types.SimpleNamespace(encode=lambda rgb: "enc")
+    gf.finder = types.SimpleNamespace(const=dict(text=None, text_pad=None), find=find)
+    gf.phr = [(4, "top", None, False)]
+    gf.stats = None
+    rgb = np.zeros((40, 60, 3), np.uint8)
+    plain = gf.classes(rgb, (30, 20))
+    assert asked == ["top"] and set(np.unique(plain)) == {0, 4}
+    gf.also = ((SC.HAIR, "hair", None),)
+    del asked[:]
+    m = gf.classes(rgb, (30, 20))
+    assert asked == ["top", "hair"]
+    assert np.array_equal(m == 4, plain == 4), "the garment's pixels stay the garment's"
+    assert int((m == SC.HAIR).sum()) == 10 * 18 - 4 * 6 and m[9, 12] == 4 and m[15, 20] == SC.HAIR
+    assert gf.finder.const["text"] is None, "the finder is left as it was"
+
+
+def test_the_look_counts_the_skin_the_area_counts(body, monkeypatch):
+    """2611 085, 087 (j2801): a trunk the parser calls 'face' with no head near. The area takes it for skin since
+    j2796; the look left the whole face class out of 'the skin the parser is sure of', so clothing on it (half of one
+    person's area) called for no maps. The look counts the face class as the area does: a face where a head is."""
+    from contour.retouch import bodyskin as BS
+    from contour.track import skincloth as SC
+    cut, tr, _ = body
+    _drop_look(tr)
+    parse0 = BS._parse_cached
+
+    def as_face(tracker, p_, t_, rgb_, own_):
+        pr = parse0(tracker, p_, t_, rgb_, own_)
+        return None if pr is None else dict(pr, face=pr["skin"].copy())     # every skin pixel 'face', the top included
+    try:
+        _fur_parser(monkeypatch)                       # (the top is skin to the parser)
+        parse0 = BS._parse_cached
+        monkeypatch.setattr(BS, "_parse_cached", as_face)
+        B.body_on(cut, skin=100)
+        seen = []
+        _garment_words(monkeypatch, seen)
+        assert BS.head_spots(tr.store, 2) == [], "no head in the scene"
+        assert SC.run(tr, SC.needed(tr, cut)) is True
+        assert SC.info(tr)["ranges"] == [[0, B.N]], "clothing on skin of the face class away from every head is found"
+        # with a head there the face class is a face: not the body's skin, nothing to find on it
+        _drop_look(tr)
+        monkeypatch.setattr(BS, "head_spots", lambda st_, t_: [(480.0, 360.0, 2000.0)])
+        assert SC.run(tr, SC.needed(tr, cut)) is True and SC.info(tr)["ranges"] == []
     finally:
         _drop_look(tr)
 
