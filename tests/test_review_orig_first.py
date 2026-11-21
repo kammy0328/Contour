@@ -77,13 +77,19 @@ def test_next_cut_cancel_closes_decoders(project,monkeypatch):
 def test_original_decode_does_not_block_ui():
     from contour.ui.viewer import Viewer
     app=QApplication.instance() or QApplication([])
-    start=time.perf_counter(); observed=[]
+    began=[]; observed=[]
     def slow_frame(t):
         time.sleep(.25)
         return np.zeros((48,64,3),np.uint8)
     viewer=NS(s=NS(cut=NS(id='A'),frame=slow_frame),t=0,_img_cache={},_store_img=Mock())
-    QTimer.singleShot(0,lambda:Viewer._qimg(viewer,'orig'))
-    QTimer.singleShot(10,lambda:observed.append(time.perf_counter()-start))
+    # The clock starts when the event loop reaches this test's own timers: what earlier tests left for the loop
+    # (windows not deleted yet, their queued events) is handled first and is not the original's decoding. Measured
+    # from before app.exec(), the heartbeat came 0.19 to 0.22 s late in a run of every test (Windows and Linux)
+    # and in time alone: j2800, j2805.
+    def first():
+        began.append(time.perf_counter()); Viewer._qimg(viewer,'orig')
+    QTimer.singleShot(0,first)
+    QTimer.singleShot(10,lambda:observed.append(time.perf_counter()-began[0]))
     QTimer.singleShot(350,app.quit)
     app.exec()
     assert observed and observed[0]<.15, f'UI heartbeat delayed {observed[0]:.3f}s by original frame decoding'

@@ -2003,6 +2003,16 @@ def test_a_person_on_the_picture_only_between_two_looks_is_looked_at(body, monke
     assert SC.look_frames(pres, [1, 2], 0, 21) == [0, 7, 12, 16, 20]
     assert SC.look_frames(pres, [1], 4, 10) == [4, 9], "the work range's own looks fall on the stay"
     assert SC.look_frames(np.zeros((1, 21), bool), [0], 0, 21) == [0, 12, 20], "never on the picture"
+    # coming into the picture (j2804: 645 px of the person on the stay's middle frame, 13 363 two frames on): the
+    # frame the person is largest on, and among frames about as large the one nearest the middle
+    boxes = np.zeros((3, 21, 4), np.float32)
+    for t in range(3, 12):
+        boxes[1, t] = (100, 100, 100 + 20 * (t - 2), 400)              # wider every frame
+    assert SC.look_frames(pres, [0, 1], 0, 21, boxes) == [0, 11, 12, 20], "largest on the last frame of the stay"
+    boxes[1, 3:12] = (100, 100, 300, 400)                              # the same size throughout: the middle
+    assert SC.look_frames(pres, [0, 1], 0, 21, boxes) == [0, 7, 12, 20]
+    boxes[1, 3:12] = np.nan                                            # no box: the middle
+    assert SC.look_frames(pres, [0, 1], 0, 21, boxes) == [0, 7, 12, 20]
     cut, tr, _ = body
     st = tr.store
     keep = st.present.copy()
