@@ -538,6 +538,15 @@ def free_gpu_memory() -> None:
             pass
 
 
+def _no_pool(e: BaseException) -> bool:
+    """onnxruntime's answer to a run that asks a memory pool the session does not have to give memory back
+    ('Did not find an arena based allocator registered for device-id combination in the memory arena shrink list:
+    gpu:0'): every run of a model that CUDA was asked for and the runtime opened on the CPU by itself ended with it
+    (CUDA not starting: j2805)."""
+    t = str(e).lower()
+    return "arena shrink list" in t or "arena based allocator" in t
+
+
 class Session:
     """An onnxruntime session whose run() gets over a moment without GPU memory: what can be dropped is dropped and
     the run is tried again (another process, the preview or a render often frees its memory a moment later). Still
@@ -566,7 +575,8 @@ class Session:
                 self._ro = None
 
     def run(self, *a, **k):
-        if self._ro is not None and "run_options" not in k and len(a) < 3:
+        ours = self._ro is not None and "run_options" not in k and len(a) < 3
+        if ours:
             k["run_options"] = self._ro
         for attempt in range(self.RETRIES + 1):
             try:
@@ -576,6 +586,12 @@ class Session:
                     self._first_run(time.perf_counter() - t0)
                 return out
             except Exception as e:
+                if ours and _no_pool(e):
+                    # the session has no memory pool of the kind the option names (opened on the CPU alone, or an
+                    # accelerator with a pool of another kind): the run is made without it, from now on
+                    self._ro = None
+                    k.pop("run_options", None)
+                    return self.run(*a, **k)
                 if not is_oom(e):
                     raise
                 sys.stderr.write(f"GPU OOM {Path(self._path).name} (try {attempt + 1}): {str(e)[:300]}\n")
@@ -774,7 +790,10 @@ def _session_raw(path: Path):
                 why = why + [_why_not_gpu(None) if BK.driver_state()[0] == "old" else
                              "가속 장치를 열지 못해 CPU로 실행 (드라이버·CUDA 라이브러리 확인)"]
             BK.note(path, asked=asked, session=got, reasons=why, setting=want)
-            return Session(sess, path, shrink, verify=verify, asked=asked)
+            # (the run's option that gives the pool's spare memory back is CUDA's: by what the session has, not by
+            # what was asked for. A session the runtime opened on the CPU by itself has no such pool, and every run
+            # ended with an error: j2805)
+            return Session(sess, path, shrink and "CUDAExecutionProvider" in got, verify=verify, asked=asked)
         except Exception as e:
             err = e
             if not (on_gpu and is_oom(e)) or attempt:

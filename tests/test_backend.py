@@ -295,6 +295,54 @@ def test_a_real_model_on_this_computer_is_recorded_by_what_it_ran_on():
     assert str(ROOT) not in t and str(Path.home()) not in t, "no path of this computer in the diagnostics"
 
 
+def test_a_model_the_runtime_opened_on_the_cpu_by_itself_runs(monkeypatch):
+    """j2805 (the 4070 Ti with CUDA_VISIBLE_DEVICES=-1: CUDA does not start): onnxruntime opened every model on the
+    CPU by itself, and every run of the small models ended with 'Did not find an arena based allocator registered
+    for device-id combination in the memory arena shrink list: gpu:0'. The run's option that gives the CUDA pool's
+    spare memory back went by what was asked for, not by what the session has (so in 1.22 too; a DirectML session
+    has no such pool either). Here: the runtime of this computer, asked for CUDA."""
+    import onnxruntime as ort
+    if "CUDAExecutionProvider" in ort.get_available_providers():
+        pytest.skip("this computer has CUDA: the session is opened on it")
+    monkeypatch.setattr(M, "providers", lambda: [(CUDA, {}), CPU])        # as a PC with the GPU runtime asks
+    s = M._session_raw(SPOT)
+    assert list(s.get_providers()) == [CPU], "opened on the CPU alone"
+    i = s.get_inputs()[0]
+    out = s.run(None, {i.name: np.zeros([1, 4, 64, 64], np.float32)})
+    assert out and np.isfinite(out[0]).all()
+    assert s._ro is None, "no CUDA pool to give memory back to"
+    r = [r for r in BK.records() if r["file"] == SPOT.name][0]
+    assert r["ran"] and r["backend"] == "cpu" and BK.effective(r) == "cpu" and r["asked"][0] == "cuda"
+    assert any("CPU" in w for w in r["reasons"]), r["reasons"]
+
+
+def test_a_run_whose_memory_option_the_session_has_no_pool_for_goes_on_without_it(monkeypatch):
+    """The same message from a session that has the accelerator in its list (a pool of another kind): the option is
+    dropped and the run made again, once; any other error is the caller's as before."""
+    calls = []
+
+    class S:
+        def run(self, names, feed, run_options=None):
+            calls.append(run_options is not None)
+            if run_options is not None:
+                raise RuntimeError("[ONNXRuntimeError] : 2 : INVALID_ARGUMENT : Did not find an arena based allocator "
+                                   "registered for device-id  combination in the memory arena shrink list: gpu:0")
+            return [feed["x"]]
+
+        def get_providers(self):
+            return [CUDA, CPU]
+    s = M.Session(S(), "small.onnx", shrink=True)
+    assert s._ro is not None
+    assert s.run(None, {"x": np.ones(2)})[0].sum() == 2 and calls == [True, False]
+    assert s._ro is None and s.run(None, {"x": np.ones(2)})[0].sum() == 2 and calls == [True, False, False]
+
+    class Bad(S):
+        def run(self, names, feed, run_options=None):
+            raise RuntimeError("INVALID_ARGUMENT : Got invalid dimensions for input")
+    with pytest.raises(RuntimeError, match="invalid dimensions"):
+        M.Session(Bad(), "small.onnx", shrink=True).run(None, {"x": np.ones(2)})
+
+
 def test_the_pose_crops_of_a_frame_are_a_batch_that_may_be_halved():
     src = (ROOT / "contour" / "track" / "infer.py").read_text(encoding="utf-8")
     assert "self.sess.batch_input = self.inp" in src
