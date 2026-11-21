@@ -7,6 +7,7 @@ nothing in the project changes; a copy of the project, a missing original or mis
 be read. Before 1.22.2 there was nothing to hand an analysed project to for review."""
 import hashlib
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -105,7 +106,7 @@ def test_report_json_and_pictures_without_models_or_changes(tmp_path, no_models)
     from contour import review as RV
     prj, cut, v = _analysed(tmp_path)
     before = _digest(Path(prj.path))
-    out = RV.build(prj.path)
+    out = RV.build(prj.path, images=True)                     # (pictures are asked for: see the default report below)
     assert out.parent == Path(prj.path) / "ai_review"
     assert _digest(Path(prj.path)) == before, "nothing in the project changed"
     rev = json.loads((out / "review.json").read_text(encoding="utf-8"))
@@ -148,7 +149,7 @@ def test_copy_missing_original_and_missing_stores(tmp_path, no_models):
     cp = tmp_path / "copy" / Path(prj.path).name
     shutil.copytree(prj.path, cp)
     v.unlink()                                                 # the original is gone
-    out = RV.build(str(cp), out_dir=str(tmp_path / "rv_out"))
+    out = RV.build(str(cp), out_dir=str(tmp_path / "rv_out"), images=True)
     c = json.loads((out / "review.json").read_text(encoding="utf-8"))["cuts"][0]
     assert c["id"] == cut.id and c["source"]["found"] is False
     assert "source_missing" in _kinds(c) and "lowconf" in _kinds(c)
@@ -211,3 +212,154 @@ def test_a_timeline_index_saved_as_a_float(tmp_path, no_models):
     p.save()
     c = json.loads((RV.build(prj.path, images=False) / "review.json").read_text(encoding="utf-8"))["cuts"][0]
     assert c["number"] == "004" and c["timeline"]["index"] == 3 and c["work"]["rec_tc_in"] == "00:00:00:10"
+
+
+# ------------------------------------------------------------------ the default report (instruction 2026-11-20 §4-4)
+def _strings(x):
+    if isinstance(x, dict):
+        for k, v in x.items():
+            yield from _strings(k)
+            yield from _strings(v)
+    elif isinstance(x, (list, tuple)):
+        for v in x:
+            yield from _strings(v)
+    elif isinstance(x, str):
+        yield x
+
+
+def test_the_default_report_has_no_footage_and_no_media_path(tmp_path, no_models):
+    """No picture of a frame, no crop, and no absolute path of a media file: a source by its name, the project by
+    its folder name. (1.22.2 wrote img/ with frames, source.path and project.folder in full.)"""
+    from contour import review as RV
+    from contour.core.project import Project
+    media = tmp_path / "미디어 원본" / "reel 01"
+    media.mkdir(parents=True)
+    prj, cut, v = _analysed(tmp_path)
+    moved = media / "A001 클립.mp4"
+    shutil.move(str(v), moved)
+    p = Project.load(prj.path)                                 # the cut now points at a file outside the project
+    p.cuts[0].source = str(moved)
+    p.cuts[0].info.path = str(moved)
+    p.cuts[0].retouch_ref = str(media / "A001 클립_after.mov")
+    p.cuts[0].stats.last_output = str(tmp_path / "out" / "A001_reshape.mov")
+    p.save()
+    out = RV.build(prj.path)
+    names = sorted(f.relative_to(out).as_posix() for f in out.rglob("*") if f.is_file())
+    assert names == ["report.md", "review.json"], "nothing but the two text files (no img/, no crop)"
+    rev = json.loads((out / "review.json").read_text(encoding="utf-8"))
+    assert rev["contains"] == {"pictures": False, "crops": False, "media_paths": "name"}
+    c = rev["cuts"][0]
+    assert c["source"] == {"name": "A001 클립.mp4", "found": True} and rev["project"]["folder"] == Path(prj.path).name
+    assert not any(f.get("image") for f in c["findings"])
+    text = (out / "review.json").read_text(encoding="utf-8") + (out / "report.md").read_text(encoding="utf-8")
+    for leak in (str(tmp_path), str(media), "미디어 원본", "reel 01", str(Path.home())):
+        assert leak not in text, f"a path of this computer is in the report: {leak}"
+    absolute = [x for x in _strings(rev) if re.match(r"^[A-Za-z]:[\\/]", x) or x.startswith("\\\\")
+                or (x.startswith("/") and "/" in x[1:])]
+    assert not absolute, absolute
+    assert "영상·크롭이 없고" in (out / "report.md").read_text(encoding="utf-8")
+    # a source inside the project folder is named by its place there
+    inside = Path(prj.path) / "media" / "b.mp4"
+    inside.parent.mkdir()
+    shutil.copy(moved, inside)
+    p = Project.load(prj.path)
+    p.cuts[0].source = str(inside)
+    p.cuts[0].info.path = str(inside)
+    p.save()
+    c = json.loads((RV.build(prj.path) / "review.json").read_text(encoding="utf-8"))["cuts"][0]
+    assert c["source"]["name"] == "media/b.mp4"
+    # the original gone: said with the name, still without a path
+    moved.unlink()
+    inside.unlink()
+    out = RV.build(prj.path)
+    c = json.loads((out / "review.json").read_text(encoding="utf-8"))["cuts"][0]
+    f = next(f for f in c["findings"] if f["kind"] == "source_missing")
+    assert f["evidence"] == "원본을 찾을 수 없음: media/b.mp4" and str(tmp_path) not in json.dumps(c, ensure_ascii=False)
+    assert not (out / "img").exists(), "no picture drawn on the matte either unless asked for"
+
+
+def test_the_report_says_state_failure_times_settings_and_summary(tmp_path, no_models, monkeypatch):
+    from contour import review as RV
+    from contour.core import media as M
+    from contour.core.project import Project
+    prj, cut, v = _analysed(tmp_path)
+    p = Project.load(prj.path)
+    a = p.cuts[0]
+    a.stats.analysis_seconds, a.stats.analysis_runs, a.stats.active_seconds = 83.4, 2, 410.0
+    a.stats.auto_ok_rate, a.stats.renders, a.stats.render_seconds, a.stats.corrections = 0.91, 1, 55.0, 3
+    a.models_used = {"matte_rvm": "0123456789abcdef"}
+    a.model_versions = {"matte_rvm": "2026.11.1"}
+    make_video(tmp_path / "f.mp4")
+    b = p.add_cut(M.probe(str(tmp_path / "f.mp4")), "c2")                      # an analysis that failed
+    b.status = dict(auto="bad", reason="분석 실패: GPU 메모리가 부족합니다", failed=True)
+    make_video(tmp_path / "e.mp4")
+    e = p.add_cut(M.probe(str(tmp_path / "e.mp4")), "c3")                      # left out by the quick look
+    e.status = dict(auto="none", reason="빠른 검사: 인물 없음", prescan=True, prescan_info=dict(verdict="none", looked=6))
+    p.set_learn(True)
+    p.save()
+    (Path(p.cache_dir(a)) / "proxy_960x720.mp4").write_bytes(b"p" * 5000)
+    out = RV.build(prj.path)
+    rev = json.loads((out / "review.json").read_text(encoding="utf-8"))
+    ca, cb, ce = rev["cuts"]
+    # state of the analysis and of what is saved
+    assert ca["analysis"]["analyzed"] and ca["analysis"]["models"] == {"matte_rvm": "0123456789abcdef"}
+    assert ca["analysis"]["model_versions"] == {"matte_rvm": "2026.11.1"} and not ca["analysis"]["failed"]
+    cs = ca["caches"]
+    assert cs["tracks"] and cs["tracks_bytes"] > 0 and cs["matte"]["bytes"] == N * MW * MH and cs["matte"]["made"]
+    assert cs["matte"]["file"] == f"cuts/{a.id}/cache/matte_{MW}x{MH}.u8" and cs["cloth"] is None
+    assert cs["proxy"] == {"files": 1, "bytes": 5000}
+    # why it failed, and the cut the quick look left out
+    assert cb["analysis"]["failed"] and "GPU 메모리" in cb["analysis"]["failure"] and not cb["analysis"]["analyzed"]
+    assert ce["analysis"]["prescan"]["verdict"] == "none" and not ce["analysis"]["failed"]
+    # times
+    t = ca["times"]
+    assert (t["analysis_seconds"], t["analysis_runs"], t["worked_seconds"], t["renders"], t["render_seconds"],
+            t["corrections"]) == (83.4, 2, 410.0, 1, 55.0, 3)
+    assert re.match(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d$", t["analysed"]) and cb["times"]["analysed"] == ""
+    assert ca["metrics"] == {"auto_ok_rate": 0.91, "persons": 2, "targets": 1, "work_frames": N}
+    # settings and where it ran, without a path
+    s = rev["settings"]
+    assert s["accuracy"] and s["proxy_long_side"] and "system" in s and s["cache_folder"] == "기본"
+    assert s["learning"] == {"project": True, "chosen": True, "collect": True, "self_learning": True}
+    # summary figures
+    m = rev["summary"]
+    assert (m["cuts"], m["analysed"], m["failed"], m["skipped_prescan"]) == (3, 1, 1, 1)
+    assert m["stores"]["matte"] == 1 and m["stores"]["cloth"] == 0 and m["model_versions"] == {"matte_rvm": {"2026.11.1": 1}}
+    assert m["auto_ok_rate_mean"] == 0.91 and m["analysis_seconds"] == 83.4 and m["persons"] == 2 and m["cache_bytes"] > 0
+    assert m["by_kind"]["lowconf"] >= 1 and sum(m["by_state"].values()) == 3
+    md = (out / "report.md").read_text(encoding="utf-8")
+    for word in ("## 요약 지표", "## 설정", "분석 실패 원인: 분석 실패: GPU 메모리가 부족합니다", "모델 패키지 버전: matte_rvm 2026.11.1",
+                 "분석 실패 1컷", "프록시 파일 1개", "학습 데이터 수집·자동 학습: 이 프로젝트 켬"):
+        assert word in md, word
+
+
+def test_cli_and_menu_make_the_report_without_pictures_unless_asked(qapp, tmp_path, no_models, monkeypatch, capsys):
+    from PySide6.QtWidgets import QMessageBox
+    from contour import review as RV
+    from contour.ui import main_window as MW_
+    import time
+    prj, cut, v = _analysed(tmp_path)
+    assert RV.main([prj.path, "--out", str(tmp_path / "plain")]) == 0
+    assert not (tmp_path / "plain" / "img").exists()
+    assert RV.main([prj.path, "--out", str(tmp_path / "pics"), "--images"]) == 0
+    assert list((tmp_path / "pics" / "img").glob("*.jpg"))
+    rev = json.loads((tmp_path / "pics" / "review.json").read_text(encoding="utf-8"))
+    assert rev["contains"]["pictures"] is True and "영상 프레임 그림" in (tmp_path / "pics" / "report.md").read_text(encoding="utf-8")
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.No))
+    w = MW_.MainWindow()
+    try:
+        monkeypatch.setattr(w, "show_error", lambda title, text: None)
+        w.open_project(prj.path, wait=True)
+        for images in (False, True):
+            w.make_ai_review(open_folder=False, images=images)
+            t0 = time.time()
+            while w.job is not None and time.time() - t0 < 30:
+                qapp.processEvents()
+                time.sleep(0.01)
+            assert (Path(w.last_review) / "img").exists() == images
+    finally:
+        w.proxy_builder.cancel()
+        w.thumbcache.stop()
+        w.session.dirty = False
+        w._discard_on_close = True
+        w.close()

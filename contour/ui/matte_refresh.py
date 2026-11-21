@@ -172,6 +172,18 @@ class MatteRefresher(QObject):
             clear(cut)
             self.changed.emit(cut.id)
             return
+        try:
+            from .modelsdlg import needed_text
+            need = needed_text(cut)
+        except Exception:
+            need = ""
+        if need:
+            # analysed with model package versions that are not on this computer: the marks stay, the matte in
+            # use stays, and nothing is made with another version (the cut's note says what to install or do)
+            if self.last_error != need:
+                self.last_error = need
+                self.changed.emit(cut.id)
+            return
         job = dict(cut=cut.id, gen=self.gen.get(cut.id, 0), cancel=False, tracker=tr, ranges=rs)
         self.running = job
         self.changed.emit(cut.id)

@@ -897,6 +897,8 @@ def matte_line(ctl, tracker, cut) -> str:
     except Exception:
         meta = {}
     t = f"이 컷의 매트: {meta.get('model') or 'SAM'}"
+    if models_line(cut)[1]:
+        return t + " · 분석한 모델 버전이 이 컴퓨터에 없어 자동 갱신을 쉽니다 (이전 매트로 보입니다)"
     ref = getattr(ctl, "refresher", None)
     stt = ref.state(cut) if ref is not None else ""
     n = sum(b - a for a, b in ((cut.status or {}).get("matte_dirty") or []))
@@ -909,6 +911,26 @@ def matte_line(ctl, tracker, cut) -> str:
         return t + f" · 마지막 자동 갱신 실패: {err[:60]}"
     k = len(meta.get("refreshed") or [])
     return t + (f" · 최신 (편집 뒤 자동 갱신 {k}회)" if k else " · 최신")
+
+def models_line(cut) -> tuple:
+    """(text, blocked): the model package versions the cut was analysed with ('' when it ran with models that are
+    not packages), and whether one of them is not on this computer (then the text says what is needed)."""
+    mv = getattr(cut, "model_versions", None) or {}
+    if cut is None or not cut.analyzed or not mv:
+        return "", False
+    try:
+        from ..track import modelpkg as MP, models as M
+        miss = [n for n in MP.needs(mv) if not n["installed"]]
+        if miss:
+            return ("없는 모델 버전: " + ", ".join(f"{M.MODELS.get(n['key'], {}).get('label', n['key'])} {n['want']}"
+                                              for n in miss)
+                    + ". 그 버전을 설치하거나 컷 전체를 다시 분석해야 매트 갱신·구간 다시 분석을 할 수 있습니다 "
+                      "(편집·미리보기·렌더는 그대로 됩니다)."), True
+        vs = sorted(set(mv.values()))
+        return f"분석한 모델 패키지 {len(mv)}개 · 버전 {', '.join(vs[:3])}" + (" 외" if len(vs) > 3 else ""), False
+    except Exception:
+        return "", False
+
 
 class TrackTab(_Tab):
     def __init__(self, ctl):
@@ -928,6 +950,14 @@ class TrackTab(_Tab):
         self.seg_info = Wd.label("", "Faint", 11)
         self.seg_info.setWordWrap(True)
         self.add(self.seg_info)
+        self.pkg_info = Wd.label("", "Faint", 11)
+        self.pkg_info.setWordWrap(True)
+        self.add(self.pkg_info)
+        self.pkg_btn = Wd.button("모델 관리 열기", "", "", "이 컷을 분석한 모델 버전을 설치하거나, 설치된 모델을 확인합니다")
+        self.pkg_btn.clicked.connect(self.ctl.open_models)
+        self.add(self.pkg_btn)
+        self.pkg_info.setVisible(False)
+        self.pkg_btn.setVisible(False)
         # learning (clip adaptation, cumulative model, re-solving from corrections) is always on and automatic
         # ranges
         self.add(Wd.Section("구간 (타임라인에서 Shift+드래그로 선택)"))
@@ -1006,6 +1036,13 @@ class TrackTab(_Tab):
         self.analyze_btn.style().unpolish(self.analyze_btn)
         self.analyze_btn.style().polish(self.analyze_btn)
         self.seg_info.setText(matte_line(self.ctl, s.tracker, cut))
+        txt, blocked = models_line(cut)
+        self.pkg_info.setText(txt)
+        self.pkg_info.setObjectName("Warn" if blocked else "Faint")
+        self.pkg_info.style().unpolish(self.pkg_info)
+        self.pkg_info.style().polish(self.pkg_info)
+        self.pkg_info.setVisible(bool(txt))
+        self.pkg_btn.setVisible(blocked)
         self.rematte.setEnabled(bool(cut.analyzed and st is not None))
         sel = self.ctl.selection
         self.sel_label.setText(f"선택: {sel[0]}~{sel[1]} 프레임 ({sel[1] - sel[0] + 1}f)" if sel else "선택된 구간 없음")

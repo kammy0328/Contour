@@ -1,0 +1,11 @@
+# macOS 12 or later on Apple Silicon (arm64), Python 3.12. The same versions as requirements.txt (Windows x64).
+# The runtime is the plain onnxruntime package: on macOS it carries the Core ML execution provider besides the
+# CPU one, so no second runtime package is installed (never onnxruntime-gpu or -directml beside it).
+numpy==2.5.3
+opencv-python-headless==5.0.0.93
+opencolorio==2.6.0
+PySide6==6.12.0
+scipy==1.18.1
+onnxruntime==1.24.4
+# SAM 3.1's person finder is rewritten on this computer (track/onnx_patch.py) with it
+onnx==1.23.2

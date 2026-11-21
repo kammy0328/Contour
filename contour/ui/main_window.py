@@ -583,7 +583,9 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         a_save = m.addAction(I.icon("save", 14), "저장  Ctrl+S")
         a_save.setEnabled(self.session.project is not None)
-        a_learn = m.addAction("이 프로젝트를 학습 데이터에 포함")
+        a_learn = m.addAction("이 프로젝트에서 학습 데이터 수집·자동 학습")
+        a_learn.setToolTip("켠 프로젝트에서만 분석한 컷의 학습용 이미지·샘플을 이 컴퓨터에 모으고 자동 학습을 시작합니다 "
+                           "(기본 꺼짐). 꺼도 편집·미리보기·렌더와 이미 학습된 모델은 그대로 씁니다. 어디로도 보내지 않습니다")
         a_learn.setCheckable(True)
         a_learn.setChecked(bool(self.session.project and self.session.project.learn))
         a_learn.setEnabled(self.session.project is not None)
@@ -591,9 +593,18 @@ class MainWindow(QMainWindow):
         a_tl.setEnabled(self.session.project is not None)
         a_tlx = m.addAction("타임라인 내보내기…")
         a_tlx.setEnabled(self.session.project is not None and bool(self.session.project.timeline_cuts()))
-        a_review = m.addAction("AI 검수 자료 만들기")
-        a_review.setToolTip("저장된 추적·매트·QC로 컷별 보고서(report.md)·JSON·그림을 만듭니다. 모델을 다시 돌리지 않습니다")
+        a_review = m.addAction("AI 검수 리포트 만들기")
+        a_review.setToolTip("저장된 추적·매트·QC로 컷별 분석·캐시 상태, 실패 원인, 시간, 설정, 요약 지표를 report.md와 "
+                            "review.json으로 만듭니다. 영상·크롭·미디어 절대경로는 넣지 않고, 모델을 다시 돌리지 않습니다")
         a_review.setEnabled(self.session.project is not None)
+        a_review_img = m.addAction("AI 검수 리포트 만들기 (화면 그림 포함)")
+        a_review_img.setToolTip("위 리포트에, 문제가 큰 프레임의 화면 그림(추적 뼈대·인물 영역 표시)을 더합니다. "
+                                "영상 프레임이 리포트 폴더에 들어가므로 밖으로 내보낼 때 주의하세요")
+        a_review_img.setEnabled(self.session.project is not None)
+        a_relink = m.addAction("원본 다시 연결…")
+        a_relink.setToolTip("원본 영상·LUT의 위치가 바뀌었을 때(다른 컴퓨터, 다른 드라이브, Windows ↔ Mac) 폴더를 골라 같은 이름의 "
+                            "파일을 찾아 연결합니다. 크기·프레임 속도·프레임 수가 같은 파일만 연결하고, 분석 결과와 보정값은 그대로 둡니다")
+        a_relink.setEnabled(self.session.project is not None)
         a_reveal = m.addAction("프로젝트 폴더 열기")
         a_reveal.setEnabled(self.session.project is not None)
         act = m.exec(self.proj_btn.mapToGlobal(self.proj_btn.rect().bottomLeft()))
@@ -611,14 +622,20 @@ class MainWindow(QMainWindow):
         elif act == a_save:
             self.save()
         elif act == a_learn:
-            self.session.project.learn = act.isChecked()
+            self.session.project.set_learn(act.isChecked())
             self.session.dirty = True
+            self.toast("이 프로젝트에서 학습 데이터 수집·자동 학습을 켰습니다 (이 컴퓨터에만 저장)" if act.isChecked() else
+                       "이 프로젝트에서 학습 데이터 수집·자동 학습을 껐습니다", "ok")
         elif act == a_tl:
             self.import_timeline()
         elif act == a_tlx:
             self._tl_action("export", self.tlstrip.selected_ids())
         elif act == a_review:
             self.make_ai_review()
+        elif act == a_review_img:
+            self.make_ai_review(images=True)
+        elif act == a_relink:
+            self.relink_media()
         elif act == a_reveal:
             QDesktopServices.openUrl(QUrl.fromLocalFile(self.session.project.path))
         elif act.data():
@@ -717,6 +734,72 @@ class MainWindow(QMainWindow):
         times.update({f"cut_{k}": v for k, v in (getattr(self.session, "open_times", None) or {}).items()})
         self.open_times = times                     # seconds: project.json, list usable, first cut opened
         self._tell_legacy(prj)
+        self._tell_learning(prj)
+        self._tell_missing(prj)
+
+    def relink_media(self, folder: str = ""):
+        """원본 다시 연결: the media this computer does not find, looked for by name under a folder and connected
+        when it is the same footage (core/relink.py). The analysis and the edits stay with the cuts."""
+        from ..core import relink as RL
+        prj = self.session.project
+        if prj is None:
+            return
+        if self.job is not None or self.batch.busy:
+            self.toast("진행 중인 작업이 끝난 뒤 원본을 다시 연결할 수 있습니다.", kind="warn")
+            return
+        if not RL.missing(prj):
+            self.toast("연결할 것이 없습니다 (모든 원본이 제자리에 있습니다)", "ok")
+            return
+        if not folder:
+            folder = QFileDialog.getExistingDirectory(self, "원본이 있는 폴더", str(Path(prj.path).parent))
+        if not folder:
+            return
+        if not self.save():
+            self.toast("저장하지 못해 원본을 연결하지 않았습니다", kind="error")
+            return
+
+        def work(progress, cancelled):
+            return RL.relink(prj, folder, progress=progress, cancel=cancelled)
+
+        def done(res):
+            if res["linked"]:
+                self.session.dirty = True
+                self.save()
+                self.cutlist.refresh(self.session.cut.id if self.session.cut else None)
+                self.tlstrip.refresh()
+                if self.session.cut is not None:
+                    self._reopen_cut()
+            self.toast(RL.summary(res), "ok" if res["linked"] and not (res["different"] or res["not_found"]) else "warn")
+        self.run_job("원본 찾는 중", work, done)
+
+    def _tell_missing(self, prj):
+        """On opening: how many cuts have no original here, and where to connect them (once per opening)."""
+        try:
+            from ..core import relink as RL
+            miss = [m for m in RL.missing(prj) if m["kind"] == "source"]
+            if miss:
+                n = sum(len(m["cuts"]) for m in miss)
+                self.toast(f"원본을 찾을 수 없는 컷 {n}개가 있습니다. 프로젝트 메뉴의 '원본 다시 연결'에서 파일이 있는 폴더를 "
+                           "고르면 다시 이어집니다 (분석 결과와 보정값은 그대로입니다).", kind="warn")
+        except Exception:
+            traceback.print_exc()
+
+    def _tell_learning(self, prj):
+        """Once per project made before 1.24 whose file said (or left out, which meant) that it is in the learning
+        data: learning from a project now starts only where it is switched on by hand, and this one never was."""
+        try:
+            if not getattr(prj, "learn_before", False) or prj.learn_set:
+                return
+            key = str(prj.created or prj.path)
+            s_ = settings()
+            if key in (s_.learn_notified or []):
+                return
+            self.toast("1.24부터 학습 데이터 수집과 자동 학습은 직접 켠 프로젝트에서만 합니다. 이 프로젝트는 꺼져 있습니다 "
+                       "(프로젝트 메뉴에서 켤 수 있습니다). 편집·미리보기·렌더와 이미 학습된 모델은 그대로 씁니다.")
+            s_.learn_notified = (list(s_.learn_notified or []) + [key])[-500:]
+            s_.save()
+        except Exception:
+            traceback.print_exc()
 
     def _tell_legacy(self, prj):
         """Once per project: what an older project had that 1.22.2 no longer applies (the separate mode, drawn
@@ -902,6 +985,11 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _learn_allowed(self) -> bool:
+        """Learning was switched on by hand for the open project (see learn.allowed)."""
+        from ..learn import allowed
+        return allowed(self.session.project)
+
     def _collect_learning(self, force: bool = False):
         s = self.session
         if s.cut is None or s.tracker is None or s.tracker.store is None:
@@ -1074,10 +1162,11 @@ class MainWindow(QMainWindow):
                 # body segments were added in this version: measure their widths in the background
                 tr.widths_stale = False
                 self.edit_worker.submit(("widths", -1), lambda: (tr.update_widths(), tr.save()))
+            blocked = self._version_note(cut)      # analysed with package versions that are not on this computer
             if st is not None and not (st.has_vis and st.has_face):
                 self.toast("이전 버전에서 분석한 컷입니다. 가려진 관절 판정과 얼굴·피부 보정을 쓰려면 다시 분석하세요.",
                            kind="warn")
-            elif tr is not None and st is not None and st.has_face:
+            elif tr is not None and st is not None and st.has_face and not blocked:
                 self._ensure_facelayer(tr)
             self.refresher.kick()                 # marks left from the last time it was open
         self._refresh_all()
@@ -1111,7 +1200,8 @@ class MainWindow(QMainWindow):
         from ..core.frames import source_present
         if s.proxy is None:
             self.viewer.message = ("원본 파일을 찾을 수 없습니다: " + str(cut.source or cut.info.path)
-                                   + "\n파일을 원래 자리에 두거나 다시 연결하세요.")
+                                   + "\n파일을 원래 자리에 두거나, 프로젝트 메뉴의 '원본 다시 연결'에서 파일이 있는 폴더를 "
+                                     "고르세요.")
             self.viewer.update()
             self._refresh_all()
             return
@@ -1561,6 +1651,8 @@ class MainWindow(QMainWindow):
             if err == "__cancelled__":
                 self.toast("취소했습니다.")
                 pass
+            elif "VersionNeeded" in str(err):
+                self._versions_needed(str(err))
             else:
                 self.show_error(title + " 실패", err)
 
@@ -1573,6 +1665,50 @@ class MainWindow(QMainWindow):
         # started right here, not from a timer: a timer outlived the window in the tests and started a job for a
         # window already gone (a crash)
         self.job.start(QThread.LowPriority)
+
+    def _versions_needed(self, text: str):
+        """Work on the open cut needs model package versions that are not on this computer: nothing is switched to
+        another version by itself; installing that version or analysing the whole cut again is asked."""
+        from .modelsdlg import ask_versions
+        got = ask_versions(self, text)
+        if got == "models":
+            self.open_models()
+        elif got == "reanalyse":
+            self.run_analysis()
+
+    def open_models(self):
+        from .modelsdlg import ModelsDialog
+        d = ModelsDialog(self)
+        d.exec()
+        if d.changed:
+            self._models_changed()
+
+    def _models_changed(self):
+        """A model version was put in use or taken out: sessions made with the old files are dropped (the next
+        work opens the ones in use) and the open cut says again what it needs."""
+        try:
+            self.refresher.models.clear()
+        except Exception:
+            pass
+        if self.session.cut is not None:
+            self._version_note(self.session.cut, again=True)
+            self.inspector.refresh()
+
+    def _version_note(self, cut, again: bool = False) -> str:
+        """Said once per cut and state: the package versions this cut was analysed with are not here."""
+        from .modelsdlg import needed_text
+        try:
+            txt = needed_text(cut) if cut is not None and cut.analyzed else ""
+        except Exception:
+            txt = ""
+        seen = getattr(self, "_version_noted", None)
+        if seen is None:
+            seen = self._version_noted = {}
+        if txt and (again or seen.get(cut.id) != txt):
+            self.toast(txt, kind="warn")
+        if cut is not None:
+            seen[cut.id] = txt
+        return txt
 
     def _batch_warned(self, cid: str, text: str):
         seen = getattr(self, "_batch_warn_seen", set())
@@ -1589,6 +1725,11 @@ class MainWindow(QMainWindow):
             fb = take_cpu_fallbacks()
         except Exception:
             return
+        try:
+            from ..track.models import device_label
+            self.dev_lbl.setText(f"추론: {device_label()}")     # by what the models really ran on
+        except Exception:
+            pass
         if fb:
             names = ", ".join(sorted({n for n, _ in fb}))[:120]
             why = "GPU 메모리가 부족해" if any(w == "GPU 메모리 부족" for _, w in fb) else "GPU에서 열지 못해"
@@ -1655,6 +1796,7 @@ class MainWindow(QMainWindow):
                 st.analysis_spf = round(spf if not st.analysis_spf else 0.5 * st.analysis_spf + 0.5 * spf, 3)
                 st.save()
             cut.stats.analysis_runs += 1
+            cut.stats.analysis_seconds = round(time.time() - t_start, 1)
             ok = tr.auto_ok_rate(cut.tracking.conf_threshold)
             cut.stats.auto_ok_rate = ok
             log_event("analysis", s.project.name, cut.name, frames=cut.work_range[1] - cut.work_range[0], auto_ok=ok,
@@ -1675,12 +1817,15 @@ class MainWindow(QMainWindow):
             self.inspector.show_tab("reshape")
             self._refresh_all()
             self.toast(f"분석 완료 · 인물 {len(cut.persons)}명 · 자동 추적 성공률 {ok * 100:.0f}%", kind="ok")
-            if cut.retouch_ref and Path(cut.retouch_ref).exists() and s.project.learn and cut.learn:
+            from ..learn import allowed as learn_allowed
+            if cut.retouch_ref and Path(cut.retouch_ref).exists() and learn_allowed(s.project, cut):
                 QTimer.singleShot(1500, lambda: self.learn_style(cut))
             fr = getattr(self, "_fusion_res", None)
             if fr and fr.get("active"):
                 log_event("self_learning", s.project.name, cut.name, fusion_gain=fr.get("gain"), cuts=fr.get("cuts"))
-            QTimer.singleShot(4000, self.models_page.maybe_self_train)
+            if learn_allowed(s.project, cut):
+                # automatic learning starts only from a project where it was switched on
+                QTimer.singleShot(4000, self.models_page.maybe_self_train)
 
         self.run_job("분석 중", work, done, est_s=nfr * (spf0 or DEFAULT_SPF))
 
@@ -1811,11 +1956,12 @@ class MainWindow(QMainWindow):
         elif action.startswith("status:"):
             from ..learn import statuscal as SC
             v = action.split(":", 1)[1]
+            learn = self._learn_allowed()
             for c in sel:
                 ST.set_user(c, v or None)
-                if v:
+                if v and learn:
                     SC.record(c, v)
-            if v:
+            if v and learn:
                 SC.refit()
             self.session.dirty = True
             self.tlstrip.update_counts()
@@ -1823,7 +1969,7 @@ class MainWindow(QMainWindow):
             from ..learn import statuscal as SC
             for c in sel:
                 ST.set_reviewed(c, action.endswith("1"))
-                if action.endswith("1") and not (c.status or {}).get("user"):
+                if action.endswith("1") and not (c.status or {}).get("user") and self._learn_allowed():
                     SC.record(c, (c.status or {}).get("auto", ""))      # checked and left as it was: a confirmation
             self.session.dirty = True
             self.tlstrip.update_counts()
@@ -1837,9 +1983,10 @@ class MainWindow(QMainWindow):
             cur = self.session.cut
             if cur is not None and cur.tl and not (cur.status or {}).get("reviewed") and cur in rest:
                 ST.set_reviewed(cur, True)
-                from ..learn import statuscal as SC
-                SC.record(cur, (cur.status or {}).get("user") or (cur.status or {}).get("auto", ""))
-                SC.refit()
+                if self._learn_allowed():
+                    from ..learn import statuscal as SC
+                    SC.record(cur, (cur.status or {}).get("user") or (cur.status or {}).get("auto", ""))
+                    SC.refit()
                 self.session.dirty = True
                 rest = [c for c in rest if c is not cur]
                 self.tlstrip.update_counts()
@@ -2200,7 +2347,8 @@ class MainWindow(QMainWindow):
         try:
             from ..learn import identity as ID
             from ..track import xlink as XL
-            ID.refit()
+            if self._learn_allowed():
+                ID.refit()
             r = XL.link(prj)
         except Exception as e:
             traceback.print_exc()
@@ -2231,7 +2379,8 @@ class MainWindow(QMainWindow):
         self.toast(f"일괄 분석 끝: {done}컷" + (f" · 실패 {failed}컷" if failed else ""), "ok" if not failed else "warn")
         if done:
             QTimer.singleShot(2500, lambda: self._relink())
-        QTimer.singleShot(4000, self.models_page.maybe_self_train)
+        if self._learn_allowed():
+            QTimer.singleShot(4000, self.models_page.maybe_self_train)
 
     # ================================================================== retouch style learning
     def learn_style(self, cut=None, after: str = ""):
@@ -2404,8 +2553,9 @@ class MainWindow(QMainWindow):
             self.run_job("구간 적용 중", apply_work, applied, cancellable=False)
         self.run_job("구간 다시 분석 중 (얼굴·목)", work, done)
 
-    def make_ai_review(self, open_folder: bool = True):
-        """AI 검수 자료 (§6): read from the saved project, so it is saved first; nothing is analysed again."""
+    def make_ai_review(self, open_folder: bool = True, images: bool = False):
+        """AI 검수 리포트: read from the saved project, so it is saved first; nothing is analysed again. Without
+        pictures of the footage unless asked for (instruction 2026-11-20 §4-4)."""
         prj = self.session.project
         if prj is None:
             return
@@ -2416,7 +2566,7 @@ class MainWindow(QMainWindow):
 
         def work(progress, cancelled):
             from .. import review as RV
-            return str(RV.build(path, progress=progress, cancel=cancelled))
+            return str(RV.build(path, images=images, progress=progress, cancel=cancelled))
 
         def done(out):
             self.last_review = out
@@ -2424,10 +2574,11 @@ class MainWindow(QMainWindow):
                 shown = Path(out).relative_to(path).as_posix()
             except ValueError:
                 shown = out
-            self.toast(f"AI 검수 자료를 만들었습니다: {shown} (report.md, review.json)", kind="ok")
+            self.toast(f"AI 검수 리포트를 만들었습니다: {shown} (report.md, review.json"
+                       + (", img: 영상 프레임 포함)" if images else "; 영상·크롭·미디어 경로 없음)"), kind="ok")
             if open_folder:
                 QDesktopServices.openUrl(QUrl.fromLocalFile(out))
-        self.run_job("AI 검수 자료 만드는 중", work, done)
+        self.run_job("AI 검수 리포트 만드는 중", work, done)
 
     def _matte_state_changed(self, cid: str):
         cut = self.session.cut
@@ -4374,7 +4525,10 @@ class MainWindow(QMainWindow):
 
     def open_settings(self):
         d = SettingsDialog(self)
-        if d.exec():
+        ok = d.exec()
+        if getattr(d, "models_changed", False):
+            self._models_changed()
+        if ok:
             from ..core import playcache as PC
             before = PC.setting_values()
             changed = d.apply() or PC.setting_values() != before     # the view, or a setting results are made with

@@ -13,10 +13,15 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 APP_NAME = "DIAP"
-APP_VERSION = "1.23.0"
+APP_VERSION = "1.24.0"
 
 
 def default_data_dir() -> Path:
+    """Settings, models, presets, learned data (kept across updates).
+    Windows: Documents\\DIAP_Data, where it always was (an install that has Documents\\Contour_Data from before the
+    rename goes on using it): nothing is moved, so the settings and caches of an existing install are simply found.
+    macOS: ~/Library/Application Support/DIAP, the system's place for an app's own data (a ~/DIAP_Data from a
+    source run before 1.24 goes on being used). Elsewhere: ~/DIAP_Data."""
     if sys.platform == "win32":
         base = Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Documents"
     else:
@@ -26,7 +31,18 @@ def default_data_dir() -> Path:
     new = base / "DIAP_Data"
     if old.exists() and not new.exists():
         return old
+    if sys.platform == "darwin" and not new.exists():
+        return Path.home() / "Library" / "Application Support" / APP_NAME
     return new
+
+
+def default_cache_dir(data: Path) -> Path:
+    """Proxies and other things made again from the footage whenever missing. Windows and elsewhere: <data>\\cache,
+    as before. macOS: ~/Library/Caches/DIAP (the system may clear it; nothing in it is the only copy), unless the
+    data folder is one from before 1.24, whose cache stays inside it."""
+    if sys.platform == "darwin" and Path(data) == Path.home() / "Library" / "Application Support" / APP_NAME:
+        return Path.home() / "Library" / "Caches" / APP_NAME
+    return Path(data) / "cache"
 
 
 @dataclass
@@ -38,10 +54,12 @@ class AppSettings:
     display: str = ""
     view: str = ""
     proxy_long_side: int = 1920
-    gpu: str = "auto"                     # auto | cuda | dml | cpu
+    gpu: str = "auto"                     # auto | cuda | dml | coreml | cpu (which a model gets: track/backend.py)
     accuracy: str = "high"                # high | balanced | fast
+    # Both apply only inside a project where learning was switched on by hand (learn.allowed, 1.24): on their own
+    # they start nothing. Switching one off here stops it in every project.
     collect_learning_data: bool = True
-    self_learning: bool = True        # learn from every analysed cut on its own (no corrections needed)
+    self_learning: bool = True        # learn from the analysed cuts on their own (no corrections needed)
     face_model: str = ""              # '' = the default (faceparse.DEFAULT_MODEL), 'mp' (commercial use) or 'face_parse' (non-commercial)
     cloth_model: str = ""             # '' = the default (clothing.DEFAULT_MODEL), 'sam31' (commercial use) or 'parse_clothes' (non-commercial)
     unified_model: bool = False       # DIAP's combined model in place of face_parse, parse_clothes, matte_rvm (experiment)
@@ -49,6 +67,7 @@ class AppSettings:
     recent_projects: list = field(default_factory=list)
     known_projects: list = field(default_factory=list)   # every project the project manager lists (no limit)
     legacy_notified: list = field(default_factory=list)  # projects told once that their 보호/분리 settings are gone
+    learn_notified: list = field(default_factory=list)   # projects told once that learning is now off unless chosen
     pm_sort: str = "modified"             # project manager order: modified | name | created (last chosen)
     play_loop: bool = False               # transport: repeat the cut (off: playback goes on into the next cut)
     open_last_on_start: bool = False      # skip the project manager at start and open the last project
@@ -66,6 +85,8 @@ class AppSettings:
     skip_version: str = ""                # an update the user chose to skip
     auto_update_check: bool = True
     analysis_spf: float = 0.0             # seconds per frame of a whole-cut analysis on this PC (learned; 0 = unknown)
+    model_registry: str = ""              # where a signed list of model packages is read from (address or folder);
+                                          # "" = nowhere (no storage provider is decided: set by hand in 모델 관리)
 
     # ------------------------------------------------------------------ paths
     @property
@@ -77,7 +98,7 @@ class AppSettings:
     @property
     def cache_path(self) -> Path:
         """This computer's cache of proxies: a fast local disk, not the project's (often network) folder."""
-        p = Path(self.cache_dir) if self.cache_dir else self.data_path / "cache"
+        p = Path(self.cache_dir) if self.cache_dir else default_cache_dir(self.data_path)
         try:
             p.mkdir(parents=True, exist_ok=True)
         except OSError:

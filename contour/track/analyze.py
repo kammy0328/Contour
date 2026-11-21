@@ -19,6 +19,7 @@ from .store import TrackStore
 from ..core.project import PERSON_COLORS, Cut, Person, Project
 from ..core.proxy import MatteStore, Proxy
 from ..warp import body as B
+from .modelpkg import cut_models as _cut_models
 
 Progress = Optional[Callable[[float, str], None]]
 
@@ -324,11 +325,17 @@ class CutTracker:
         cut = self.cut
         keep = dict(store=self.store, persons=_copy.deepcopy(cut.persons), joint_keys=dict(cut.joint_keys),
                     analyzed=cut.analyzed, analysis_version=cut.analysis_version, cs_analysed=cut.cs_analysed,
-                    models_used=dict(cut.models_used or {}))
+                    models_used=dict(cut.models_used or {}), model_versions=dict(cut.model_versions or {}))
         a, b = cut.work_range
         MRV.begin(self, copy=not (a <= 0 and b >= self.proxy.n))
         try:
-            return self._analyze(progress, cancel, accuracy)
+            # the model packages in use now are the ones this analysis runs with to its end (instruction 2026-11-20
+            # §4-2), whatever is installed meanwhile; they are written on the cut with its result
+            from . import modelpkg as MPK
+            with MPK.pinned() as pins:
+                st = self._analyze(progress, cancel, accuracy)
+                cut.model_versions = {k: v for k, v in pins.items() if k in (cut.models_used or {})}
+                return st
         except BaseException:
             if MRV.staging(self):
                 MRV.drop(self)
@@ -336,6 +343,7 @@ class CutTracker:
             cut.persons, cut.joint_keys = keep["persons"], keep["joint_keys"]
             cut.analyzed, cut.analysis_version = keep["analyzed"], keep["analysis_version"]
             cut.cs_analysed, cut.models_used = keep["cs_analysed"], keep["models_used"]
+            cut.model_versions = keep["model_versions"]
             self._label_cache.clear()
             self._geo_cache = {}
             self._head_raw = {}
@@ -2027,6 +2035,7 @@ class CutTracker:
         self._skin_models = {}
         self.save()
 
+    @_cut_models
     def rebuild_matte(self, progress: Progress = None, cancel: Optional[Callable[[], bool]] = None,
                       accuracy: str = "high") -> None:
         """Make the person matte again with SAM 2, prompted by the current (corrected) tracking, then

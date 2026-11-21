@@ -91,7 +91,14 @@ def setting_values() -> tuple:
         return ()
 
 
-EXTRA: List[Callable[[], object]] = []      # more that a finished frame depends on (model package versions, stage 3)
+def _model_versions() -> list:
+    """The model packages in use (instruction 2026-11-20 §4-2: the keys of results carry the versions they were
+    made with). Models that are not packages are told by the settings and the cut's own record."""
+    from ..track import modelpkg
+    return sorted(modelpkg.store().active_versions().items())
+
+
+EXTRA: List[Callable[[], object]] = [_model_versions]      # more that a finished frame depends on
 
 
 def state_digest(project, cut, origin=()) -> str:

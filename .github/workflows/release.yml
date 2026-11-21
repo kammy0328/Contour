@@ -124,6 +124,11 @@ jobs:
           Push-Location C:\ct\app
           & C:\ct\python\python.exe -m contour.batch --help 2>&1 | Tee-Object -Append -FilePath "$env:GITHUB_WORKSPACE\ci\smoke.txt"
           Pop-Location
+          # the installed app's own short run (tools/ci_smoke.py): a project opened, a proxy made, the models that come
+          # with the app run once, one cut exported, the child job started. No GPU on the runner: the models end
+          # on the CPU and say why.
+          & C:\ct\python\python.exe C:\ct\app\tools\ci_smoke.py --json "$env:GITHUB_WORKSPACE\ci\smoke_installed.json" 2>&1 | Tee-Object -Append -FilePath "$env:GITHUB_WORKSPACE\ci\smoke.txt"
+          if ($LASTEXITCODE -ne 0) { throw "the installed app's short run failed" }
 
       - name: Update from the previous release with the app's own updater (Program Files)
         shell: pwsh

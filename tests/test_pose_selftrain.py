@@ -109,7 +109,7 @@ def test_collect_from_original_alone(tmp_path, monkeypatch):
     from contour.core import settings as SE
     SE._settings = SE.AppSettings(data_dir=str(tmp_path / "data"))
     st = _store(N=40, overlap_at=None)
-    prj = NS(name="MV_A", path=str(tmp_path / "MV_A"), client="", learn=True)
+    prj = NS(name="MV_A", path=str(tmp_path / "MV_A"), client="", learn=True, learn_set=True)
     n = RF.collect_auto(prj, _cut(), NS(store=st, proxy=_Proxy()))
     assert n >= 20
     f = RF.auto_shard(prj, _cut())

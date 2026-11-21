@@ -21,6 +21,7 @@ import numpy as np
 
 from . import facelayer as FL
 from . import faceparse as FP
+from .modelpkg import cut_models as _cut_models
 
 ITEMS = (("face", "얼굴·목"), ("track", "추적"), ("body", "몸 윤곽"))
 READY = {"face"}
@@ -73,6 +74,7 @@ class _TrackerSlice:
         return self._tr._virtual_face(p, int(t) + self.s0)
 
 
+@_cut_models
 def candidate(tracker, pid: int, a: int, b: int, progress: Optional[Callable[[float, str], None]] = None,
               cancel: Optional[Callable[[], bool]] = None) -> Optional[dict]:
     """The face layer of person pid over frames [a, b), made again (nothing written). None when there is no face

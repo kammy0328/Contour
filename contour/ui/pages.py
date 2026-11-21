@@ -996,9 +996,12 @@ class ModelsPage(QWidget):
         self.eval_btn = Wd.button("벤치마크 다시 측정", "", "gauge")
         self.eval_btn.clicked.connect(self.evaluate)
         self.collect = QCheckBox("작업하면서 학습 데이터 모으기")
+        self.collect.setToolTip("프로젝트 메뉴에서 '학습 데이터 수집·자동 학습'을 켠 프로젝트에서만 모읍니다 (기본 꺼짐).\n"
+                                "여기서 끄면 모든 프로젝트에서 멈춥니다. 모은 데이터는 이 컴퓨터에만 있습니다.")
         self.collect.toggled.connect(self._collect)
         self.selfl = QCheckBox("분석한 영상으로 자가학습")
-        self.selfl.setToolTip("분석할 때마다 확실하게 추적된 관절을 스스로 정답으로 삼아 학습 데이터에 넣고,\n"
+        self.selfl.setToolTip("프로젝트 메뉴에서 '학습 데이터 수집·자동 학습'을 켠 프로젝트에서만 시작합니다 (기본 꺼짐).\n"
+                              "분석할 때마다 확실하게 추적된 관절을 스스로 정답으로 삼아 학습 데이터에 넣고,\n"
                               "새 영상이 충분히 쌓이면 자동으로 새 모델을 학습합니다.\n"
                               "새 모델은 플래시·색 조명·모션블러를 씌운 화면과 직접 고친 관절에서\n"
                               "모두 더 정확할 때만 적용됩니다.")
@@ -1137,9 +1140,12 @@ class ModelsPage(QWidget):
         s.save()
 
     def maybe_self_train(self):
-        """After an analysis: train a new version on its own once enough new footage has been seen."""
-        from ..learn import refiner as RF
+        """After an analysis: train a new version on its own once enough new footage has been seen. Only from a
+        project where learning was switched on by hand (the callers check too; this is the last gate)."""
+        from ..learn import allowed, refiner as RF
         if not getattr(settings(), "self_learning", True) or self.job is not None or not RF.torch_available():
+            return False
+        if not allowed(getattr(self.main.session, "project", None)):
             return False
         try:
             n, k = RF.new_auto_since_last()

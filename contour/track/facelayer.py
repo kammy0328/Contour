@@ -24,6 +24,7 @@ import time
 import numpy as np
 
 from . import faceparse as FP
+from .modelpkg import cut_models as _cut_models
 
 VERSION = 1
 MIN_FACE_PX = 48       # proxy px (1920 wide): smaller faces are not parsed
@@ -121,6 +122,7 @@ def _reliability(skin: np.ndarray, lm_crop: np.ndarray) -> float:
     return float(skin.astype(np.float32)[sel].mean())
 
 
+@_cut_models
 def build(tracker, progress: Optional[Callable[[float, str], None]] = None,
           cancel: Optional[Callable[[], bool]] = None, persons: Optional[set] = None, keep: bool = True):
     """The face layer of the cut, written to its file (swapped in once complete). persons: only these store

@@ -13,6 +13,7 @@ import json
 import time
 from pathlib import Path
 
+import os
 import numpy as np
 import pytest
 
@@ -35,7 +36,20 @@ def old_project(tmp_path):
 
 
 def _same_env(golden) -> bool:
+    """Bit for bit only where the fixture's numbers can be expected again: the same libraries, and not on a hosted CI
+    runner (its CPU differs from run to run, and a filter's last rounding step with it: the preview of the first
+    GitHub run was within one step of the golden everywhere, not equal). The tolerances are checked everywhere."""
+    if os.environ.get("GITHUB_ACTIONS"):
+        return False
     return str(golden["env"]) == BU.env_key()
+
+
+def test_exact_comparison_is_left_to_machines_that_can_give_it(monkeypatch):
+    env = BU.env_key()
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    assert _same_env({"env": env}) and not _same_env({"env": env + "x"})
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    assert not _same_env({"env": env})
 
 
 def test_fixture_is_what_1222_wrote(golden):
@@ -225,6 +239,11 @@ def test_saving_keeps_everything_1222_wrote(old_project, golden):
         if k == "cuts":
             for c0, c1 in zip(v, now_prj["cuts"]):
                 _holds(c0, c1, "cut")
+        elif k == "learn":
+            # the one value that is not carried over (instruction 2026-11-20 §4-4): 1.22.2 wrote true for every
+            # project (its default, never a choice); learning is now off unless switched on by hand, and the file
+            # says so for an older build that opens it too
+            assert v is True and now_prj["learn"] is False and now_prj["learn_set"] is False
         else:
             assert now_prj[k] == v, k
     with np.load(cut_dir / "tracks.npz") as d:

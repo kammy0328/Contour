@@ -1,4 +1,5 @@
-"""Model registry, downloads and ONNX Runtime sessions (CUDA -> DirectML -> CPU).
+"""Model registry, downloads and ONNX Runtime sessions (Windows CUDA -> DirectML -> CPU, macOS Core ML -> CPU;
+which of them a model gets, what it really ran on and why: track/backend.py).
 
 Pose/detector weights are the OpenMMLab RTMPose / RTMW / YOLOX ONNX exports
 (Apache-2.0). The matte model is Robust Video Matting (GPL-3.0, fine for
@@ -14,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -96,11 +98,41 @@ MODELS: Dict[str, dict] = {
 POSE_MODEL_KEYS = ["pose_rtmpose_x", "pose_rtmw_x", "pose_rtmpose_m", "pose_dwpose_l"]
 
 
-def model_path(key: str) -> Path:
-    """Single file models: the .onnx file. Multi file models (spec 'files'): their folder."""
+def legacy_path(key: str) -> Path:
+    """Where a model downloaded by the app itself (before model packages) is. Single file models: the .onnx file.
+    Multi file models (spec 'files'): their folder."""
     if key in MODELS and MODELS[key].get("files"):
         return settings().models_path / "onnx" / key
     return settings().models_path / "onnx" / f"{key}.onnx"
+
+
+def packaged(key: str) -> Optional[Path]:
+    """The model as an installed package (modelpkg): the version this work is pinned to, else the one in use.
+    None when the model is not a package on this computer."""
+    try:
+        from . import modelpkg as MP
+        return MP.resolve(key)
+    except Exception:
+        return None
+
+
+def pinned_missing(key: str) -> str:
+    """The version this work is pinned to when that version is not installed ('' otherwise): the model is then not
+    opened from anywhere else."""
+    try:
+        from . import modelpkg as MP
+        pins = MP.current_pins()
+        if pins and key in pins and MP.store().path(key, pins[key]) is None:
+            return pins[key]
+    except Exception:
+        pass
+    return ""
+
+
+def model_path(key: str) -> Path:
+    """Where the model is opened from: its installed package (a version that never changes), else where the app
+    itself downloaded it (legacy_path)."""
+    return packaged(key) or legacy_path(key)
 
 
 # models an analysis runs with (recorded on the cut, so a result can be told apart from one made with other files)
@@ -113,7 +145,26 @@ def fingerprint(key: str) -> str:
     """First 16 hex digits of the SHA-256 of the model's file(s) ('' when not downloaded). Hashed once per file version:
     cached by name, size and modification time in models/hashes.json (a 940 MB model takes a few seconds once)."""
     import hashlib
-    p = model_path(key)
+    try:
+        from . import modelpkg as MP
+        ver = MP.version_in_use(key)
+        pkg = MP.store().package(key, ver) if ver else None
+        if pkg is not None:
+            # a package's content never changes: from its own list, not read again. The same figure the app's own
+            # download of the same files has (below), so a cut analysed before its model came as a package and one
+            # analysed after name the same files
+            fs = sorted((Path(f.path), f.sha256) for f in pkg.files
+                        if not f.path.endswith((".part", ".json")) and ".broken" not in Path(f.path).name
+                        and ".noaccess" not in Path(f.path).name)
+            if fs:
+                h_pkg = hashlib.sha256()
+                for fp_, hx in fs:
+                    h_pkg.update(f"{fp_.name}:{hx};".encode())
+                return h_pkg.hexdigest()[:16]
+            return pkg.sha256[:16]
+    except Exception:
+        pass
+    p = legacy_path(key)
     files = sorted(f for f in p.rglob("*") if f.is_file() and not f.name.endswith((".part", ".json"))
                    and ".broken" not in f.name and ".noaccess" not in f.name) if p.is_dir() else ([p] if p.is_file() else [])
     if not files:
@@ -165,7 +216,9 @@ def fingerprints(keys=ANALYSIS_KEYS) -> dict:
 
 
 def is_downloaded(key: str) -> bool:
-    p = model_path(key)
+    if packaged(key) is not None:
+        return True
+    p = legacy_path(key)
     files = MODELS.get(key, {}).get("files")
     if files:
         return all(_usable(p / Path(u).name) for u in files) and \
@@ -238,9 +291,28 @@ def _download(url: str, dst: Path, progress: Optional[Callable[[float, str], Non
 
 
 def ensure_model(key: str, progress: Optional[Callable[[float, str], None]] = None) -> Path:
-    """Download (once) and return the local ONNX path (or the folder of a multi file model)."""
-    out = model_path(key)
+    """Download (once) and return the local ONNX path (or the folder of a multi file model). A model installed as
+    a package is returned as it is (every file it needs is in the package; nothing is downloaded or made beside
+    it). Work pinned to a package version that is not on this computer gets an error that names it, never another
+    version in its place."""
+    pk = packaged(key)
+    if pk is not None:
+        return pk
+    want = pinned_missing(key)
+    if want:
+        raise RuntimeError(f"{MODELS.get(key, {}).get('label', key)}: 이 작업을 시작한 모델 버전 {want}이(가) 설치되어 있지 "
+                           f"않습니다. 모델 관리에서 그 버전을 설치하거나 다시 분석하세요.")
+    out = legacy_path(key)
     spec = MODELS[key]
+    try:
+        return _ensure_legacy(key, out, spec, progress)
+    except OSError as e:
+        # no connection, a name that does not resolve, a download cut short (URLError, timeouts and the like are
+        # all OSError): what is missing, how to get it without a connection, and what goes on working
+        raise ModelMissing(key, str(getattr(e, "reason", e))[:160]) from e
+
+
+def _ensure_legacy(key: str, out: Path, spec: dict, progress) -> Path:
     if spec.get("files"):
         out.mkdir(parents=True, exist_ok=True)
         files = spec["files"]
@@ -366,6 +438,12 @@ def providers() -> List:
         elif want in ("auto", "dml") and "DmlExecutionProvider" in avail:
             chosen.append("DmlExecutionProvider")
             _device_label = "DirectML"
+        elif want in ("auto", "coreml") and "CoreMLExecutionProvider" in avail and sys.platform == "darwin":
+            # which models are given to Core ML is decided per model (backend.for_model): with '자동' only those
+            # checked on a Mac, so until one is the label stays CPU
+            from . import backend as BK
+            chosen.append(("CoreMLExecutionProvider", dict(BK.COREML_OPTIONS)))
+            _device_label = "Core ML" if (want == "coreml" or BK.COREML_OK) else "CPU"
         else:
             _device_label = "CPU"
         chosen.append("CPUExecutionProvider")
@@ -374,8 +452,14 @@ def providers() -> List:
 
 
 def device_label() -> str:
+    """The device for the status line: what was decided for this system, corrected by what the models opened so
+    far really ran on (backend.summary_label)."""
     providers()
-    return _device_label
+    try:
+        from . import backend as BK
+        return BK.summary_label(_device_label)
+    except Exception:
+        return _device_label
 
 
 def reset_providers() -> None:
@@ -470,10 +554,16 @@ class Session:
 
     RETRIES = 2
 
-    def __init__(self, sess, path, shrink: bool = False):
+    def __init__(self, sess, path, shrink: bool = False, verify: bool = False, asked=None):
         self._s = sess
         self._path = str(path)
         self._ro = None
+        self._verify = bool(verify)          # the first run's record tells which provider ran each operator
+        self._ran = False
+        self._asked = list(asked or [])
+        # the name of the input whose first dimension is a batch of items that do not depend on each other (set
+        # by the model's owner, e.g. the pose crops of one frame): with no GPU memory left the batch is halved
+        self.batch_input: Optional[str] = None
         if shrink:
             try:
                 import onnxruntime as ort
@@ -490,7 +580,11 @@ class Session:
             k["run_options"] = self._ro
         for attempt in range(self.RETRIES + 1):
             try:
-                return self._s.run(*a, **k)
+                t0 = time.perf_counter()
+                out = self._s.run(*a, **k)
+                if not self._ran:
+                    self._first_run(time.perf_counter() - t0)
+                return out
             except Exception as e:
                 if ours and _no_pool(e):
                     # the session has no memory pool of the kind the option names (opened on the CPU alone, or an
@@ -502,9 +596,81 @@ class Session:
                     raise
                 sys.stderr.write(f"GPU OOM {Path(self._path).name} (try {attempt + 1}): {str(e)[:300]}\n")
                 if attempt >= self.RETRIES:
-                    raise GpuMemoryError(GPU_OOM_TEXT) from e
+                    return self._without_memory(e, a, k)
                 free_gpu_memory()
                 time.sleep(1.5 * (attempt + 1))
+
+    def _first_run(self, seconds: float) -> None:
+        """After the first run: which provider ran the operators (the session's profile), kept with the reasons."""
+        self._ran = True
+        from . import backend as BK
+        place = {}
+        if self._verify:
+            self._verify = False
+            try:
+                f = self._s.end_profiling()
+                place = BK.placement(f)
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+            except Exception:
+                place = {}
+        try:
+            got = [p for p in self._s.get_providers()]
+        except Exception:
+            got = []
+        if place:
+            backend, cpu_share = BK.ran_on(place)
+        else:
+            # no profile (a CPU session, or profiling not available): the session's own first provider
+            backend, cpu_share = (BK.BACKEND.get(got[0], "") if got else ""), 0.0
+        why = []
+        asked_acc = [b for b in self._asked if b != "cpu"]
+        name = Path(self._path).name
+        if asked_acc and backend == "cpu":
+            why.append("가속 장치를 요청했지만 연산이 모두 CPU에서 실행됨")
+            if not any(n == name for n, _ in cpu_fallbacks):
+                cpu_fallbacks.append((name, "GPU 실행 장치를 쓰지 못함"))
+        elif asked_acc and place and cpu_share > BK.CPU_HEAVY:
+            why.append(f"연산 시간의 {cpu_share * 100:.0f}%가 CPU에서 실행됨 (가속 장치에 없는 연산)")
+        BK.note(self._path, ran=True, backend=backend, placement=place, cpu_share=round(cpu_share, 3),
+                first_ms=round(seconds * 1000.0, 1), session=got, reasons=why)
+
+    def _without_memory(self, err, a, k):
+        """The GPU has no memory for this run even after what could be dropped was dropped: a batch is run in
+        halves; a model the CPU can run in reasonable time goes on there (said once, with the reason); the others
+        end with the message that says what to close."""
+        from . import backend as BK
+        name = Path(self._path).name
+        feed = a[1] if len(a) > 1 else k.get("input_feed")
+        bi = self.batch_input
+        if bi and isinstance(feed, dict) and bi in feed and len(feed[bi]) > 1:
+            n = len(feed[bi])
+            h = n // 2
+            BK.note(self._path, reasons=[f"GPU 메모리 부족: 배치 {n}개를 나눠 실행"])
+            sys.stderr.write(f"GPU OOM {name}: batch {n} -> {h} + {n - h}\n")
+            outs = []
+            for part in (slice(0, h), slice(h, n)):
+                f2 = dict(feed)
+                f2[bi] = feed[bi][part]
+                outs.append(self.run(a[0] if a else k.get("output_names"), f2))
+            return [np.concatenate([x[i] for x in outs]) if getattr(outs[0][i], "shape", ())[:1] == (h,)
+                    else outs[0][i] for i in range(len(outs[0]))]
+        if any(name.startswith(x) for x in BK.CPU_TOO_SLOW) or os.environ.get("DIAP_OOM_CPU", "1") == "0":
+            raise GpuMemoryError(GPU_OOM_TEXT) from err
+        try:
+            import onnxruntime as ort
+            self._s = ort.InferenceSession(self._path, sess_options=_options(False), providers=["CPUExecutionProvider"])
+        except Exception:
+            raise GpuMemoryError(GPU_OOM_TEXT) from err
+        self._ro = None
+        self.batch_input = bi
+        sys.stderr.write(f"MODEL ON CPU {name} (GPU 메모리 부족)\n")
+        cpu_fallbacks.append((name, "GPU 메모리 부족"))
+        BK.note(self._path, backend="cpu", session=["CPUExecutionProvider"],
+                reasons=["GPU 메모리 부족: 이 모델을 CPU로 전환 (다른 GPU 프로그램을 끝내고 다시 시작하면 GPU로 돌아갑니다)"])
+        return self._s.run(*a, **{kk: v for kk, v in k.items() if kk != "run_options"})
 
     def __getattr__(self, name):
         return getattr(self._s, name)
@@ -535,7 +701,12 @@ def take_cpu_fallbacks() -> List:
     return out
 
 
-def _session_raw(path: Path):
+_prof_n = [0]
+_verified: set = set()          # model files whose first run was looked at in this process (once is enough)
+
+
+def _options(dml: bool):
+    """The session settings every model gets (threads, spinning; DirectML's own needs)."""
     import onnxruntime as ort
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -550,44 +721,96 @@ def _session_raw(path: Path):
         # threads took the CPU from the one that was working
         so.add_session_config_entry("session.intra_op.allow_spinning", "0")
         so.add_session_config_entry("session.inter_op.allow_spinning", "0")
-    if "DmlExecutionProvider" in [p if isinstance(p, str) else p[0] for p in providers()]:
+    if dml:
         # DirectML requires sequential execution without memory patterns
         so.enable_mem_pattern = False
         so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-    prov = providers()
+    return so
+
+
+def _why_not_gpu(err) -> str:
+    """Why a model that was asked to run on an accelerator was opened on the CPU, for the person."""
+    from . import backend as BK
+    if err is not None and is_oom(err):
+        return "GPU 메모리 부족"
+    state, text = BK.driver_state()
+    if state == "old":
+        return text
+    t = str(err or "").lower()
+    if "cudnn" in t or "cublas" in t or "cufft" in t or "nvrtc" in t or ".dll" in t or "libcu" in t or "load library" in t:
+        return ("CUDA 라이브러리를 불러오지 못함 (" + str(err)[:120] + ")")
+    return "GPU에서 열지 못함" + (f" ({str(err)[:120]})" if err is not None else "")
+
+
+def _session_raw(path: Path):
+    import onnxruntime as ort
+    from . import backend as BK
+    base = providers()
+    names = [p if isinstance(p, str) else p[0] for p in base]
+    so = _options("DmlExecutionProvider" in names)
+    try:
+        want = settings().gpu
+    except Exception:
+        want = "auto"
+    # the system's list narrowed for this model (a package that is for other backends, Core ML only for the
+    # models checked on it), with why
+    prov, why = BK.for_model(path, base, want)
+    asked = [BK.BACKEND.get(p if isinstance(p, str) else p[0], "") for p in prov]
     on_gpu = any((p if isinstance(p, str) else p[0]) != "CPUExecutionProvider" for p in prov)
     err = None
-    shrink = on_gpu and os.environ.get("DIAP_RUN_SHRINK", RUN_SHRINK) == "1" and not Path(path).name.startswith(
+    name = Path(path).name
+    # (the GPU memory pool settings are CUDA's and DirectML's, as before; Core ML has no pool of ours)
+    pooled = on_gpu and "CoreMLExecutionProvider" not in names
+    shrink = pooled and os.environ.get("DIAP_RUN_SHRINK", RUN_SHRINK) == "1" and not name.startswith(
         ("image-encoder", "finder", "click-decoder"))
-    if on_gpu and os.environ.get("DIAP_SHARE_ARENA", SHARE_ARENA) == "1":
+    if pooled and os.environ.get("DIAP_SHARE_ARENA", SHARE_ARENA) == "1":
         _share_cuda_arena(so)
+    # the first run of a model on an accelerator writes which provider ran each operator (once per model file in
+    # this process): the name of a provider in the session's list is not taken for acceleration
+    verify = on_gpu and os.environ.get("DIAP_VERIFY_BACKEND", "1") != "0" and str(path) not in _verified
+    if verify:
+        try:
+            _prof_n[0] += 1
+            so.enable_profiling = True
+            so.profile_file_prefix = str(Path(tempfile.gettempdir()) / f"diap_place_{os.getpid()}_{_prof_n[0]}")
+        except Exception:
+            verify = False
     for attempt in range(2 if on_gpu else 1):
         try:
             sess = ort.InferenceSession(str(path), sess_options=so, providers=prov)
             _check_actual(sess, prov, path)
+            if verify:
+                _verified.add(str(path))
             try:
                 got = list(sess.get_providers())
             except Exception:
                 got = []
+            if on_gpu and not any(BK.BACKEND.get(g, "cpu") != "cpu" for g in got):
+                # opened, but on the CPU alone (the accelerator's libraries did not load): with the reason
+                why = why + [_why_not_gpu(None) if BK.driver_state()[0] == "old" else
+                             "가속 장치를 열지 못해 CPU로 실행 (드라이버·CUDA 라이브러리 확인)"]
+            BK.note(path, asked=asked, session=got, reasons=why, setting=want)
             # (the run's option that gives the pool's spare memory back is CUDA's: by what the session has, not by
             # what was asked for. A session the runtime opened on the CPU by itself has no such pool, and every run
             # ended with an error: j2805)
-            return Session(sess, path, shrink and "CUDAExecutionProvider" in got)
+            return Session(sess, path, shrink and "CUDAExecutionProvider" in got, verify=verify, asked=asked)
         except Exception as e:
             err = e
             if not (on_gpu and is_oom(e)) or attempt:
                 break
             # out of GPU memory while loading: free what can be freed and try once more on the GPU
-            sys.stderr.write(f"GPU OOM loading {Path(path).name}: {str(e)[:300]}\n")
+            sys.stderr.write(f"GPU OOM loading {name}: {str(e)[:300]}\n")
             free_gpu_memory()
             time.sleep(1.0)
     # A broken GPU setup should never stop the app: fall back to CPU (much slower: noted and shown to the user)
-    sess = ort.InferenceSession(str(path), sess_options=so, providers=["CPUExecutionProvider"])
+    sess = ort.InferenceSession(str(path), sess_options=_options(False), providers=["CPUExecutionProvider"])
     if on_gpu:
-        why = "GPU 메모리 부족" if err is not None and is_oom(err) else "GPU에서 열지 못함"
-        sys.stderr.write(f"MODEL ON CPU {Path(path).name} ({why}): {str(err)[:300]}\n")
-        cpu_fallbacks.append((Path(path).name, why))
-    return Session(sess, path)
+        short = "GPU 메모리 부족" if err is not None and is_oom(err) else "GPU에서 열지 못함"
+        sys.stderr.write(f"MODEL ON CPU {name} ({short}): {str(err)[:300]}\n")
+        cpu_fallbacks.append((name, short))
+        why = why + [_why_not_gpu(err)]
+    BK.note(path, asked=asked, session=["CPUExecutionProvider"], reasons=why, setting=want)
+    return Session(sess, path, asked=asked)
 
 
 class ModelFileError(RuntimeError):
@@ -616,6 +839,23 @@ def session(path: Path):
             raise
         if _broken(first) and not isinstance(first, PermissionError):
             import time as _t
+            own = _package_of(p)
+            if own is not None:
+                # a file of an installed package: never renamed or fetched again on its own. When its files are
+                # no longer what the list said, the version is taken out of use (the one in use before it comes
+                # back) and the message says which package to install again
+                key, ver = own
+                from . import modelpkg as MP
+                now = None
+                bad = not MP.store().verify(key, ver)
+                if bad:
+                    now = MP.store().set_aside(key, ver)
+                sys.stderr.write(f"MODEL PACKAGE BROKEN {key} {ver} ({p.name}) verified={not bad}: {str(first)[:300]}\n")
+                raise ModelFileError(
+                    f"{MODELS.get(key, {}).get('label', key)} {ver}: 모델 파일을 열지 못했습니다 ({p.name}). "
+                    + ((f"설치된 파일이 손상되어 사용을 멈췄습니다. 이전 버전 {now}을(를) 씁니다. " if now else
+                        "설치된 파일이 손상되어 사용을 멈췄습니다. ") + "모델 관리에서 이 패키지를 다시 설치하세요."
+                       if bad else "파일은 목록과 같습니다: 이 버전의 DIAP·ONNX Runtime과 맞는 패키지인지 확인하세요.")) from first
             try:
                 p.rename(p.with_name(p.name + f".broken{int(_t.time())}"))
             except OSError:
@@ -638,9 +878,87 @@ def session(path: Path):
             raise first
 
 
+def _package_of(path) -> Optional[tuple]:
+    try:
+        from . import modelpkg as MP
+        return MP.store().owns(path)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------------------------- what work needs
+# Which models a kind of work opens (the work itself asks for them with ensure_model; this is for telling the
+# person, before they start and without a connection, what is missing and what goes on working without it).
+# Retouch, preview and render run on models that are part of the app (track/data, assets/onnx): never listed here.
+TASKS = (
+    ("prescan", "빠른 검사 (인물 없는 컷 건너뛰기)", "없으면 모든 컷을 일반 분석으로 넘깁니다"),
+    ("analyze", "분석 (추적·인물 매트)", "없으면 새 분석·다시 분석·매트 갱신을 할 수 없습니다"),
+    ("clothes", "옷 영역", "없으면 옷 영역을 새로 만들 수 없습니다 (저장된 옷 영역은 그대로 씁니다)"),
+    ("face", "얼굴·목 영역", "없으면 얼굴·목 영역을 새로 만들 수 없습니다 (저장된 영역은 그대로 씁니다)"),
+)
+ALWAYS = "프로젝트 열기·컷 전환·보정값 편집·기존 분석 결과 보기·미리보기·렌더는 모델 다운로드 없이 됩니다."
+
+
+def task_models(task: str, accuracy: str = "") -> List[str]:
+    """The keys the task opens with the settings as they are (accuracy 'max' adds its extra models)."""
+    if task == "prescan":
+        return ["det_yolox_m"]
+    if task == "analyze":
+        keys = ["det_yolox_m", "pose_rtmpose_x", "pose_rtmw_x", "pose_rtmpose_m", "face_yunet", "face_rtm106",
+                "hand_rtm21", "face_sface", "matte_rvm", "seg_sam31", "seg_sam31_find"]
+        if accuracy == "max":
+            keys += ["det_yolox_x", "pose_dwpose_l"]
+        return keys + [k for k in task_models("face") if k not in keys]
+    if task == "clothes":
+        try:
+            from . import clothing as CL
+            return ["parse_clothes"] if CL.cloth_model() == "parse_clothes" else ["seg_sam31", "seg_sam31_find"]
+        except Exception:
+            return ["seg_sam31", "seg_sam31_find"]
+    if task == "face":
+        try:
+            from . import faceparse as FP
+            return [] if FP.face_model() == "mp" else [FP.MODEL_KEY]         # 'mp' is part of the app
+        except Exception:
+            return []
+    return []
+
+
+def missing(task: str, accuracy: str = "") -> List[str]:
+    return [k for k in task_models(task, accuracy) if not is_downloaded(k)]
+
+
+def availability(accuracy: str = "") -> List[dict]:
+    """For every kind of work: [{task, label, ok, missing: [{key, label, size_mb}], limit}]."""
+    out = []
+    for task, label, limit in TASKS:
+        miss = missing(task, accuracy)
+        out.append(dict(task=task, label=label, ok=not miss, limit="" if not miss else limit,
+                        missing=[dict(key=k, label=MODELS.get(k, {}).get("label", k),
+                                      size_mb=MODELS.get(k, {}).get("size_mb", 0)) for k in miss]))
+    return out
+
+
+class ModelMissing(RuntimeError):
+    """A model the work needs is not on this computer and could not be had (no connection, no package)."""
+
+    def __init__(self, key: str, why: str = ""):
+        spec = MODELS.get(key, {})
+        super().__init__(f"{spec.get('label', key)} 모델이 이 컴퓨터에 없고 받지 못했습니다"
+                         + (f" ({why})" if why else "") + ". 인터넷에 연결한 뒤 다시 하거나, 설정의 모델 관리에서 모델 패키지 "
+                         "파일을 가져오세요. " + ALWAYS)
+        self.key = key
+
+
 def gpu_report() -> str:
+    """One line for the settings: the runtime, what it offers, the device read from the system, the choice."""
     try:
         import onnxruntime as ort
-        return f"onnxruntime {ort.__version__} · 사용 가능: {', '.join(ort.get_available_providers())} · 선택: {device_label()}"
+        from . import backend as BK
+        g = BK.gpu()
+        dev = (f" · {g['name']} {g.get('memory_mb', 0) // 1024} GB · 드라이버 {g.get('driver')}" if g.get("vendor") == "nvidia"
+               else f" · {g['name']}" if g.get("vendor") == "apple" else "")
+        return (f"onnxruntime {ort.__version__} · 사용 가능: {', '.join(ort.get_available_providers())}{dev}"
+                f" · 선택: {device_label()}")
     except Exception as e:
         return f"onnxruntime 오류: {e}"

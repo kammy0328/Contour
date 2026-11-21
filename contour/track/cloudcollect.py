@@ -59,6 +59,12 @@ def collect(tracker) -> int:
             return 0
     except Exception:
         pass
+    try:
+        from ..learn import allowed
+        if not allowed(getattr(tracker, "project", None), getattr(tracker, "cut", None)):
+            return 0                 # crops for training are taken only in a project where learning was switched on
+    except Exception:
+        return 0
     st = tracker.store
     px = tracker.proxy
     if st is None or px is None or not getattr(st, "has_face", False) or not len(st.pids):

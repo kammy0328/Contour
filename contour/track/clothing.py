@@ -16,6 +16,7 @@ import numpy as np
 
 from . import skeleton as S
 from .exposure import analysis_view
+from .modelpkg import cut_models as _cut_models
 
 CLASSES = ["배경", "모자", "머리카락", "선글라스", "상의", "치마", "바지", "원피스", "벨트", "왼 신발", "오른 신발",
            "얼굴", "왼 다리", "오른 다리", "왼 팔", "오른 팔", "가방", "스카프"]
@@ -282,6 +283,7 @@ def _garment_frame(gf, st, proxy, pres, t: int, frame: np.ndarray, lab, rgb, mw:
     return frame
 
 
+@_cut_models
 def run(tracker, persons: List[int], progress: Optional[Callable[[float, str], None]] = None,
         cancel: Optional[Callable[[], bool]] = None) -> bool:
     """Parse the given people (store indices) on every frame of the work range into the clothing store. The masks
@@ -613,6 +615,7 @@ def restage(tracker, frames, staged: dict, cancel=None, models: Optional[dict] =
     return dict(frames=out, stale=[])
 
 
+@_cut_models
 def refresh_stale(tracker, progress=None, cancel=None, models: Optional[dict] = None) -> List[List[int]]:
     """The stale ranges made again with the owners in use (a refresh whose clothing could not be made with it, a
     cut from 1.22.2): frame by frame, each range taken off the list once all of it is written. The ranges done."""

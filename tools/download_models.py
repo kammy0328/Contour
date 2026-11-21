@@ -1,4 +1,10 @@
-"""Download every model once (about 1.1 GB) so the first analysis starts immediately."""
+"""Download every model once (about 1.1 GB) so the first analysis starts immediately.
+
+    python tools/download_models.py [--max] [--registry ADDRESS|FOLDER|ZIP]
+
+With a model registry (the argument, or 설정 > 모델 관리's address) and a publishing key in this version, the models
+the registry offers are installed as packages first (a signed list, each file checked: track/modelpkg.py); the
+models it does not offer are downloaded the way they always were. Only model files come in; nothing is sent."""
 import sys
 from pathlib import Path
 
@@ -28,6 +34,30 @@ def main():
     if "--max" in sys.argv:
         keys += ["det_yolox_x", "pose_dwpose_l", "seg_sam2_b"]
     failed = []
+    reg = ""
+    if "--registry" in sys.argv:
+        reg = sys.argv[sys.argv.index("--registry") + 1]
+    else:
+        try:
+            from contour.core.settings import settings
+            reg = getattr(settings(), "model_registry", "") or ""
+        except Exception:
+            reg = ""
+    if reg:
+        from contour.track import modelpkg as MP
+        if not MP.TRUSTED:
+            print("  [패키지] 이 버전에는 모델 배포 키가 없어 패키지 설치를 건너뜁니다")
+        else:
+            try:
+                with MP.registry_at(reg) as r:
+                    offered = {o["key"] for o in MP.offered(r) if not o["why"]}
+                res = MP.bring_in(reg, [k for k in keys if k in offered])
+                for k, v in res["installed"] + res["kept"]:
+                    print(f"  [패키지] {M.MODELS.get(k, {}).get('label', k)} {v}")
+                for k, t in res["failed"].items():
+                    print(f"  [패키지 실패] {k}: {t}")
+            except MP.PackageError as e:
+                print(f"  [패키지] 목록을 쓰지 못했습니다 ({e}). 이전 방식으로 받습니다")
     for k in keys:
         spec = M.MODELS[k]
         if M.is_downloaded(k):

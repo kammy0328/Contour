@@ -111,9 +111,18 @@ class TimelineExportDialog(QDialog):
         g.addWidget(QLabel("코덱"), 0, 0)
         g.addWidget(self.fmt, 0, 1)
         self.enc = QComboBox()
-        for k, t in (("auto", "자동 (NVENC 있으면 사용)"), ("nvenc", "NVENC (GPU, 빠름)"), ("x265", "x265 (CPU, 같은 용량에서 더 깨끗함)")):
+        import sys as _sys
+        if _sys.platform == "darwin":
+            # a Mac has no NVENC; its hardware encoder is offered by name only (the choice is the person's until
+            # its pictures were compared with x265's on a real Mac)
+            encs = (("auto", "자동 (x265)"), ("videotoolbox", "VideoToolbox (하드웨어, 빠름)"),
+                    ("x265", "x265 (CPU, 같은 용량에서 더 깨끗함)"))
+        else:
+            encs = (("auto", "자동 (NVENC 있으면 사용)"), ("nvenc", "NVENC (GPU, 빠름)"),
+                    ("x265", "x265 (CPU, 같은 용량에서 더 깨끗함)"))
+        for k, t in encs:
             self.enc.addItem(t, k)
-        self.enc.setCurrentIndex(["auto", "nvenc", "x265"].index(exp.encoder) if exp.encoder in ("auto", "nvenc", "x265") else 0)
+        self.enc.setCurrentIndex(max(0, self.enc.findData(exp.encoder)))
         self.q = QComboBox()
         for k, t in (("normal", "보통"), ("high", "고화질"), ("max", "최고 화질")):
             self.q.addItem(t, k)

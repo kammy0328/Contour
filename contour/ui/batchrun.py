@@ -57,6 +57,41 @@ def _tree(pid: int) -> List[int]:
     return out
 
 
+def worker_command(args: List[str]) -> tuple:
+    """(program, arguments) that run `contour.batch` with these arguments without a window.
+    From source or the Windows install: the console python (next to pythonw.exe / DIAP.exe when started with
+    one of those) with -m contour.batch. A packed app (the Mac .app): the app's own program with --worker batch,
+    which app.py hands to contour.batch before anything of the window is loaded (started again without that it
+    would open a second DIAP)."""
+    exe = sys.executable
+    if getattr(sys, "frozen", False):
+        return exe, ["--worker", "batch"] + list(args)
+    if not Path(exe).name.lower().startswith("python.exe"):
+        # pythonw.exe or the DIAP.exe launcher (a renamed pythonw): the console python next to it
+        cand = Path(exe).with_name("python.exe")
+        if cand.exists():
+            exe = str(cand)
+    return exe, ["-m", "contour.batch"] + list(args)
+
+
+def _kill_tree(pids: List[int]) -> None:
+    """Ends processes that are still there (the children of a worker that was stopped: its ffmpeg readers)."""
+    for q in pids:
+        try:
+            if sys.platform == "win32":
+                import ctypes
+                h = ctypes.windll.kernel32.OpenProcess(0x0001, False, q)       # PROCESS_TERMINATE
+                if h:
+                    ctypes.windll.kernel32.TerminateProcess(h, 1)
+                    ctypes.windll.kernel32.CloseHandle(h)
+            else:
+                import os
+                import signal
+                os.kill(q, signal.SIGKILL)
+        except Exception:
+            pass
+
+
 def _suspend(pid: int, on: bool) -> bool:
     """Stops (on) or lets go on (off) a process and its children where they are."""
     ok = False
@@ -147,9 +182,12 @@ class BatchRunner(QObject):
             return
         if self.proc is not None:
             self._killed = True
+            pid = int(self.proc.processId() or 0)
+            kids = [q for q in _tree(pid) if q != pid] if pid else []     # (found before it is gone)
             if self.paused:
                 self.resume()
             self.proc.kill()
+            _kill_tree(kids)              # what it had started (ffmpeg) does not stay behind
 
     def pause(self) -> bool:
         """Stops the running analysis where it is (the process keeps its memory); resume() goes on."""
@@ -191,14 +229,9 @@ class BatchRunner(QObject):
         p.setStandardErrorFile(str(self._errfile))
         p.readyReadStandardOutput.connect(self._read)
         p.finished.connect(self._finished)
-        exe = sys.executable
-        if not Path(exe).name.lower().startswith("python.exe"):
-            # pythonw.exe or the DIAP.exe launcher (a renamed pythonw): the console python next to it
-            cand = Path(exe).with_name("python.exe")
-            if cand.exists():
-                exe = str(cand)
+        exe, argv = worker_command(list(args))
         p.setProgram(exe)
-        p.setArguments(["-m", "contour.batch"] + list(args))
+        p.setArguments(argv)
         if sys.platform == "win32":
             try:
                 # no window, below-normal priority: the computer stays responsive while it analyses

@@ -126,7 +126,10 @@ class UpdateDialog(QDialog):
         self.skip.setEnabled(True)
 
     def _install(self, path):
-        self.msg.setText("설치 파일 확인 완료 (SHA-256). 저장하고 DIAP을 닫은 뒤 설치합니다. 설치 중 Windows 권한 확인 창이 뜨면 '예'를 누르세요.")
+        import sys as _sys
+        self.msg.setText("설치 파일 확인 완료 (SHA-256). 저장하고 DIAP을 닫습니다. 열리는 창에서 DIAP을 응용 프로그램 폴더로 옮기세요."
+                         if _sys.platform == "darwin" else
+                         "설치 파일 확인 완료 (SHA-256). 저장하고 DIAP을 닫은 뒤 설치합니다. 설치 중 Windows 권한 확인 창이 뜨면 '예'를 누르세요.")
         self.main.save()
         U.launch_installer(__import__("pathlib").Path(path))
         self.accept()

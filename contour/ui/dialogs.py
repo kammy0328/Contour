@@ -165,10 +165,37 @@ class SettingsDialog(QDialog):
         self.open_last.setToolTip("끄면(기본) 시작할 때 프로젝트 관리 화면이 먼저 뜹니다")
         form.addRow("시작", self.open_last)
         self.gpu = QComboBox()
-        for v, t in (("auto", "자동"), ("cuda", "CUDA (NVIDIA)"), ("dml", "DirectML"), ("cpu", "CPU")):
+        import sys as _sys
+        # the devices this system has (Windows: CUDA, DirectML; a Mac: Core ML); which models go to which, what
+        # they really ran on and why is decided and told in one place (track/backend.py, 진단)
+        devs = {"win32": (("cuda", "CUDA (NVIDIA)"), ("dml", "DirectML")),
+                "darwin": (("coreml", "Core ML (모든 모델에 시도)"),)}.get(_sys.platform, (("cuda", "CUDA (NVIDIA)"),))
+        for v, t in (("auto", "자동"),) + devs + (("cpu", "CPU"),):
             self.gpu.addItem(t, v)
         self.gpu.setCurrentIndex(max(0, self.gpu.findData(s.gpu)))
-        form.addRow("추론 장치", self.gpu)
+        self.gpu.setToolTip("자동: 이 컴퓨터에서 확인된 장치로 모델마다 정합니다 (Windows는 CUDA → DirectML → CPU, Mac은 "
+                            "확인된 모델만 Core ML, 나머지 CPU). GPU를 쓰지 못한 모델은 CPU로 실행하고 사유를 진단에 적습니다")
+        diag = QPushButton("진단…")
+        diag.setToolTip("런타임·GPU·드라이버와, 모델마다 요청한 장치·세션의 장치 목록·실제로 연산이 실행된 장치·CPU로 바뀐 사유")
+        diag.clicked.connect(self._diagnostics)
+        grow = QWidget()
+        gl_ = QHBoxLayout(grow)
+        gl_.setContentsMargins(0, 0, 0, 0)
+        gl_.addWidget(self.gpu, 1)
+        gl_.addWidget(diag)
+        form.addRow("추론 장치", grow)
+        mb = QPushButton("모델 관리…")
+        mb.setToolTip("작업별로 필요한 모델과 이 컴퓨터에 있는 모델, 모델 패키지 가져오기(인터넷 없이 폴더·zip에서)")
+        mb.clicked.connect(self._models)
+        mrow = QWidget()
+        ml_ = QHBoxLayout(mrow)
+        ml_.setContentsMargins(0, 0, 0, 0)
+        self.models_info = Wd.label("", "Faint", 11)
+        ml_.addWidget(self.models_info, 1)
+        ml_.addWidget(mb)
+        form.addRow("모델", mrow)
+        self.models_changed = False
+        self._models_line()
         lg = QPushButton("로그 폴더 열기")
         lg.setToolTip("문제가 생기면 이 폴더의 errors.log, freeze.log, output.log를 보내 주세요")
         lg.clicked.connect(self._open_logs)
@@ -229,6 +256,55 @@ class SettingsDialog(QDialog):
         freed = PJ.clear_orphans(dirs)
         self._cache_usage()
         QMessageBox.information(self, "쓰지 않는 캐시 지우기", f"{PJ.human(freed)}를 비웠습니다.")
+
+    def _diagnostics(self):
+        from ..track import backend as BK
+        d = QDialog(self)
+        d.setWindowTitle("추론 장치 진단")
+        d.resize(820, 520)
+        v = QVBoxLayout(d)
+        v.setContentsMargins(18, 16, 18, 14)
+        box = QPlainTextEdit()
+        box.setReadOnly(True)
+        box.setLineWrapMode(QPlainTextEdit.NoWrap)
+        box.setPlainText(BK.text())
+        v.addWidget(box, 1)
+        note = Wd.label("'실제'는 세션이 가진 장치 이름이 아니라 첫 실행에서 연산이 실행된 장치입니다. 모델은 처음 쓸 때 "
+                        "열리므로, 분석이나 보정을 한 번 한 뒤에 모델별 줄이 채워집니다.", "Faint", 11)
+        note.setWordWrap(True)
+        v.addWidget(note)
+        h = QHBoxLayout()
+        cp = QPushButton("복사")
+        cp.clicked.connect(lambda: __import__("PySide6.QtWidgets", fromlist=["QApplication"]).QApplication.clipboard()
+                           .setText(box.toPlainText()))
+        again = QPushButton("다시 읽기")
+        again.clicked.connect(lambda: (BK.gpu(refresh=True), box.setPlainText(BK.text())))
+        close = QPushButton("닫기")
+        close.clicked.connect(d.accept)
+        h.addWidget(cp)
+        h.addWidget(again)
+        h.addStretch(1)
+        h.addWidget(close)
+        v.addLayout(h)
+        self._diag_dialog = d
+        d.exec()
+
+    def _models_line(self):
+        try:
+            from ..track import models as M
+            av = M.availability()
+            miss = sum(len(a["missing"]) for a in av if a["task"] == "analyze")
+            self.models_info.setText("분석에 필요한 모델이 모두 있습니다" if not miss else
+                                     f"분석에 필요한 모델 {miss}개가 없습니다 (처음 분석할 때 받습니다)")
+        except Exception:
+            self.models_info.setText("")
+
+    def _models(self):
+        from .modelsdlg import ModelsDialog
+        d = ModelsDialog(self)
+        d.exec()
+        self.models_changed = self.models_changed or d.changed
+        self._models_line()
 
     def _open_logs(self):
         from PySide6.QtCore import QUrl
