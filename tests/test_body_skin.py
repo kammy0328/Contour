@@ -784,3 +784,71 @@ def test_a_render_of_the_cut_retouches_the_body_in_its_10_bit_planes(scene, body
             after = float(Y1[t][ring].mean() - Y1[t][spot].mean())
             left.append(after / before)
     assert max(left) < 0.5, f"what is left of the dark spot on each frame: {[round(v, 2) for v in left]}"
+
+
+# ------------------------------------------------------------------------------------------------- what is not the body's
+def _conf_scene():
+    """A picture with an arm (the parser is sure it is skin), a face of the same colour and a prop of the same
+    colour the parser is not sure about, all inside the person's own pixels; and the parser's maps of it."""
+    from contour.retouch import bodyskin as BS
+    h, w = 240, 320
+    rng = np.random.default_rng(3)
+    rgb = np.full((h, w, 3), 58, np.uint8)
+    yy, xx = np.mgrid[0:h, 0:w]
+    arm = (xx >= 30) & (xx < 120) & (yy >= 50) & (yy < 190)
+    face = np.hypot(xx - 190, yy - 80) < 34
+    prop = (xx >= 240) & (xx < 300) & (yy >= 130) & (yy < 210)
+    skin = arm | face | prop
+    rgb[skin] = np.clip(np.array((204, 152, 128)) + rng.normal(0, 3, (int(skin.sum()), 3)), 0, 255).astype(np.uint8)
+    own = np.ones((h, w), np.float32)
+    S = 256                             # the parser's own size
+    def m(sel, v=255):
+        return cv2.resize(np.where(sel, v, 0).astype(np.uint8), (S, S), interpolation=cv2.INTER_AREA)
+    parse = dict(box=(0, 0, w, h), skin=np.maximum(m(arm | face), m(prop, 77)), hair=m(np.zeros_like(arm)),
+                 cloth=m(np.zeros_like(arm)), face=m(face))
+    inner = lambda sel: cv2.erode(sel.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
+    return rgb, own, parse, inner(arm), inner(face), inner(prop)
+
+
+def test_a_face_the_parser_sees_is_never_body_skin(monkeypatch):
+    """BANANAS 083 (j2793): a face among the person's own pixels with no landmarks and no head joints to place it
+    (the person's own in profile or half hidden, or somebody's the matte gave them) was body skin: smoothed, and
+    its features taken for blemishes. The parser's face class is the face's, whoever places the head."""
+    from contour.retouch import bodyskin as BS
+    rgb, own, parse, arm, face, prop = _conf_scene()
+    conf, model, parsed, allow = BS.skin_conf(rgb, own, None, parse, None, None, 200.0)
+    assert parsed and model is not None
+    assert conf[arm].min() > 0.9, "the arm is body skin as before"
+    assert conf[face].max() < 0.02 and allow[face].max() < 0.02, "the face is not, and no neighbour's skin is carried onto it"
+    # the same parse without the face class told apart (a parser stood in for by the tests): as it was
+    old = {k: v for k, v in parse.items() if k != "face"}
+    assert BS.skin_conf(rgb, own, None, old, None, None, 200.0)[0][face].min() > 0.9
+    monkeypatch.setattr(BS, "FACE_OUT", None)
+    assert BS.skin_conf(rgb, own, None, parse, None, None, 200.0)[0][face].min() > 0.9, "1.23's first build: body skin"
+
+
+def test_what_the_parser_is_not_sure_of_is_skin_only_beside_skin_it_found(monkeypatch):
+    """2611 036 (j2790): a glowing light stick in a hand. The parser gave it a skin share of about a third, nowhere
+    was it sure of skin, and the colour (the face's, in the same light) agreed: the stick became body skin. A weak
+    answer is no longer skin 'found'; skin the parser misses still counts beside skin it is sure of."""
+    from contour.retouch import bodyskin as BS
+    rgb, own, parse, arm, face, prop = _conf_scene()
+    prior = BS.fit_model(rgb, (arm | face).astype(np.float32))
+    assert prior is not None
+    # nothing the parser is sure of: only the prop's weak answer, and the face's colour to go by
+    S = parse["skin"].shape[0]
+    weak = dict(parse, skin=np.where(parse["skin"] > 100, 0, parse["skin"]).astype(np.uint8), face=np.zeros((S, S), np.uint8))
+    conf = BS.skin_conf(rgb, own, None, weak, None, prior, 200.0)[0]
+    assert conf[prop].max() < 0.02, "a prop of the skin's colour the parser is not sure of stays as it is"
+    monkeypatch.setattr(BS, "SUPPORT_FROM", None)
+    assert BS.skin_conf(rgb, own, None, weak, None, prior, 200.0)[0][prop].min() > 0.5, "1.23's first build: body skin"
+    monkeypatch.undo()
+    # skin the parser misses beside skin it found: the lower part of the arm is not in its skin map at all
+    part = parse["skin"].copy()
+    part[int(S * 120 / 240):, :int(S * 130 / 320)] = 0
+    conf = BS.skin_conf(rgb, own, None, dict(parse, skin=part), None, None, 200.0)[0]
+    yy, xx = np.mgrid[0:240, 0:320]
+    just_below = arm & (yy >= 122) & (yy < 126)
+    far_below = arm & (yy >= 170)
+    assert conf[just_below].min() > 0.5, "beside skin the parser found, the colour is enough"
+    assert conf[far_below].max() < 0.05, "far from it, it is not"

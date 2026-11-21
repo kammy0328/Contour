@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import threading
 import time
+import zlib
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -408,8 +409,10 @@ def _widen(a0: int, a1: int, want: int, limit: int) -> Tuple[int, int]:
 
 
 def parse_person(rgb_u8: np.ndarray, own: np.ndarray) -> Optional[dict]:
-    """The parser's view of one person: {'box': (x0, y0, x1, y1) in this picture, 'skin', 'hair', 'cloth': uint8
-    maps of the box at the parser's size}. own: the person's own pixels (0..1) on this picture."""
+    """The parser's view of one person: {'box': (x0, y0, x1, y1) in this picture, 'skin', 'hair', 'cloth', 'face':
+    uint8 maps of the box at the parser's size}. 'skin' is body skin and face skin together (both teach the skin's
+    colour); 'face' is the face skin alone (never the body's: skin_conf). own: the person's own pixels (0..1) on
+    this picture."""
     ys = np.nonzero(own.max(1) > 0.3)[0]
     xs = np.nonzero(own.max(0) > 0.3)[0]
     if len(ys) < 4 or len(xs) < 4:
@@ -433,7 +436,7 @@ def parse_person(rgb_u8: np.ndarray, own: np.ndarray) -> Optional[dict]:
     from ..track import faceparse as FP
     u8 = lambda a: (np.clip(a, 0, 1) * 255 + 0.5).astype(np.uint8)
     return dict(box=(x0, y0, x1, y1), skin=u8(pr[FP.MP_BODY] + pr[FP.MP_FACE]), hair=u8(pr[FP.MP_HAIR]),
-                cloth=u8(pr[FP.MP_CLOTHES] + pr[FP.MP_OTHERS]))
+                cloth=u8(pr[FP.MP_CLOTHES] + pr[FP.MP_OTHERS]), face=u8(pr[FP.MP_FACE]))
 
 
 def _place(parse: dict, name: str, shape: Tuple[int, int]) -> np.ndarray:
@@ -449,6 +452,12 @@ SKIN_SURE = (0.55, 0.80)    # the parser's skin share from which a pixel teaches
 NOT_SKIN = (0.35, 0.65)     # the parser's clothes / accessories / hair share from which a pixel is left out .. fully
 SUPPORT = 0.035             # of the person's size: skin the parser misses counts this near to skin it found
 SUPPORT_GAIN = 3.0
+SUPPORT_FROM = (0.40, 0.70)  # the parser's skin share from which a pixel counts as skin it found .. fully. None: any
+                            # share counts by its size (1.23's first build: a prop the parser gave 0.3 was 'found',
+                            # and with the face's colour on it, a light stick in a hand became body skin: j2790)
+FACE_OUT = (0.35, 0.65)     # the parser's face-skin share from which a pixel is the face's, not the body's .. fully.
+                            # None: only the head the landmarks or the head joints place is left out (a face with
+                            # neither, or somebody else's face among the person's own pixels, was body skin: j2793)
 OTHERS_NEAR = 0.012         # of the frame's height: this near to another person's pixels the owner is not sure
 CONF = (0.30, 0.62)         # the joined confidence from which a pixel is retouched .. in full
 COLOUR_ONLY = 0.75          # without the parser the colour alone must be this sure (0..1 of skin_probability)
@@ -506,12 +515,17 @@ def skin_conf(rgb_u8: np.ndarray, own: np.ndarray, others: Optional[np.ndarray],
         sk = _place(parse, "skin", (h, w))
         no = np.maximum(_place(parse, "cloth", (h, w)), _place(parse, "hair", (h, w)))
         not_other = 1.0 - _ss(NOT_SKIN[0], NOT_SKIN[1], no)
+        if FACE_OUT is not None and "face" in parse:
+            # a face the parser sees is the face's own retouch's or nobody's: this person's without landmarks or
+            # head joints to place it, or somebody's the matte gave to this person
+            not_other = not_other * (1.0 - _ss(FACE_OUT[0], FACE_OUT[1], _place(parse, "face", (h, w))))
         teach = _ss(SKIN_SURE[0], SKIN_SURE[1], sk) * (own > 0.8)
         if garment is not None:
             teach = teach * (garment < 0.3)
         model = fit_model(rgb_u8, teach)
         sg = max(1.5, SUPPORT * size)
-        support = np.clip(cv2.GaussianBlur(sk, (0, 0), sg) * SUPPORT_GAIN, 0, 1)
+        found = sk if SUPPORT_FROM is None else _ss(SUPPORT_FROM[0], SUPPORT_FROM[1], sk)
+        support = np.clip(cv2.GaussianBlur(found, (0, 0), sg) * SUPPORT_GAIN, 0, 1)
     if model is None:
         model = prior
     if model is None:
@@ -562,6 +576,20 @@ def garments(tracker, t: int, p: int, size: Tuple[int, int]) -> Optional[np.ndar
         return cv2.GaussianBlur(cv2.resize(g.astype(np.float32), size, interpolation=cv2.INTER_LINEAR), (0, 0), 1.0)
     except Exception:
         return None
+
+
+def garment_token(tracker) -> str:
+    """What garments() depends on besides the frame, as a short text for cache keys: no clothing masks, or which
+    ones (when they were made, what is out of use in them)."""
+    try:
+        from ..track import clothing as CL
+        if not tracker.cloth.exists():
+            return "c0"
+        s_ = CL._state(tracker)
+        return "c%x" % (zlib.crc32(repr((s_.get("made"), s_.get("analysis"), s_.get("pids"), s_.get("stale"),
+                                         s_.get("skin"))).encode()) & 0xffffff)
+    except Exception:
+        return "c0"
 
 
 _CLOCK = threading.Lock()

@@ -21,6 +21,34 @@ from ..core.params import RETOUCH_KEYS
 from ..track import skeleton as S
 
 
+# Where the time of preparing and retouching goes, for a measurement (tools, the PC test jobs): TIMING = {} switches
+# it on, and every stage adds its seconds and its count under its name. None (always, in the app): nothing is kept.
+TIMING: Optional[dict] = None
+
+
+class _tm:
+    """with _tm("stage"): ...  adds the block's seconds to TIMING["stage"] = [seconds, calls] when TIMING is on."""
+    __slots__ = ("name", "t0")
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def __enter__(self):
+        if TIMING is not None:
+            import time
+            self.t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc):
+        d = TIMING
+        if d is not None:
+            import time
+            e = d.setdefault(self.name, [0.0, 0])
+            e[0] += time.perf_counter() - self.t0
+            e[1] += 1
+        return False
+
+
 @dataclass
 class Job:
     p: int
@@ -1182,7 +1210,7 @@ def _sig(cut, tracker) -> tuple:
         vals.append((person.id, pp.skin_scope, round(float(fth), 3), tuple(on),
                      round(float(getattr(pp, "blemish_size", 50.0)), 1),      # the spot sizes the flaws are looked for at
                      getattr(pp, "body_scope", "all"), round(float(getattr(pp, "body_blemish_size", 40.0)), 1)))
-    return (id(tracker.store), getattr(cut, "analysis_version", 0), tuple(vals))
+    return (id(tracker.store), getattr(cut, "analysis_version", 0), tuple(vals), BS.garment_token(tracker))
 
 
 def _raw_cached(cut, tracker, s: int, cache):
@@ -1197,7 +1225,8 @@ def _raw_cached(cut, tracker, s: int, cache):
     if s in lru:
         lru.move_to_end(s)
         return lru[s]
-    rf = _prepare_raw(cut, tracker, s, cache)
+    with _tm("raw"):
+        rf = _prepare_raw(cut, tracker, s, cache)
     if rf is not None:
         for j in rf.jobs:
             j.masks = {k: v.astype(np.float16) for k, v in j.masks.items()}
@@ -1220,13 +1249,15 @@ def _steady(cut, tracker, st, rf: RetouchFrame, cache) -> RetouchFrame:
         # the body's mask has no face to follow: it is held steady along the picture's own motion (_steady_bskin)
         if j.body and j.body.get("mask") is not None:
             try:
-                j.body = dict(j.body, mask=_steady_bskin(cut, tracker, st, rf, j, cache))
+                with _tm("body.steady_area"):
+                    j.body = dict(j.body, mask=_steady_bskin(cut, tracker, st, rf, j, cache))
             except Exception:
                 import traceback
                 traceback.print_exc()
         if getattr(j, "bdet", None) is not None:
             try:
-                j.bdet = _steady_bdet(cut, tracker, st, rf, j, cache)
+                with _tm("body.steady_spots"):
+                    j.bdet = _steady_bdet(cut, tracker, st, rf, j, cache)
             except Exception:
                 import traceback
                 traceback.print_exc()
@@ -1550,7 +1581,8 @@ def _body_motion(tracker, j, t: int, s: int, box_t, box_s) -> Optional[dict]:
             w_s = BS.ownership(tracker, s, j.p, size)[0]
         except Exception:
             w_t = w_s = None
-        a, b = BS.motion_pair(_gray(px, t), _gray(px, s), box_t, box_s, w_t, w_s)
+        with _tm("body.motion"):
+            a, b = BS.motion_pair(_gray(px, t), _gray(px, s), box_t, box_s, w_t, w_s)
         got = (a, b) if t < s else (b, a)
         with _BFLOW_LOCK:
             lru[key] = got
@@ -2072,8 +2104,10 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 bscope = norm_body_scope(getattr(pp, "body_scope", "all"))
 
                 def mk_body():
-                    b = base()
-                    m_, info_ = BS.body_mask(tracker, p, t, b["rgb"], body_scope_set(bscope), b.get("model"))
+                    with _tm("body.base"):
+                        b = base()
+                    with _tm("body.area"):
+                        m_, info_ = BS.body_mask(tracker, p, t, b["rgb"], body_scope_set(bscope), b.get("model"))
                     pm_ = BS.pack_mask(m_) if m_ is not None else None
                     pa_ = BS.pack_allow(info_.allow) if pm_ is not None else None
                     maps_ = {"m": pm_["m"]} if pm_ is not None else {}
@@ -2082,12 +2116,17 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                     return dict(maps=maps_, thumb=None, pm=pm_,
                                 info=dict(ref=float(info_.ref), model=info_.model, parsed=bool(info_.parsed),
                                           box=info_.box, allow=pa_))
-                bd = get("bskin", mk_body, bscope)
+                # the clothing the analysis found is part of the area: masks made before it was found (or with
+                # another state of it) are made again
+                ctok = BS.garment_token(tracker)
+                bd = get("bskin", mk_body, f"{bscope}:{ctok}")
                 if bd["pm"] is not None and tuple(bd["pm"]["shape"]) == tuple(shape) and bd["info"]["ref"] > 0:
                     job.body = dict(bd["info"], mask=bd["pm"])
                     if v.get("body_blemish", 0) > 1e-4:
-                        job.bdet = get("bdet", lambda: _bdet_raw(cut, px, t, job, base()["rgb"]),
-                                       f"{bscope}:{job.body_size:.3f}:sn{int(BP.SPOTNET)}")
+                        def mk_bdet():
+                            with _tm("body.spots"):
+                                return _bdet_raw(cut, px, t, job, base()["rgb"])
+                        job.bdet = get("bdet", mk_bdet, f"{bscope}:{ctok}:{job.body_size:.3f}:sn{int(BP.SPOTNET)}")
                         job.bmarks = _body_marks(st, p, t, pp, v)
             except Exception:
                 import traceback
@@ -3765,7 +3804,8 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
         bmY = None
         if job.body and job.body.get("mask") is not None and (v.get("body_skin", 0) > 1e-4 or v.get("body_blemish", 0) > 1e-4):
             try:
-                bmY = BS.refine(job.body["mask"], job.body.get("model"), Y, Cb, Cr)
+                with _tm("apply.body_area"):
+                    bmY = BS.refine(job.body["mask"], job.body.get("model"), Y, Cb, Cr)
             except Exception:
                 import traceback
                 traceback.print_exc()
@@ -3787,9 +3827,10 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                 if bd_ is not None:
                     if getattr(job, "bmarks", None):
                         bd_ = BP.apply_marks(bd_, job.bmarks, bd_["scale"])
-                    Y, Cb, Cr = BP.fill(Y, Cb, Cr, regB, bd_, float(np.clip(v["body_blemish"], 0, 1)), job.body_size,
-                                        float(job.body["ref"]) * y_per_src, y_per_src, cs,
-                                        lambda *a_: _spot_fill(*a_, plane_h=hY))
+                    with _tm("apply.body_spots"):
+                        Y, Cb, Cr = BP.fill(Y, Cb, Cr, regB, bd_, float(np.clip(v["body_blemish"], 0, 1)), job.body_size,
+                                            float(job.body["ref"]) * y_per_src, y_per_src, cs,
+                                            lambda *a_: _spot_fill(*a_, plane_h=hY))
             except Exception:
                 import traceback
                 traceback.print_exc()
@@ -3928,7 +3969,8 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                 mB = bmY
                 if "skin" in job.masks and v["skin"] > 1e-4 and job.skin is not None:
                     mB = mB * (1.0 - np.clip(M(job.masks["skin"], (hY, wY)), 0, 1))
-                Y, Cb, Cr = _body_smooth(Y, Cb, Cr, mB, job, y_per_src, cs, src)
+                with _tm("apply.body_smooth"):
+                    Y, Cb, Cr = _body_smooth(Y, Cb, Cr, mB, job, y_per_src, cs, src)
             except Exception:
                 import traceback
                 traceback.print_exc()
