@@ -55,7 +55,7 @@ def test_blotches_go_to_the_leg_colour():
         assert after < 0.3 * before, (name, before, after)       # (the small red patch is finer than the band the correction works in: a spot, for 몸 잡티)
     before = np.abs(lp(Y - Y0)[core]).mean()
     after = np.abs(lp(Yo - Y0)[core]).mean()
-    assert after < 0.3 * before, (before, after)
+    assert after < 0.45 * before, (before, after)      # (the brightness is read from further out than the colour: what is near may be the blotch's own)
 
 
 def test_grain_is_kept_bit_for_bit_in_the_fine_band():

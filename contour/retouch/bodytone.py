@@ -26,6 +26,8 @@ KNEE_ALONG = 1.55         # the knee's own area reaches this many half widths of
 KNEE_ACROSS = 1.20        # ... and this many across it (1 = the leg's own width at the knee)
 KNEE_EDGE = (0.70, 1.15)  # elliptical radius over which the area falls from full to nothing
 RING = (1.05, 3.4)        # the leg's skin read from: from this elliptical radius (where the area is nearly gone) out to this
+RES_FROM = 1.5            # elliptical radius from which the leg's own shading is read for the knee (what is nearer may be the blotch's)
+RES_DEN = 0.02            # the weight of ring pixels near enough (within the BROAD blur) from which the leg's shading is spread over the knee
 FINE = 0.12               # of a half width (at least 2 px): what is finer than this (grain, pores, hair) is never changed
 BROAD = 0.9               # of a half width: the leg's own shading (light across the knee) is broader than this
 DARK_KEEP = 0.12          # of a blotch darker than the leg round it: this share stays
@@ -96,16 +98,18 @@ def leg_coords(shape: Tuple[int, int], centre, axis):
     return dx * float(axis[0]) + dy * float(axis[1]), -dx * float(axis[1]) + dy * float(axis[0])
 
 
-LEG_EDGE = (0.80, 1.15)   # across the leg, in half widths: from where a pixel is the leg's .. to where it is not
+SHIN_SHARE = 0.4          # the share of the shin's weight against the thigh's, in the leg's colour read from the picture
+DARK_RIM = 0.80           # of a half width: kept off the leg's skin round what is dark in the strip (sock, hem, shoe)
+LEG_EDGE = (0.62, 0.92)   # across the leg, in half widths: from where a pixel is the leg's .. to where it is not
 LOCAL_MIN_Y = 0.25         # a leg's skin in a picture is brighter than this (the 75th percentile of the strip) ...
-LOCAL_MIN_CHROMA = 0.02    # ... and its (Cb, Cr) is this far from grey
-CHROMA_SIG = 0.012        # at least: how far (Cb, Cr) may be from the leg's own colour and still be the leg's skin
+LOCAL_MIN_CHROMA = 0.012   # ... and its (Cb, Cr) is this far from grey
+CHROMA_SIG = 0.004        # at least: how far (Cb, Cr) may be from the leg's own colour and still be the leg's skin (a dim, flat picture has small colour differences)
 
 
 def _skin_like(yref: float, mb: float, mr: float) -> bool:
     """Whether a piece of the picture of this brightness and (Cb, Cr) can be skin: bright enough, not grey, on the warm
     side (red over blue; any light's cast keeps that for skin)."""
-    return yref >= LOCAL_MIN_Y and float(np.hypot(mb, mr)) >= LOCAL_MIN_CHROMA and mr > 0.012 and mb < 0.012 and mr > -mb * 0.5
+    return yref >= LOCAL_MIN_Y and float(np.hypot(mb, mr)) >= LOCAL_MIN_CHROMA and mr > 0.006 and mb < 0.012 and mr > -mb * 0.3
 
 
 def local_zone_skin(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, zone: np.ndarray) -> Optional[np.ndarray]:
@@ -129,7 +133,7 @@ def local_zone_skin(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, zone: np.ndar
     if not _skin_like(yref, mb, mr):
         return None
     d = np.hypot(cb - mb, cr - mr)
-    sig = max(CHROMA_SIG, 2.2 * float(np.median(d[c2])))
+    sig = max(CHROMA_SIG, 2.5 * float(np.median(d[c2])))
     return (zone * light * np.exp(-0.5 * (d / sig) ** 2)).astype(np.float32)
 
 
@@ -160,14 +164,20 @@ def local_skin(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, centre, axis, half
         return None                                        # black tights, a grey trouser, a blue top: cloth, not skin
     d = np.hypot(cb - mb, cr - mr)
     mad = float(np.median(d[core]))
-    sig = max(CHROMA_SIG, 2.2 * mad)
+    sig = max(CHROMA_SIG, 2.5 * mad)
     near = np.exp(-0.5 * (d / sig) ** 2).astype(np.float32)
-    ring = (leg * light * near * _ss(RING[0], RING[0] + 0.35, e) * (1.0 - _ss(RING[1] - 0.6, RING[1], e))).astype(np.float32)
-    return (leg * light).astype(np.float32), ring
+    # the rim of a sock, a hem, a shoe (its blur, the shade it throws on the leg) is not the leg's skin either
+    r = int(max(2, DARK_RIM * half))
+    dark = cv2.dilate((light < 0.6).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1)))
+    rim = 1.0 - cv2.GaussianBlur(dark.astype(np.float32), (0, 0), max(1.0, 0.4 * r))
+    lt = (light * rim).astype(np.float32)
+    thigh = 1.0 - (1.0 - SHIN_SHARE) * _ss(0.0, 0.5, u / half)     # (the thigh runs up from the knee, the shin down: the shin is read less, it is the one that sits in a sock's shade)
+    ring = (leg * lt * near * thigh * _ss(RING[0], RING[0] + 0.35, e) * (1.0 - _ss(RING[1] - 0.6, RING[1], e))).astype(np.float32)
+    return (leg * lt).astype(np.float32), ring
 
 
 def tone_plane(P: np.ndarray, area: np.ndarray, ring: np.ndarray, half: float, k: float, kind: str,
-               firm: Optional[np.ndarray] = None) -> np.ndarray:
+               firm: Optional[np.ndarray] = None, ring_res: Optional[np.ndarray] = None) -> np.ndarray:
     """One plane (a luma or a chroma plane) of the knee's tone work. area: 0..1 where the knee's own area is (inside the
     leg's skin), ring: 0..1 the skin the colour is read from, half: half the leg's width in this plane's pixels,
     k: 0..1, kind: 'luma' or 'chroma'. -> the plane (a copy)."""
@@ -184,13 +194,14 @@ def tone_plane(P: np.ndarray, area: np.ndarray, ring: np.ndarray, half: float, k
     sig_f = max(2.0, FINE * half)
     sig_b = max(2.0, BROAD * half)
     base = cv2.GaussianBlur(I, (0, 0), sig_f)             # everything but the grain
-    pl = _plane(base, W)
+    pl = _plane(base, W) if kind == "luma" else None     # (colour: the ring's own, one value; the leg's light is what runs along it)
     S = pl if pl is not None else np.full_like(base, float((base * W).sum() / max(float(W.sum()), 1e-6)))
     flat = base - S                                       # (S is the plane here: what the leg's skin does by itself, as seen from the ring)
     ringpx = W > 0.5
     nat = 1.4826 * float(np.median(np.abs(flat[ringpx] - np.median(flat[ringpx])))) if int(ringpx.sum()) > 30 else 0.0
-    res_, _den = _nconv(base - S, W, sig_b)               # what the plane misses of the leg round the knee, spread over the knee
-    S = S + res_
+    Wr = ring_res[y0:y1, x0:x1].astype(np.float32) if ring_res is not None else W
+    res_, den = _nconv(base - S, Wr, sig_b)               # what the plane misses of the leg round the knee, spread over the knee ...
+    S = S + res_ * (den / (den + RES_DEN)).astype(np.float32)      # ... as far as there is leg round it near enough to say
     dev = base - S                                        # the knee's own difference from the leg round it
     if kind == "luma":
         dev2 = np.where(dev < 0, DARK_KEEP * dev, LIGHT_KEEP * dev)
@@ -256,16 +267,18 @@ def knee_tone(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, skin: Optional[np.n
         if got is None:
             continue
         w_area, w_ring = got
-        Yo = tone_plane(Yo, w_area, w_ring, half, k, "luma")
+        w_far = (w_ring * _ss(RES_FROM, RES_FROM + 0.4, e)).astype(np.float32)
+        Yo = tone_plane(Yo, w_area, w_ring, half, k, "luma", ring_res=w_far)
         for nm in ("cb", "cr"):
             Pc = Cbo if nm == "cb" else Cro
             if Pc.shape == (hY, wY):
-                wa, wr, hf = w_area, w_ring, half
+                wa, wr, wf, hf = w_area, w_ring, w_far, half
             else:
                 wa = cv2.resize(w_area, (wC, hC), interpolation=cv2.INTER_AREA)
                 wr = cv2.resize(w_ring, (wC, hC), interpolation=cv2.INTER_AREA)
+                wf = cv2.resize(w_far, (wC, hC), interpolation=cv2.INTER_AREA)
                 hf = max(1.5, half * cs)
-            Pn = tone_plane(Pc, wa, wr, hf, k, "chroma")
+            Pn = tone_plane(Pc, wa, wr, hf, k, "chroma", ring_res=wf)
             if nm == "cb":
                 Cbo = Pn
             else:
