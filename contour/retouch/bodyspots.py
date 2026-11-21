@@ -23,6 +23,7 @@ with several people adds a few kilobytes to the caches.
 """
 from __future__ import annotations
 
+import threading
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -33,7 +34,8 @@ from . import detect as DT
 # ------------------------------------------------------------------------------------------------- finding
 DET_REF = 240.0             # the body's size (face width) is at most this many pixels on the picture spots are looked for on
 SMALL = 0.012               # of the body's size: the smallest spot size looked for, whatever the largest is (3 px at least)
-THREADS = 4                 # pieces looked at side by side at most
+THREADS = None              # pieces looked at side by side, of all the people of a frame together. None: by the
+                            # computer's processors (workers()); a number: that many
 DET_GAIN = 1.25             # the original is read when it has this many times the analysis picture's pixels
 TILE = 768                  # a piece's side (pixels of the picture looked at)
 TILE_LAP = 128              # pieces overlap by this much: a spot at one piece's edge is whole in the next
@@ -82,6 +84,33 @@ CAND = np.dtype([("x", "f4"), ("y", "f4"),              # centre, source px
                  ("lum", "f4"),                          # the skin's level round it (0..1)
                  ("px0", "f4"), ("py0", "f4"),           # its patch: top left in source px,
                  ("off", "i4"), ("w", "i2"), ("h", "i2")])   # place in the packed patches, size in picture px
+
+
+def workers() -> int:
+    """How many pieces are looked at side by side. Looking is most of what a frame with body blemishes costs (a
+    person of a 4K mid shot is six to nine pieces of a third of a second each), and four at a time left most of a
+    large computer idle while the frames of an export waited (j2799: 3 s a frame for three people). Two thirds of
+    the processors, 12 at most: an export's own frames and the reader run beside it."""
+    if THREADS is not None:
+        return max(1, int(THREADS))
+    import os
+    n = os.cpu_count() or 4
+    return max(2, min(12, n - max(2, n // 3)))
+
+
+_POOL: list = [None, 0]
+_POOL_LOCK = threading.Lock()
+
+
+def _pool():
+    """The threads the pieces are looked at on: one set for every person and frame (each call's pieces wait their
+    turn in it, so three people of a frame share the processors instead of each bringing four threads)."""
+    from concurrent.futures import ThreadPoolExecutor
+    n = workers()
+    with _POOL_LOCK:
+        if _POOL[0] is None or _POOL[1] != n:
+            _POOL[0], _POOL[1] = ThreadPoolExecutor(max_workers=n, thread_name_prefix="bodyspots"), n
+        return _POOL[0]
 
 
 def spot_size(body_size: float, ref: float) -> float:
@@ -324,10 +353,8 @@ def detect(pieces, region_at, model, ref_src: float, body_size: float, scale: fl
         return find(Y, Cb, Cr, reg, ref, size, origin=(sa[0], sa[1]), scale=fx, core=core_px, net=net)
 
     tiles = _tiles(*bx)
-    if THREADS > 1 and len(tiles) > 1 and net_for is None:
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=min(THREADS, len(tiles))) as ex:
-            got = list(ex.map(one, tiles))          # in the pieces' order whichever finishes first
+    if workers() > 1 and len(tiles) > 1 and net_for is None:
+        got = list(_pool().map(one, tiles))         # in the pieces' order whichever finishes first
     else:
         got = [one(tile) for tile in tiles]
     all_c, all_s, all_r = [], [], []

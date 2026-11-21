@@ -367,6 +367,35 @@ def test_spots_are_found_on_the_originals_pixels_in_tiles(body, monkeypatch):
     assert not d3["src"] and int(BP.taken(d3).sum()) < 4
 
 
+def test_the_pieces_of_all_people_are_looked_at_on_one_set_of_threads(body, monkeypatch):
+    """j2799: three people of a 4K frame, each looking at their pieces four at a time: 3 s a frame, the largest person
+    deciding, most of an 18-thread computer idle. One set of threads for everybody's pieces, as many as the computer
+    has room for; the spots are the same however many there are."""
+    import os
+    from contour.retouch import bodyspots as BP
+    from contour.retouch import engine as RE
+    for n, want in ((2, 2), (4, 2), (8, 6), (12, 8), (18, 12), (64, 12)):
+        monkeypatch.setattr(os, "cpu_count", lambda n=n: n)
+        assert BP.workers() == want, (n, BP.workers())
+    monkeypatch.setattr(BP, "THREADS", 3)
+    assert BP.workers() == 3
+    a = BP._pool()
+    assert BP._pool() is a and a._max_workers == 3
+    monkeypatch.setattr(BP, "THREADS", 5)
+    b = BP._pool()
+    assert b is not a and b._max_workers == 5
+    cut, tr, _ = body
+    B.body_on(cut, blemish=100, size=B.SPOT_SIZE)
+    monkeypatch.setattr(BP, "TILE", 256)
+    monkeypatch.setattr(BP, "TILE_LAP", 64)
+    got = {}
+    for n in (1, 5):
+        monkeypatch.setattr(BP, "THREADS", n)
+        got[n] = RE._prepare_raw(cut, tr, 2, {}).jobs[0].bdet
+    assert got[1]["tiles"] >= 4 and len(got[1]["cands"]) > 0
+    assert _same(got[1], got[5])
+
+
 def test_a_spot_that_flickers_is_removed_on_every_frame(body):
     """The thigh's pimple is half as strong on one frame. Alone that frame would leave more of it; with its
     neighbours it is removed there as on the frames round it (the retouch does not blink)."""

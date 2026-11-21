@@ -34,6 +34,33 @@ from . import skin as SK
 from ..track import skeleton as S
 from ..warp.body import SEG_INDEX, SEGMENTS
 
+# Where an area's time goes, for a measurement (the PC test jobs set this to engine.TIMING's dict): each step of
+# body_mask adds its seconds and its count under "area.<step>". None (always, in the app): nothing is kept.
+TIMING: Optional[dict] = None
+
+
+class _step:
+    __slots__ = ("name", "t0")
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def __enter__(self):
+        self.t0 = time.perf_counter() if TIMING is not None else None
+        return self
+
+    def __exit__(self, *exc):
+        d = TIMING
+        if d is not None and self.t0 is not None:
+            e = d.setdefault("area." + self.name, [0.0, 0, 0.0])
+            dt = time.perf_counter() - self.t0
+            e[0] += dt
+            e[1] += 1
+            if len(e) > 2:
+                e[2] += dt
+        return False
+
+
 # ------------------------------------------------------------------------------------------------- parts
 # name, region, joint a, joint b, length over the face width, full width over the face width (adult build)
 LIMBS = [
@@ -759,14 +786,17 @@ def body_mask(tracker, p: int, t: int, rgb_u8: np.ndarray, regions: set, prior: 
     rgb_u8, and what is known of the body. regions: body regions chosen (project.body_scope_set)."""
     st = tracker.store
     px = tracker.proxy
-    info = body_info(st, p, t)
+    with _step("info"):
+        info = body_info(st, p, t)
     h, w = rgb_u8.shape[:2]
-    own, others = ownership(tracker, t, p, (w, h))
+    with _step("own"):
+        own, others = ownership(tracker, t, p, (w, h))
     if own is None or float(own.max()) < 0.3 or info.ref < REF_MIN:
         return None, info
     hands = st.hand[p, t] if getattr(st, "has_hands", False) and np.isfinite(st.hand[p, t][:, :2]).any() else None
-    maps = region_maps(info, (h, w), px.sx, px.sy, hands)
-    area = chosen(maps, regions)
+    with _step("regions"):
+        maps = region_maps(info, (h, w), px.sx, px.sy, hands)
+        area = chosen(maps, regions)
     if float(area.max()) <= 0.01:
         return None, info
     ys = np.nonzero(own.max(1) > 0.3)[0]
@@ -774,7 +804,8 @@ def body_mask(tracker, p: int, t: int, rgb_u8: np.ndarray, regions: set, prior: 
     info.box = (float(xs[0]), float(ys[0]), float(xs[-1] + 1), float(ys[-1] + 1)) if len(xs) and len(ys) else None
     if info.box is None:
         return None, info
-    parse = _parse_cached(tracker, p, t, rgb_u8, own)
+    with _step("parse"):
+        parse = _parse_cached(tracker, p, t, rgb_u8, own)
     size = float(np.sqrt(max(1.0, float((own > 0.3).sum()))))
     sig = max(0.6, min(0.0025 * h, 0.008 * info.ref * px.sx))
     # the person's own piece of the picture, with room for the widest of the blurs round it: every map below is that
@@ -788,7 +819,8 @@ def body_mask(tracker, p: int, t: int, rgb_u8: np.ndarray, regions: set, prior: 
     else:
         x0, y0, x1, y1 = 0, 0, w, h
     win = (slice(y0, y1), slice(x0, x1))
-    g = garments(tracker, t, p, (w, h))
+    with _step("garments"):
+        g = garments(tracker, t, p, (w, h))
     limbs = np.maximum.reduce([maps["arm"][win], maps["leg"][win], maps["neck"][win]])
     own_w = own[win]
     if ISLANDS:
@@ -807,9 +839,10 @@ def body_mask(tracker, p: int, t: int, rgb_u8: np.ndarray, regions: set, prior: 
     heads = None
     if FACE_NEAR is not None and parse is not None and "face" in parse:
         heads = heads_map(head_spots(st, t), (x0, y0, x1, y1), px.sx, px.sy, soft_h)
-    conf, model, parsed, allow = skin_conf(np.ascontiguousarray(rgb_u8[win]), own_w,
-                                           others[win] if others is not None else None, parse,
-                                           g[win] if g is not None else None, prior, size, limbs, (x0, y0), h, heads)
+    with _step("conf"):
+        conf, model, parsed, allow = skin_conf(np.ascontiguousarray(rgb_u8[win]), own_w,
+                                               others[win] if others is not None else None, parse,
+                                               g[win] if g is not None else None, prior, size, limbs, (x0, y0), h, heads)
     info.model, info.parsed = model, parsed
     a_ = np.clip(area[win], 0, 1)
     info.allow = np.zeros((h, w), np.float32)
