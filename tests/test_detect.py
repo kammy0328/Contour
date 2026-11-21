@@ -245,3 +245,20 @@ def test_neck_mask_leaves_out_what_is_far_darker_than_the_face():
     assert float(m1[290:320, 215:235].mean()) < 0.05, "now: it stays out"
     assert float(m1[300:325, 140:185].mean()) > 0.7, "the neck itself is kept"
     assert float(m1[340:400, 140:185].mean()) < 0.05, "and the black top under it is not"
+
+
+def test_skin_mask_dark_guard_takes_hair_over_the_cheek_out_but_only_round_the_face():
+    from contour.retouch import skin as SK
+    h, w = 600, 1100
+    lm = np.zeros((68, 3), np.float32)
+    for i in range(17):
+        a = np.pi * i / 16
+        lm[i, :2] = (300 - 100 * np.cos(a), 200 + 140 * np.sin(a))
+    rgb = np.full((h, w, 3), 150, np.uint8)
+    rgb[180:260, 330:380] = 40                        # hair over the right cheek, next to the face
+    rgb[300:420, 900:1000] = 40                        # a leg in shadow far from the face
+    m = np.ones((h, w), np.float32)
+    m1 = SK._dark_guard(m, rgb, lm)
+    assert float(m1[190:250, 340:370].mean()) < 0.05, "the hair is out of the mask"
+    assert float(m1[200:240, 260:300].mean()) > 0.95, "the skin stays"
+    assert float(m1[310:410, 910:990].mean()) > 0.95, "far from the face nothing changes"

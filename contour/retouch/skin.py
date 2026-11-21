@@ -741,6 +741,32 @@ def _neck_lines_back(out: np.ndarray, rgb_u8: np.ndarray, lm: np.ndarray, Wf: fl
 
 # --------------------------------------------------------------------------- mask
 
+DARK_GUARD = (0.30, 0.46)   # of the face's own skin brightness: round the face the mask fades out between these
+DARK_ZONE = 1.7             # face widths round the face where the guard works (not on a leg or an arm in shadow)
+
+
+def _dark_guard(m: np.ndarray, rgb_u8: np.ndarray, lm: np.ndarray) -> np.ndarray:
+    """Hair lying over the cheek or beside the neck, a black top under it: far darker than the face's skin, and the
+    colour model lets it through when its hue is the skin's (a log clip seen in Rec.709, dark brown hair). Round
+    the face the mask is taken out where the picture is much darker than the skin the mask sits on."""
+    h, w = m.shape
+    Wf = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
+    c = lm[:17, :2][np.isfinite(lm[:17, :2]).all(1)].mean(0) if np.isfinite(lm[:17, :2]).all(1).any() else None
+    if c is None or Wf < 8:
+        return m
+    Y = rgb_u8.astype(np.float32) @ np.array([0.299, 0.587, 0.114], np.float32)
+    zone = np.zeros((h, w), np.uint8)
+    cv2.circle(zone, (int(round(c[0])), int(round(c[1]))), int(DARK_ZONE * Wf), 255, -1)
+    zf = cv2.GaussianBlur(zone.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.15 * Wf))
+    sel = (zone > 0) & (m > 0.6)
+    if sel.sum() < 40:
+        return m
+    yref = float(np.median(Y[sel]))
+    Ys = cv2.GaussianBlur(Y, (0, 0), max(1.0, 0.012 * Wf))
+    g = _sstep(DARK_GUARD[0] * yref, DARK_GUARD[1] * yref, Ys)
+    return (m * (1.0 - zf * (1.0 - g))).astype(np.float32)
+
+
 def skin_mask(job: SkinJob, rgb_proxy: np.ndarray, sx: float, sy: float, person_alpha: Optional[np.ndarray],
               model, parse: Optional[dict] = None, body_region: Optional[np.ndarray] = None,
               cover: Optional[np.ndarray] = None, prob0: Optional[np.ndarray] = None) -> np.ndarray:
@@ -839,6 +865,8 @@ def skin_mask(job: SkinJob, rgb_proxy: np.ndarray, sx: float, sy: float, person_
             cv2.circle(hm, (int(round(c[0])), int(round(c[1]))), int(rad), 255, -1)
             k = max(3, int(rad * 0.3) | 1)
             m *= 1.0 - cv2.GaussianBlur(hm.astype(np.float32) / 255.0, (k, k), 0)
+    if DARK_GUARD is not None and lm is not None and np.isfinite(lm[[0, 16], :2]).all():
+        m = _dark_guard(m, rgb_proxy, lm)
     # edge softening follows the face size (a fixed pixel blur washed a small face's mask out: during a zoom
     # the retouch faded in instead of holding its strength)
     sig = max(0.8, 0.0025 * h)
