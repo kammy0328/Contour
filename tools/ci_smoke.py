@@ -21,6 +21,12 @@ import time
 import traceback
 from pathlib import Path
 
+for _s in (sys.stdout, sys.stderr):                  # what the steps say is Korean in part: a console on a Windows code page (a CI pipe) must not stop the run
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
