@@ -231,6 +231,12 @@ def _masked_skin(Yo, skin, e, area, half):
     # a sock, a hem, a shoe is not the leg's skin even where the area takes it for skin: darker than the leg round it
     yref = float(np.median(Yo[a0:a1, b0:b1][sel]))
     light = _ss(NOT_SKIN[0], NOT_SKIN[1], Yo / max(yref, 1e-4)).astype(np.float32)
+    # the rim of a sock, a hem, a shoe (its blur, the shade it throws on the leg) is not the leg's skin either: the area
+    # takes the blur's pixels for skin, and the knee would be pulled up to the leg's light there (a bright crescent along the
+    # sock's top edge, strongest where the sock is nearest the knee)
+    r = int(max(2, DARK_RIM * half))
+    dark = cv2.dilate((light < 0.6).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1)))
+    light = (light * (1.0 - cv2.GaussianBlur(dark.astype(np.float32), (0, 0), max(1.0, 0.4 * r)))).astype(np.float32)
     # holes in the area (a blotch the parser takes for something else): closed up as far as the leg's colour is there
     half_k = 2 * int(max(1, 0.30 * half)) + 1
     sk_c = cv2.morphologyEx(sk, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (half_k, half_k)))

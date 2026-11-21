@@ -210,3 +210,23 @@ def test_without_a_body_area_cloth_is_left_alone():
         Cr2 = np.where(skin > 0.5, cr_ + (Cr - 0.08) * 0.3, Cr).astype(np.float32)
         out = BT.knee_tone(Y2, Cb2, Cr2, None, KNEE, 1.0)
         assert out[0] is Y2 and out[1] is Cb2 and out[2] is Cr2, (ymean, cb_, cr_)
+
+
+def test_the_soft_top_edge_of_a_sock_is_not_pulled_up_to_the_legs_light():
+    """The body skin's area takes the blur at a sock's edge for skin: the knee used to be lifted there to the leg's light, a
+    bright crescent along the sock's top edge (a flat dim clip seen in Rec.709, the sock within the knee's reach)."""
+    gy, gx = np.mgrid[0:H, 0:W].astype(np.float32)
+    leg = (np.abs(gx - CX) < HALF) & (gy < 200)
+    ramp = np.clip((gy - 134) / 8.0, 0, 1)
+    Y = np.full((H, W), 0.40, np.float32)
+    Cb = np.zeros((H, W), np.float32)
+    Cr = np.zeros((H, W), np.float32)
+    Y[leg] = 0.55 * (1 - ramp[leg]) + 0.05 * ramp[leg]
+    Cb[leg] = -0.05 * (1 - ramp[leg])
+    Cr[leg] = 0.08 * (1 - ramp[leg])
+    Y += np.random.default_rng(1).normal(0, 0.01, Y.shape).astype(np.float32)
+    skin = cv2.GaussianBlur(leg.astype(np.float32), (0, 0), 0.8)
+    Yo, Cbo, Cro = BT.knee_tone(Y, Cb, Cr, skin, KNEE, 1.0)
+    band = (gy >= 130) & (gy < 150) & (np.abs(gx - CX) < HALF - 4)
+    assert float(np.abs(Yo - Y)[band].max()) < 0.01
+    assert float(np.abs(Cbo - Cb)[band].max()) < 0.005
