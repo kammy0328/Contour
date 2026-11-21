@@ -1280,6 +1280,44 @@ def test_the_area_is_steadied_on_the_piece_the_person_takes(body, monkeypatch):
         B.body_on(cut, 1)
 
 
+def test_the_motions_of_a_frames_bodies_are_measured_side_by_side(body, monkeypatch):
+    """Two new pairs of frames a person and frame, 0.07 to 0.12 s each on a 4K cut, one after the other while the
+    frames of an export wait (j2799). The pairs a frame's steadying will ask for are measured side by side first;
+    the steadied areas and spots are the same."""
+    import threading
+    from contour.retouch import engine as RE, bodyskin as BS
+    cut, tr, _ = body
+    cut.person(1).role = "target"
+    try:
+        B.body_on(cut, 0, skin=100, blemish=100, size=B.SPOT_SIZE)
+        B.body_on(cut, 1, skin=100, blemish=100, size=B.SPOT_SIZE)
+        seen = []
+        pair0 = BS.motion_pair
+        monkeypatch.setattr(BS, "motion_pair", lambda *a, **k: (seen.append(threading.get_ident()), pair0(*a, **k))[1])
+        got = {}
+        me = threading.get_ident()
+        for n in (1, 4):
+            monkeypatch.setattr(RE, "MOTION_PAIRS", n)
+            tr.__dict__.pop("_steady_lru", None)
+            tr.__dict__.pop("_bflow", None)
+            del seen[:]
+            rows = {}
+            for t in (2, 3, 4):
+                rf = RE.prepare(cut, tr, t, {})
+                for j in rf.jobs:
+                    rows[(t, j.pid)] = (j.body["mask"], j.bdet)
+            got[n] = (rows, list(seen))
+        (r1, s1), (r4, s4) = got[1], got[4]
+        assert len(r1) == 6 and sorted(r1) == sorted(r4)
+        assert set(s1) == {me}, "one after the other: where they are asked for"
+        assert len(s4) == len(s1) and me not in set(s4[:4]), "the first frame's pairs: side by side, each measured once"
+        for k in r1:
+            assert _same(r1[k][0], r4[k][0]) and _same(r1[k][1], r4[k][1]), f"frame and person {k}"
+    finally:
+        cut.person(1).role = "protect"
+        B.body_on(cut, 1)
+
+
 def _same(a, b) -> bool:
     if isinstance(a, dict):
         return isinstance(b, dict) and a.keys() == b.keys() and all(_same(a[k], b[k]) for k in a)

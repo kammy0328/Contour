@@ -1262,6 +1262,11 @@ def _steady(cut, tracker, st, rf: RetouchFrame, cache) -> RetouchFrame:
     px = tracker.proxy
     N = st.final.shape[1]
     k = np.array([px.sx, px.sy])
+    try:
+        _body_motions_ahead(cut, tracker, st, rf, cache)
+    except Exception:
+        import traceback
+        traceback.print_exc()
     for j in rf.jobs:
         # the body's mask has no face to follow: it is held steady along the picture's own motion (_steady_bskin)
         if j.body and j.body.get("mask") is not None:
@@ -1614,6 +1619,73 @@ def _body_motion(tracker, j, t: int, s: int, box_t, box_s) -> Optional[dict]:
             while len(lru) > n:
                 lru.popitem(last=False)
     return got[0] if t < s else got[1]
+
+
+MOTION_PAIRS = 4        # motions of the bodies of a frame measured side by side (1: each when it is asked for, one after
+                        # the other: 0.07 to 0.12 s a pair, two new pairs a person and frame: j2799)
+
+
+def _body_motions_ahead(cut, tracker, st, rf: RetouchFrame, cache) -> None:
+    """The motions the steadying of this frame's bodies will ask for (_body_neighbours), measured side by side and
+    kept where _body_motion finds them. What each needs of the tracker (the frames, the owners) is fetched here,
+    one after the other; the measuring itself touches nothing shared."""
+    if MOTION_PAIRS <= 1 or STEADY_R < 1:
+        return
+    from collections import OrderedDict
+    t = rf.t
+    px = tracker.proxy
+    N = st.final.shape[1]
+    todo = []
+    for j in rf.jobs:
+        box = (j.body or {}).get("box") if j.body else None
+        if box is None or j.body.get("mask") is None:
+            continue
+        for d in range(1, STEADY_R + 1):
+            for s_ in (t - d, t + d):
+                if not (0 <= s_ < N and bool(st.present[j.p, s_]) and st.connected(s_, t)):
+                    continue
+                rs = _raw_cached(cut, tracker, s_, cache)       # (this may start the motions' table over)
+                lru = tracker.__dict__.get("_bflow")
+                key = (j.pid, min(t, s_), max(t, s_))
+                with _BFLOW_LOCK:
+                    known = lru is not None and tracker.__dict__.get("_bflow_sig") == tracker.__dict__.get("_steady_sig") \
+                        and key in lru
+                if known or any(e[0] == key for e in todo):
+                    continue
+                js = next((x for x in rs.jobs if x.pid == j.pid), None) if rs is not None else None
+                todo.append((key, j, s_, box, (js.body or {}).get("box") if (js is not None and js.body) else None))
+    if len(todo) < 2:
+        return
+    size = (px.w, px.h)
+    grays, owns = {}, {}
+    for _key, j, s_, _b, _bs in todo:
+        for f in (t, s_):
+            if f not in grays:
+                grays[f] = _gray(px, f)
+            if (j.p, f) not in owns:
+                try:
+                    owns[(j.p, f)] = BS.ownership(tracker, f, j.p, size, others=False)[0]
+                except Exception:
+                    owns[(j.p, f)] = None
+
+    def one(e):
+        _key, j, s_, box, box_s = e
+        with _tm("body.motion"):
+            return BS.motion_pair(grays[t], grays[s_], box, box_s, owns[(j.p, t)], owns[(j.p, s_)])
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(MOTION_PAIRS, len(todo))) as ex:
+        got = list(ex.map(one, todo))
+    sig = tracker.__dict__.get("_steady_sig")
+    lru = tracker.__dict__.get("_bflow")
+    if lru is None or tracker.__dict__.get("_bflow_sig") != sig:
+        lru = tracker.__dict__["_bflow"] = OrderedDict()
+        tracker.__dict__["_bflow_sig"] = sig
+    with _BFLOW_LOCK:
+        for (key, _j, s_, _b, _bs), (a, b) in zip(todo, got):
+            lru[key] = (a, b) if t < s_ else (b, a)
+        n = BFLOW_LRU * max(1, len({k[0] for k in lru}))
+        while len(lru) > n:
+            lru.popitem(last=False)
 
 
 def _steady_bdet(cut, tracker, st, rf: RetouchFrame, j, cache) -> dict:
