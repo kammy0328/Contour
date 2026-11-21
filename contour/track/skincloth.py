@@ -42,7 +42,7 @@ LOOK_FILE = Path(__file__).resolve().parent / "data" / "sam31_text_skinlook.npz"
 SURE = 0.80                 # the parser's skin share from which a pixel is skin it is sure of
 DIRTY_SHARE = 0.10          # of the skin the parser is sure of on a person: called clothing by the garment words ...
 DIRTY_PX = 0.0004           # ... and that much of the picture, from which the frames round the look get their maps
-BODY_KEYS = ("body_skin", "body_blemish")
+BODY_KEYS = ("body_skin", "body_blemish", "knee_tone", "belly_fold")
 _LRU = 24                   # garment maps kept in memory
 
 

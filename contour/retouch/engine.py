@@ -16,6 +16,7 @@ import numpy as np
 
 from . import bodyskin as BS
 from . import bodyspots as BP
+from . import bodytone as BTN
 from . import detect as DT
 from . import skin as SK
 from ..core.params import RETOUCH_KEYS
@@ -93,6 +94,7 @@ class Job:
     body_size: float = 0.4                 # 0..1 largest spot taken by the body blemish removal
     bdet: Optional[dict] = None            # the body's spot candidates of this frame (retouch.bodyspots)
     bmarks: Optional[list] = None          # the operator's body spot marks as they lie on this frame
+    tone: Optional[dict] = None            # where the knees and the belly are (retouch.bodytone.person_geometry), source px
 
 
 @dataclass
@@ -1396,6 +1398,7 @@ def _body_marks(st, p: int, t: int, pp, v) -> Optional[list]:
         return None
 
 
+BODY_EFFECTS = ("body_skin", "body_blemish", "knee_tone", "belly_fold")   # the values that bring the body skin's area with them
 BDET_NOW = True            # a job that came without its spots (a single frame, a test) has them found on the plane
 
 
@@ -2368,7 +2371,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 job.masks["teeth"] = get("teeth", lambda: teeth_mask(lm, base()["rgbf"])) * fw
             if v["eye_white"] > 1e-4:
                 job.masks["eyew"] = get("eyew", lambda: eye_white_mask(lm, base()["rgbf"])) * fw
-        if v.get("body_skin", 0) > 1e-4 or v.get("body_blemish", 0) > 1e-4:
+        if any(v.get(k_, 0) > 1e-4 for k_ in BODY_EFFECTS):
             # body skin (1.23): its own area, apart from the face's regions (retouch.bodyskin)
             try:
                 from ..core.project import body_scope_set, norm_body_scope
@@ -2396,6 +2399,8 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 bd = get("bskin", mk_body, f"{bscope}:{ctok}", btok)
                 if bd["pm"] is not None and tuple(bd["pm"]["shape"]) == tuple(shape) and bd["info"]["ref"] > 0:
                     job.body = dict(bd["info"], mask=bd["pm"], key=f"{bscope}:{ctok}")
+                    if v.get("knee_tone", 0) > 1e-4 or v.get("belly_fold", 0) > 1e-4:
+                        job.tone = BTN.person_geometry(st.final[p, t], st.widths[p, t])
                     if v.get("body_blemish", 0) > 1e-4:
                         def mk_bdet():
                             with _tm("body.spots"):
@@ -4152,7 +4157,7 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
         prot_ = det.get("protect")
         # body skin (1.23): its area on this picture, laid at this picture's own pixels, found before anything changes
         bmY = None
-        if job.body and job.body.get("mask") is not None and (v.get("body_skin", 0) > 1e-4 or v.get("body_blemish", 0) > 1e-4):
+        if job.body and job.body.get("mask") is not None and any(v.get(k_, 0) > 1e-4 for k_ in BODY_EFFECTS):
             try:
                 with _tm("apply.body_area"):
                     bmY = BS.refine(job.body["mask"], job.body.get("model"), Y, Cb, Cr)
@@ -4181,6 +4186,28 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                         Y, Cb, Cr = BP.fill(Y, Cb, Cr, regB, bd_, float(np.clip(v["body_blemish"], 0, 1)), job.body_size,
                                             float(job.body["ref"]) * y_per_src, y_per_src, cs,
                                             lambda *a_: _spot_fill(*a_, plane_h=hY))
+            except Exception:
+                import traceback
+                traceback.print_exc()
+        # 0c. knee tone (1.25): the knee's blotches, redness and bruise-like patches to the leg's own colour; the grain stays
+        if bmY is not None and job.tone and job.tone.get("knees") and v.get("knee_tone", 0) > 1e-4:
+            try:
+                regK = bmY
+                for nm_ in ("skinx", "neck"):
+                    if nm_ in job.masks:                  # (what the face's area holds is the face's)
+                        regK = regK * (1.0 - np.clip(M(job.masks[nm_], (hY, wY)), 0, 1))
+                kn_ = [((cx * y_per_src, cy * y_per_src), (ax_, ay_), hf_ * y_per_src)
+                       for (cx, cy, ax_, ay_, hf_) in job.tone["knees"]]
+                with _tm("apply.knee_tone"):
+                    Y, Cb, Cr = BTN.knee_tone(Y, Cb, Cr, regK, kn_, float(np.clip(v["knee_tone"], 0, 1)), cs)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+        # 0d. belly creases (1.25): the folds a bent trunk makes, filled from the skin round them; none found, nothing changed
+        if bmY is not None and job.tone and job.tone.get("belly") and v.get("belly_fold", 0) > 1e-4:
+            try:
+                with _tm("apply.belly_fold"):
+                    Y, Cb, Cr = BTN.belly_fold(Y, Cb, Cr, bmY, job.tone["belly"], float(np.clip(v["belly_fold"], 0, 1)), y_per_src)
             except Exception:
                 import traceback
                 traceback.print_exc()

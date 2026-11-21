@@ -233,7 +233,7 @@ class ReshapeTab(_Tab):
         self.body_note.setWordWrap(True)
         v.addWidget(self.body_note)
 
-        def effect(key, title, extra_key, extra_label, extra_default, extra_tip, what):
+        def switch(key, title):
             tg = Wd.Toggle()
             tg.toggled.connect(lambda on, k=key: self.ctl.set_body_on(k, on))
             v.addWidget(Wd.FieldRow(title, tg, PARAM[key].tip))
@@ -246,6 +246,9 @@ class ReshapeTab(_Tab):
             r.keyToggled.connect(self.ctl.toggle_param_key)
             v.addWidget(r)
             self.body_rows[key] = r
+
+        def effect(key, title, extra_key, extra_label, extra_default, extra_tip, what):
+            switch(key, title)
             e = Wd.ParamRow(extra_key, extra_label, 0, 100, 1, "pct", extra_default)
             e.name.setFixedWidth(64)
             e.name.setToolTip(extra_tip)
@@ -260,6 +263,10 @@ class ReshapeTab(_Tab):
         v.addSpacing(4)
         self.body_size = effect("body_blemish", "몸 잡티 제거", "body_blemish_size", "최대 크기", 40,
                                 "지울 잡티의 최대 크기 (몸 크기 기준). 이보다 큰 자국은 그대로 둡니다", "blemish_size")
+        v.addSpacing(4)
+        switch("knee_tone", "무릎 얼룩 정리")
+        v.addSpacing(4)
+        switch("belly_fold", "뱃살 주름 제거")
         v.addSpacing(4)
         v.addWidget(Wd.label("적용 부위", "", 12))
         box = QWidget()
@@ -362,6 +369,7 @@ class ReshapeTab(_Tab):
                 r.set_key_state("none")
         skin_on = bool(pp is not None and pp.body_on("body_skin"))
         spot_on = bool(pp is not None and pp.body_on("body_blemish"))
+        tone_on = bool(pp is not None and (pp.body_on("knee_tone") or pp.body_on("belly_fold")))
         self.body_detail.setEnabled(enabled and skin_on)
         self.body_size.setEnabled(enabled and spot_on)
         if pp is not None:
@@ -373,7 +381,7 @@ class ReshapeTab(_Tab):
             cb.blockSignals(True)
             cb.setChecked(scope == "all" if k == "all" else (scope != "all" and k in regs))
             cb.blockSignals(False)
-            cb.setEnabled(enabled and (skin_on or spot_on))
+            cb.setEnabled(enabled and (skin_on or spot_on or tone_on))
         for kind in ("remove", "exclude"):
             b = self.body_mark_btns[kind]
             b.blockSignals(True)
@@ -383,7 +391,7 @@ class ReshapeTab(_Tab):
         n = len(pp.body_marks) if pp is not None else 0
         self.body_mark_btns["clear"].setEnabled(enabled and n > 0)
         text, can = body_cloth_line(getattr(self.ctl.session, "tracker", None), getattr(self.ctl.session, "cut", None),
-                                    skin_on or spot_on)
+                                    skin_on or spot_on or tone_on)
         self.body_cloth_info.setText(text)
         self.body_cloth_btn.setEnabled(enabled and can)
         self.body_mark_r.setEnabled(enabled and spot_on)
