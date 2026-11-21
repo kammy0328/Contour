@@ -283,6 +283,11 @@ class Registry:
         raise NotImplementedError
         yield                                                    # pragma: no cover
 
+    def holds(self, pkg: Package) -> bool:
+        """False when this place plainly does not carry the package (a folder or a zip with some of the list's
+        packages: the offline import of one model). A place that cannot tell without asking for a file: True."""
+        return True
+
 
 class DirRegistry(Registry):
     """A folder with the layout of the module text (the tests' registry; a package brought in by hand)."""
@@ -307,6 +312,9 @@ class DirRegistry(Registry):
             yield fh
         finally:
             fh.close()
+
+    def holds(self, pkg: Package) -> bool:
+        return (self.root / pkg.key / pkg.version).is_dir()
 
 
 class HttpRegistry(Registry):
@@ -912,18 +920,35 @@ def bring_in(where, keys=None, progress: Optional[Callable[[float, str], None]] 
              versions: Optional[Dict[str, str]] = None, activate: bool = True, st: Optional[Store] = None) -> dict:
     """Installs from a registry (address, folder or zip) the newest usable version of every key it offers (or of
     `keys`; `versions` names exact ones), each with the full checks. A package that fails leaves the others and
-    what was in use alone. -> {"installed": [(key, version)], "kept": [(key, version)], "failed": {key: text}}"""
+    what was in use alone. A folder or a zip that carries only some of its list's packages (one model brought in
+    by hand) gives those: the others are named in "absent", not failed; a key asked for by name has to be there.
+    -> {"installed": [(key, version)], "kept": [(key, version)], "failed": {key: text}, "absent": [key]}"""
     st = st or store()
-    res = dict(installed=[], kept=[], failed={})
+    res = dict(installed=[], kept=[], failed={}, absent=[])
     with registry_at(where) as reg:
         data, sig = reg.manifest()
         pkgs = verify_manifest(data, sig, trusted)            # an unsigned or changed list: nothing is installed
-        want = sorted({p.key for p in pkgs} if keys is None else set(keys))
+        held = {}
+        for p in pkgs:
+            if reg.holds(p):
+                held.setdefault(p.key, []).append(p)
+        if keys is None:
+            res["absent"] = sorted({p.key for p in pkgs} - set(held))
+            want = sorted(held)
+        else:
+            want = sorted(set(keys))
+        from ..core.settings import APP_VERSION
+        ort = _ort_version()
         total = len(want) or 1
         for i, key in enumerate(want):
             if cancel and cancel():
                 raise PackageError("cancelled", "취소됨")
             ver = (versions or {}).get(key)
+            if ver is None and key in held and len(held[key]) < sum(1 for p in pkgs if p.key == key):
+                # some versions of this key are not here: the newest usable one of those that are
+                mine = sorted(held[key], key=lambda p: _ver(p.version))
+                ok = [p for p in mine if not (p.fits(APP_VERSION, ort) or io_mismatch(p))]
+                ver = (ok or mine)[-1].version
             had = set(st.versions(key))
 
             def prog(f, msg, i=i):

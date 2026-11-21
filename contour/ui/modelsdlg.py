@@ -207,6 +207,8 @@ class ModelsDialog(QDialog):
             parts.append(f"이미 있음 {len(res['kept'])}개")
         if res["failed"]:
             parts.append("실패: " + " / ".join(f"{t}" for t in res["failed"].values()))
+        if not parts and res.get("absent"):
+            parts.append(f"목록에 있는 패키지 {len(res['absent'])}개의 파일이 여기에 없습니다")
         self.msg.setText(" · ".join(parts) or "가져올 패키지가 없습니다.")
 
     def bring_in(self, where: str):

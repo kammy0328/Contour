@@ -804,6 +804,40 @@ def test_bringing_in_a_folder_or_a_zip_installs_what_it_holds_and_says_what_fail
     assert e.value.why == "missing"
 
 
+def test_a_folder_or_zip_with_some_of_the_lists_packages_gives_those(tmp_path, app_store, monkeypatch):
+    """One model brought in by hand: the signed list names every package, the zip carries one (tools/modelpkg.py
+    zip --keys). That one is installed; the others are not failures, they are simply not there. An older version
+    that is there is taken when the newest is not."""
+    monkeypatch.setattr(MP, "TRUSTED", dict(KEYS))
+    root = tmp_path / "reg"
+    make_registry(root, [RVM, RVM2, A1, A2])
+    part = tmp_path / "part"
+    (part / "matte_rvm").mkdir(parents=True)
+    for f in ("manifest.json", "manifest.sig"):
+        (part / f).write_bytes((root / f).read_bytes())
+    os.rename(root / "matte_rvm" / "2026.11.1", part / "matte_rvm" / "2026.11.1")     # only the older version
+    res = MP.bring_in(part)
+    assert res["installed"] == [("matte_rvm", "2026.11.1")] and res["failed"] == {} and res["absent"] == ["pose_x"]
+    assert app_store.active("matte_rvm") == "2026.11.1" and app_store.active("pose_x") is None
+    # asked for by name: it has to be there
+    res = MP.bring_in(part, keys=["pose_x"])
+    assert list(res["failed"]) == ["pose_x"] and "파일이 없습니다" in res["failed"]["pose_x"] and res["absent"] == []
+    # a package whose folder is there with a file gone is a failure, not an absence
+    (part / "pose_x" / "2026.12.1").mkdir(parents=True)
+    (part / "pose_x" / "2026.12.1" / "model.onnx").write_bytes(b"B" * 5200)
+    res = MP.bring_in(part)
+    assert res["kept"] == [("matte_rvm", "2026.11.1")] and list(res["failed"]) == ["pose_x"] and res["absent"] == []
+    # the same as a zip
+    z = tmp_path / "one.zip"
+    with zipfile.ZipFile(z, "w") as zf:
+        for f in ("manifest.json", "manifest.sig"):
+            zf.write(root / f, f)
+        zf.write(root / "matte_rvm" / "2026.12.1" / "rvm.onnx", "matte_rvm/2026.12.1/rvm.onnx")
+    res = MP.bring_in(z)
+    assert res["installed"] == [("matte_rvm", "2026.12.1")] and res["failed"] == {} and res["absent"] == ["pose_x"]
+    assert app_store.active("matte_rvm") == "2026.12.1"
+
+
 def test_the_publishing_tool_makes_a_registry_the_app_takes(tmp_path, app_store, capsys):
     import importlib.util
     spec = importlib.util.spec_from_file_location("modelpkg_tool", Path(__file__).resolve().parents[1] / "tools" / "modelpkg.py")
@@ -846,7 +880,9 @@ def test_the_publishing_tool_makes_a_registry_the_app_takes(tmp_path, app_store,
         assert sorted(zf.namelist()) == ["manifest.json", "manifest.sig", "matte_rvm/2026.11.1/matte_rvm.onnx"]
     assert T.main(["install", "--from", str(z), "--keys", "matte_rvm", "--pub", pub, "--id", "pub-1"]) == 0
     assert app_store.active("matte_rvm") == "2026.11.1"
-    assert T.main(["install", "--from", str(z), "--pub", pub, "--id", "pub-1"]) == 1, "seg_sam2_s is not in the zip"
+    assert T.main(["install", "--from", str(z), "--pub", pub, "--id", "pub-1"]) == 0, "what the zip holds is enough"
+    assert T.main(["install", "--from", str(z), "--keys", "seg_sam2_s", "--pub", pub, "--id", "pub-1"]) == 1, \
+        "asked for by name and not in the zip"
     assert app_store.active("seg_sam2_s") is None
     assert T.main(["list"]) == 0 and "matte_rvm" in capsys.readouterr().out
     (reg / "seg_sam2_s" / "2026.11.1" / "vision_encoder.onnx").write_bytes(b"F" * 3000)
