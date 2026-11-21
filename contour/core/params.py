@@ -30,6 +30,7 @@ class ParamDef:
 GROUPS: List[Tuple[str, str, str]] = [
     # key, title, hint shown at the right of the header
     ("skin", "피부", ""),
+    ("bodyskin", "몸 피부", ""),
     ("body", "몸", "− 가늘게  /  + 넓게"),
     ("shape", "키 · 비율", "+ 길게 / 넓게"),
     ("face", "얼굴형", "− 작게 / 짧게"),
@@ -110,6 +111,12 @@ PARAMS: List[ParamDef] = [
     ParamDef("skin_sat", "피부 채도", "skin", -40, 40, kind="skin"),
     ParamDef("grain", "그레인", "skin", 0, 100, unit="pct", kind="skin", tip="피부 영역에 필름 그레인 (매끈해진 피부에 질감)"),
     ParamDef("grain_color", "색상 그레인", "skin", 0, 100, unit="pct", kind="skin", tip="0이면 모노크롬 그레인"),
+    # ---- body skin (1.23): its own switches and values, apart from the face's; 0 = off
+    ParamDef("body_skin", "몸 피부 보정", "bodyskin", 0, 100, unit="pct", kind="skin",
+             tip="얼굴 밖의 보이는 피부(목·어깨, 팔·손, 몸통, 다리)의 결을 고르게. 옷·머리카락·장신구와 다른 인물은 제외됩니다"),
+    ParamDef("body_blemish", "몸 잡티 제거", "bodyskin", 0, 100, unit="pct", kind="skin",
+             tip="몸 피부의 작은 트러블·붉은 점을 주변 피부로 메웁니다. 문신·점·주근깨·흉터, 옷 경계, 손(마디 주름)은 그대로 둡니다. "
+                 "남겨 둔 자국은 아래 '제거' 표시로 지울 수 있습니다"),
     # ---- colour
     ParamDef("lip_hue", "입술 색조", "color", -40, 40, unit="deg", kind="color", tip="− 쪽이 핑크/보라, + 쪽이 코랄/오렌지"),
     ParamDef("lip_sat", "입술 채도", "color", -60, 60, kind="color"),
@@ -131,6 +138,13 @@ FACE_KEYS = [p.key for p in PARAMS if p.kind == "face"]
 HEAD_KEYS = [p.key for p in PARAMS if p.kind == "head"]
 GEOMETRY_KEYS = BODY_KEYS + SHAPE_KEYS + FACE_KEYS + HEAD_KEYS     # everything that moves pixels
 RETOUCH_KEYS = [p.key for p in PARAMS if p.kind in ("skin", "color")]
+# body skin (1.23). Each effect is on when its value is above 0; a new person has both at 0 (off). The regions are
+# apart from the face's 보정 부위: an older project's body regions there (목, 어깨·쇄골, 팔, 손, 다리 under the face's
+# 피부결) keep working as they did
+BODY_SKIN_KEYS = ["body_skin", "body_blemish"]
+BODY_START = {"body_skin": 50.0, "body_blemish": 50.0}        # the value an effect starts from when it is switched on
+BODY_REGIONS: List[Tuple[str, str]] = [("neck", "목·어깨"), ("arm", "팔·손"), ("torso", "몸통 앞면·등"), ("leg", "다리")]
+BODY_ALL = "all"                                               # 전신: every part of the body there is, the face left out
 # body parts that have a measured width (range multiplier)
 WIDTH_KEYS = ["waist", "upper_arm", "forearm", "thighs", "calves", "knee", "neck", "pelvis"]
 

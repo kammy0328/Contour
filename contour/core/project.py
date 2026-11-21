@@ -56,6 +56,51 @@ def scope_set(v) -> set:
     return set(norm_scope(v).split(","))
 
 
+def norm_body_scope(v) -> str:
+    """Where the body skin effects go: 'all' (전신) or body regions as 'neck,arm,...' (params.BODY_REGIONS).
+    Anything else, and nothing at all, is 전신."""
+    from .params import BODY_ALL, BODY_REGIONS
+    keys = [k for k, _ in BODY_REGIONS]
+    got = [k for k in keys if k in str(v or "").split(",")]
+    return ",".join(got) if got and len(got) < len(keys) else BODY_ALL
+
+
+def body_scope_set(v) -> set:
+    """The body regions of a scope ('all': every one of them)."""
+    from .params import BODY_ALL, BODY_REGIONS
+    s = norm_body_scope(v)
+    return {k for k, _ in BODY_REGIONS} if s == BODY_ALL else set(s.split(","))
+
+
+BODY_MARK_KINDS = ("remove", "exclude")      # 몸 잡티 marks by hand: this spot goes / nothing is removed here
+
+
+def norm_body_marks(v) -> list:
+    """Body blemish marks as saved: [{id, kind, t, pts [[x, y], ...] and r in source pixels of frame t, part,
+    uv [[u, v], ...], ru}] (retouch.bodyskin anchors them to a body part; a mark without a part stays where it
+    was drawn). Marks that cannot be read are left out."""
+    out = []
+    for m in v or []:
+        try:
+            if m.get("kind") not in BODY_MARK_KINDS:
+                continue
+            pts = [[float(x), float(y)] for x, y in m.get("pts") or []]
+            if not pts:
+                continue
+            d = dict(id=str(m.get("id") or uuid.uuid4().hex[:8]), kind=m["kind"], t=int(m.get("t", 0)),
+                     pts=pts, r=float(m.get("r", 6.0)), part=str(m.get("part") or ""))
+            uv = [[float(a), float(b)] for a, b in m.get("uv") or []]
+            if d["part"] and len(uv) == len(pts):
+                d["uv"] = uv
+                d["ru"] = float(m.get("ru", 0.0))
+            else:
+                d["part"] = ""
+            out.append(d)
+        except Exception:
+            continue
+    return out
+
+
 @dataclass
 class Curve:
     base: float = 0.0
@@ -127,6 +172,12 @@ class PartParams:
     skin_scope: str = "face,neck"    # skin regions, comma separated: face, neck, shoulder, arm, hand, leg
     grain_size: float = 1.0          # grain particle size (px at 1080p)
     blemish_size: float = 50.0       # 0..100 largest spot the blemish removal takes (share of the face width)
+    # body skin (1.23; amounts 'body_skin' and 'body_blemish', 0 = off)
+    body_detail: float = 60.0        # 결 보존: % of the fine texture (pores, fine hair) the body smoothing gives back
+    body_blemish_size: float = 40.0  # 0..100 largest spot the body blemish removal takes (share of the body part's size)
+    body_scope: str = "all"          # 'all' (전신) or body regions: neck, arm, torso, leg (norm_body_scope)
+    body_memo: Dict[str, dict] = field(default_factory=dict)   # an effect switched off: its curve, to come back as it was
+    body_marks: List[dict] = field(default_factory=list)       # 몸 잡티 marks by hand (norm_body_marks)
     cloth: str = "include"           # body edits and clothes: include | skirt (skirt, dress below the waist kept) | all
     feather: float = 50.0            # 0..100 how softly shape changes fade into their surroundings
     sculpt: Dict[int, List[float]] = field(default_factory=dict)   # dense face point index -> [du, dv]
@@ -169,6 +220,39 @@ class PartParams:
     def skin_active(self) -> bool:
         return self.retouch_active()
 
+    # ---- body skin
+    def body_on(self, key: str) -> bool:
+        """A body skin effect (body_skin | body_blemish) is switched on: its value is above 0 somewhere."""
+        c = self.amounts.get(key)
+        return c is not None and (c.base > 1e-6 or any(v > 1e-6 for v in c.keys.values()))
+
+    def set_body_on(self, key: str, on: bool) -> None:
+        """Switch a body skin effect on or off. Off keeps its values (keys too) to come back to; on the first
+        time it starts from params.BODY_START."""
+        from .params import BODY_SKIN_KEYS, BODY_START
+        if key not in BODY_SKIN_KEYS or on == self.body_on(key):
+            return
+        if on:
+            memo = self.body_memo.pop(key, None)
+            c = Curve.from_dict(memo) if memo else Curve(base=BODY_START[key])
+            if not (c.base > 1e-6 or any(v > 1e-6 for v in c.keys.values())):
+                c = Curve(base=BODY_START[key])
+            self.amounts[key] = c
+        else:
+            self.body_memo[key] = self.amounts[key].to_dict()
+            self.amounts[key] = Curve(base=0.0)
+
+    def copy_body_from(self, src: "PartParams", marks: bool = False) -> None:
+        """The body skin settings that are not sliders (texture kept, largest spot, regions, the switched-off
+        values). marks: the hand marks too (they belong to one cut's frames and one person's body: only for a copy
+        of the same person in the same cut)."""
+        self.body_detail = float(src.body_detail)
+        self.body_blemish_size = float(src.body_blemish_size)
+        self.body_scope = norm_body_scope(src.body_scope)
+        self.body_memo = {k: dict(v) for k, v in src.body_memo.items()}
+        if marks:
+            self.body_marks = norm_body_marks(src.body_marks)
+
     def keyed_parts(self) -> List[str]:
         return [k for k in ALL_KEYS if self.amounts.get(k) is not None and self.amounts[k].keys]
 
@@ -176,10 +260,27 @@ class PartParams:
         return {"amounts": {k: c.to_dict() for k, c in self.amounts.items()}, "widths": dict(self.widths),
                 "strength": self.strength.to_dict(), "skin_detail": self.skin_detail, "skin_scope": self.skin_scope,
                 "grain_size": self.grain_size, "feather": self.feather, "blemish_size": self.blemish_size, "cloth": self.cloth,
+                **self._body_dict(),
                 "sculpt": {str(k): list(v) for k, v in self.sculpt.items()},
                 "body_sculpt": dict(self.body_sculpt), "body_sides": self.body_sides,
                 **({"skin_basic": {"level": self.skin_basic.get("level", "std"),
                                    "remove": list(self.skin_basic.get("remove", []))}} if self.skin_basic else {})}
+
+    def _body_dict(self) -> dict:
+        """The body skin settings, only what is not as a new person has it (a project that never used them is
+        written as before)."""
+        out = {}
+        if abs(self.body_detail - 60.0) > 1e-9:
+            out["body_detail"] = self.body_detail
+        if abs(self.body_blemish_size - 40.0) > 1e-9:
+            out["body_blemish_size"] = self.body_blemish_size
+        if norm_body_scope(self.body_scope) != "all":
+            out["body_scope"] = norm_body_scope(self.body_scope)
+        if self.body_memo:
+            out["body_memo"] = {k: dict(v) for k, v in self.body_memo.items()}
+        if self.body_marks:
+            out["body_marks"] = norm_body_marks(self.body_marks)
+        return out
 
     @classmethod
     def from_dict(cls, d) -> "PartParams":
@@ -207,6 +308,12 @@ class PartParams:
         p.skin_scope = norm_scope(d.get("skin_scope", "face"))
         p.grain_size = float(d.get("grain_size", 1.0))
         p.blemish_size = float(d.get("blemish_size", 50.0))
+        p.body_detail = min(100.0, max(0.0, float(d.get("body_detail", 60.0))))
+        p.body_blemish_size = min(100.0, max(0.0, float(d.get("body_blemish_size", 40.0))))
+        p.body_scope = norm_body_scope(d.get("body_scope", "all"))
+        from .params import BODY_SKIN_KEYS
+        p.body_memo = {k: dict(v) for k, v in (d.get("body_memo") or {}).items() if k in BODY_SKIN_KEYS and isinstance(v, dict)}
+        p.body_marks = norm_body_marks(d.get("body_marks"))
         p.cloth = d.get("cloth", "include") if d.get("cloth") in ("include", "skirt", "all") else "include"
         p.feather = float(d.get("feather", 50.0))
         p.sculpt = {int(k): [float(v[0]), float(v[1])] for k, v in (d.get("sculpt") or {}).items()}
@@ -249,6 +356,7 @@ class PartParams:
         p.skin_scope = self.skin_scope
         p.grain_size = self.grain_size
         p.blemish_size = self.blemish_size
+        p.copy_body_from(self)
         p.cloth = self.cloth
         p.feather = self.feather
         p.sculpt = {k: list(v) for k, v in self.sculpt.items()}

@@ -56,10 +56,36 @@ def test_existing_project_reads_back_every_value(old_project, golden):
     cut = prj.cuts[0]
     was = json.loads(str(golden["cut_json"]).replace(json.dumps(BU.PLACEHOLDER)[1:-1], json.dumps(str(src))[1:-1]))
     now = json.loads(json.dumps(cut.to_dict(), ensure_ascii=False))
-    for k, v in was.items():
-        assert k in now, f"{k}: a value 1.22.2 saved is no longer read"
-        assert now[k] == v, f"{k}: read back as {now[k]!r}, 1.22.2 had {v!r}"
+    _holds(was, now, "cut")
     assert BU.digest(pdir) == before, "reading a project writes nothing"
+
+
+def _holds(was, now, where: str) -> None:
+    """Every value 1.22.2 saved is read back as it was. A later version may know more (a new slider at its
+    default: 1.23's body skin values, off), never less and never another value."""
+    if isinstance(was, dict):
+        assert isinstance(now, dict), f"{where}: no longer a group of values"
+        for k, v in was.items():
+            assert k in now, f"{where}.{k}: a value 1.22.2 saved is no longer read"
+            _holds(v, now[k], f"{where}.{k}")
+    else:
+        assert now == was, f"{where}: read back as {now!r}, 1.22.2 had {was!r}"
+
+
+def test_new_values_of_a_later_version_are_off_in_an_old_project(old_project):
+    """What a version after 1.22.2 added to a person's values starts switched off in a project made before it,
+    and a project that never used it is written without it (1.23: body skin)."""
+    from contour.core.project import Project
+    from contour.core.params import BODY_SKIN_KEYS
+    pdir, _src = old_project
+    cut = Project.load(str(pdir)).cuts[0]
+    for pp in cut.params.values():
+        assert all(pp.amounts[k].base == 0.0 and not pp.amounts[k].keys for k in BODY_SKIN_KEYS)
+        assert not pp.body_on("body_skin") and not pp.body_on("body_blemish")
+        assert pp.body_scope == "all" and pp.body_marks == [] and pp.body_memo == {}
+        d = pp.to_dict()
+        assert not [k for k in d if k.startswith("body_") and k not in ("body_sculpt", "body_sides")], \
+            "an unused body skin setting is not written into the project"
 
 
 def test_existing_project_opens_in_a_session_without_writing(old_project):
@@ -198,10 +224,86 @@ def test_saving_keeps_everything_1222_wrote(old_project, golden):
             continue
         if k == "cuts":
             for c0, c1 in zip(v, now_prj["cuts"]):
-                for kk, vv in c0.items():
-                    assert kk in c1 and c1[kk] == vv, f"cut.{kk}"
+                _holds(c0, c1, "cut")
         else:
             assert now_prj[k] == v, k
     with np.load(cut_dir / "tracks.npz") as d:
         for k, v in was_tracks.items():
             assert k in d.files and np.array_equal(d[k], v, equal_nan=True), f"tracks.{k}"
+
+
+# ------------------------------------------------------------------------------------------------- body regions chosen by hand
+# Instruction 2026-11-20 §2: "기존 프로젝트의 명시적인 몸 영역 선택은 마이그레이션 후에도 같은 결과를 유지". The second
+# fixture (tools/make_baseline_fixture.py --body) is the same person with bare shoulders, saved by 1.22.2 with the skin
+# retouch's regions 어깨·쇄골, 팔, 손, 다리 chosen besides the face and neck. 1.23 adds the body skin effects beside
+# them; the regions of before keep working as they did, and nothing is moved over to the new ones.
+FIX_BODY = Path(__file__).resolve().parent / "data" / "baseline_1222_body"
+
+
+@pytest.fixture
+def golden_body():
+    with np.load(FIX_BODY / "golden.npz", allow_pickle=False) as d:
+        return {k: d[k] for k in d.files}
+
+
+@pytest.fixture
+def old_body_project(tmp_path):
+    return BU.copy_fixture(FIX_BODY, tmp_path)
+
+
+def test_body_fixture_has_the_regions_and_they_did_something_in_1222(golden_body):
+    assert str(golden_body["version"]) == "1.22.2"
+    cut = json.loads(str(golden_body["cut_json"]))
+    assert cut["params"]["0"]["skin_scope"] == BU.BODY_REGIONS
+    d = np.abs(golden_body["preview"].astype(np.int32) - golden_body["preview_face"].astype(np.int32)).max(-1)
+    assert int((d > 0).sum()) > 200 and int(d.max()) >= 10, "the fixture's body regions change nothing: it would hold nothing"
+    # and where: on the bare skin below the face (it begins at row 87 of the frames), not on the face
+    ys = np.nonzero(d[0] > 0)[0]
+    assert float((ys >= 84).mean()) > 0.9 and int(ys.min()) > 70, "the difference of the two is below the face"
+
+
+def test_explicit_body_regions_render_what_1222_rendered(old_body_project, golden_body):
+    from contour.core.project import Project
+    pdir, src = old_body_project
+    prj = Project.load(str(pdir))
+    pp = prj.cuts[0].params_for(0)
+    assert pp.skin_scope == BU.BODY_REGIONS
+    assert not pp.body_on("body_skin") and not pp.body_on("body_blemish") and pp.body_scope == "all", \
+        "the regions of before are not turned into the new effects"
+    with BU.NoModels():
+        planes = BU.render_planes(prj, prj.cuts[0])
+    g = golden_body["planes"]
+    assert planes.shape == g.shape and planes.dtype == g.dtype
+    d = np.abs(planes.astype(np.int32) - g.astype(np.int32))
+    where = np.unravel_index(int(d.argmax()), d.shape)
+    assert d.max() <= PLANE_TOL, f"max difference {d.max()} of 1023 at frame/plane/y/x {where}, mean {d.mean():.4f}"
+    assert d.mean() <= 0.05, f"mean difference {d.mean():.4f}"
+    if _same_env(golden_body):
+        assert np.array_equal(planes, g), f"same libraries as the fixture: {int((d > 0).sum())} values differ"
+
+
+def test_explicit_body_regions_preview_what_1222_showed(old_body_project, golden_body):
+    from contour.core.project import Project
+    pdir, src = old_body_project
+    prj = Project.load(str(pdir))
+    with BU.NoModels():
+        prev = BU.preview_frames(prj, prj.cuts[0], [int(t) for t in golden_body["frames"]])
+    g = golden_body["preview"]
+    assert prev.shape == g.shape
+    d = np.abs(prev.astype(np.int32) - g.astype(np.int32))
+    assert d.max() <= PREVIEW_TOL, f"max difference {d.max()} of 255, mean {d.mean():.4f}"
+    if _same_env(golden_body):
+        assert np.array_equal(prev, g)
+
+
+def test_explicit_body_regions_are_saved_as_they_were(old_body_project, golden_body):
+    """Opened and saved by the code of now: the regions are the ones 1.22.2 wrote, and no body skin value was added
+    for a project that does not use them."""
+    from contour.core.project import Project
+    pdir, src = old_body_project
+    prj = Project.load(str(pdir))
+    prj.save()
+    now = json.loads((pdir / "project.json").read_text(encoding="utf-8"))["cuts"][0]["params"]["0"]
+    assert now["skin_scope"] == BU.BODY_REGIONS
+    assert not [k for k in now if k.startswith("body_") and k not in ("body_sculpt", "body_sides")]
+    assert now["amounts"]["body_skin"]["base"] == 0 and now["amounts"]["body_blemish"]["base"] == 0

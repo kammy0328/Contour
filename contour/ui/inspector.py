@@ -28,6 +28,26 @@ def _scroll(inner: QWidget) -> QScrollArea:
     return sa
 
 
+
+def body_cloth_line(tracker, cut, on: bool):
+    """(what the body skin box says about the look for skin-coloured clothing, whether a look can be made now)."""
+    if tracker is None or cut is None or getattr(tracker, "store", None) is None or not on:
+        return "", False
+    try:
+        from ..track import skincloth as SC
+        if not SC.needed(tracker, cut):
+            inf = SC.info(tracker)
+            if inf.get("state") == "current":
+                if inf.get("ranges"):
+                    return f"피부색 옷 확인됨: {int(inf.get('frames', 0))}프레임에서 옷·머리카락을 제외합니다.", False
+                return "피부색 옷 확인됨: 피부로 잘못 볼 옷·머리카락이 없습니다.", False
+            return "옷 영역(옷 유지) 분석을 그대로 씁니다.", False
+        st_ = SC.info(tracker).get("state")
+        return ("인물 매트가 바뀌어 피부색 옷을 다시 확인해야 합니다." if st_ == "stale"
+                else "피부색 옷(퍼, 살색 옷)은 아직 확인 전입니다. 내보낼 때 자동으로 확인합니다."), True
+    except Exception:
+        return "", False
+
 class _Tab(QWidget):
     def __init__(self, ctl):
         super().__init__()
@@ -127,6 +147,8 @@ class ReshapeTab(_Tab):
         self.groups: Dict[str, tuple] = {}
         unit_map = {"%": "%", "pct": "pct", "deg": "deg"}
         for gkey, title, hint in GROUPS:
+            if gkey == "bodyskin":
+                continue                    # body skin has its own box in the skin tab (_body_skin_box)
             if (gkey in self.SKIN_GROUPS) != (part == "skin"):
                 continue
             head = Wd.GroupHeader(title, hint, expanded=self._expanded.get(gkey, False))
@@ -163,6 +185,13 @@ class ReshapeTab(_Tab):
             self.groups[gkey] = (head, box)
             add(head)
             add(box)
+        self.body_rows: Dict[str, Wd.ParamRow] = {}
+        self.body_toggles: Dict[str, Wd.Toggle] = {}
+        self.body_scope_boxes: Dict[str, QCheckBox] = {}
+        self.body_mark_btns: Dict[str, QPushButton] = {}
+        self.body_detail = self.body_size = self.body_mark_r = self.body_mark_info = self.body_note = None
+        if part == "skin":
+            self.add(self._body_skin_box())
         btns = QHBoxLayout()
         reset = Wd.button("초기화", "ghost", "refresh-cw",
                           "이 인물의 피부·색 보정 값을 처음으로" if part == "skin" else "이 인물의 몸매·얼굴형 값을 처음으로")
@@ -188,6 +217,183 @@ class ReshapeTab(_Tab):
             self._retain(self.feather)
         if part == "skin":
             self._show_view(self._view)
+
+    # ---- skin: body skin (1.23)
+    def _body_skin_box(self):
+        """몸 피부: 몸 피부 보정 (강도, 결 보존) and 몸 잡티 제거 (강도, 최대 잡티 크기) with their switches, where they go
+        (전신 or regions) and the hand marks of the blemish tool. Apart from the face's values above."""
+        from ..core.params import BODY_REGIONS, PARAM
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 10, 0, 4)
+        v.setSpacing(4)
+        v.addWidget(Wd.Section("몸 피부"))
+        self.body_note = Wd.label("얼굴 밖의 보이는 피부에만 들어갑니다 (얼굴이 화면에 없어도 됩니다). 옷·머리카락·"
+                                  "장신구와 다른 인물은 제외되고, 확실하지 않은 곳은 그대로 둡니다.", "Faint", 11)
+        self.body_note.setWordWrap(True)
+        v.addWidget(self.body_note)
+
+        def effect(key, title, extra_key, extra_label, extra_default, extra_tip, what):
+            tg = Wd.Toggle()
+            tg.toggled.connect(lambda on, k=key: self.ctl.set_body_on(k, on))
+            v.addWidget(Wd.FieldRow(title, tg, PARAM[key].tip))
+            self.body_toggles[key] = tg
+            r = Wd.ParamRow(key, "강도", 0, 100, 1, "pct", 0)
+            r.name.setFixedWidth(64)
+            r.name.setToolTip(PARAM[key].tip)
+            r.changed.connect(lambda k, val: self.ctl.param_changed(k, val, False))
+            r.committed.connect(lambda k, val: self.ctl.param_changed(k, val, True))
+            r.keyToggled.connect(self.ctl.toggle_param_key)
+            v.addWidget(r)
+            self.body_rows[key] = r
+            e = Wd.ParamRow(extra_key, extra_label, 0, 100, 1, "pct", extra_default)
+            e.name.setFixedWidth(64)
+            e.name.setToolTip(extra_tip)
+            self._retain(e)
+            e.changed.connect(lambda k, val: self.ctl.set_body(what, val, False))
+            e.committed.connect(lambda k, val: self.ctl.set_body(what, val, True))
+            v.addWidget(e)
+            return e
+        self.body_detail = effect("body_skin", "몸 피부 보정", "body_detail", "결 보존", 60,
+                                  "모공·잔털 같은 가는 결을 남기는 정도. 높을수록 결은 그대로 두고 얼룩만 고르게 합니다",
+                                  "detail")
+        v.addSpacing(4)
+        self.body_size = effect("body_blemish", "몸 잡티 제거", "body_blemish_size", "최대 크기", 40,
+                                "지울 잡티의 최대 크기 (몸 크기 기준). 이보다 큰 자국은 그대로 둡니다", "blemish_size")
+        v.addSpacing(4)
+        v.addWidget(Wd.label("적용 부위", "", 12))
+        box = QWidget()
+        box.setToolTip("전신: 얼굴을 뺀 보이는 피부 전부 (관절을 못 찾은 클로즈업도 포함)\n"
+                       "부위를 고르면 그 부위만. 몸통은 팔·다리·목을 뺀 나머지입니다")
+        gl = QGridLayout(box)
+        gl.setContentsMargins(0, 2, 0, 2)
+        gl.setHorizontalSpacing(10)
+        gl.setVerticalSpacing(4)
+        for i, (k, lab) in enumerate([("all", "전신")] + list(BODY_REGIONS)):
+            cb = QCheckBox(lab)
+            cb.toggled.connect(lambda on, kk=k: self._body_scope_toggled(kk, on))
+            gl.addWidget(cb, i // 3, i % 3)
+            self.body_scope_boxes[k] = cb
+        v.addWidget(box)
+        v.addSpacing(4)
+        v.addWidget(Wd.label("잡티 직접 표시", "", 12))
+        mr = QHBoxLayout()
+        mr.setContentsMargins(0, 0, 0, 0)
+        mr.setSpacing(6)
+        for kind, text, tip in (("remove", "제거", "자동으로 못 찾았거나 남겨 둔 자국(점·흉터 등)을 찍거나 그려서 지웁니다"),
+                                ("exclude", "제외", "자동 제거가 건드리면 안 되는 곳을 찍거나 그려서 그대로 둡니다")):
+            b = Wd.button(text, "", "pencil" if kind == "remove" else "shield", tip)
+            b.setCheckable(True)
+            b.toggled.connect(lambda on, kk=kind: self._body_mark_toggled(kk, on))
+            mr.addWidget(b)
+            self.body_mark_btns[kind] = b
+        clear = Wd.button("표시 지우기", "ghost", "trash-2", "이 인물의 잡티 표시를 모두 지웁니다")
+        clear.clicked.connect(self.ctl.clear_body_marks)
+        mr.addWidget(clear)
+        mr.addStretch(1)
+        self.body_mark_btns["clear"] = clear
+        mw = QWidget()
+        mw.setLayout(mr)
+        v.addWidget(mw)
+        self.body_mark_r = Wd.ParamRow("body_mark_r", "표시 크기", 2, 60, 1, "x", 8)
+        self.body_mark_r.name.setFixedWidth(64)
+        self.body_mark_r.name.setToolTip("찍거나 그리는 표시의 반지름 (원본 픽셀)")
+        self._retain(self.body_mark_r)
+        self.body_mark_r.changed.connect(lambda k, val: self.ctl.set_body_mark_radius(val))
+        self.body_mark_r.committed.connect(lambda k, val: self.ctl.set_body_mark_radius(val))
+        v.addWidget(self.body_mark_r)
+        self.body_mark_info = Wd.label("", "Faint", 11)
+        self.body_mark_info.setWordWrap(True)
+        v.addWidget(self.body_mark_info)
+        cr = QHBoxLayout()
+        cr.setContentsMargins(0, 2, 0, 0)
+        cr.setSpacing(6)
+        self.body_cloth_info = Wd.label("", "Faint", 11)
+        self.body_cloth_info.setWordWrap(True)
+        cr.addWidget(self.body_cloth_info, 1)
+        self.body_cloth_btn = Wd.button("옷 확인", "ghost", "search",
+                                        "피부색 옷(퍼, 살색 상의·스타킹 등)과 피부로 잘못 볼 머리카락을 SAM 3.1로 찾아 몸 피부에서 제외합니다.\n"
+                                        "몸 효과를 켜면 자동으로 하고, 내보낼 때도 안 되어 있으면 먼저 합니다")
+        self.body_cloth_btn.clicked.connect(lambda: self.ctl.ensure_skin_cloth(quiet=False))
+        cr.addWidget(self.body_cloth_btn)
+        cw = QWidget()
+        cw.setLayout(cr)
+        v.addWidget(cw)
+        v.addWidget(Wd.label("K: 적용 영역과 찾은 잡티 보기 (빨강: 제거 · 회색: 남겨 둠)", "Faint", 11))
+        return w
+
+    def _body_scope_toggled(self, key: str, on: bool):
+        from ..core.params import BODY_REGIONS
+        keys = [k for k, _ in BODY_REGIONS]
+        if key == "all":
+            sel = "all" if on else ",".join(keys[:1])
+        else:
+            got = [k for k in keys if self.body_scope_boxes[k].isChecked()]
+            sel = ",".join(got) if got else "all"          # never nothing: with every region off it is 전신 again
+        self.ctl.set_body("scope", sel, True)
+
+    def _body_mark_toggled(self, kind: str, on: bool):
+        if on:
+            self.ctl.set_body_mark_mode(kind)
+        elif getattr(self.ctl.viewer, "tool", "") == "bodymark" and getattr(self.ctl.viewer, "mark_kind", "") == kind:
+            self.ctl.set_body_mark_mode("")
+
+    def _fill_body(self, pp, enabled: bool, t: int):
+        from ..core.params import BODY_REGIONS
+        from ..core.project import body_scope_set, norm_body_scope
+        v = self.ctl.viewer
+        marking = getattr(v, "tool", "") == "bodymark"
+        for key, tg in self.body_toggles.items():
+            on = bool(pp is not None and pp.body_on(key))
+            tg.blockSignals(True)
+            tg.setChecked(on)
+            tg.blockSignals(False)
+            tg.setEnabled(enabled)
+            r = self.body_rows[key]
+            r.setEnabled(enabled and on)
+            if pp is not None:
+                c = pp.amounts[key]
+                # a switched-off effect shows the value it comes back with
+                memo = pp.body_memo.get(key) if not on else None
+                r.set_value(float(memo.get("base", 0.0)) if memo else c.value(t))
+                r.set_key_state("key" if c.has_key(t) else ("animated" if c.is_animated() else "none"))
+            else:
+                r.set_value(0)
+                r.set_key_state("none")
+        skin_on = bool(pp is not None and pp.body_on("body_skin"))
+        spot_on = bool(pp is not None and pp.body_on("body_blemish"))
+        self.body_detail.setEnabled(enabled and skin_on)
+        self.body_size.setEnabled(enabled and spot_on)
+        if pp is not None:
+            self.body_detail.set_value(pp.body_detail)
+            self.body_size.set_value(pp.body_blemish_size)
+        scope = norm_body_scope(pp.body_scope) if pp is not None else "all"
+        regs = body_scope_set(scope)
+        for k, cb in self.body_scope_boxes.items():
+            cb.blockSignals(True)
+            cb.setChecked(scope == "all" if k == "all" else (scope != "all" and k in regs))
+            cb.blockSignals(False)
+            cb.setEnabled(enabled and (skin_on or spot_on))
+        for kind in ("remove", "exclude"):
+            b = self.body_mark_btns[kind]
+            b.blockSignals(True)
+            b.setChecked(marking and getattr(v, "mark_kind", "") == kind)
+            b.blockSignals(False)
+            b.setEnabled(enabled and spot_on)
+        n = len(pp.body_marks) if pp is not None else 0
+        self.body_mark_btns["clear"].setEnabled(enabled and n > 0)
+        text, can = body_cloth_line(getattr(self.ctl.session, "tracker", None), getattr(self.ctl.session, "cut", None),
+                                    skin_on or spot_on)
+        self.body_cloth_info.setText(text)
+        self.body_cloth_btn.setEnabled(enabled and can)
+        self.body_mark_r.setEnabled(enabled and spot_on)
+        self.body_mark_r.set_value(float(getattr(v, "mark_r", 8.0)))
+        if n:
+            nr = sum(1 for m in pp.body_marks if m.get("kind") == "remove")
+            self.body_mark_info.setText(f"표시 {n}개 (제거 {nr} · 제외 {n - nr})" + ("" if spot_on else " · 몸 잡티 제거를 켜면 적용됩니다"))
+        else:
+            self.body_mark_info.setText("")
+        self.body_mark_info.setVisible(bool(n))
 
     # ---- skin: basic adjustment
     def _basic_box(self):
@@ -607,6 +813,7 @@ class ReshapeTab(_Tab):
                 r.set_key_state("none")
         if self.part == "skin":
             self._fill_basic(pp, enabled)
+            self._fill_body(pp, enabled, t)
         if pp is not None:
             if self.strength is not None:
                 self.strength.set_value(pp.strength.value(t))

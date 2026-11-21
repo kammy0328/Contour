@@ -963,12 +963,14 @@ def smooth_channel(I: np.ndarray, mask: np.ndarray, strength: float, keep: float
     """I float32 (0..1-ish), mask same size. Returns the smoothed channel (only where mask > 0).
     relative: the edge threshold follows the skin's own brightness (luma), so a dark grade and a flash
     frame of the same face are smoothed alike."""
-    ys, xs = np.nonzero(mask > 0.004)
-    if not len(xs):
+    sel = mask > 0.004
+    ys = np.flatnonzero(sel.any(1))         # (the rows and columns with something: listing every pixel of the mask
+    if not len(ys):                         # took longer than the smoothing of a small area on a 4K plane)
         return I
+    xs = np.flatnonzero(sel.any(0))
     pad = 3 * r + 4
-    y0, y1 = max(0, ys.min() - pad), min(I.shape[0], ys.max() + pad + 1)
-    x0, x1 = max(0, xs.min() - pad), min(I.shape[1], xs.max() + pad + 1)
+    y0, y1 = max(0, int(ys[0]) - pad), min(I.shape[0], int(ys[-1]) + pad + 1)
+    x0, x1 = max(0, int(xs[0]) - pad), min(I.shape[1], int(xs[-1]) + pad + 1)
     roi = I[y0:y1, x0:x1].astype(np.float32)
     m = mask[y0:y1, x0:x1]
     if relative:

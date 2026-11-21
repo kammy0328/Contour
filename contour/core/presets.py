@@ -91,6 +91,8 @@ def make(pp: PartParams, frame: float, name: str, groups: List[str], points: boo
         if getattr(pp, "skin_basic", None):
             d["skin"]["basic"] = {"level": pp.skin_basic.get("level", "std"),
                                   "remove": list(pp.skin_basic.get("remove", []))}
+    if "bodyskin" in groups:
+        d["bodyskin"] = dict(detail=pp.body_detail, blemish_size=pp.body_blemish_size, scope=pp.body_scope)
     if points:
         if pp.sculpt:
             d["sculpt"] = {str(k): list(v) for k, v in pp.sculpt.items()}
@@ -144,6 +146,14 @@ def apply(pp: PartParams, d: dict) -> None:
         b = sk.get("basic") or {}
         pp.skin_basic = {"level": b["level"], "remove": list(b.get("remove") or [])} \
             if isinstance(b, dict) and b.get("level") in ("light", "std", "strong") else {}
+    bs = d.get("bodyskin")
+    if bs:
+        from .project import norm_body_scope
+        pp.body_detail = float(bs.get("detail", pp.body_detail))
+        pp.body_blemish_size = float(bs.get("blemish_size", pp.body_blemish_size))
+        pp.body_scope = norm_body_scope(bs.get("scope", pp.body_scope))
+    if "bodyskin" in (d.get("groups") or []):
+        pp.body_memo = {}                 # the preset says what is on and off: nothing kept from before to come back to
     if "sculpt" in d:
         pp.sculpt = {int(k): [float(v[0]), float(v[1])] for k, v in d["sculpt"].items()}
     if "body_sculpt" in d:

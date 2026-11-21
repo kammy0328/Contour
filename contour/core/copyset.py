@@ -132,6 +132,7 @@ def apply_copy(src: Cut, dst: Cut, mapping: Dict[int, Optional[int]], frame: int
                 d_params.skin_scope = s_params.skin_scope
                 d_params.grain_size = s_params.grain_size
                 d_params.blemish_size = s_params.blemish_size
+                d_params.copy_body_from(s_params)          # (the hand marks stay with the cut they were made on)
                 d_params.cloth = s_params.cloth
                 d_params.feather = s_params.feather
                 d_params.sculpt = s_params.sculpt

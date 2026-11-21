@@ -1,0 +1,501 @@
+{
+ "format": 1,
+ "name": "baseline",
+ "cuts": [
+  {
+   "id": "e6df387d68",
+   "name": "c1",
+   "source": "C:\\DIAP_Baseline\\src.mkv",
+   "info": {
+    "path": "C:\\DIAP_Baseline\\src.mkv",
+    "kind": "video",
+    "width": 192,
+    "height": 144,
+    "fps_num": 24,
+    "fps_den": 1,
+    "frames": 6,
+    "seq_pattern": "",
+    "seq_start": 0,
+    "codec": "h264",
+    "pix_fmt": "yuv444p",
+    "bit_depth": 8,
+    "chroma": "444",
+    "has_alpha": false,
+    "is_float": false,
+    "color_range": "tv",
+    "color_matrix": "bt709",
+    "color_trc": "",
+    "color_primaries": "",
+    "timecode": "",
+    "has_audio": false,
+    "duration": 0.25,
+    "offset": 0,
+    "meta_text": "ENCODER=Lavc60.31.102 libx264"
+   },
+   "in_frame": 0,
+   "out_frame": -1,
+   "input_cs": "",
+   "cs_auto": "",
+   "cs_analysed": "",
+   "models_used": {},
+   "lut_path": "",
+   "mode": "warp",
+   "persons": [
+    {
+     "id": 0,
+     "name": "A",
+     "color": "#ff8800",
+     "role": "target",
+     "profile": [],
+     "first": 0,
+     "last": 0,
+     "reid": [],
+     "faces": [],
+     "member": "",
+     "member_conf": 0.0,
+     "still": false,
+     "hold": ""
+    },
+    {
+     "id": 1,
+     "name": "B",
+     "color": "#00aaff",
+     "role": "protect",
+     "profile": [],
+     "first": 0,
+     "last": 0,
+     "reid": [],
+     "faces": [],
+     "member": "",
+     "member_conf": 0.0,
+     "still": false,
+     "hold": ""
+    }
+   ],
+   "params": {
+    "0": {
+     "amounts": {
+      "waist": {
+       "base": 25.0,
+       "keys": {},
+       "smooth": true
+      },
+      "upper_arm": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "forearm": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "shoulders": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "thighs": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "calves": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "legs": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "knee": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "neck": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "shoulder_line": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "pelvis": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "hip_up": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "arm_under": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "belly": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "body_sculpt": {
+       "base": 100,
+       "keys": {},
+       "smooth": true
+      },
+      "height": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "leg_length": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "body_width": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "face": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "face_length": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "lower_face": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "jaw": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "jaw_fix": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "cheekbone": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "chin": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "chin_width": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "eyes": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "eye_height": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "eye_dist": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "eye_tilt": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "nose": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "nose_bridge": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "mouth": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "mouth_corner": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "philtrum": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "sculpt": {
+       "base": 100,
+       "keys": {},
+       "smooth": true
+      },
+      "head": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "crown": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "hair_volume": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "skin": {
+       "base": 70.0,
+       "keys": {},
+       "smooth": true
+      },
+      "nasolabial": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "mouth_lines": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "blemish": {
+       "base": 40.0,
+       "keys": {},
+       "smooth": true
+      },
+      "dark_circle": {
+       "base": 30.0,
+       "keys": {},
+       "smooth": true
+      },
+      "shine": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "redness": {
+       "base": 15.0,
+       "keys": {},
+       "smooth": true
+      },
+      "neck_lines": {
+       "base": 30.0,
+       "keys": {},
+       "smooth": true
+      },
+      "neck_bumps": {
+       "base": 20.0,
+       "keys": {},
+       "smooth": true
+      },
+      "skin_bright": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "skin_warm": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "skin_sat": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "grain": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "grain_color": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "lip_hue": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "lip_sat": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "lip_bright": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "blush": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "blush_hue": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "shading": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "highlight": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "teeth": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "eye_white": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      },
+      "knee_dark": {
+       "base": 0.0,
+       "keys": {},
+       "smooth": true
+      }
+     },
+     "widths": {
+      "waist": 1.0,
+      "upper_arm": 1.0,
+      "forearm": 1.0,
+      "thighs": 1.0,
+      "calves": 1.0,
+      "knee": 1.0,
+      "neck": 1.0,
+      "pelvis": 1.0
+     },
+     "strength": {
+      "base": 100.0,
+      "keys": {},
+      "smooth": true
+     },
+     "skin_detail": 45.0,
+     "skin_scope": "face,neck,shoulder,arm,hand,leg",
+     "grain_size": 1.0,
+     "feather": 50.0,
+     "blemish_size": 50.0,
+     "cloth": "include",
+     "sculpt": {},
+     "body_sculpt": {},
+     "body_sides": "person",
+     "skin_basic": {
+      "level": "std",
+      "remove": [
+       "acne"
+      ]
+     }
+    }
+   },
+   "joint_keys": {},
+   "locked": {},
+   "confirmed": {},
+   "hidden": {},
+   "protect": {
+    "others": true,
+    "falloff_pct": 3.0,
+    "border": true,
+    "reach": 1.9,
+    "lines": [],
+    "shapes": []
+   },
+   "tracking": {
+    "models": [
+     "pose_rtmpose_x",
+     "pose_rtmw_x",
+     "pose_rtmpose_m"
+    ],
+    "face": true,
+    "point_tracker": true,
+    "second_pass": true,
+    "smoothing": 0.35,
+    "conf_threshold": 0.55,
+    "adapt": true,
+    "refiner": true,
+    "flip_tta": false,
+    "detail": true,
+    "reid": true,
+    "members": 0,
+    "video_track": "off",
+    "seg": "sam2"
+   },
+   "output": {
+    "format": "prores_4444_xq",
+    "out_dir": "",
+    "name_pattern": "{cut}_reshape",
+    "include_audio": true,
+    "matte_person": false,
+    "matte_warp": false,
+    "output_cs": ""
+   },
+   "qc": [],
+   "stats": {
+    "active_seconds": 0.0,
+    "corrections": 0,
+    "analysis_runs": 0,
+    "auto_ok_rate": -1.0,
+    "renders": 0,
+    "render_seconds": 0.0,
+    "last_output": ""
+   },
+   "analyzed": true,
+   "analysis_version": 2,
+   "created": 1795187754.1606886,
+   "benchmark_id": "",
+   "learn": true,
+   "pending_copy": {},
+   "removed": [],
+   "edit_points": [],
+   "retouch_ref": "",
+   "style_learned": {},
+   "tl": {},
+   "status": {},
+   "version": 1,
+   "versions": {}
+  }
+ ],
+ "input_cs": "",
+ "created": 1795187754.0558834,
+ "modified": 1795187754.820863,
+ "learn": true,
+ "client": "",
+ "timeline": {},
+ "members": {},
+ "member_cannot": []
+}

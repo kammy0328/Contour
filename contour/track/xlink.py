@@ -341,10 +341,13 @@ def copy_settings(project, src_cut_id: str, pid: int, scope: str = "beauty") -> 
             continue
         dst = c2.params_for(int(p2))
         for k, cv in src.amounts.items():
-            if scope == "all" or groups.get(k) in ("skin", "color"):
+            if scope == "all" or groups.get(k) in ("skin", "bodyskin", "color"):
                 dst.amounts[k] = _copy.deepcopy(cv)
                 dst.amounts[k].keys = {}           # frame keys belong to the source cut's frames
         dst.skin_detail = src.skin_detail
+        dst.copy_body_from(src)
+        for m_ in dst.body_memo.values():          # (the switched-off values too: no keys of another cut's frames)
+            m_["keys"] = {}
         dst.skin_basic = dict(getattr(src, "skin_basic", {}) or {})
         c2.person(int(p2)).role = q.role if q.role == "target" else c2.person(int(p2)).role
         n += 1

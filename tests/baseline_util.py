@@ -14,6 +14,7 @@ W, H, N = 192, 144, 6
 MW, MH = W // 2, H // 2
 PLACEHOLDER = "C:\\DIAP_Baseline\\src.mkv"        # the path the frozen project.json holds (a Windows project)
 ALLOWED_NEW = ("matte_prompts.npz",)               # files a later version may add to an old project when it is opened
+BODY_REGIONS = "face,neck,shoulder,arm,hand,leg"   # the second fixture: the skin retouch's body regions chosen by hand
 
 
 def env_key() -> str:
@@ -24,9 +25,11 @@ def env_key() -> str:
     return f"{platform.system()}-{platform.machine()}|numpy {np.__version__}|opencv {cv2.__version__}"
 
 
-def frames_rgb() -> np.ndarray:
+def frames_rgb(bare: bool = False) -> np.ndarray:
     """N frames (H, W, 3) uint8: a person in a medium close-up at the left (skin with fine texture and a few
-    spots, a striped top), a smaller one at the right, on a textured background; everyone drifts a little."""
+    spots, a striped top), a smaller one at the right, on a textured background; everyone drifts a little.
+    bare (the second fixture): the top begins lower, the shoulders and the chest above it are bare skin with the
+    same texture and a few spots (what the skin retouch's body regions work on)."""
     rng = np.random.default_rng(1222)
     bg = np.zeros((H, W, 3), np.float32)
     yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
@@ -44,6 +47,15 @@ def frames_rgb() -> np.ndarray:
             y0 = int(top + hw * 2.3)
             stripes = 25 * ((xx[y0:H, max(0, x0):min(W, x1)] // 4) % 2)
             f[y0:H, max(0, x0):min(W, x1)] = np.array(col, np.float32) + stripes[..., None]
+            if bare:
+                y1 = min(H, int(y0 + hw * 1.5))
+                sel = np.zeros((H, W), bool)
+                sel[y0:y1, max(0, x0):min(W, x1)] = True
+                f[sel] = np.array((205, 160, 135), np.float32) + skin_tex[sel][:, None]
+                for dx, dy in ((-14, 10), (8, 22), (16, 34)):
+                    sx, sy = int(cx + dx * hw / 30), int(y0 + dy * hw / 30)
+                    if 1 <= sx < W - 1 and 1 <= sy < y1 - 1:
+                        f[sy - 1:sy + 2, sx - 1:sx + 2] -= 45
             # head: skin with texture
             m = ((xx - cx) / hw) ** 2 + ((yy - (top + hw * 1.15)) / (hw * 1.25)) ** 2 <= 1.0
             f[m] = np.array((205, 160, 135), np.float32) + skin_tex[m][:, None]
@@ -55,11 +67,11 @@ def frames_rgb() -> np.ndarray:
     return np.stack(out)
 
 
-def write_source(path: Path) -> Path:
+def write_source(path: Path, bare: bool = False) -> Path:
     """The frames as a lossless file (decoded bit for bit on every platform)."""
     from contour.core import media as MD
     MD.configure_ffmpeg()
-    fr = frames_rgb()
+    fr = frames_rgb(bare)
     cmd = [MD.ffmpeg_bin(), "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", "24",
            "-i", "-", "-c:v", "libx264", "-pix_fmt", "yuv444p", "-qp", "0", "-color_range", "tv", "-colorspace",
            "bt709", str(path)]
@@ -88,8 +100,9 @@ def face68(cx: float, top: float, w: float) -> np.ndarray:
     return lm
 
 
-def make_project(folder: Path, src: Path):
-    """The analysed project, written by whatever version of the code is imported (the fixture: 1.22.2)."""
+def make_project(folder: Path, src: Path, regions: str = ""):
+    """The analysed project, written by whatever version of the code is imported (the fixture: 1.22.2).
+    regions: the skin retouch's regions of the person retouched (the second fixture: BODY_REGIONS)."""
     from contour.core import media as M
     from contour.core.params import skin_basic_values
     from contour.core.project import Curve, Person, Project
@@ -106,6 +119,8 @@ def make_project(folder: Path, src: Path):
     for k, v in skin_basic_values("std", ["acne"]).items():
         pp.amounts[k] = Curve(base=float(v))
     pp.skin_basic = {"level": "std", "remove": ["acne"]}
+    if regions:
+        pp.skin_scope = regions
     st = TrackStore(N, [0, 1])
     st.has_vis = st.has_face = True
     for p, (cx0, top, hw, body_w, sign) in enumerate(((62, 18, 30, 54, 1), (150, 40, 12, 22, -1))):
@@ -175,12 +190,29 @@ class NoModels:
         def none(*a, **k):
             raise RuntimeError("no model in the baseline")
         MOD.session = none
+        # a parser another test of this process already loaded would still be used (it is kept by the engine once
+        # made): set aside for the time of the baseline, which is made and compared without any model
+        self._kept = []
+        try:
+            import contour.retouch.engine as RE
+            self._kept.append((RE._FPARSER, RE._FPARSER[0]))
+            RE._FPARSER[0] = False
+        except Exception:
+            pass
+        try:
+            import contour.retouch.bodyskin as BS
+            self._kept.append((BS._PARSER, BS._PARSER[0]))
+            BS._PARSER[0] = False
+        except Exception:
+            pass
         return self
 
     def __exit__(self, *exc):
         self._fp.available = self._old[0]
         if self._old[1] is not None:
             self._mod.session = self._old[1]
+        for box, was in self._kept:
+            box[0] = was
         return False
 
 
