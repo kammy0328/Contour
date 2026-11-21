@@ -2376,6 +2376,10 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             try:
                 from ..core.project import body_scope_set, norm_body_scope
                 bscope = norm_body_scope(getattr(pp, "body_scope", "all"))
+                if v.get("knee_tone", 0) > 1e-4 or v.get("belly_fold", 0) > 1e-4:
+                    # (from the tracks alone: the knee tone reads the leg's skin from the picture itself where the body
+                    # skin's area is not there)
+                    job.tone = BTN.person_geometry(st.final[p, t], st.widths[p, t])
 
                 def mk_body():
                     with _tm("body.base"):
@@ -2399,8 +2403,6 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 bd = get("bskin", mk_body, f"{bscope}:{ctok}", btok)
                 if bd["pm"] is not None and tuple(bd["pm"]["shape"]) == tuple(shape) and bd["info"]["ref"] > 0:
                     job.body = dict(bd["info"], mask=bd["pm"], key=f"{bscope}:{ctok}")
-                    if v.get("knee_tone", 0) > 1e-4 or v.get("belly_fold", 0) > 1e-4:
-                        job.tone = BTN.person_geometry(st.final[p, t], st.widths[p, t])
                     if v.get("body_blemish", 0) > 1e-4:
                         def mk_bdet():
                             with _tm("body.spots"):
@@ -4190,11 +4192,11 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                 import traceback
                 traceback.print_exc()
         # 0c. knee tone (1.25): the knee's blotches, redness and bruise-like patches to the leg's own colour; the grain stays
-        if bmY is not None and job.tone and job.tone.get("knees") and v.get("knee_tone", 0) > 1e-4:
+        if job.tone and job.tone.get("knees") and v.get("knee_tone", 0) > 1e-4:
             try:
                 regK = bmY
                 for nm_ in ("skinx", "neck"):
-                    if nm_ in job.masks:                  # (what the face's area holds is the face's)
+                    if regK is not None and nm_ in job.masks:      # (what the face's area holds is the face's)
                         regK = regK * (1.0 - np.clip(M(job.masks[nm_], (hY, wY)), 0, 1))
                 kn_ = [((cx * y_per_src, cy * y_per_src), (ax_, ay_), hf_ * y_per_src)
                        for (cx, cy, ax_, ay_, hf_) in job.tone["knees"]]
@@ -4204,7 +4206,7 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                 import traceback
                 traceback.print_exc()
         # 0d. belly creases (1.25): the folds a bent trunk makes, filled from the skin round them; none found, nothing changed
-        if bmY is not None and job.tone and job.tone.get("belly") and v.get("belly_fold", 0) > 1e-4:
+        if job.tone and job.tone.get("belly") and v.get("belly_fold", 0) > 1e-4:
             try:
                 with _tm("apply.belly_fold"):
                     Y, Cb, Cr = BTN.belly_fold(Y, Cb, Cr, bmY, job.tone["belly"], float(np.clip(v["belly_fold"], 0, 1)), y_per_src)

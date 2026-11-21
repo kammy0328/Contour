@@ -88,6 +88,84 @@ def knee_geometry(shape: Tuple[int, int], centre, axis, half: float):
     return np.sqrt((u / (KNEE_ALONG * half)) ** 2 + (v / (KNEE_ACROSS * half)) ** 2).astype(np.float32)
 
 
+def leg_coords(shape: Tuple[int, int], centre, axis):
+    """(u, v) of every pixel from a knee: u along the leg, v across it (pixels)."""
+    h, w = shape
+    gy, gx = np.mgrid[0:h, 0:w].astype(np.float32)
+    dx, dy = gx - float(centre[0]), gy - float(centre[1])
+    return dx * float(axis[0]) + dy * float(axis[1]), -dx * float(axis[1]) + dy * float(axis[0])
+
+
+LEG_EDGE = (0.80, 1.15)   # across the leg, in half widths: from where a pixel is the leg's .. to where it is not
+LOCAL_MIN_Y = 0.25         # a leg's skin in a picture is brighter than this (the 75th percentile of the strip) ...
+LOCAL_MIN_CHROMA = 0.02    # ... and its (Cb, Cr) is this far from grey
+CHROMA_SIG = 0.012        # at least: how far (Cb, Cr) may be from the leg's own colour and still be the leg's skin
+
+
+def _skin_like(yref: float, mb: float, mr: float) -> bool:
+    """Whether a piece of the picture of this brightness and (Cb, Cr) can be skin: bright enough, not grey, on the warm
+    side (red over blue; any light's cast keeps that for skin)."""
+    return yref >= LOCAL_MIN_Y and float(np.hypot(mb, mr)) >= LOCAL_MIN_CHROMA and mr > 0.012 and mb < 0.012 and mr > -mb * 0.5
+
+
+def local_zone_skin(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, zone: np.ndarray) -> Optional[np.ndarray]:
+    """The skin inside a zone (0..1) when the body skin's area is not there: what has the zone's own colour, if that
+    colour can be skin (_skin_like) and its brightness is not far under the zone's. None when it cannot."""
+    hY, wY = Y.shape
+    core = zone > 0.9
+    if int(core.sum()) < 80:
+        return None
+    if Cb.shape != (hY, wY):
+        cb = cv2.resize(Cb.astype(np.float32), (wY, hY), interpolation=cv2.INTER_LINEAR)
+        cr = cv2.resize(Cr.astype(np.float32), (wY, hY), interpolation=cv2.INTER_LINEAR)
+    else:
+        cb, cr = Cb.astype(np.float32), Cr.astype(np.float32)
+    yref = float(np.percentile(Y[core], 75))
+    light = _ss(NOT_SKIN[0], NOT_SKIN[1], Y / max(yref, 1e-4)).astype(np.float32)
+    c2 = core & (light > 0.9)
+    if int(c2.sum()) < 60:
+        return None
+    mb, mr = float(np.median(cb[c2])), float(np.median(cr[c2]))
+    if not _skin_like(yref, mb, mr):
+        return None
+    d = np.hypot(cb - mb, cr - mr)
+    sig = max(CHROMA_SIG, 2.2 * float(np.median(d[c2])))
+    return (zone * light * np.exp(-0.5 * (d / sig) ** 2)).astype(np.float32)
+
+
+def local_skin(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, centre, axis, half: float, e: np.ndarray):
+    """The skin of one leg round a knee when the body skin's area is not there (the parser found nothing to hold on to:
+    a dim picture, a colour cast, dark tights): only the leg's own strip, from the joints. -> (area, ring): the strip
+    without the dark (sock, hem, shoe), and the part of it round the knee whose colour is the leg's (what is read from).
+    None where the strip does not show enough of a leg."""
+    hY, wY = Y.shape
+    u, v = leg_coords((hY, wY), centre, axis)
+    leg = (1.0 - _ss(LEG_EDGE[0], LEG_EDGE[1], np.abs(v) / half)).astype(np.float32)
+    band = (leg > 0.9) & (e > RING[0]) & (e < RING[1])
+    if int(band.sum()) < 80:
+        return None
+    yb = Y[band]
+    yref = float(np.percentile(yb, 75))                    # (a sock, a hem or a shoe in the strip is darker than the leg)
+    light = _ss(NOT_SKIN[0], NOT_SKIN[1], Y / max(yref, 1e-4)).astype(np.float32)
+    core = band & (light > 0.9)
+    if int(core.sum()) < 60:
+        return None
+    if Cb.shape != (hY, wY):
+        cb = cv2.resize(Cb.astype(np.float32), (wY, hY), interpolation=cv2.INTER_LINEAR)
+        cr = cv2.resize(Cr.astype(np.float32), (wY, hY), interpolation=cv2.INTER_LINEAR)
+    else:
+        cb, cr = Cb.astype(np.float32), Cr.astype(np.float32)
+    mb, mr = float(np.median(cb[core])), float(np.median(cr[core]))
+    if not _skin_like(yref, mb, mr):
+        return None                                        # black tights, a grey trouser, a blue top: cloth, not skin
+    d = np.hypot(cb - mb, cr - mr)
+    mad = float(np.median(d[core]))
+    sig = max(CHROMA_SIG, 2.2 * mad)
+    near = np.exp(-0.5 * (d / sig) ** 2).astype(np.float32)
+    ring = (leg * light * near * _ss(RING[0], RING[0] + 0.35, e) * (1.0 - _ss(RING[1] - 0.6, RING[1], e))).astype(np.float32)
+    return (leg * light).astype(np.float32), ring
+
+
 def tone_plane(P: np.ndarray, area: np.ndarray, ring: np.ndarray, half: float, k: float, kind: str,
                firm: Optional[np.ndarray] = None) -> np.ndarray:
     """One plane (a luma or a chroma plane) of the knee's tone work. area: 0..1 where the knee's own area is (inside the
@@ -128,11 +206,32 @@ def tone_plane(P: np.ndarray, area: np.ndarray, ring: np.ndarray, half: float, k
     return out
 
 
-def knee_tone(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, skin: np.ndarray, knees, k: float, cs: float = 1.0):
+def _masked_skin(Yo, skin, e, area, half):
+    """(area, ring) weights of one knee from the body skin's area, or None where it has not enough of the leg."""
+    ringw = _ss(RING[0], RING[0] + 0.35, e) * (1.0 - _ss(RING[1] - 0.6, RING[1], e))
+    sk = np.clip(skin, 0, 1).astype(np.float32)
+    rr = _roi(ringw * sk, 4, 0.2)
+    if rr is None:
+        return None
+    a0, a1, b0, b1 = rr
+    sel = (ringw[a0:a1, b0:b1] * sk[a0:a1, b0:b1]) > 0.5
+    if int(sel.sum()) < 60:
+        return None
+    # a sock, a hem, a shoe is not the leg's skin even where the area takes it for skin: darker than the leg round it
+    yref = float(np.median(Yo[a0:a1, b0:b1][sel]))
+    light = _ss(NOT_SKIN[0], NOT_SKIN[1], Yo / max(yref, 1e-4)).astype(np.float32)
+    # holes in the area (a blotch the parser takes for something else): closed up as far as the leg's colour is there
+    half_k = 2 * int(max(1, 0.30 * half)) + 1
+    sk_c = cv2.morphologyEx(sk, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (half_k, half_k)))
+    sk_w = np.maximum(sk, np.minimum(sk_c, 1.0) * 0.9) * light
+    return (area * sk_w).astype(np.float32), (ringw * _ss(0.6, 0.9, sk) * light).astype(np.float32)
+
+
+def knee_tone(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, skin: Optional[np.ndarray], knees, k: float, cs: float = 1.0):
     """The knee tone of one person on one picture.
 
     Y, Cb, Cr: the picture's planes (float; Cb and Cr cs times the size of Y, in pixels, 1 = the same size),
-    skin: 0..1 the person's skin area at Y's size (retouch.bodyskin), knees: [(centre (x, y), leg axis (unit), half the
+    skin: 0..1 the person's skin area at Y's size (retouch.bodyskin; None: there is none, read from the leg's own strip, local_skin), knees: [(centre (x, y), leg axis (unit), half the
     leg's width)] in Y's pixels, k: 0..1. -> (Y, Cb, Cr), copies (the planes themselves where nothing changed)."""
     if k < 1e-4 or not knees:
         return Y, Cb, Cr
@@ -147,23 +246,16 @@ def knee_tone(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, skin: np.ndarray, k
         area = 1.0 - _ss(KNEE_EDGE[0], KNEE_EDGE[1], e)
         if float(area.max()) < 0.05:
             continue
-        ringw = _ss(RING[0], RING[0] + 0.35, e) * (1.0 - _ss(RING[1] - 0.6, RING[1], e))
-        sk = np.clip(skin, 0, 1).astype(np.float32)
-        # a sock, a hem, a shoe is not the leg's skin even where the area takes it for skin: darker than the leg round it
-        rr = _roi(ringw * sk, 4, 0.2)
-        if rr is None:
+        got = None
+        if skin is not None:                              # the body area says where the skin is (and where it is not)
+            got = _masked_skin(Yo, skin, e, area, half)
+        else:                                             # no body area (the parser found nothing to hold on to): the leg's own strip
+            ls = local_skin(Yo, Cbo, Cro, centre, axis, half, e)
+            if ls is not None and int((ls[1] > 0.5).sum()) >= 60:
+                got = ((area * ls[0]).astype(np.float32), ls[1])
+        if got is None:
             continue
-        a0, a1, b0, b1 = rr
-        sel = (ringw[a0:a1, b0:b1] * sk[a0:a1, b0:b1]) > 0.5
-        if int(sel.sum()) < 60:
-            continue
-        yref = float(np.median(Yo[a0:a1, b0:b1][sel]))
-        light = _ss(NOT_SKIN[0], NOT_SKIN[1], Yo / max(yref, 1e-4)).astype(np.float32)
-        # holes in the area (a blotch the parser takes for something else): closed up as far as the leg's colour is there
-        sk_c = cv2.morphologyEx(sk, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * int(max(1, 0.30 * half)) + 1,) * 2))
-        sk_w = np.maximum(sk, np.minimum(sk_c, 1.0) * 0.9) * light
-        w_area = (area * sk_w).astype(np.float32)
-        w_ring = (ringw * _ss(0.6, 0.9, sk) * light).astype(np.float32)     # inside the skin only: not its soft edge
+        w_area, w_ring = got
         Yo = tone_plane(Yo, w_area, w_ring, half, k, "luma")
         for nm in ("cb", "cr"):
             Pc = Cbo if nm == "cb" else Cro
@@ -283,7 +375,7 @@ def belly_zone(shape: Tuple[int, int], geom: dict, scale: float) -> np.ndarray:
     return (1.0 - _ss(BELLY_EDGE[0], BELLY_EDGE[1], e)).astype(np.float32)
 
 
-def belly_fold(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, skin: np.ndarray, geom: Optional[dict], k: float, scale: float):
+def belly_fold(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, skin: Optional[np.ndarray], geom: Optional[dict], k: float, scale: float):
     """The belly's creases filled from the skin round them (the same finder and fill the neck's lines use, laid across the
     trunk's axis), and the broad, faint folds beside them flattened a little. Where there is no crease nothing changes.
     -> (Y, Cb, Cr) (the planes themselves where nothing changed)."""
@@ -293,8 +385,8 @@ def belly_fold(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, skin: np.ndarray, 
     z = belly_zone(Y.shape, geom, scale)
     if float(z.max()) < 0.05:
         return Y, Cb, Cr
-    m = (z * np.clip(skin, 0, 1)).astype(np.float32)
-    if float(m.max()) < 0.05:
+    m = (z * np.clip(skin, 0, 1)).astype(np.float32) if skin is not None else local_zone_skin(Y, Cb, Cr, z)
+    if m is None or float(m.max()) < 0.05:
         return Y, Cb, Cr
     width = max(1.5, CREASE_WIDTH * geom["trunk"] * scale)
     Yo, Cbo, Cro = E._crease_lift(Y, Cb, Cr, m, float(k), width, axis=np.asarray(geom["u"], np.float32), hold=None)

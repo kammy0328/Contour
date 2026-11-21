@@ -181,3 +181,32 @@ def test_person_geometry_from_a_standing_pose():
     b = g["belly"]
     # the waist runs from the neck to the pelvis: the belly lies a little over half way down it, the trunk runs down
     assert b is not None and b["u"][1] > 0.95 and 100 < b["c"][1] < 175 and b["along"] > 10
+
+
+# ---- no body area (the parser found nothing): the leg's own strip, from the joints and the picture
+
+def test_without_a_body_area_the_blotches_still_go_to_the_leg_colour():
+    Y, Cb, Cr, skin, blob, red = scene()
+    Y0, Cb0, Cr0, *_ = scene(blotch=False)
+    Yo, Cbo, Cro = BT.knee_tone(Y, Cb, Cr, None, KNEE, 1.0)
+    core = (BT.knee_geometry((H, W), KNEE[0][0], KNEE[0][1], HALF) < 0.6) & (skin > 0.9)
+    for name, a, b, c in (("cb", Cb, Cbo, Cb0), ("cr", Cr, Cro, Cr0), ("y", Y, Yo, Y0)):
+        before = np.abs(lp(a - c)[core]).mean()
+        after = np.abs(lp(b - c)[core]).mean()
+        assert after < 0.4 * before, (name, before, after)
+    gy, gx = np.mgrid[0:H, 0:W]
+    away = (np.abs(gx - CX) > HALF + 3) | (gy > 175)             # beside the leg, the sock, below it: as it was
+    for a, b in ((Y, Yo), (Cb, Cbo), (Cr, Cro)):
+        assert np.array_equal(a[away], b[away])
+
+
+def test_without_a_body_area_cloth_is_left_alone():
+    Y, Cb, Cr, skin, *_ = scene()
+    for ymean, cb_, cr_ in ((0.08, 0.0, 0.0),            # black tights: dark
+                            (0.5, 0.01, -0.02),          # a blue-grey trouser: bright, not warm
+                            (0.5, 0.0, 0.0)):            # a grey one
+        Y2 = np.where(skin > 0.5, ymean + (Y - 0.55) * 0.3, Y).astype(np.float32)
+        Cb2 = np.where(skin > 0.5, cb_ + (Cb + 0.05) * 0.3, Cb).astype(np.float32)
+        Cr2 = np.where(skin > 0.5, cr_ + (Cr - 0.08) * 0.3, Cr).astype(np.float32)
+        out = BT.knee_tone(Y2, Cb2, Cr2, None, KNEE, 1.0)
+        assert out[0] is Y2 and out[1] is Cb2 and out[2] is Cr2, (ymean, cb_, cr_)
