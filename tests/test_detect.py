@@ -214,3 +214,34 @@ def test_neck_mask_takes_the_side_in_shade_not_thin_things():
     assert float(m0[300:340, 120:160].mean()) < 0.1, "before: the side in shade is no neck"
     assert float(m1[300:340, 120:160].mean()) > 0.7
     assert float(m1[300:340, 230:232].mean()) < 0.5, "the strand stays out"
+
+
+def test_neck_mask_leaves_out_what_is_far_darker_than_the_face():
+    """Hair falling beside the neck and a black top under it are no neck, even where the colour model and the
+    parser let them through (a log clip seen in Rec.709, hair and cloth of the skin's hue but a third of its light)."""
+    from contour.retouch import engine as RE
+    h, w = 420, 360
+    lm = np.zeros((68, 3), np.float32)
+    for i in range(17):
+        a = np.pi * i / 16
+        lm[i, :2] = (180 - 100 * np.cos(a), 120 + 140 * np.sin(a))
+    lm[17:27, :2] = [(100 + 18 * k, 90) for k in range(10)]
+    lm[27:, 0] = 180
+    lm[27:, 1] = np.linspace(110, 230, 41)
+    prob = np.ones((h, w), np.float32)
+    rgb = np.full((h, w, 3), 150, np.uint8)            # the face and the neck: one skin
+    rgb[:, 205:] = 45                                  # hair beside the neck
+    rgb[330:, :] = 30                                  # a black top under it
+    parse = dict(neck=np.ones((h, w), np.float32), skin=np.zeros((h, w), np.float32), cover=np.ones((h, w), np.float32), trust=1.0)
+    old = RE.NECK_DARK
+    try:
+        RE.NECK_DARK = None
+        m0 = RE.neck_mask(lm, None, None, (h, w), 1.0, 1.0, prob, None, 1.5, rgb, None, parse)
+        RE.NECK_DARK = old
+        m1 = RE.neck_mask(lm, None, None, (h, w), 1.0, 1.0, prob, None, 1.5, rgb, None, parse)
+    finally:
+        RE.NECK_DARK = old
+    assert float(m0[290:320, 215:235].mean()) > 0.5, "before: the hair is taken for neck"
+    assert float(m1[290:320, 215:235].mean()) < 0.05, "now: it stays out"
+    assert float(m1[300:325, 140:185].mean()) > 0.7, "the neck itself is kept"
+    assert float(m1[340:400, 140:185].mean()) < 0.05, "and the black top under it is not"

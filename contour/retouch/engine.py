@@ -738,6 +738,7 @@ def body_regions(regions: set, kp: np.ndarray, hand: Optional[np.ndarray], shape
 
 
 NECK_SHADE = True          # the parser's neck counts where the colour model misses a broad stretch of it (shade)
+NECK_DARK = (0.40, 0.58)    # of the face's own skin brightness: the neck mask fades out between these (hair, a black top)
 NECK_SHADE_MIN = 0.045     # of the face width: narrower stretches the colour model leaves out stay out (hair, a chain)
 
 
@@ -824,6 +825,12 @@ def neck_mask(lm: np.ndarray, kp: np.ndarray, widths, shape, sx: float, sy: floa
             over = (Yl - (1.3 * yref + 4.0)) / max(0.3 * yref, 4.0)
             g = 1.0 - np.clip(cv2.GaussianBlur(over, (0, 0), max(1.0, 0.01 * Wf)), 0, 1)
             f = f * g
+            if NECK_DARK is not None:
+                # far darker than the face's own skin: hair falling beside or over the neck, a black top under it.
+                # A neck in shade is darker than the face too, but not by this much (measured on a log clip seen
+                # in Rec.709: shaded necks 0.6 to 0.9 times the face, hair and black cloth under 0.45)
+                Ys = cv2.GaussianBlur(Yl, (0, 0), max(1.0, 0.012 * Wf))
+                f = f * _ss(NECK_DARK[0] * yref, NECK_DARK[1] * yref, Ys)
     if parse is not None and parse.get("trust", 0) > 0 and f.max() > 0.01:
         # the face parser tells the neck from the collar, the shirt, a necklace, hair and a hand in front of it,
         # which the skin colour cannot when they share the skin's colour. Below its crop it sees nothing: there
