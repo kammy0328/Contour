@@ -230,3 +230,21 @@ def test_the_soft_top_edge_of_a_sock_is_not_pulled_up_to_the_legs_light():
     band = (gy >= 130) & (gy < 150) & (np.abs(gx - CX) < HALF - 4)
     assert float(np.abs(Yo - Y)[band].max()) < 0.01
     assert float(np.abs(Cbo - Cb)[band].max()) < 0.005
+
+
+def test_one_pixels_change_is_held_to_the_limit():
+    """A strong blotch is evened, but no pixel moves by more than the limit (the reference's knee moves by under 1 %)."""
+    gy, gx = np.mgrid[0:H, 0:W].astype(np.float32)
+    leg = (np.abs(gx - CX) < HALF) & (gy < 200)
+    Y = np.full((H, W), 0.40, np.float32)
+    Y[leg] = 0.55
+    Cb = np.zeros((H, W), np.float32)
+    Cr = np.zeros((H, W), np.float32)
+    blot = (gx - CX) ** 2 + (gy - CY) ** 2 < (0.5 * HALF) ** 2
+    Y[blot] = 0.25
+    Cr[blot] = 0.10
+    skin = cv2.GaussianBlur(leg.astype(np.float32), (0, 0), 0.8)
+    Yo, Cbo, Cro = BT.knee_tone(Y, Cb, Cr, skin, KNEE, 1.0)
+    assert float(np.abs(Yo - Y).max()) <= BT.MAX_CHANGE["luma"] + 1e-4
+    assert float(np.abs(Cro - Cr).max()) <= BT.MAX_CHANGE["chroma"] + 1e-4
+    assert float(np.abs(Yo - Y).max()) > 0.005         # still does something

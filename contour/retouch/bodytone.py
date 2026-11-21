@@ -37,6 +37,7 @@ NOT_SKIN = (0.45, 0.65)   # brightness over the leg's: from where a pixel is ski
 FIRM = (0.55, 1.6)        # a blotch's size over the leg's own colour variation: from where it is fully taken .. (a smaller
                           # difference is the skin's own and is taken less: never less than FIRM_MIN of it)
 FIRM_MIN = 0.55
+MAX_CHANGE = {"luma": 0.05, "chroma": 0.04}   # the most one pixel's plane may move (soft limit): the knee is evened, not repainted
 
 
 def _ss(e0: float, e1: float, x):
@@ -213,7 +214,13 @@ def tone_plane(P: np.ndarray, area: np.ndarray, ring: np.ndarray, half: float, k
     if firm is not None:
         g = g * firm[y0:y1, x0:x1]
     new_base = S + dev2
-    out[y0:y1, x0:x1] = I + A * float(k) * g * (new_base - base)
+    d = A * float(k) * g * (new_base - base)
+    cap = MAX_CHANGE.get(kind) if MAX_CHANGE else None
+    if cap:
+        c0 = 0.6 * cap                                     # soft limit: what is under 0.6 of the cap passes as it is, more is
+        a = np.abs(d)                                      # squeezed towards the cap
+        d = np.where(a <= c0, d, np.sign(d) * (c0 + (cap - c0) * np.tanh((a - c0) / (cap - c0)))).astype(np.float32)
+    out[y0:y1, x0:x1] = I + d
     return out
 
 
