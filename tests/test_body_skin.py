@@ -1987,6 +1987,43 @@ def test_a_cut_without_such_clothing_costs_its_looks_only(body, monkeypatch):
         _drop_look(tr)
 
 
+def test_a_person_on_the_picture_only_between_two_looks_is_looked_at(body, monkeypatch):
+    """BANANAS 155 P9 (j2803): on the picture on frames 3..11 of a cut of 21, where the looks fell on 0, 12 and 20.
+    Nobody was looked at, and the top the parser takes for skin stayed in the area (98 % of it). A stay on the picture
+    that no look falls on gets a look of its own."""
+    from contour.track import skincloth as SC
+    pres = np.zeros((3, 21), bool)
+    pres[0] = True
+    pres[1, 3:12] = True
+    pres[2, 0] = True
+    pres[2, 14:20] = True
+    assert SC.look_frames(pres, [0], 0, 21) == [0, 12, 20], "on every frame: the usual looks"
+    assert SC.look_frames(pres, [0, 1], 0, 21) == [0, 7, 12, 20], "the middle of frames 3..11"
+    assert SC.look_frames(pres, [2], 0, 21) == [0, 12, 16, 20], "one stay has a look (0), the other gets one (14..19)"
+    assert SC.look_frames(pres, [1, 2], 0, 21) == [0, 7, 12, 16, 20]
+    assert SC.look_frames(pres, [1], 4, 10) == [4, 9], "the work range's own looks fall on the stay"
+    assert SC.look_frames(np.zeros((1, 21), bool), [0], 0, 21) == [0, 12, 20], "never on the picture"
+    cut, tr, _ = body
+    st = tr.store
+    keep = st.present.copy()
+    _drop_look(tr)
+    _fur_parser(monkeypatch)
+    B.body_on(cut, skin=100)
+    try:
+        st.present[0, 0] = st.present[0, B.N - 1] = False       # not there on the frames the looks fall on (0 and 7)
+        top = _inside(_kinds(tr, 2) == B.CLOTH, 4)
+        assert float(_area(cut, tr, 2)[top].mean()) > 0.8, "the defect: the top is body skin"
+        seen = []
+        _garment_words(monkeypatch, seen)
+        assert SC.run(tr, SC.needed(tr, cut)) is True
+        assert 3 in seen, "the stay on frames 1..6 has a look of its own (its middle)"
+        assert SC.info(tr)["ranges"] == [[0, B.N]] and SC.info(tr)["looks"] == 3
+        assert float(_area(cut, tr, 2)[top].max()) < 0.05, "the top is no longer body skin"
+    finally:
+        st.present[...] = keep
+        _drop_look(tr)
+
+
 def test_a_look_is_of_its_analysis_its_owners_and_the_people_it_saw(body, monkeypatch):
     from contour.track import skincloth as SC
     cut, tr, _ = body

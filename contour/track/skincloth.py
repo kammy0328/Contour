@@ -7,8 +7,9 @@ gaps between the strands removed as blemishes: j2790). SAM 3.1's garment words (
 clothes (j2794: 53..96 % of that area taken away, nothing on a cut without them), at about 1.6 s a frame: too slow
 for every frame of every cut with a body value on, and most cuts have no such garment.
 
-So the cut is looked at: every LOOK_STEP-th frame gets its garment map, and on it, for each person, how much of what
-the parser is sure is that person's bare skin the garment words call clothing. Where that is more than the two agree
+So the cut is looked at: every LOOK_STEP-th frame gets its garment map (and one frame of each stay of a person on the
+picture that falls between two of them: look_frames), and on it, for each person, how much of what the parser is
+sure is that person's bare skin the garment words call clothing. Where that is more than the two agree
 on at a garment's edge, the frames from the look before to the look after get their garment maps too and the body
 skin's area leaves the clothing out there (bodyskin.garments). Elsewhere nothing more is made and the parser stands
 as it is: what a look costs a cut with nothing to find is a twelfth of the frames.
@@ -227,6 +228,23 @@ def _dirty(row: Dict[int, list], picture_px: int) -> bool:
     return False
 
 
+def look_frames(present, persons: List[int], a: int, b: int) -> List[int]:
+    """The frames of the work range [a, b) a look looks at: every LOOK_STEP-th and the last, and for a person who is
+    on the picture for a run of frames none of those falls on, that run's middle frame. (A person who comes and goes
+    between two looks was never looked at: BANANAS 155 P9, on frames 3..11 of 21 in a top the parser takes for skin,
+    kept all of it in the area: j2803.) present: (people, frames) of the store; persons: store indices."""
+    looks = set(range(a, b, LOOK_STEP)) | {b - 1}
+    for p in persons:
+        row = np.asarray(present[p, a:b], bool)
+        if not row.any():
+            continue
+        edge = np.flatnonzero(np.diff(np.concatenate([[False], row, [False]]).astype(np.int8)))
+        for s, e in zip(edge[::2], edge[1::2]):                 # on the picture over [a + s, a + e)
+            if not any(a + s <= t < a + e for t in looks):
+                looks.add(int(a + (s + e - 1) // 2))
+    return sorted(looks)
+
+
 def ranges_of(looks: List[int], dirty: List[bool]) -> List[List[int]]:
     """The [a, b) frame ranges that get garment maps: from the look before a dirty look to the look after it."""
     from .matte_refresh import merge
@@ -283,7 +301,7 @@ def _run(tracker, persons, progress, cancel, gf, old, t0) -> bool:
     W, H = int(proxy.w), int(proxy.h)
     d = _dir(tracker)
     d.mkdir(parents=True, exist_ok=True)
-    looks = sorted(set(range(a, b, LOOK_STEP)) | {b - 1})
+    looks = look_frames(st.present, persons, a, b)
     clothes = list(CL.ALL_CLOTHES)
 
     def frame_map(t):
