@@ -64,3 +64,73 @@ def test_piece_of_a_timeline_stretch(vids):
     assert np.array_equal(sc.piece(0, box), full[0][20:100, 20:120])
     assert np.array_equal(sc.piece(4, box), full[1][20:100, 20:120])
     sc.close()
+
+
+def test_two_regions_are_read_side_by_side(vids, monkeypatch):
+    """j2799 (three people of a 4K frame, body blemishes): each person's piece of the original waited for the one
+    before it under one lock, a third of a second each. Different regions are read at the same time, one region by
+    one thread at a time; the pieces are the same."""
+    import threading
+    import time
+    from contour.core import frames as FR, media as MD
+    from contour.core.colour import PASSTHROUGH, ViewSettings, manager
+    FR.pool().clear()
+    info = MD.probe(str(vids["prores"]))
+    vs = ViewSettings(input_cs=PASSTHROUGH)
+    boxes = [(4, 4, 60, 60), (230, 150, 300, 230)]
+    ref = FR.SourceCrops(info, manager(), vs)
+    assert ref._grid(boxes[0]) != ref._grid(boxes[1])
+    want = [[ref.piece(i, b) for i in (0, 1, 2)] for b in boxes]
+    ref.close()
+    FR.pool().clear()
+    read0 = FR.FrameReader.read
+    now, peak, lk = [0], [0], threading.Lock()
+
+    def slow(self):
+        with lk:
+            now[0] += 1
+            peak[0] = max(peak[0], now[0])
+        try:
+            time.sleep(0.1)
+            return read0(self)
+        finally:
+            with lk:
+                now[0] -= 1
+    monkeypatch.setattr(FR.FrameReader, "read", slow)
+    sc = FR.SourceCrops(info, manager(), vs)
+    got, errs = [None, None], []
+
+    def one(k):
+        try:
+            got[k] = [sc.piece(i, boxes[k]) for i in (0, 1, 2)]
+        except Exception as e:                      # pragma: no cover
+            errs.append(e)
+    ths = [threading.Thread(target=one, args=(k,)) for k in range(2)]
+    for th in ths:
+        th.start()
+    for th in ths:
+        th.join(60)
+    assert not errs, errs
+    assert peak[0] == 2, "the two regions were read one after the other"
+    for k in range(2):
+        for a, b in zip(got[k], want[k]):
+            assert np.array_equal(a, b)
+    assert sc.seeks == 2 and len(sc._readers) == 2
+    # one region asked for by two threads at once: one reader, each frame decoded once
+    FR.pool().clear()
+    n0, s0 = sc.decoded, sc.seeks
+    peak[0] = 0
+    same = [None, None]
+
+    def again(k):
+        same[k] = sc.piece(4, boxes[0])
+    ths = [threading.Thread(target=again, args=(k,)) for k in range(2)]
+    for th in ths:
+        th.start()
+    for th in ths:
+        th.join(60)
+    assert np.array_equal(same[0], same[1]) and peak[0] == 1
+    assert sc.seeks - s0 <= 1 and sc.decoded - n0 <= 5, (sc.seeks - s0, sc.decoded - n0)
+    procs = [r[0]._proc for r in sc._readers.values()]
+    sc.close()
+    assert all(pr.poll() is not None for pr in procs) and not sc._readers

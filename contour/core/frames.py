@@ -381,12 +381,22 @@ class SourceCrops:
         self.base = (info.kind, str(info.path if info.kind == "video" else info.seq_pattern),
                      int(getattr(info, "seq_start", 0) or 0), _sig(info), int(getattr(info, "offset", 0) or 0),
                      self.n, vs.key(), _decode_key(info), "crop")
-        self._lock = threading.RLock()
+        self._lock = threading.RLock()              # the table of readers
         # one reader per region (several faces of one frame), the least recently used closed beyond CROP_READERS:
         # with one reader for all of them it restarted at every face (review 6c3dcb3: 12 restarts for 6 frames x 2)
         self._readers: "OrderedDict[tuple, list]" = OrderedDict()      # key -> [reader, next frame]
+        # a region is read by one thread at a time, different regions side by side (the people of a frame: with one
+        # lock for all of them the second and third person waited a third of a second each: j2799)
+        self._rlocks: dict = {}
         self.decoded = 0
         self.seeks = 0
+
+    def _region_lock(self, key) -> "threading.Lock":
+        with self._lock:
+            lk = self._rlocks.get(key)
+            if lk is None:
+                lk = self._rlocks[key] = threading.Lock()
+            return lk
 
     def _drop(self, key) -> None:
         r = self._readers.pop(key, None)
@@ -398,8 +408,15 @@ class SourceCrops:
 
     def close(self) -> None:
         with self._lock:
+            keys = list(self._readers)
+        for k in keys:
+            with self._region_lock(k):              # (a read under way finishes first)
+                with self._lock:
+                    self._drop(k)
+        with self._lock:
             for k in list(self._readers):
                 self._drop(k)
+            self._rlocks.clear()
 
     def _grid(self, box) -> Tuple[int, int, int, int]:
         W, H = int(self.info.width), int(self.info.height)
@@ -422,7 +439,7 @@ class SourceCrops:
         p = pool()
         a = p.get((key, i))
         if a is None:
-            with self._lock:
+            with self._region_lock(key):
                 a = p.get((key, i))
                 if a is None:
                     a = self._decode(i, gb, (ow, oh), key)
@@ -433,19 +450,30 @@ class SourceCrops:
         return np.array(a[max(0, ya):max(ya + 1, yb), max(0, xa):max(xa + 1, xb)])
 
     def _decode(self, i: int, gb, osz, key) -> np.ndarray:
-        r = self._readers.get(key)
-        if r is None or not (r[1] <= i <= r[1] + 8):
-            self._drop(key)
+        """Frame i of a region, with the region's lock held (piece)."""
+        with self._lock:
+            r = self._readers.get(key)
+            if r is not None and not (r[1] <= i <= r[1] + 8):
+                self._drop(key)
+                r = None
+        if r is None:
             pf = "gbrpf32le" if self.info.is_float else "rgb48le"
             gw, gh = gb[2] - gb[0], gb[3] - gb[1]
             rd = FrameReader(self.info, i, self.n - i, pf, size=osz if osz != (gw, gh) else None, prefetch=2,
                              crop=(gb[0], gb[1], gw, gh))
             r = [rd, i]
-            self._readers[key] = r
-            self.seeks += 1
-            while len(self._readers) > CROP_READERS:
-                self._drop(next(iter(self._readers)))
-        self._readers.move_to_end(key)
+            with self._lock:
+                self._readers[key] = r
+                self.seeks += 1
+                for k in list(self._readers):               # the least recently used first; one being read stays
+                    if len(self._readers) <= CROP_READERS:
+                        break
+                    lk = self._rlocks.get(k)
+                    if k != key and not (lk is not None and lk.locked()):
+                        self._drop(k)
+        with self._lock:
+            if key in self._readers:
+                self._readers.move_to_end(key)
         got = None
         p = pool()
         while r[1] <= i:
@@ -453,7 +481,14 @@ class SourceCrops:
             if planes is None:
                 err = r[0].error_text.strip()
                 at = r[1]
-                self._drop(key)
+                with self._lock:
+                    if self._readers.get(key) is r:
+                        self._drop(key)
+                    else:
+                        try:
+                            r[0].close()
+                        except Exception:
+                            pass
                 raise FrameError(f"원본에서 프레임 {i}의 일부를 읽지 못했습니다 ({at}에서 끝남). {err[:300]}")
             u8 = self.cm.to_display_u8(planes_to_rgb_float(planes, r[0].layout), self.vs)
             self.decoded += 1

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import threading
 import time
+import zlib
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -32,6 +33,33 @@ import numpy as np
 from . import skin as SK
 from ..track import skeleton as S
 from ..warp.body import SEG_INDEX, SEGMENTS
+
+# Where an area's time goes, for a measurement (the PC test jobs set this to engine.TIMING's dict): each step of
+# body_mask adds its seconds and its count under "area.<step>". None (always, in the app): nothing is kept.
+TIMING: Optional[dict] = None
+
+
+class _step:
+    __slots__ = ("name", "t0")
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def __enter__(self):
+        self.t0 = time.perf_counter() if TIMING is not None else None
+        return self
+
+    def __exit__(self, *exc):
+        d = TIMING
+        if d is not None and self.t0 is not None:
+            e = d.setdefault("area." + self.name, [0.0, 0, 0.0])
+            dt = time.perf_counter() - self.t0
+            e[0] += dt
+            e[1] += 1
+            if len(e) > 2:
+                e[2] += dt
+        return False
+
 
 # ------------------------------------------------------------------------------------------------- parts
 # name, region, joint a, joint b, length over the face width, full width over the face width (adult build)
@@ -323,6 +351,7 @@ def chosen(maps: Dict[str, np.ndarray], regions: set) -> np.ndarray:
 
 # ------------------------------------------------------------------------------------------------- the parser
 PARSE_ON = True             # False: colour, matte and garments alone say what is skin
+ROI = True                  # the area's maps are made for the person's own piece of the picture (False: the whole frame)
 PARSE_PAD = 0.06            # the person's box is widened by this share before it is parsed
 PARSE_ASPECT = 1.6          # and its long side is at most this many times its short side
 PARSE_LRU = 96              # person-frames kept (each four 256 x 256 maps)
@@ -407,9 +436,9 @@ def _widen(a0: int, a1: int, want: int, limit: int) -> Tuple[int, int]:
     return b0, b0 + want
 
 
-def parse_person(rgb_u8: np.ndarray, own: np.ndarray) -> Optional[dict]:
-    """The parser's view of one person: {'box': (x0, y0, x1, y1) in this picture, 'skin', 'hair', 'cloth': uint8
-    maps of the box at the parser's size}. own: the person's own pixels (0..1) on this picture."""
+def parse_box(own: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+    """The piece of the picture the parser is shown for a person (x0, y0, x1, y1): their own pixels' box, a little
+    wider. None: too small to show."""
     ys = np.nonzero(own.max(1) > 0.3)[0]
     xs = np.nonzero(own.max(0) > 0.3)[0]
     if len(ys) < 4 or len(xs) < 4:
@@ -427,20 +456,39 @@ def parse_person(rgb_u8: np.ndarray, own: np.ndarray) -> Optional[dict]:
         y0, y1 = _widen(y0, y1, int(np.ceil(bw / PARSE_ASPECT)), h)
     if y1 - y0 < 8 or x1 - x0 < 8:
         return None
+    return int(x0), int(y0), int(x1), int(y1)
+
+
+def parse_person(rgb_u8: np.ndarray, own: np.ndarray, box: Optional[Tuple[int, int, int, int]] = None) -> Optional[dict]:
+    """The parser's view of one person: {'box': (x0, y0, x1, y1) in this picture, 'skin', 'hair', 'cloth', 'face':
+    uint8 maps of the box at the parser's size}. 'skin' is body skin and face skin together; 'face' is the face skin
+    alone (never the body's: skin_conf). own: the person's own pixels (0..1) on this picture; box: parse_box(own)
+    when it is known already."""
+    box = box if box is not None else parse_box(own)
+    if box is None:
+        return None
+    x0, y0, x1, y1 = box
     pr = _probs(np.ascontiguousarray(rgb_u8[y0:y1, x0:x1]))
     if pr is None:
         return None
     from ..track import faceparse as FP
     u8 = lambda a: (np.clip(a, 0, 1) * 255 + 0.5).astype(np.uint8)
     return dict(box=(x0, y0, x1, y1), skin=u8(pr[FP.MP_BODY] + pr[FP.MP_FACE]), hair=u8(pr[FP.MP_HAIR]),
-                cloth=u8(pr[FP.MP_CLOTHES] + pr[FP.MP_OTHERS]))
+                cloth=u8(pr[FP.MP_CLOTHES] + pr[FP.MP_OTHERS]), face=u8(pr[FP.MP_FACE]))
 
 
-def _place(parse: dict, name: str, shape: Tuple[int, int]) -> np.ndarray:
-    """One of the parser's maps on the whole picture (float32 0..1; 0 outside the person's box)."""
+def _place(parse: dict, name: str, shape: Tuple[int, int], origin: Tuple[int, int] = (0, 0)) -> np.ndarray:
+    """One of the parser's maps on the picture (float32 0..1; 0 outside the person's box), or on a piece of it:
+    shape (h, w) of the piece, origin (x, y) of its top left corner on the whole picture."""
     x0, y0, x1, y1 = parse["box"]
+    ox, oy = int(origin[0]), int(origin[1])
     out = np.zeros(shape, np.float32)
-    out[y0:y1, x0:x1] = cv2.resize(parse[name], (x1 - x0, y1 - y0), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
+    ax0, ay0 = max(x0, ox), max(y0, oy)
+    ax1, ay1 = min(x1, ox + shape[1]), min(y1, oy + shape[0])
+    if ax1 <= ax0 or ay1 <= ay0:
+        return out
+    m = cv2.resize(parse[name], (x1 - x0, y1 - y0), interpolation=cv2.INTER_LINEAR)
+    out[ay0 - oy:ay1 - oy, ax0 - ox:ax1 - ox] = m[ay0 - y0:ay1 - y0, ax0 - x0:ax1 - x0].astype(np.float32) / 255.0
     return out
 
 
@@ -449,15 +497,81 @@ SKIN_SURE = (0.55, 0.80)    # the parser's skin share from which a pixel teaches
 NOT_SKIN = (0.35, 0.65)     # the parser's clothes / accessories / hair share from which a pixel is left out .. fully
 SUPPORT = 0.035             # of the person's size: skin the parser misses counts this near to skin it found
 SUPPORT_GAIN = 3.0
+SUPPORT_FROM = (0.40, 0.70)  # the parser's skin share from which a pixel counts as skin it found .. fully. None: any
+                            # share counts by its size (1.23's first build: a prop the parser gave 0.3 was 'found',
+                            # and with the face's colour on it, a light stick in a hand became body skin: j2790)
+SUPPORT_LIMB = None         # (0.15, 0.35) tried: on a limb the joints place, with the skin's colour learnt from this
+                            # person's own skin on this frame, a parser share from here counts as found .. fully (an
+                            # arm in shadow gets a third from the parser and is left as it is: 2611 105). Off: a fur
+                            # sleeve is on a limb as well and gets the same third (BANANAS 118), and what is not surely
+                            # skin stays as it is
+FACE_OUT = (0.35, 0.65)     # the parser's face-skin share from which a pixel is the face's, not the body's .. fully.
+                            # None: only the head the landmarks or the head joints place is left out (a face with
+                            # neither, or somebody else's face among the person's own pixels, was body skin: j2793)
+FACE_NEAR = 1.0             # of a face's width: the parser's face class is a face this near to where a head is (this
+                            # person's by the landmarks and by the head joints, any other tracked person's). Away from
+                            # every head it is the parser's mistake: a back or a trunk with no face in the picture gets
+                            # the face class (2611 060, 084: FACE_OUT took the back out), and so does a denim jacket
+                            # (lngshot 089). There it is not left out as a face.
+                            # None: the face class is a face wherever the parser says so
+FACE_TEACH = "own"          # where the face class teaches the skin's colour. "own": on this person's own face, where
+                            # their landmarks place it (a face that is one). "near": at any head (1.23 until j2799: the
+                            # back of a head in a black cap is 'face' to the parser, it taught black, and the back of
+                            # a black hoodie was body skin: lngshot 089 P2). "never": nowhere (the body class alone:
+                            # a tenth of the area of one person in ten changes, j2801). "joined": the own face and
+                            # what of the face class is in one piece with it (tried for 2611 022, where a dark slab
+                            # beside the face lost its area with "own": the slab is hair in the shade, and is better
+                            # left as it is). j2801, 104 people: "own" against "near" changes more than a twentieth
+                            # of the area of 15, the hoodie and such among them
+FACE_ELSE = "skin"          # the face class away from every head: "skin": skin the parser found, like the body class
+                            # (the colour still has to agree); "unknown": nothing by itself, skin only beside skin of
+                            # the body class
+FACE_ALONE = 0.5            # with nothing else to learn the colour from (no skin of the body class, no face of the cut
+                            # brought along): the face class away from every head teaches it when this share of it has
+                            # a colour skin has under ordinary light (a bare back alone in the picture, 2611 060; a
+                            # denim jacket or a silhouette has not). 0: never
+ISLANDS = True              # a piece of the person's own pixels apart from the rest that none of the person's joints
+                            # reaches is not the body's for sure (a light stick in the crowd the matte gave to the
+                            # dancer behind it: 2611 036). With no joint at all: every piece but the largest
+ISLAND_ELSE = "sure"        # such a piece: "sure": the person's skin where the parser itself is sure of skin
+                            # (ISLAND_SURE) and the colour learnt from the rest of the person agrees: a hand whose
+                            # arm is outside the picture (lngshot 034), fingertips the blur parted from the hand
+                            # (lngshot 044). It teaches no colour and is no skin 'found' for what lies near it.
+                            # "out": not the person's at all (1.23 until j2799: those hands were left as they are)
+ISLAND_SURE = (0.70, 0.90)  # the parser's skin share from which a pixel of such a piece is skin .. fully (the light
+                            # stick had 0.34 to 0.70)
+ISLAND_HELD = (8, 0.01)     # pixels of a joint-placed part on a piece from which it is held: this many, and this share
+ISLAND_JOINT = 0.25         # of the body's size: a joint in view places this much round itself
 OTHERS_NEAR = 0.012         # of the frame's height: this near to another person's pixels the owner is not sure
 CONF = (0.30, 0.62)         # the joined confidence from which a pixel is retouched .. in full
 COLOUR_ONLY = 0.75          # without the parser the colour alone must be this sure (0..1 of skin_probability)
 MODEL_MIN = 150             # skin pixels needed to learn the colour from
+SOFT_PER = 4.0              # a wide blur is made on a picture reduced until its width is this many pixels (within
+                            # 0.004 of the blur of the picture itself, at a thirtieth of its time for a large person:
+                            # most of what an area cost). 0: every blur on the picture itself
 
 
 def _ss(e0: float, e1: float, x):
     t = np.clip((x - e0) / max(e1 - e0, 1e-9), 0.0, 1.0)
     return (t * t * (3.0 - 2.0 * t)).astype(np.float32)
+
+
+def _soft(a: np.ndarray, sigma: float) -> np.ndarray:
+    """cv2.GaussianBlur(a, (0, 0), sigma) of a float32 map. A wide one (how near skin the parser found is, how near
+    another person) is a smooth map whatever it is made from: the picture is reduced by whole blocks until sigma is
+    SOFT_PER of its pixels, blurred there by what the reducing and the enlarging do not already blur, and enlarged.
+    The picture's edge is mirrored as GaussianBlur mirrors it."""
+    f = int(sigma / SOFT_PER) if SOFT_PER > 0 else 1
+    if f < 2:
+        return cv2.GaussianBlur(a, (0, 0), sigma)
+    h, w = a.shape
+    pad = -(-(int(np.ceil(4.0 * sigma)) + 1) // f) * f
+    hs, ws = -(-(h + 2 * pad) // f), -(-(w + 2 * pad) // f)
+    big = cv2.copyMakeBorder(a, pad, hs * f - h - pad, pad, ws * f - w - pad, cv2.BORDER_REFLECT_101)
+    small = cv2.resize(big, (ws, hs), interpolation=cv2.INTER_AREA)
+    # a block's mean spreads by f * f / 12, the linear enlarging by f * f / 6 (variances, picture px): the rest
+    small = cv2.GaussianBlur(small, (0, 0), float(np.sqrt(max(0.25, (sigma / f) ** 2 - 0.25))))
+    return np.ascontiguousarray(cv2.resize(small, (ws * f, hs * f), interpolation=cv2.INTER_LINEAR)[pad:pad + h, pad:pad + w])
 
 
 def fit_model(rgb_u8: np.ndarray, weight: np.ndarray) -> Optional[tuple]:
@@ -467,8 +581,7 @@ def fit_model(rgb_u8: np.ndarray, weight: np.ndarray) -> Optional[tuple]:
     n = int(sel.sum())
     if n < MODEL_MIN:
         return None
-    ycc = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2YCrCb)
-    px = ycc[sel].astype(np.float32)
+    px = cv2.cvtColor(np.ascontiguousarray(rgb_u8[sel])[None], cv2.COLOR_RGB2YCrCb)[0].astype(np.float32)
     px = px[(px[:, 0] > 12) & (px[:, 0] < 245)]
     if len(px) < MODEL_MIN:
         return None
@@ -485,13 +598,36 @@ def fit_model(rgb_u8: np.ndarray, weight: np.ndarray) -> Optional[tuple]:
     return X.mean(0), np.linalg.inv(cov), yref
 
 
+def _joined(on: np.ndarray, seed: np.ndarray) -> np.ndarray:
+    """The pieces of `on` (bool) that `seed` (bool) lies on, float32 0/1."""
+    n, lab = cv2.connectedComponents(on.astype(np.uint8), connectivity=8)
+    out = np.zeros(on.shape, np.float32)
+    if n <= 1:
+        return out
+    hit = np.unique(lab[seed & on])
+    hit = hit[hit > 0]
+    if len(hit):
+        lut = np.zeros(n, np.float32)
+        lut[hit] = 1.0
+        out = lut[lab]
+    return out
+
+
 def skin_conf(rgb_u8: np.ndarray, own: np.ndarray, others: Optional[np.ndarray], parse: Optional[dict],
               garment: Optional[np.ndarray], prior: Optional[tuple],
-              size: float) -> Tuple[np.ndarray, Optional[tuple], bool, np.ndarray]:
+              size: float, limbs: Optional[np.ndarray] = None, origin: Tuple[int, int] = (0, 0),
+              frame_h: Optional[int] = None, heads: Optional[np.ndarray] = None,
+              face_own: Optional[np.ndarray] = None,
+              weak: Optional[np.ndarray] = None) -> Tuple[np.ndarray, Optional[tuple], bool, np.ndarray]:
     """How sure each pixel is this person's bare skin (float32 0..1), the colour model that said so, whether the
     parser was used, and where this frame does not rule skin out. own: the person's matte where the pixel is
     theirs; others: everybody else's; garment: 1 on clothes the analysis found; prior: a colour model to start from
-    when there is no parser (the face's); size: the person's size on this picture (px) for the distances.
+    when there is no parser (the face's); size: the person's size on this picture (px) for the distances; limbs:
+    where the joints place an arm, a leg or the neck (0..1); heads: where a head is, anybody's (0..1; None: not
+    known, the parser's face class is a face wherever it is); face_own: where this person's landmarks place their
+    own face (0..1; None: nowhere); weak: the pieces of own that no joint reaches (0..1, own_islands; None: none).
+    The maps are the whole picture's or a piece of it (body_mask gives the person's own piece): origin is the
+    piece's top left corner on the picture the parser's box is given in, frame_h the whole picture's height.
 
     The last map is what the frame knows for sure whatever the colour says: the pixel is the person's own, the
     parser does not call it clothes or hair, the analysis found no garment on it, no other person is beside it.
@@ -503,15 +639,60 @@ def skin_conf(rgb_u8: np.ndarray, own: np.ndarray, others: Optional[np.ndarray],
     support = np.ones((h, w), np.float32)
     parsed = parse is not None
     if parsed:
-        sk = _place(parse, "skin", (h, w))
-        no = np.maximum(_place(parse, "cloth", (h, w)), _place(parse, "hair", (h, w)))
+        sk = _place(parse, "skin", (h, w), origin)
+        no = np.maximum(_place(parse, "cloth", (h, w), origin), _place(parse, "hair", (h, w), origin))
         not_other = 1.0 - _ss(NOT_SKIN[0], NOT_SKIN[1], no)
-        teach = _ss(SKIN_SURE[0], SKIN_SURE[1], sk) * (own > 0.8)
+        sk_t = sk                           # what teaches the colour
+        sk_a = None                         # ... and what may when nothing else does (FACE_ALONE)
+        sk_w = sk                           # ... and what is skin on a piece no joint reaches
+        if FACE_OUT is not None and "face" in parse:
+            # a face the parser sees is the face's own retouch's or nobody's: this person's without landmarks or
+            # head joints to place it, or somebody's the matte gave to this person
+            fc = _place(parse, "face", (h, w), origin)
+            sk_w = np.clip(sk - fc, 0, 1)
+            if heads is not None and FACE_NEAR is not None:
+                # ... where a head is. The face class away from every head is no face (FACE_NEAR): what it is the
+                # colour says, learnt from skin the parser calls the body's, from this person's own face
+                # (FACE_TEACH) or brought along from it
+                if FACE_TEACH == "near":
+                    sk_t = np.clip(sk - fc * (1.0 - heads), 0, 1)
+                elif FACE_TEACH in ("own", "joined") and face_own is not None:
+                    mine = np.clip(face_own, 0, 1)
+                    if FACE_TEACH == "joined":
+                        mine = np.maximum(mine, _joined((fc > 0.5) & (own > 0.5), mine > 0.5))
+                    sk_t = np.clip(sk - fc * (1.0 - mine), 0, 1)
+                else:
+                    sk_t = np.clip(sk - fc, 0, 1)
+                fc = fc * heads
+                sk_a = np.clip(sk - fc, 0, 1)
+            not_other = not_other * (1.0 - _ss(FACE_OUT[0], FACE_OUT[1], fc))
+        can = own > 0.8
+        if weak is not None:
+            can = can & (weak < 0.5)
         if garment is not None:
-            teach = teach * (garment < 0.3)
-        model = fit_model(rgb_u8, teach)
+            can = can & (garment < 0.3)
+        model = fit_model(rgb_u8, _ss(SKIN_SURE[0], SKIN_SURE[1], sk_t) * can)
+        if model is None and prior is None and sk_a is not None and FACE_ALONE > 0:
+            cand = (_ss(SKIN_SURE[0], SKIN_SURE[1], sk_a) > 0.5) & can
+            n = int(cand.sum())
+            if n >= MODEL_MIN:
+                ok = cand & (SK.skin_probability(rgb_u8, None) > 0.5)
+                if int(ok.sum()) >= max(MODEL_MIN, FACE_ALONE * n):
+                    model = fit_model(rgb_u8, ok.astype(np.float32))
         sg = max(1.5, SUPPORT * size)
-        support = np.clip(cv2.GaussianBlur(sk, (0, 0), sg) * SUPPORT_GAIN, 0, 1)
+        sk_f = sk_t if FACE_ELSE == "unknown" else sk
+        found = sk_f if SUPPORT_FROM is None else _ss(SUPPORT_FROM[0], SUPPORT_FROM[1], sk_f)
+        if SUPPORT_FROM is not None and SUPPORT_LIMB is not None and limbs is not None and model is not None:
+            # two more witnesses for a weak answer: the joints place a limb there, and the colour it is held against
+            # is this person's own skin's of this frame (not a face's brought along)
+            found = np.maximum(found, _ss(SUPPORT_LIMB[0], SUPPORT_LIMB[1], sk) * np.clip(limbs, 0, 1))
+        if weak is not None:
+            found = found * (1.0 - weak)
+        support = np.clip(_soft(found, sg) * SUPPORT_GAIN, 0, 1)
+        if weak is not None:
+            # a piece no joint reaches: skin where the parser itself is sure of it, not beside skin it found
+            # (skin of the body class: a face out there is somebody's)
+            support = support * (1.0 - weak) + _ss(ISLAND_SURE[0], ISLAND_SURE[1], sk_w) * weak
     if model is None:
         model = prior
     if model is None:
@@ -523,39 +704,153 @@ def skin_conf(rgb_u8: np.ndarray, own: np.ndarray, others: Optional[np.ndarray],
     if garment is not None:
         allow = allow * (1.0 - np.clip(garment, 0, 1))
     if others is not None and float(others.max()) > 0.05:
-        sg = max(1.0, OTHERS_NEAR * h)
-        allow = allow * (1.0 - np.clip(cv2.GaussianBlur(others, (0, 0), sg) * 2.5, 0, 1))
+        sg = max(1.0, OTHERS_NEAR * (frame_h or h))
+        allow = allow * (1.0 - np.clip(_soft(others, sg) * 2.5, 0, 1))
+    if weak is not None and not parsed:
+        allow = allow * (1.0 - weak)        # (the colour alone says nothing about a piece apart)
     c = col * allow * support
     return _ss(CONF[0], CONF[1], c), model, parsed, allow.astype(np.float32)
 
 
+def head_spots(st, t: int) -> List[Tuple[float, float, float]]:
+    """Where heads are on frame t, every tracked person's: [(x, y, the face's width)] in source px. A face by its
+    landmarks and a head by its joints both count (the landmarks of a person in a crowd can sit on the face of
+    the one in front: BANANAS 083)."""
+    out = []
+    has_f = bool(getattr(st, "has_face", False))
+    for q in np.nonzero(st.present[:, t])[0]:
+        q = int(q)
+        if has_f:
+            lm = st.face[q, t]
+            if np.isfinite(lm[:, :2]).all():
+                c = lm[:, :2].astype(np.float64).mean(0)
+                out.append((float(c[0]), float(c[1]), float(np.hypot(*(lm[16, :2] - lm[0, :2])))))
+        xy, _hid = _joints(st, q, t)
+        head = [xy[j] for j in (S.NOSE, S.L_EYE, S.R_EYE, S.L_EAR, S.R_EAR) if np.isfinite(xy[j]).all()]
+        if head:
+            wd = ref_width(st, q, t)
+            if wd > 0:
+                c = np.mean(head, 0)
+                out.append((float(c[0]), float(c[1]), float(wd)))
+    return out
+
+
+def heads_map(spots, window: Tuple[int, int, int, int], sx: float, sy: float, soft: float = 1.0) -> np.ndarray:
+    """head_spots as a map of the piece `window` (x0, y0, x1, y1) of the analysis picture (float32 0..1): 1 within
+    FACE_NEAR face widths of a head, its edge `soft` pixels soft."""
+    x0, y0, x1, y1 = window
+    m = np.zeros((y1 - y0, x1 - x0), np.uint8)
+    k = 0.5 * (sx + sy)
+    any_ = False
+    for x, y, wd in spots:
+        r = float(FACE_NEAR or 0.0) * wd * k
+        if r < 1.0:
+            continue
+        cx, cy = int(round(x * sx)) - x0, int(round(y * sy)) - y0
+        if cx < -r - 2 or cy < -r - 2 or cx > m.shape[1] + r + 2 or cy > m.shape[0] + r + 2:
+            continue
+        cv2.circle(m, (cx, cy), int(round(r)), 255, -1, cv2.LINE_AA)
+        any_ = True
+    if not any_:
+        return m.astype(np.float32)
+    return cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0), max(1.0, float(soft)))
+
+
+def own_islands(own: np.ndarray, placed: np.ndarray) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """The pieces of own that lie apart and that no joint-placed part of the person reaches (ISLANDS). placed:
+    where the joints place an arm, a leg, the neck or the head (0..1). Returns (own, weak): with ISLAND_ELSE
+    "sure" own as it is and where those pieces are (float32 0..1, with their soft rims; None: there are none);
+    with "out" own without them, and None."""
+    n, lab = cv2.connectedComponents((own > 0.5).astype(np.uint8), connectivity=8)
+    if n <= 2:
+        return own, None
+    flat = lab.ravel()
+    size = np.bincount(flat, minlength=n).astype(np.float64)
+    held = np.bincount(flat, weights=(placed > 0.5).ravel().astype(np.float64), minlength=n)
+    keep = held >= np.maximum(ISLAND_HELD[0], ISLAND_HELD[1] * size)
+    keep[0] = False
+    if not keep.any():
+        keep[1 + int(np.argmax(size[1:]))] = True
+    if keep[1:].all():
+        return own, None
+    kept = keep[lab]
+    if ISLAND_ELSE == "sure":
+        apart = (lab > 0) & ~kept
+        weak = cv2.dilate(apart.astype(np.uint8), np.ones((5, 5), np.uint8)) * (~kept).astype(np.uint8)
+        return own, weak.astype(np.float32)
+    ok = cv2.dilate(kept.astype(np.uint8), np.ones((5, 5), np.uint8))           # (with its soft rim)
+    return own * ok, None
+
+
+# ------------------------------------------------------------------------------------------------- what an area is made from
+TOKEN_ARRAYS = ("final", "present", "vis", "widths", "scale", "face", "face_vis", "hand", "hand_raw")
+
+
+def track_token(st, t0: int, t1: int) -> int:
+    """What the tracks say about the frames t0 .. t1 (both in), as one number: everybody's joints and which of them
+    are hidden, the widths, sizes, faces and hands there, where the picture jumps, who is tracked and on which
+    revision of the matte. Everything a body's area takes from the tracks is in the number of the frames
+    t - REF_FRAMES .. t + REF_FRAMES: body_info and ref_width read the person's own frames round t, head_spots
+    everybody's heads, and a pixel no segment claims is owned by the nearest skeleton, anybody's. An area made
+    earlier is this frame's area for as long as the number is what it was (instruction 2026-11-20 §2: a tracking
+    update makes the frames it reaches again, not the cut). A few hundredths of a millisecond."""
+    n = int(st.final.shape[1])
+    lo, hi = max(0, int(t0)), min(n, int(t1) + 1)
+    c = zlib.crc32(repr((id(st), tuple(getattr(st, "pids", ())), int(getattr(st, "matte_rev", 0) or 0), lo, hi)).encode())
+    if hi <= lo:
+        return c
+    for name in TOKEN_ARRAYS:
+        a = getattr(st, name, None)
+        if a is None or getattr(a, "ndim", 0) < 2:
+            continue
+        c = zlib.crc32(np.ascontiguousarray(a[:, lo:hi]), c)
+    j = getattr(st, "jump", None)
+    if j is not None and getattr(j, "ndim", 0) == 1:
+        c = zlib.crc32(np.ascontiguousarray(j[lo:hi]), c)
+    return c
+
+
 # ------------------------------------------------------------------------------------------------- one frame's mask
-def ownership(tracker, t: int, p: int, size: Tuple[int, int]) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+def ownership(tracker, t: int, p: int, size: Tuple[int, int],
+              others: bool = True) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """(the person's own pixels, everybody else's) on a picture of size (w, h), float32 0..1: the matte where
     the pixel's owner is this person / another tracked person. A matte pixel nobody owns is neither: it stays
-    as it is."""
+    as it is. others=False: the first alone (None for the second)."""
     a = tracker.matte.get(t)
     lab = tracker.labels(t)
     if a is None or lab is None:
         return None, None
     af = np.asarray(a).astype(np.float32) / 255.0
     own = cv2.resize(af * (lab == p), size, interpolation=cv2.INTER_LINEAR)
+    if not others:
+        return own, None
     oth = (lab != p) & (lab >= 0)
     others = cv2.resize(af * oth, size, interpolation=cv2.INTER_LINEAR) if oth.any() else None
     return own, others
 
 
 def garments(tracker, t: int, p: int, size: Tuple[int, int]) -> Optional[np.ndarray]:
-    """Clothes, shoes, hats and bags the analysis found on this frame (float32 0..1 at size (w, h)), or None when
-    it made no clothing masks or they are of another matte (stale: not used until they are made again)."""
+    """Clothes, shoes, hats and bags found on this frame (float32 0..1 at size (w, h)), or None when nothing says
+    so. From the clothing masks of 옷 유지 where they are in use for this person on this frame (made for this
+    analysis, not of another matte); else from the look for clothing and hair the body parser takes for skin
+    (track.skincloth), which has a map only where it found such clothing or hair."""
     try:
         from ..track import clothing as CL
-        if not tracker.cloth.exists() or CL.stale_at(tracker, t):
-            return None
-        cm = tracker.cloth.get(t)
+        cm = None
+        if tracker.cloth.exists() and not CL.stale_at(tracker, t):
+            s_ = CL._state(tracker)
+            if s_.get("analysis") == tracker.cut.analysis_version and int(tracker.store.pids[p]) in s_.get("pids", []):
+                c0 = tracker.cloth.get(t)
+                if c0 is not None and c0.any():           # this frame of the person was parsed (0: never written)
+                    cm = c0
+        kinds = list(CL.ALL_CLOTHES)
+        if cm is None:
+            from ..track import skincloth as SC
+            cm = SC.get(tracker, t)
+            kinds.append(SC.HAIR)                         # (the look finds hair the parser takes for skin too)
         if cm is None:
             return None
-        g = np.isin(np.asarray(cm).astype(np.int16) - 1, list(CL.ALL_CLOTHES)).astype(np.uint8)
+        g = np.isin(np.asarray(cm).astype(np.int16) - 1, kinds).astype(np.uint8)
         if not g.any():
             return None
         g = cv2.dilate(g, np.ones((3, 3), np.uint8))
@@ -564,24 +859,44 @@ def garments(tracker, t: int, p: int, size: Tuple[int, int]) -> Optional[np.ndar
         return None
 
 
+def garment_token(tracker) -> str:
+    """What garments() depends on besides the frame, as a short text for cache keys: no clothing masks, or which
+    ones (when they were made, what is out of use in them)."""
+    try:
+        from ..track import clothing as CL
+        from ..track import skincloth as SC
+        a = "c0"
+        if tracker.cloth.exists():
+            s_ = CL._state(tracker)
+            a = "c%x" % (zlib.crc32(repr((s_.get("made"), s_.get("analysis"), s_.get("pids"),
+                                          CL.stale_ranges(tracker))).encode()) & 0xffffff)
+        return a + SC.token(tracker)
+    except Exception:
+        return "c0"
+
+
 _CLOCK = threading.Lock()
 
 
 def _parse_cached(tracker, p: int, t: int, rgb_u8: np.ndarray, own: np.ndarray) -> Optional[dict]:
-    """parse_person, kept per person and frame for this analysis of the cut."""
+    """parse_person, kept per person and frame for this analysis of the cut. A kept answer is the answer for the
+    piece of the picture it was made for: when the person's own pixels take another piece now (a tracking update
+    gave them other pixels), the parser is asked again."""
     key = (int(p), int(t))
     sig = (id(tracker.store), getattr(getattr(tracker, "cut", None), "analysis_version", 0), rgb_u8.shape[:2])
+    box = parse_box(own)
     with _CLOCK:
         lru = tracker.__dict__.get("_bparse")
         if lru is None or tracker.__dict__.get("_bparse_sig") != sig:
             lru = tracker.__dict__["_bparse"] = OrderedDict()
             tracker.__dict__["_bparse_sig"] = sig
-        if key in lru:
+        if key in lru and lru[key][0] == box:
             lru.move_to_end(key)
-            return lru[key]
-    pr = parse_person(rgb_u8, own)
+            return lru[key][1]
+    pr = parse_person(rgb_u8, own, box) if box is not None else None
     with _CLOCK:
-        lru[key] = pr
+        lru[key] = (box, pr)
+        lru.move_to_end(key)
         while len(lru) > PARSE_LRU:
             lru.popitem(last=False)
     return pr
@@ -593,29 +908,76 @@ def body_mask(tracker, p: int, t: int, rgb_u8: np.ndarray, regions: set, prior: 
     rgb_u8, and what is known of the body. regions: body regions chosen (project.body_scope_set)."""
     st = tracker.store
     px = tracker.proxy
-    info = body_info(st, p, t)
+    with _step("info"):
+        info = body_info(st, p, t)
     h, w = rgb_u8.shape[:2]
-    own, others = ownership(tracker, t, p, (w, h))
+    with _step("own"):
+        own, others = ownership(tracker, t, p, (w, h))
     if own is None or float(own.max()) < 0.3 or info.ref < REF_MIN:
         return None, info
     hands = st.hand[p, t] if getattr(st, "has_hands", False) and np.isfinite(st.hand[p, t][:, :2]).any() else None
-    maps = region_maps(info, (h, w), px.sx, px.sy, hands)
-    area = chosen(maps, regions)
+    with _step("regions"):
+        maps = region_maps(info, (h, w), px.sx, px.sy, hands)
+        area = chosen(maps, regions)
     if float(area.max()) <= 0.01:
         return None, info
     ys = np.nonzero(own.max(1) > 0.3)[0]
     xs = np.nonzero(own.max(0) > 0.3)[0]
     info.box = (float(xs[0]), float(ys[0]), float(xs[-1] + 1), float(ys[-1] + 1)) if len(xs) and len(ys) else None
-    parse = _parse_cached(tracker, p, t, rgb_u8, own)
+    if info.box is None:
+        return None, info
+    with _step("parse"):
+        parse = _parse_cached(tracker, p, t, rgb_u8, own)
     size = float(np.sqrt(max(1.0, float((own > 0.3).sum()))))
-    conf, model, parsed, allow = skin_conf(rgb_u8, own, others, parse, garments(tracker, t, p, (w, h)), prior, size)
+    sig = max(0.6, min(0.0025 * h, 0.008 * info.ref * px.sx))
+    # the person's own piece of the picture, with room for the widest of the blurs round it: every map below is that
+    # piece's (the same numbers as on the whole picture; a person is a tenth of a 2560 px frame, and each map of the
+    # whole frame cost as much as the whole person does now: j2796)
+    soft_h = max(1.0, 0.05 * info.ref * 0.5 * (px.sx + px.sy))          # the edge of where a head is
+    if ROI:
+        pad = int(np.ceil(4.0 * max(SUPPORT * size, OTHERS_NEAR * h, sig, 1.5, soft_h))) + 4
+        x0, x1 = max(0, int(xs[0]) - pad), min(w, int(xs[-1]) + 1 + pad)
+        y0, y1 = max(0, int(ys[0]) - pad), min(h, int(ys[-1]) + 1 + pad)
+    else:
+        x0, y0, x1, y1 = 0, 0, w, h
+    win = (slice(y0, y1), slice(x0, x1))
+    with _step("garments"):
+        g = garments(tracker, t, p, (w, h))
+    limbs = np.maximum.reduce([maps["arm"][win], maps["leg"][win], maps["neck"][win]])
+    own_w = own[win]
+    weak = None
+    if ISLANDS:
+        # what the joints place: the limbs, the neck, the head, and each joint that is in view itself (a hip with no
+        # knee in the picture places no limb, but the piece it lies on is the person's)
+        placed = np.maximum(limbs, maps["head"][win])
+        xy_, hid_ = _joints(st, p, t)
+        dots = np.zeros(placed.shape, np.uint8)
+        rj = max(2, int(round(ISLAND_JOINT * info.ref * 0.5 * (px.sx + px.sy))))
+        for j_ in range(len(xy_)):
+            if np.isfinite(xy_[j_]).all() and not hid_[j_]:
+                cv2.circle(dots, (int(round(xy_[j_][0] * px.sx)) - x0, int(round(xy_[j_][1] * px.sy)) - y0), rj, 255, -1)
+        if dots.any():
+            placed = np.maximum(placed, dots.astype(np.float32) / 255.0)
+        own_w, weak = own_islands(own_w, placed)
+    heads = None
+    if FACE_NEAR is not None and parse is not None and "face" in parse:
+        heads = heads_map(head_spots(st, t), (x0, y0, x1, y1), px.sx, px.sy, soft_h)
+    face_own = maps["head"][win] if (info.head is not None and info.head[0] == "poly") else None
+    with _step("conf"):
+        conf, model, parsed, allow = skin_conf(np.ascontiguousarray(rgb_u8[win]), own_w,
+                                               others[win] if others is not None else None, parse,
+                                               g[win] if g is not None else None, prior, size, limbs, (x0, y0), h, heads,
+                                               face_own, weak)
     info.model, info.parsed = model, parsed
-    info.allow = allow * np.clip(area, 0, 1)
-    m = conf * area
+    a_ = np.clip(area[win], 0, 1)
+    info.allow = np.zeros((h, w), np.float32)
+    info.allow[win] = allow * a_
+    m = conf * a_
     if float(m.max()) <= 0.01:
         return None, info
-    sig = max(0.6, min(0.0025 * h, 0.008 * info.ref * px.sx))
-    return np.clip(cv2.GaussianBlur(m, (0, 0), sig), 0, 1).astype(np.float32), info
+    out = np.zeros((h, w), np.float32)
+    out[win] = np.clip(cv2.GaussianBlur(m, (0, 0), sig), 0, 1)
+    return out, info
 
 
 # ------------------------------------------------------------------------------------------------- at the picture's own size
@@ -901,9 +1263,11 @@ def _flow(gray_t: np.ndarray, gray_s: np.ndarray, box, weight: Optional[np.ndarr
     return dict(box=(x0, y0, x1, y1), map=mp, same=same.astype(np.float32))
 
 
-def carry(mo: dict, m_s: np.ndarray, shape: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray]:
+def carry(mo: dict, m_s: np.ndarray, shape: Tuple[int, int],
+          window: Optional[Tuple[int, int, int, int]] = None) -> Tuple[np.ndarray, np.ndarray]:
     """A map of frame s (analysis pixels, any float type) carried onto frame t along `mo` (motion): (the map on a
-    picture of `shape`, how much it can be trusted there 0..1). Outside the measured piece both are 0."""
+    picture of `shape`, how much it can be trusted there 0..1). Outside the measured piece both are 0.
+    window (x0, y0, x1, y1): only that piece of the two maps is made (the same numbers)."""
     x0, y0, x1, y1 = mo["box"]
     h, w = shape
     bw, bh = x1 - x0, y1 - y0
@@ -915,11 +1279,77 @@ def carry(mo: dict, m_s: np.ndarray, shape: Tuple[int, int]) -> Tuple[np.ndarray
         same = mo["same"]
     src = m_s if m_s.dtype == np.float32 else m_s.astype(np.float32)
     piece = cv2.remap(src, mp[..., 0], mp[..., 1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-    out = np.zeros((h, w), np.float32)
-    conf = np.zeros((h, w), np.float32)
-    out[y0:y1, x0:x1] = piece
-    conf[y0:y1, x0:x1] = same
+    if window is None:
+        out = np.zeros((h, w), np.float32)
+        conf = np.zeros((h, w), np.float32)
+        out[y0:y1, x0:x1] = piece
+        conf[y0:y1, x0:x1] = same
+        return out, conf
+    wx0, wy0, wx1, wy1 = window
+    out = np.zeros((wy1 - wy0, wx1 - wx0), np.float32)
+    conf = np.zeros((wy1 - wy0, wx1 - wx0), np.float32)
+    ax0, ay0, ax1, ay1 = max(x0, wx0), max(y0, wy0), min(x1, wx1), min(y1, wy1)
+    if ax1 > ax0 and ay1 > ay0:
+        out[ay0 - wy0:ay1 - wy0, ax0 - wx0:ax1 - wx0] = piece[ay0 - y0:ay1 - y0, ax0 - x0:ax1 - x0]
+        conf[ay0 - wy0:ay1 - wy0, ax0 - wx0:ax1 - wx0] = same[ay0 - y0:ay1 - y0, ax0 - x0:ax1 - x0]
     return out, conf
+
+
+# ------------------------------------------------------------------------------------------------- hands
+HAND_PAD = 0.25             # the outline of a hand's points is widened by this share (the points lie inside the hand)
+HAND_SURE = 1.5             # the whole-body pose's hand points count from this score (as engine's neck mask takes them)
+HAND_ZONE = (1.0, 0.45)     # with the forearm alone: the hand reaches this many face widths beyond the wrist, and is
+                            # this many wide each side of the forearm's line (an arm pointing at the camera is short
+                            # in the picture, its hand is not)
+
+
+def hand_shapes(st, p: int, t: int, info: BodyInfo) -> List[np.ndarray]:
+    """Where person p's hands are on frame t: outlines, (N, 2) float32 in source px. From the hand's own points
+    (tracked, else the whole-body pose's where it is sure of them) with room round them, and from the wrist on
+    along the forearm."""
+    out = []
+    pts = None
+    try:
+        if getattr(st, "has_hands", False) and np.isfinite(st.hand[p, t][:, :2]).any():
+            pts = np.asarray(st.hand[p, t], np.float64)[:, :2]
+        elif getattr(st, "hand_raw", None) is not None:
+            h_ = np.asarray(st.hand_raw[p, t], np.float64).copy()
+            h_[~(np.nan_to_num(h_[:, 2]) >= HAND_SURE)] = np.nan
+            pts = h_[:, :2]
+    except Exception:
+        pts = None
+    if pts is not None:
+        for i0 in (0, 21):
+            q = pts[i0:i0 + 21]
+            q = q[np.isfinite(q).all(1)]
+            if len(q) >= 5:
+                hull = cv2.convexHull(q.astype(np.float32)).reshape(-1, 2).astype(np.float64)
+                c = hull.mean(0)
+                out.append((c + (hull - c) * (1.0 + HAND_PAD)).astype(np.float32))
+    for side in ("l", "r"):
+        f = info.parts.get(f"forearm_{side}")
+        if f is None or f"hand_{side}" not in info.parts:       # (no hand part: the wrist is behind something)
+            continue
+        u = f.b - f.a
+        L = float(np.hypot(*u))
+        if L < 2.0:
+            continue
+        u = u / L
+        n = np.array([-u[1], u[0]])
+        reach = max(HAND_LEN * L, HAND_ZONE[0] * info.ref)
+        half = max(HAND_R * L, HAND_ZONE[1] * info.ref)
+        a_, b_ = f.b - u * 0.15 * reach, f.b + u * reach
+        arc = [b_ + half * (np.cos(th) * n + np.sin(th) * u) for th in np.linspace(0.0, np.pi, 9)]
+        out.append(np.array([a_ - n * half, a_ + n * half] + arc, np.float32))
+    return out
+
+
+def on_hand(shapes, x: float, y: float) -> bool:
+    """Whether a point (source px) lies on one of hand_shapes' outlines."""
+    for poly in shapes or ():
+        if len(poly) >= 3 and cv2.pointPolygonTest(np.asarray(poly, np.float32).reshape(-1, 1, 2), (float(x), float(y)), False) >= 0:
+            return True
+    return False
 
 
 # ------------------------------------------------------------------------------------------------- hand marks

@@ -115,7 +115,8 @@ PARAMS: List[ParamDef] = [
     ParamDef("body_skin", "몸 피부 보정", "bodyskin", 0, 100, unit="pct", kind="skin",
              tip="얼굴 밖의 보이는 피부(목·어깨, 팔·손, 몸통, 다리)의 결을 고르게. 옷·머리카락·장신구와 다른 인물은 제외됩니다"),
     ParamDef("body_blemish", "몸 잡티 제거", "bodyskin", 0, 100, unit="pct", kind="skin",
-             tip="몸 피부의 작은 트러블·붉은 점을 주변 피부로 메웁니다. 문신·점·주근깨·흉터와 옷 경계는 그대로 둡니다"),
+             tip="몸 피부의 작은 트러블·붉은 점을 주변 피부로 메웁니다. 문신·점·주근깨·흉터, 옷 경계, 손(마디 주름)은 그대로 둡니다. "
+                 "남겨 둔 자국은 아래 '제거' 표시로 지울 수 있습니다"),
     # ---- colour
     ParamDef("lip_hue", "입술 색조", "color", -40, 40, unit="deg", kind="color", tip="− 쪽이 핑크/보라, + 쪽이 코랄/오렌지"),
     ParamDef("lip_sat", "입술 채도", "color", -60, 60, kind="color"),

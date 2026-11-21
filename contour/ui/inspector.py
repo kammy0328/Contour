@@ -28,6 +28,26 @@ def _scroll(inner: QWidget) -> QScrollArea:
     return sa
 
 
+
+def body_cloth_line(tracker, cut, on: bool):
+    """(what the body skin box says about the look for skin-coloured clothing, whether a look can be made now)."""
+    if tracker is None or cut is None or getattr(tracker, "store", None) is None or not on:
+        return "", False
+    try:
+        from ..track import skincloth as SC
+        if not SC.needed(tracker, cut):
+            inf = SC.info(tracker)
+            if inf.get("state") == "current":
+                if inf.get("ranges"):
+                    return f"피부색 옷 확인됨: {int(inf.get('frames', 0))}프레임에서 옷·머리카락을 제외합니다.", False
+                return "피부색 옷 확인됨: 피부로 잘못 볼 옷·머리카락이 없습니다.", False
+            return "옷 영역(옷 유지) 분석을 그대로 씁니다.", False
+        st_ = SC.info(tracker).get("state")
+        return ("인물 매트가 바뀌어 피부색 옷을 다시 확인해야 합니다." if st_ == "stale"
+                else "피부색 옷(퍼, 살색 옷)은 아직 확인 전입니다. 내보낼 때 자동으로 확인합니다."), True
+    except Exception:
+        return "", False
+
 class _Tab(QWidget):
     def __init__(self, ctl):
         super().__init__()
@@ -285,6 +305,20 @@ class ReshapeTab(_Tab):
         self.body_mark_info = Wd.label("", "Faint", 11)
         self.body_mark_info.setWordWrap(True)
         v.addWidget(self.body_mark_info)
+        cr = QHBoxLayout()
+        cr.setContentsMargins(0, 2, 0, 0)
+        cr.setSpacing(6)
+        self.body_cloth_info = Wd.label("", "Faint", 11)
+        self.body_cloth_info.setWordWrap(True)
+        cr.addWidget(self.body_cloth_info, 1)
+        self.body_cloth_btn = Wd.button("옷 확인", "ghost", "search",
+                                        "피부색 옷(퍼, 살색 상의·스타킹 등)과 피부로 잘못 볼 머리카락을 SAM 3.1로 찾아 몸 피부에서 제외합니다.\n"
+                                        "몸 효과를 켜면 자동으로 하고, 내보낼 때도 안 되어 있으면 먼저 합니다")
+        self.body_cloth_btn.clicked.connect(lambda: self.ctl.ensure_skin_cloth(quiet=False))
+        cr.addWidget(self.body_cloth_btn)
+        cw = QWidget()
+        cw.setLayout(cr)
+        v.addWidget(cw)
         v.addWidget(Wd.label("K: 적용 영역과 찾은 잡티 보기 (빨강: 제거 · 회색: 남겨 둠)", "Faint", 11))
         return w
 
@@ -348,6 +382,10 @@ class ReshapeTab(_Tab):
             b.setEnabled(enabled and spot_on)
         n = len(pp.body_marks) if pp is not None else 0
         self.body_mark_btns["clear"].setEnabled(enabled and n > 0)
+        text, can = body_cloth_line(getattr(self.ctl.session, "tracker", None), getattr(self.ctl.session, "cut", None),
+                                    skin_on or spot_on)
+        self.body_cloth_info.setText(text)
+        self.body_cloth_btn.setEnabled(enabled and can)
         self.body_mark_r.setEnabled(enabled and spot_on)
         self.body_mark_r.set_value(float(getattr(v, "mark_r", 8.0)))
         if n:

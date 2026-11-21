@@ -111,6 +111,8 @@ class GarmentFinder:
                                  ph == CATCH_ALL[0]))
 
     stats: dict = None
+    also: tuple = ()        # more phrases for the same picture: (class, text, text_pad). What they find takes only the
+                            # pixels no garment word claims (track.skincloth: 'hair', class 2)
 
     def classes(self, rgb: np.ndarray, size: Tuple[int, int], only: Optional[set] = None,
                 catch_all: str = "always") -> np.ndarray:
@@ -144,6 +146,15 @@ class GarmentFinder:
                     win = (sc > 0) & (out == 0) if is_catch else sc > best
                     out[win] = cls
                     best[win] = sc[win]
+            for cls, text, pad in (self.also or ()):
+                self.finder.const = dict(base, text=text, text_pad=pad)
+                t1 = time.time()
+                found = self.finder.find(enc, GARMENT_SCORE)
+                self.stats["find_s"] += time.time() - t1
+                self.stats["find_calls"] += 1
+                for d in found:
+                    lg = cv2.resize(d["lg"], (w, h), interpolation=cv2.INTER_LINEAR)
+                    out[(lg > 0) & (out == 0)] = cls
         finally:
             self.finder.const = base
         return out
