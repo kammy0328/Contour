@@ -693,7 +693,7 @@ class Project:
     modified: float = field(default_factory=time.time)
     # Learning from this project's footage (the crops and samples collected from its cuts, and the automatic
     # learning that starts from them): only when it was switched on by hand for this project (set_learn). A
-    # project that never chose (made before 1.23, whose file has no 'learn' or the old default true) is off.
+    # project that never chose (made before 1.24, whose file has no 'learn' or the old default true) is off.
     learn: bool = False
     learn_set: bool = False           # 'learn' was chosen by hand under that rule (instruction 2026-11-20 §4-4)
     learn_before: bool = False        # (not saved) the file said true under the old rule: said once on opening

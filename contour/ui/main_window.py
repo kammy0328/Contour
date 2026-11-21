@@ -785,7 +785,7 @@ class MainWindow(QMainWindow):
             traceback.print_exc()
 
     def _tell_learning(self, prj):
-        """Once per project made before 1.23 whose file said (or left out, which meant) that it is in the learning
+        """Once per project made before 1.24 whose file said (or left out, which meant) that it is in the learning
         data: learning from a project now starts only where it is switched on by hand, and this one never was."""
         try:
             if not getattr(prj, "learn_before", False) or prj.learn_set:
@@ -794,7 +794,7 @@ class MainWindow(QMainWindow):
             s_ = settings()
             if key in (s_.learn_notified or []):
                 return
-            self.toast("1.23부터 학습 데이터 수집과 자동 학습은 직접 켠 프로젝트에서만 합니다. 이 프로젝트는 꺼져 있습니다 "
+            self.toast("1.24부터 학습 데이터 수집과 자동 학습은 직접 켠 프로젝트에서만 합니다. 이 프로젝트는 꺼져 있습니다 "
                        "(프로젝트 메뉴에서 켤 수 있습니다). 편집·미리보기·렌더와 이미 학습된 모델은 그대로 씁니다.")
             s_.learn_notified = (list(s_.learn_notified or []) + [key])[-500:]
             s_.save()

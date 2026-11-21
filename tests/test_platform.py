@@ -35,7 +35,7 @@ def test_where_the_data_and_the_cache_are_on_each_system(tmp_path, monkeypatch):
     data = home / "Library" / "Application Support" / "DIAP"
     assert S.default_data_dir() == data and S.default_cache_dir(data) == home / "Library" / "Caches" / "DIAP"
     (home / "DIAP_Data").mkdir()
-    assert S.default_data_dir() == home / "DIAP_Data", "a source run's folder from before 1.23 goes on being used"
+    assert S.default_data_dir() == home / "DIAP_Data", "a source run's folder from before 1.24 goes on being used"
     assert S.default_cache_dir(home / "DIAP_Data") == home / "DIAP_Data" / "cache"
     monkeypatch.setattr(sys, "platform", "linux")
     assert S.default_data_dir() == home / "DIAP_Data"

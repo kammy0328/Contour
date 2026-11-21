@@ -21,7 +21,7 @@ def default_data_dir() -> Path:
     Windows: Documents\\DIAP_Data, where it always was (an install that has Documents\\Contour_Data from before the
     rename goes on using it): nothing is moved, so the settings and caches of an existing install are simply found.
     macOS: ~/Library/Application Support/DIAP, the system's place for an app's own data (a ~/DIAP_Data from a
-    source run before 1.23 goes on being used). Elsewhere: ~/DIAP_Data."""
+    source run before 1.24 goes on being used). Elsewhere: ~/DIAP_Data."""
     if sys.platform == "win32":
         base = Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Documents"
     else:
@@ -39,7 +39,7 @@ def default_data_dir() -> Path:
 def default_cache_dir(data: Path) -> Path:
     """Proxies and other things made again from the footage whenever missing. Windows and elsewhere: <data>\\cache,
     as before. macOS: ~/Library/Caches/DIAP (the system may clear it; nothing in it is the only copy), unless the
-    data folder is one from before 1.23, whose cache stays inside it."""
+    data folder is one from before 1.24, whose cache stays inside it."""
     if sys.platform == "darwin" and Path(data) == Path.home() / "Library" / "Application Support" / APP_NAME:
         return Path.home() / "Library" / "Caches" / APP_NAME
     return Path(data) / "cache"
@@ -56,7 +56,7 @@ class AppSettings:
     proxy_long_side: int = 1920
     gpu: str = "auto"                     # auto | cuda | dml | coreml | cpu (which a model gets: track/backend.py)
     accuracy: str = "high"                # high | balanced | fast
-    # Both apply only inside a project where learning was switched on by hand (learn.allowed, 1.23): on their own
+    # Both apply only inside a project where learning was switched on by hand (learn.allowed, 1.24): on their own
     # they start nothing. Switching one off here stops it in every project.
     collect_learning_data: bool = True
     self_learning: bool = True        # learn from the analysed cuts on their own (no corrections needed)
