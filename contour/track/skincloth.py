@@ -228,11 +228,14 @@ def _dirty(row: Dict[int, list], picture_px: int) -> bool:
     return False
 
 
-def look_frames(present, persons: List[int], a: int, b: int) -> List[int]:
+def look_frames(present, persons: List[int], a: int, b: int, boxes=None) -> List[int]:
     """The frames of the work range [a, b) a look looks at: every LOOK_STEP-th and the last, and for a person who is
-    on the picture for a run of frames none of those falls on, that run's middle frame. (A person who comes and goes
-    between two looks was never looked at: BANANAS 155 P9, on frames 3..11 of 21 in a top the parser takes for skin,
-    kept all of it in the area: j2803.) present: (people, frames) of the store; persons: store indices."""
+    on the picture for a run of frames none of those falls on, one frame of that run: the one the person is largest
+    on (boxes: the store's (people, frames, 4); of the frames within a tenth of the largest, the one nearest the
+    run's middle), the middle one without boxes. (A person who comes and goes between two looks was never looked at:
+    BANANAS 155 P9, on frames 3..11 of 21 in a top the parser takes for skin, kept all of it in the area: j2803.
+    Coming into the picture, the run's middle showed 645 px of it and two frames on 13 363: j2804.)
+    present: (people, frames) of the store; persons: store indices."""
     looks = set(range(a, b, LOOK_STEP)) | {b - 1}
     for p in persons:
         row = np.asarray(present[p, a:b], bool)
@@ -240,8 +243,17 @@ def look_frames(present, persons: List[int], a: int, b: int) -> List[int]:
             continue
         edge = np.flatnonzero(np.diff(np.concatenate([[False], row, [False]]).astype(np.int8)))
         for s, e in zip(edge[::2], edge[1::2]):                 # on the picture over [a + s, a + e)
-            if not any(a + s <= t < a + e for t in looks):
-                looks.add(int(a + (s + e - 1) // 2))
+            if any(a + s <= t < a + e for t in looks):
+                continue
+            mid = (s + e - 1) // 2
+            best = mid
+            if boxes is not None:
+                bx = np.nan_to_num(np.asarray(boxes[p, a + s:a + e], np.float64))
+                size = np.clip(bx[:, 2] - bx[:, 0], 0, None) * np.clip(bx[:, 3] - bx[:, 1], 0, None)
+                if size.size and float(size.max()) > 0:
+                    near = np.flatnonzero(size >= 0.9 * float(size.max())) + s
+                    best = int(near[np.argmin(np.abs(near - mid))])
+            looks.add(int(a + best))
     return sorted(looks)
 
 
@@ -301,7 +313,7 @@ def _run(tracker, persons, progress, cancel, gf, old, t0) -> bool:
     W, H = int(proxy.w), int(proxy.h)
     d = _dir(tracker)
     d.mkdir(parents=True, exist_ok=True)
-    looks = look_frames(st.present, persons, a, b)
+    looks = look_frames(st.present, persons, a, b, getattr(st, "boxes", None))
     clothes = list(CL.ALL_CLOTHES)
 
     def frame_map(t):
