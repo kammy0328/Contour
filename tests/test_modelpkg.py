@@ -540,12 +540,14 @@ def test_the_apps_models_are_opened_from_their_package(tmp_path, app_store, monk
     p = M.model_path("matte_rvm")
     assert p.read_bytes() == b"R" * 4000 and p != legacy
     assert M.is_downloaded("matte_rvm") and M.ensure_model("matte_rvm") == p, "nothing is downloaded for a package"
-    assert M.fingerprint("matte_rvm") == pkg.sha256[:16] and M.fingerprints(["matte_rvm"]) == {"matte_rvm": pkg.sha256[:16]}
+    fp1 = M.fingerprint("matte_rvm")
+    assert len(fp1) == 16 and M.fingerprints(["matte_rvm"]) == {"matte_rvm": fp1}
     # pinned work reads its own version, and says so by its fingerprint
     with MP.pinned():
-        pkg2 = _install(app_store, reg, key="matte_rvm", version="2026.12.1")
-        assert M.ensure_model("matte_rvm").read_bytes() == b"R" * 4000 and M.fingerprint("matte_rvm") == pkg.sha256[:16]
-    assert M.ensure_model("matte_rvm").read_bytes() == b"S" * 4100 and M.fingerprint("matte_rvm") == pkg2.sha256[:16]
+        _install(app_store, reg, key="matte_rvm", version="2026.12.1")
+        assert M.ensure_model("matte_rvm").read_bytes() == b"R" * 4000 and M.fingerprint("matte_rvm") == fp1
+    fp2 = M.fingerprint("matte_rvm")
+    assert M.ensure_model("matte_rvm").read_bytes() == b"S" * 4100 and len(fp2) == 16 and fp2 != fp1
     # pinned to a version that is not here: an error that names it, not another version and not a download
     app_store.remove("matte_rvm", "2026.11.1")
     with MP.pinned({"matte_rvm": "2026.11.1"}):
@@ -554,6 +556,45 @@ def test_the_apps_models_are_opened_from_their_package(tmp_path, app_store, monk
         assert "2026.11.1" in str(e.value) and "RVM" in str(e.value)
     # a model with no package is where it always was
     assert M.model_path("det_yolox_m") == M.legacy_path("det_yolox_m")
+
+
+def test_the_same_files_have_the_same_fingerprint_as_a_package_as_downloaded(tmp_path, app_store):
+    """A cut records the files its analysis ran with (models_used). The models this computer downloaded, published
+    as packages and installed (tools/modelpkg.py pack-installed), are the same files: their fingerprint stays what
+    it was, so nothing analysed before reads as made with another model."""
+    import importlib.util
+    from contour.track import models as M
+    spec = importlib.util.spec_from_file_location("modelpkg_tool2", Path(__file__).resolve().parents[1] / "tools" / "modelpkg.py")
+    T = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(T)
+    one = M.legacy_path("matte_rvm")
+    one.parent.mkdir(parents=True, exist_ok=True)
+    one.write_bytes(b"\x08" + b"R" * 4000)
+    many = M.legacy_path("seg_sam2_s")
+    _files(many, {"vision_encoder.onnx": b"E" * 3000, "vision_encoder.onnx_data": b"e" * 90000,
+                  "prompt_encoder_mask_decoder.onnx": b"D" * 2000, "config.json": b"{}", "left.part": b"x"})
+    before = {k: M.fingerprint(k) for k in ("matte_rvm", "seg_sam2_s")}
+    assert all(len(v) == 16 for v in before.values())
+    reg, keys = tmp_path / "reg", tmp_path / "keys"
+    assert T.main(["keygen", "--out", str(keys), "--id", "pub-2"]) == 0
+    assert T.main(["pack-installed", "--registry", str(reg), "--version", "2026.12.1", "--keys", "matte_rvm,seg_sam2_s"]) == 0
+    assert T.main(["sign", "--registry", str(reg), "--secret", str(keys / "pub-2.secret")]) == 0
+    res = MP.bring_in(str(reg), trusted={"pub-2": (keys / "pub-2.pub").read_text().strip()})
+    assert sorted(k for k, _ in res["installed"]) == ["matte_rvm", "seg_sam2_s"] and not res["failed"]
+    assert app_store.owns(M.model_path("matte_rvm")) and app_store.owns(M.model_path("seg_sam2_s"))
+    assert {k: M.fingerprint(k) for k in before} == before
+    # and with the downloaded files gone (a computer that only ever had the packages)
+    one.unlink()
+    import shutil
+    shutil.rmtree(many)
+    assert {k: M.fingerprint(k) for k in before} == before
+    # other content is another fingerprint
+    _files(tmp_path / "src", {"matte_rvm.onnx": b"\x08" + b"S" * 4000})
+    assert T.main(["pack", "--registry", str(reg), "--key", "matte_rvm", "--version", "2026.12.2", "--from",
+                   str(tmp_path / "src" / "matte_rvm.onnx")]) == 0
+    assert T.main(["sign", "--registry", str(reg), "--secret", str(keys / "pub-2.secret")]) == 0
+    MP.bring_in(str(reg), ["matte_rvm"], trusted={"pub-2": (keys / "pub-2.pub").read_text().strip()})
+    assert app_store.active("matte_rvm") == "2026.12.2" and M.fingerprint("matte_rvm") != before["matte_rvm"]
 
 
 def test_a_cut_remembers_the_versions_only_when_there_are_any(tmp_path):

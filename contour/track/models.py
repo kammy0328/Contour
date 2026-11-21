@@ -150,7 +150,18 @@ def fingerprint(key: str) -> str:
         ver = MP.version_in_use(key)
         pkg = MP.store().package(key, ver) if ver else None
         if pkg is not None:
-            return pkg.sha256[:16]                 # a package's content never changes: its own hash, not read again
+            # a package's content never changes: from its own list, not read again. The same figure the app's own
+            # download of the same files has (below), so a cut analysed before its model came as a package and one
+            # analysed after name the same files
+            fs = sorted((Path(f.path), f.sha256) for f in pkg.files
+                        if not f.path.endswith((".part", ".json")) and ".broken" not in Path(f.path).name
+                        and ".noaccess" not in Path(f.path).name)
+            if fs:
+                h_pkg = hashlib.sha256()
+                for fp_, hx in fs:
+                    h_pkg.update(f"{fp_.name}:{hx};".encode())
+                return h_pkg.hexdigest()[:16]
+            return pkg.sha256[:16]
     except Exception:
         pass
     p = legacy_path(key)
