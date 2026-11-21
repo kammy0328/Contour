@@ -7,7 +7,9 @@ display-referred image.
 """
 from __future__ import annotations
 
+import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -42,6 +44,66 @@ class ViewSettings:
     def from_dict(cls, d: Optional[dict]) -> "ViewSettings":
         d = d or {}
         return cls(**{k: d[k] for k in ("input_cs", "display", "view", "lut_path", "exposure") if k in d})
+
+
+# ----------------------------------------------------------------------------- one picture in strips (1.27)
+# OCIO's CPU processor converts every pixel on its own and gives up Python's lock while it works, so the rows of a picture can be
+# converted by several threads at once and the result is the same, bit for bit, as one call over the whole picture. With the ACES 2.0
+# view a 4K frame takes about 4 s in one call; it was most of the time a render and an analysis spent on a frame.
+STRIP_MIN_PIXELS = 1 << 20          # a picture smaller than this (1 MP) is converted in one call
+_strip_pool: Optional[ThreadPoolExecutor] = None
+_strip_pool_n = 0
+_strip_lock = threading.Lock()
+
+
+def strip_threads() -> int:
+    """How many threads convert one picture: CONTOUR_COLOUR_THREADS (1: no strips), else half of the logical CPUs, 2 to 8."""
+    try:
+        n = int(os.environ.get("CONTOUR_COLOUR_THREADS", "") or 0)
+    except ValueError:
+        n = 0
+    if n <= 0:
+        n = max(2, min(8, (os.cpu_count() or 2) // 2))
+    return n
+
+
+def _strips(n: int) -> ThreadPoolExecutor:
+    global _strip_pool, _strip_pool_n
+    with _strip_lock:
+        if _strip_pool is None or n > _strip_pool_n:
+            old = _strip_pool
+            _strip_pool = ThreadPoolExecutor(max_workers=n, thread_name_prefix="colour")
+            _strip_pool_n = n
+            if old is not None:
+                old.shutdown(wait=False)
+        return _strip_pool
+
+
+def _can_strip(a: np.ndarray, n: int) -> bool:
+    return (n > 1 and a.ndim == 3 and a.shape[2] == 3 and a.shape[0] >= n * 8 and a.shape[0] * a.shape[1] >= STRIP_MIN_PIXELS)
+
+
+def _run_strips(n: int, h: int, job) -> None:
+    """job(y0, y1) for n blocks of rows, side by side; what one of them raises is raised here."""
+    pool = _strips(n)
+    futs = [pool.submit(job, h * i // n, h * (i + 1) // n) for i in range(n)]
+    err = None
+    for f in futs:
+        try:
+            f.result()
+        except BaseException as e:      # (every strip is waited for before this goes on: none is left writing into the picture)
+            err = err or e
+    if err is not None:
+        raise err
+
+
+def apply_rgb(proc, img: np.ndarray) -> None:
+    """proc.applyRGB(img) in place (float32, C-contiguous), in strips of rows when the picture is big."""
+    n = strip_threads()
+    if _can_strip(img, n) and img.flags.c_contiguous:
+        _run_strips(n, img.shape[0], lambda y0, y1: proc.applyRGB(img[y0:y1]))
+    else:
+        proc.applyRGB(img)
 
 
 class ColourManager:
@@ -207,12 +269,33 @@ class ColourManager:
         img = np.ascontiguousarray(rgb, dtype=np.float32).copy()
         proc = self._processor(vs)
         if proc is not None:
-            proc.applyRGB(img)
+            apply_rgb(proc, img)
         elif vs.exposure:
             img *= 2.0 ** vs.exposure
         return img
 
     def to_display_u8(self, rgb: np.ndarray, vs: ViewSettings) -> np.ndarray:
+        proc = self._processor(vs)
+        n = strip_threads()
+        src = None
+        if proc is not None:
+            src = np.ascontiguousarray(rgb, dtype=np.float32)
+            if not _can_strip(src, n):
+                src = None
+        if src is not None:
+            # a strip at a time: convert, clip, scale and cut to 8 bits (the same operations in the same order as below, on a piece of the rows),
+            # so the whole picture is not copied as float again
+            out = np.empty(src.shape, np.uint8)
+
+            def one(y0: int, y1: int) -> None:
+                t = src[y0:y1].copy()
+                proc.applyRGB(t)
+                np.clip(t, 0.0, 1.0, out=t)
+                t *= 255.0
+                t += 0.5
+                out[y0:y1] = t.astype(np.uint8)
+            _run_strips(n, src.shape[0], one)
+            return out
         out = self.to_display(rgb, vs)
         np.clip(out, 0.0, 1.0, out=out)
         return (out * 255.0 + 0.5).astype(np.uint8)
@@ -228,7 +311,7 @@ class ColourManager:
                 proc = self.config.getProcessor(src, dst).getDefaultCPUProcessor()
                 self._cache[key] = proc
         img = np.ascontiguousarray(rgb, dtype=np.float32).copy()
-        proc.applyRGB(img)
+        apply_rgb(proc, img)
         return img
 
 
