@@ -30,14 +30,14 @@ RES_FROM = 1.5            # elliptical radius from which the leg's own shading i
 RES_DEN = 0.02            # the weight of ring pixels near enough (within the BROAD blur) from which the leg's shading is spread over the knee
 FINE = 0.12               # of a half width (at least 2 px): what is finer than this (grain, pores, hair) is never changed
 BROAD = 0.9               # of a half width: the leg's own shading (light across the knee) is broader than this
-DARK_KEEP = 0.12          # of a blotch darker than the leg round it: this share stays
+DARK_KEEP = 0.25          # of a blotch darker than the leg round it: this share stays
 LIGHT_KEEP = 0.65         # of a part lighter than the leg round it (the cap's relief, a highlight): this share stays
 CHROMA_KEEP = 0.06        # of a colour blotch (red, grey, purple): this share stays
 NOT_SKIN = (0.45, 0.65)   # brightness over the leg's: from where a pixel is skin of the leg .. fully (a sock, a hem is darker)
 FIRM = (0.55, 1.6)        # a blotch's size over the leg's own colour variation: from where it is fully taken .. (a smaller
                           # difference is the skin's own and is taken less: never less than FIRM_MIN of it)
 FIRM_MIN = 0.55
-MAX_CHANGE = {"luma": 0.05, "chroma": 0.04}   # the most one pixel's plane may move (soft limit): the knee is evened, not repainted
+MAX_CHANGE = {"luma": 0.035, "chroma": 0.04}   # the most one pixel's plane may move (soft limit): the knee is evened, not repainted
 
 
 def _ss(e0: float, e1: float, x):
