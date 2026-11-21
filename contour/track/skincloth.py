@@ -271,7 +271,7 @@ def run(tracker, persons: List[int], progress: Optional[Callable[[float, str], N
             g = cv2.resize(np.isin(m.astype(np.int16) - 1, clothes).astype(np.uint8), (W, H),
                            interpolation=cv2.INTER_NEAREST) > 0
             for p in pres:
-                own = BS.ownership(tracker, t, p, (W, H))[0]
+                own = BS.ownership(tracker, t, p, (W, H), others=False)[0]
                 pr = BS._parse_cached(tracker, p, t, rgb, own) if own is not None else None
                 if pr is None:
                     continue

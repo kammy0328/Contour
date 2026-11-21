@@ -65,9 +65,14 @@ DEBUG = None                # a list: what was measured round each mark is appen
 
 HOLD_NONE, HOLD_THING, HOLD_MOLE, HOLD_CROWD, HOLD_LONG, HOLD_USER, HOLD_WEAK, HOLD_EDGE = 0, 1, 2, 3, 4, 5, 6, 7
 HOLD_ALONE = 8              # seen on this frame only: no frame beside it shows the same mark at that place (fuse)
+HOLD_HAND = 9               # on a hand (engine._bdet_raw, HANDS_HELD)
 HOLD_TEXT = {HOLD_NONE: "제거", HOLD_THING: "옷·장신구·문신 등", HOLD_MOLE: "점", HOLD_CROWD: "주근깨·무늬",
              HOLD_LONG: "흉터·선", HOLD_USER: "제외 표시", HOLD_WEAK: "불확실", HOLD_EDGE: "피부 가장자리·주름",
-             HOLD_ALONE: "한 프레임에만 보임"}
+             HOLD_ALONE: "한 프레임에만 보임", HOLD_HAND: "손(마디·주름)"}
+HANDS_HELD = True           # marks on a hand are kept: the knuckles' folds and their redness are found as spots frame
+                            # after frame, at the same place of the hand, so the frames beside confirm them (BANANAS 083:
+                            # 4 to 15 'spots' a frame removed from the back of one hand). The operator's own mark still
+                            # removes a spot there. False: a hand is skin like any other (1.23's first build)
 KIND_DARK, KIND_RED, KIND_BUMP, KIND_USER = 0, 1, 2, 3
 
 CAND = np.dtype([("x", "f4"), ("y", "f4"),              # centre, source px
@@ -410,7 +415,7 @@ def fuse(own: dict, others: list, ref_src: float, sx: float, sy: float) -> dict:
     - a spot found here and on the frames round it is filled over the same patch on all of them: this frame's own
       and its best neighbour's laid on it (a spot that is fainter on one frame is else filled less there, and
       what is left of it blinks);
-    - a mark any frame holds (a thing, a mole, a pattern, a line) is held here too;
+    - a mark any frame holds (a thing, a mole, a pattern, a line, a mark on a hand) is held here too;
     - a spot is removed only when a frame beside this one shows the same spot at that place on the body: by the
       picture's own motion where that has a say, else by the body part the spot lies on (others' fourth entry,
       `where`: the joints carry the place to the neighbour, and the neighbour's own skin area tells whether the
@@ -454,7 +459,7 @@ def fuse(own: dict, others: list, ref_src: float, sx: float, sy: float) -> dict:
                     acc_p[i] += w * sm * sc_j
                     if cs["hold"][j] in (HOLD_NONE, HOLD_WEAK) and (i not in best or w * sm * sc_j > best[i][0]):
                         best[i] = (w * sm * sc_j, ds, int(j))
-                    if cs["hold"][j] in (HOLD_THING, HOLD_MOLE, HOLD_CROWD, HOLD_LONG) and hold[i] in (HOLD_NONE, HOLD_WEAK):
+                    if cs["hold"][j] in (HOLD_THING, HOLD_MOLE, HOLD_CROWD, HOLD_LONG, HOLD_HAND) and hold[i] in (HOLD_NONE, HOLD_WEAK):
                         hold[i] = cs["hold"][j]
         for j in np.nonzero(~used & np.isfinite(pos[:, 0]) & (same >= SAME_MIN))[0]:
             extra.append((float(pos[j, 0]), float(pos[j, 1]), w * float(same[j]), float(max(cs["s"][j], cs["r"][j])),
@@ -496,7 +501,7 @@ def fuse(own: dict, others: list, ref_src: float, sx: float, sy: float) -> dict:
                 jn = int(np.argmin(d))
                 if d[jn] > max(tol_a, 0.6 * float(co["d"][i])):
                     continue
-                if cs["hold"][jn] in (HOLD_THING, HOLD_MOLE, HOLD_CROWD, HOLD_LONG):
+                if cs["hold"][jn] in (HOLD_THING, HOLD_MOLE, HOLD_CROWD, HOLD_LONG, HOLD_HAND):
                     hold[i] = cs["hold"][jn]     # what that frame keeps there is kept here
                     ok = True
                     break

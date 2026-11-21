@@ -6,6 +6,7 @@ planes: 4:2:2 / 4:4:4 YUV, or float RGB), so what you see is what renders.
 """
 from __future__ import annotations
 
+import threading
 import zlib
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -26,9 +27,14 @@ from ..track import skeleton as S
 TIMING: Optional[dict] = None
 
 
+_TM_OPEN = threading.local()
+
+
 class _tm:
-    """with _tm("stage"): ...  adds the block's seconds to TIMING["stage"] = [seconds, calls] when TIMING is on."""
-    __slots__ = ("name", "t0")
+    """with _tm("stage"): ...  adds the block's seconds to TIMING["stage"] = [seconds, calls, its own seconds] when
+    TIMING is on. Its own seconds: without the stages measured inside it on the same thread (a frame's masks made
+    while a neighbour's are steadied count for the frame's masks, not for the steadying)."""
+    __slots__ = ("name", "t0", "inner")
 
     def __init__(self, name: str):
         self.name = name
@@ -36,16 +42,27 @@ class _tm:
     def __enter__(self):
         if TIMING is not None:
             import time
+            self.inner = 0.0
+            st_ = _TM_OPEN.__dict__.setdefault("stack", [])
+            st_.append(self)
             self.t0 = time.perf_counter()
         return self
 
     def __exit__(self, *exc):
         d = TIMING
-        if d is not None:
+        if d is not None and getattr(self, "t0", None) is not None:
             import time
-            e = d.setdefault(self.name, [0.0, 0])
-            e[0] += time.perf_counter() - self.t0
+            dt = time.perf_counter() - self.t0
+            st_ = _TM_OPEN.__dict__.get("stack") or []
+            if st_ and st_[-1] is self:
+                st_.pop()
+                if st_:
+                    st_[-1].inner += dt
+            e = d.setdefault(self.name, [0.0, 0, 0.0])
+            e[0] += dt
             e[1] += 1
+            if len(e) > 2:
+                e[2] += dt - self.inner
         return False
 
 
@@ -1397,7 +1414,8 @@ def _bdet_raw(cut, px, t: int, job, rgb_u8: np.ndarray) -> Optional[dict]:
             sc = FRM.source_crops(px, vs=_vs_for(cut))
             if sc is not None:
                 sc_scale = float(np.clip(round(want * 8.0) / 8.0, 0.125, 1.0))
-                img = sc.piece(t, box_src, sc_scale)
+                with _tm("body.spots.read"):
+                    img = sc.piece(t, box_src, sc_scale)
                 scale, from_src = sc_scale, True
         except Exception:
             import traceback
@@ -1440,8 +1458,14 @@ def _bdet_raw(cut, px, t: int, job, rgb_u8: np.ndarray) -> Optional[dict]:
         from . import spotnet_run as SR
         if SR.available():
             net_for = lambda im, ref_: (lambda region, size: SR.run(im.astype(np.float32) / 255.0, region, ref_, max_size=size))
-    det = BP.detect(pieces, region_at, info.get("model"), ref_src, job.body_size, 0.5 * (fx + fy), box_src, net_for)
+    with _tm("body.spots.find"):
+        det = BP.detect(pieces, region_at, info.get("model"), ref_src, job.body_size, 0.5 * (fx + fy), box_src, net_for)
     det["src"] = from_src
+    if BP.HANDS_HELD and info.get("hands"):
+        c = det["cands"]
+        for i in range(len(c)):
+            if c["hold"][i] in (BP.HOLD_NONE, BP.HOLD_WEAK) and BS.on_hand(info["hands"], float(c["x"][i]), float(c["y"][i])):
+                c["hold"][i] = BP.HOLD_HAND
     return det
 
 
@@ -1577,8 +1601,8 @@ def _body_motion(tracker, j, t: int, s: int, box_t, box_s) -> Optional[dict]:
         px = tracker.proxy
         size = (px.w, px.h)
         try:
-            w_t = BS.ownership(tracker, t, j.p, size)[0]
-            w_s = BS.ownership(tracker, s, j.p, size)[0]
+            w_t = BS.ownership(tracker, t, j.p, size, others=False)[0]
+            w_s = BS.ownership(tracker, s, j.p, size, others=False)[0]
         except Exception:
             w_t = w_s = None
         with _tm("body.motion"):
@@ -1633,17 +1657,34 @@ def _steady_bdet(cut, tracker, st, rf: RetouchFrame, j, cache) -> dict:
     return out
 
 
+STEADY_PIECE = True     # the body's area is steadied on the piece the person and their neighbours' pieces take (False:
+                        # every map of it the whole picture's, 1.23's first build)
+
+
 def _steady_bskin_make(cut, tracker, st, rf: RetouchFrame, j, cache, own: np.ndarray, box) -> np.ndarray:
     shp = own.shape
-    frames = [(1.0, own)]
-    for w, _s, js, mo in _body_neighbours(cut, tracker, st, rf, j, cache, both=True):
-        ms = BS.unpack_mask(js.body.get("mask")) if (js is not None and js.body) else None
-        carried, conf = BS.carry(mo, ms if (ms is not None and ms.shape == shp) else np.zeros(shp, np.float32), shp)
-        # where the neighbour's picture is not this one, it says what this frame says
-        frames.append((w, conf * carried + (1.0 - conf) * own))
-    if len(frames) < 3:
+    nb = _body_neighbours(cut, tracker, st, rf, j, cache, both=True)
+    if len(nb) < 2:
         return own
-    any_ = np.zeros(shp, bool)
+    # the piece of the picture anything can happen on: this frame's own area and the pieces the neighbours' motion
+    # was measured on (outside them a neighbour says what this frame says, and this frame says nothing)
+    wx0, wy0, wx1, wy1 = 0, 0, shp[1], shp[0]
+    if STEADY_PIECE:
+        r_ = _roi(own, 0)
+        bx = [mo["box"] for _w, _s, _js, mo in nb] + ([(r_[2], r_[0], r_[3], r_[1])] if r_ is not None else [])
+        wx0, wy0 = max(0, min(int(b_[0]) for b_ in bx)), max(0, min(int(b_[1]) for b_ in bx))
+        wx1, wy1 = min(shp[1], max(int(b_[2]) for b_ in bx)), min(shp[0], max(int(b_[3]) for b_ in bx))
+        if wx1 <= wx0 or wy1 <= wy0:
+            return own
+    win = (wx0, wy0, wx1, wy1)
+    own_w = own[wy0:wy1, wx0:wx1]
+    frames = [(1.0, own_w)]
+    for w, _s, js, mo in nb:
+        ms = BS.unpack_mask(js.body.get("mask")) if (js is not None and js.body) else None
+        carried, conf = BS.carry(mo, ms if (ms is not None and ms.shape == shp) else np.zeros(shp, np.float32), shp, win)
+        # where the neighbour's picture is not this one, it says what this frame says
+        frames.append((w, conf * carried + (1.0 - conf) * own_w))
+    any_ = np.zeros(own_w.shape, bool)
     for _, m in frames:
         any_ |= m > 0.004
     ys, xs = np.nonzero(any_.any(1))[0], np.nonzero(any_.any(0))[0]
@@ -1655,7 +1696,7 @@ def _steady_bskin_make(cut, tracker, st, rf: RetouchFrame, j, cache, own: np.nda
     stk = np.clip(stk, med - STEADY_WIN, med + STEADY_WIN)
     wv = np.array([w for w, _ in frames], np.float32)[:, None, None]
     avg = (stk * wv).sum(0) / float(wv.sum())
-    o_ = own[y0:y1, x0:x1]
+    o_ = own_w[y0:y1, x0:x1]
     ref_px = float((j.body or {}).get("ref", 0.0)) * tracker.proxy.sx
     near = np.clip(cv2.GaussianBlur(o_, (0, 0), max(1.0, 0.02 * ref_px)) * BODY_STEADY_HOLD, 0, 1)
     # what the frames round it add comes only beside this frame's own area, and never onto what this frame itself
@@ -1663,11 +1704,11 @@ def _steady_bskin_make(cut, tracker, st, rf: RetouchFrame, j, cache, own: np.nda
     # because the skin under it was seen a frame ago
     allow = BS.unpack_allow((j.body or {}).get("allow"))
     if allow is not None and allow.shape == shp:
-        near = near * allow[y0:y1, x0:x1]
+        near = near * allow[wy0 + y0:wy0 + y1, wx0 + x0:wx0 + x1]
     else:
         near = near * 0.0
     out = own.copy()
-    out[y0:y1, x0:x1] = o_ + (avg - o_).clip(None, 0) + (avg - o_).clip(0, None) * near
+    out[wy0 + y0:wy0 + y1, wx0 + x0:wx0 + x1] = o_ + (avg - o_).clip(None, 0) + (avg - o_).clip(0, None) * near
     return out
 
 
@@ -1790,6 +1831,59 @@ def _nbytes(m) -> int:
     return int(getattr(m, "nbytes", 0))
 
 
+def _cache_put(cache: Optional[dict], key, m) -> None:
+    """m kept under key in a frame cache (prepare's), within its memory."""
+    if cache is None:
+        return
+    cache[key] = m
+    # bounded by memory, not by count: at a 1920 proxy every mask is 8 MB, and 400 of them took
+    # over 3 GB in the preview
+    nb = cache.get("__bytes__", 0) + _nbytes(m)
+    while (len(cache) > 401 or nb > CACHE_BYTES) and len(cache) > 2:
+        k0 = next(k_ for k_ in cache if k_ != "__bytes__")
+        nb -= _nbytes(cache.pop(k0))
+    cache["__bytes__"] = max(0, nb)
+
+
+BDET_PEOPLE = 4            # people of one frame whose body spots are looked for side by side, each on their own piece
+                           # of the original (looking is most of what a frame of an export costs once the areas are
+                           # made on the people's own pieces: 0.3 to 1 s a person, one after the other: j2796).
+                           # 1: one after the other, as 1.23's first build
+
+
+def _bdet_people(cut, px, t: int, later: list, cache: Optional[dict]) -> None:
+    """The body spots of the jobs in later [(job, cache key, the frame's picture)]: found, set on the jobs and kept.
+    Several people: side by side (the same lists, in the people's order: each looks at their own pixels)."""
+    failed = object()
+
+    def one(e):
+        try:
+            with _tm("body.spots"):
+                return _bdet_raw(cut, px, t, e[0], e[2])
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            return failed
+    if len(later) > 1:
+        if DET_SRC:
+            try:                                    # (the piece reader is made once, before the threads ask for it)
+                from ..core import frames as FRM
+                from ..warp.render import _vs_for
+                FRM.source_crops(px, vs=_vs_for(cut))
+            except Exception:
+                pass
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(BDET_PEOPLE, len(later))) as ex:
+            got = list(ex.map(one, later))
+    else:
+        got = [one(later[0])]
+    for (job, key, _rgb), d in zip(later, got):
+        if d is failed:
+            continue
+        job.bdet = d
+        _cache_put(cache, key, d)
+
+
 def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optional[int] = None) -> Optional[RetouchFrame]:
     """One frame's masks on their own (see prepare). only: just this person, skin shown even at 0."""
     st = tracker.store
@@ -1797,6 +1891,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
         return None
     px = tracker.proxy
     jobs = []
+    bdet_later = []                 # (job, cache key, the frame's picture): body spots still to be looked for
     rgb_u8 = None
     rgb_f = None
     people = cut.targets() if only is None else [q for q in cut.persons if q.id == only]
@@ -1848,9 +1943,24 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             lm[:, 1] *= px.sy
         state = {}
 
+        def body_base():
+            """What the body's area needs of the frame: the picture and the face's colour model of it (none without
+            a face). Not the face's own maps: a job with nothing but body values on never asks for them (they were
+            0.6 to 0.9 s a person of a 2560 px picture, a quarter of an export's time: j2796). The same picture and
+            the same model base() has when the face's values are on as well."""
+            if "rgb" in state:
+                return state
+            if "bbase" not in state:
+                rgb_ = np.asarray(px.frame(t))
+                from ..track import facelayer as FL
+                layer_ = FL.load(tracker)
+                centre_ = layer_.colour(person.id, t) if (layer_ is not None and lm is not None) else None
+                state["bbase"] = dict(rgb=rgb_, model=SK.frame_model_for(tracker, p, t, rgb_, lm, centre_))
+            return state["bbase"]
+
         def base():
             if "rgb" not in state:
-                state["rgb"] = np.asarray(px.frame(t))
+                state["rgb"] = state["bbase"]["rgb"] if "bbase" in state else np.asarray(px.frame(t))
                 state["rgbf"] = state["rgb"].astype(np.float32) / 255.0
                 from ..track import facelayer as FL
                 layer = FL.load(tracker)
@@ -1921,15 +2031,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             if cache is not None and key in cache:
                 return cache[key]
             m = fn()
-            if cache is not None:
-                cache[key] = m
-                # bounded by memory, not by count: at a 1920 proxy every mask is 8 MB, and 400 of them took
-                # over 3 GB in the preview
-                nb = cache.get("__bytes__", 0) + _nbytes(m)
-                while (len(cache) > 401 or nb > CACHE_BYTES) and len(cache) > 2:
-                    k0 = next(k_ for k_ in cache if k_ != "__bytes__")
-                    nb -= _nbytes(cache.pop(k0))
-                cache["__bytes__"] = max(0, nb)
+            _cache_put(cache, key, m)
             return m
 
         from ..core.project import scope_set
@@ -2105,7 +2207,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
 
                 def mk_body():
                     with _tm("body.base"):
-                        b = base()
+                        b = body_base()
                     with _tm("body.area"):
                         m_, info_ = BS.body_mask(tracker, p, t, b["rgb"], body_scope_set(bscope), b.get("model"))
                     pm_ = BS.pack_mask(m_) if m_ is not None else None
@@ -2115,7 +2217,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                         maps_["a"] = pa_["m"]
                     return dict(maps=maps_, thumb=None, pm=pm_,
                                 info=dict(ref=float(info_.ref), model=info_.model, parsed=bool(info_.parsed),
-                                          box=info_.box, allow=pa_))
+                                          box=info_.box, allow=pa_, hands=BS.hand_shapes(st, p, t, info_)))
                 # the clothing the analysis found is part of the area: masks made before it was found (or with
                 # another state of it) are made again
                 ctok = BS.garment_token(tracker)
@@ -2125,8 +2227,13 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                     if v.get("body_blemish", 0) > 1e-4:
                         def mk_bdet():
                             with _tm("body.spots"):
-                                return _bdet_raw(cut, px, t, job, base()["rgb"])
-                        job.bdet = get("bdet", mk_bdet, f"{bscope}:{ctok}:{job.body_size:.3f}:sn{int(BP.SPOTNET)}")
+                                return _bdet_raw(cut, px, t, job, body_base()["rgb"])
+                        bkey = f"{bscope}:{ctok}:{job.body_size:.3f}:sn{int(BP.SPOTNET)}h{int(BP.HANDS_HELD)}"
+                        if BDET_PEOPLE > 1 and not (cache is not None and (t, person.id, "bdet", bkey) in cache):
+                            # looked for after the loop, every person of the frame side by side (_bdet_people)
+                            bdet_later.append((job, (t, person.id, "bdet", bkey), body_base()["rgb"]))
+                        else:
+                            job.bdet = get("bdet", mk_bdet, bkey)
                         job.bmarks = _body_marks(st, p, t, pp, v)
             except Exception:
                 import traceback
@@ -2159,6 +2266,8 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 job.veto = cv2.resize(pr_, (max(1, pr_.shape[1] // 4), max(1, pr_.shape[0] // 4)),
                                       interpolation=cv2.INTER_AREA).astype(np.float16)
             jobs.append(job)
+    if bdet_later:
+        _bdet_people(cut, px, t, bdet_later, cache)
     if not jobs:
         return None
     return RetouchFrame(t, jobs, (px.w, px.h), (cut.info.width, cut.info.height))
@@ -2167,11 +2276,13 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
 # --------------------------------------------------------------------------- operations
 
 def _roi(m: np.ndarray, pad: int):
-    ys, xs = np.nonzero(m > 0.004)
-    if not len(xs):
+    sel = m > 0.004
+    ys = np.flatnonzero(sel.any(1))
+    if not len(ys):
         return None
+    xs = np.flatnonzero(sel.any(0))
     h, w = m.shape
-    return (max(0, ys.min() - pad), min(h, ys.max() + pad + 1), max(0, xs.min() - pad), min(w, xs.max() + pad + 1))
+    return (max(0, int(ys[0]) - pad), min(h, int(ys[-1]) + pad + 1), max(0, int(xs[0]) - pad), min(w, int(xs[-1]) + pad + 1))
 
 
 def _lift(I: np.ndarray, m: np.ndarray, k: float, sig: float, keep: float = 0.35) -> np.ndarray:
@@ -3576,12 +3687,13 @@ GRAIN_KEEP = True        # the skin smoothing gives the original's finest band (
 GRAIN_SIGMA = 1.2        # that band, in pixels of a 1080-line picture (scaled with the plane's height)
 
 
-def _keep_fine(before: np.ndarray, after: np.ndarray, m: np.ndarray) -> np.ndarray:
+def _keep_fine(before: np.ndarray, after: np.ndarray, m: np.ndarray, rows: Optional[int] = None) -> np.ndarray:
     """after with the finest detail band of before inside m: whatever the smoothing took of the grain is put back,
-    so every strength keeps the footage's own grain. The band follows the plane's size (about a pixel at 1080)."""
+    so every strength keeps the footage's own grain. The band follows the plane's size (about a pixel at 1080);
+    rows: the plane's height when before and after are a piece of it."""
     if before.shape != after.shape or m is None or m.shape != after.shape:
         return after
-    sg = float(np.clip(GRAIN_SIGMA * after.shape[0] / 1080.0, 0.8, 2.4))
+    sg = float(np.clip(GRAIN_SIGMA * (rows or after.shape[0]) / 1080.0, 0.8, 2.4))
     fb = before - cv2.GaussianBlur(before, (0, 0), sg)
     fa = after - cv2.GaussianBlur(after, (0, 0), sg)
     # all of it wherever the smoothing reached (scaled by the mask, the partly smoothed edges kept less grain)
@@ -3679,17 +3791,83 @@ def body_hold(Y, Cb, Cr, mY, ref: float) -> Optional[np.ndarray]:
     return out
 
 
+BODY_PIECE = True          # the body smoothing is made on the area's own piece of the planes, with room for the widest
+                           # of its filters round it: the same numbers. False: on the whole planes (1.23's first
+                           # build: a second of a thread for each person on each frame of a 4K export, j2796)
+
+
+def _body_window(mY: np.ndarray, shape_c, pad: int):
+    """The piece of the planes the body smoothing needs: (y0, y1, x0, x1) on the luma plane, on the chroma planes'
+    own lines. None: nearly the whole plane, or planes whose sizes do not divide."""
+    hY, wY = mY.shape
+    hC, wC = shape_c
+    if hC < 1 or wC < 1 or hY % hC or wY % wC:
+        return None
+    fy, fx = hY // hC, wY // wC
+    r_ = _roi(mY, pad)
+    if r_ is None:
+        return None
+    y0, y1, x0, x1 = r_
+    y0, x0 = y0 // fy * fy, x0 // fx * fx
+    y1, x1 = min(hY, -(-y1 // fy) * fy), min(wY, -(-x1 // fx) * fx)
+    if (y1 - y0) * (x1 - x0) > 0.85 * hY * wY:
+        return None
+    return y0, y1, x0, x1
+
+
 def _body_smooth(Y, Cb, Cr, mY, job, y_per_src: float, cs: float, src: Optional[dict] = None):
     """The skin smoothing of the face (skin.smooth_channel: the texture's bands thinned, nothing wider than a few
     pores changed, the picture's grain given back) on the body's area mY, its bands following the body's size.
     Light and shade, the body's outline and whatever lies on the skin are wider than the bands or held (body_hold).
-    job.body_keep (결 보존) gives the finest band (pores, fine hair) back by that share."""
+    job.body_keep (결 보존) gives the finest band (pores, fine hair) back by that share.
+
+    Every filter of it looks no further than a tenth of the body's size from the area, so it is made on the area's
+    own piece of the planes (_body_window) and laid back: an arm in a 4K frame is a twentieth of the plane."""
     hY, wY = Y.shape
-    hC, wC = Cb.shape
     k = float(np.clip(job.v.get("body_skin", 0.0), 0, 1))
     ref = float(job.body["ref"]) * y_per_src
     if k < 1e-4 or ref < 4 or float(mY.max()) < 0.01:
         return Y, Cb, Cr
+    win = None
+    if BODY_PIECE and mY.shape == Y.shape and Cb.shape == Cr.shape:
+        r = int(max(1, round(0.022 * ref)))
+        rc = max(1, int(round(r * cs)))
+        up = max(hY // max(Cb.shape[0], 1), wY // max(Cb.shape[1], 1), 1)
+        # the widest reach of what follows (detect.protect, _things, _hold_maps: a tenth of the size; the bands; the
+        # fine band given back; the colour's radius on its own plane; the grain's band), and the one line of a piece
+        # a chroma plane enlarged to the luma's size does not have right at the piece's edge
+        pad = max(int(0.1 * ref) + 6, 3 * r + 4, int(3 * max(1.0, BODY_FINE * ref)) + 2, (3 * rc + 4) * up, 12) + 2
+        win = _body_window(mY, Cb.shape, pad)
+    if win is None:
+        got = _body_smooth_on(Y, Cb, Cr, mY, job, k, ref, cs, src, hY)
+        return (Y, Cb, Cr) if got is None else got
+    y0, y1, x0, x1 = win
+    fy, fx = hY // Cb.shape[0], wY // Cb.shape[1]
+    yw = (slice(y0, y1), slice(x0, x1))
+    cw = (slice(y0 // fy, y1 // fy), slice(x0 // fx, x1 // fx))
+    piece = was = None
+    if src is not None and src["Y"].shape == Y.shape:
+        # the piece's own views: what is added to dY is added to the plane itself
+        piece = {n: src[n][yw] for n in ("Y", "dY", "Jy", "Jcb", "Jcr")}
+        was = piece["Y"]
+    got = _body_smooth_on(np.ascontiguousarray(Y[yw]), np.ascontiguousarray(Cb[cw]), np.ascontiguousarray(Cr[cw]),
+                          np.ascontiguousarray(mY[yw]), job, k, ref, cs, piece, hY)
+    if got is None:
+        return Y, Cb, Cr
+    Y, Cb, Cr = Y.copy(), Cb.copy(), Cr.copy()
+    Y[yw], Cb[cw], Cr[cw] = got
+    if piece is not None and piece["Y"] is not was:
+        sy_ = src["Y"].copy()               # (a new plane, as before: the one handed in stays as it was)
+        sy_[yw] = piece["Y"]
+        src["Y"] = sy_
+    return Y, Cb, Cr
+
+
+def _body_smooth_on(Y, Cb, Cr, mY, job, k: float, ref: float, cs: float, src: Optional[dict], rows: int):
+    """_body_smooth on the planes given (whole, or the area's piece of them; rows: the whole luma plane's height).
+    None: nothing to do."""
+    hY, wY = Y.shape
+    hC, wC = Cb.shape
     if BODY_HOLD:
         hold = body_hold(Y, Cb, Cr, mY, ref)
         if hold is not None:
@@ -3697,7 +3875,7 @@ def _body_smooth(Y, Cb, Cr, mY, job, y_per_src: float, cs: float, src: Optional[
     # away from the skin's own edge and from what is held: the bands (and the colour smoothing's radius) reach that far
     mY = body_inner(mY, ref)
     if float(mY.max()) < 0.01:
-        return Y, Cb, Cr
+        return None
     mC = mY if (hC, wC) == (hY, wY) else cv2.resize(mY, (wC, hC), interpolation=cv2.INTER_AREA)
     r = int(max(1, round(0.022 * ref)))
     if hasattr(SK, "_TLS"):
@@ -3711,7 +3889,7 @@ def _body_smooth(Y, Cb, Cr, mY, job, y_per_src: float, cs: float, src: Optional[
     def smooth(P):
         P1 = SK.smooth_channel(P, mY, k, keep, r, relative=True)
         if GRAIN_KEEP:
-            P1 = _keep_fine(P, P1, mY)
+            P1 = _keep_fine(P, P1, mY, rows)
         if keep > 1e-3:
             d_ = P - P1                                   # what was taken: its finest part comes back
             r_ = _roi(mY, int(3 * sig_f) + 2)
