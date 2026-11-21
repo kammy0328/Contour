@@ -115,7 +115,11 @@ def feeds(rgb: np.ndarray) -> dict:
     return out
 
 
-def vram_mb() -> int:
+def vram_mb():
+    """(this process's GPU memory in MB, the GPU's used memory in MB), None where it is not told. Windows does
+    not tell a process's own share (WDDM: N/A): the GPU's used memory is what there is to go by there, and it holds
+    the models opened before as well (the app's sessions share one memory pool)."""
+    own = total = None
     try:
         kw = dict(capture_output=True, text=True, timeout=8)
         if os.name == "nt":
@@ -124,10 +128,14 @@ def vram_mb() -> int:
         for ln in (r.stdout or "").splitlines():
             p = [x.strip() for x in ln.split(",")]
             if len(p) >= 2 and p[0] == str(os.getpid()) and p[1].isdigit():
-                return int(p[1])
+                own = int(p[1])
+        r = subprocess.run(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"], **kw)
+        v = (r.stdout or "").strip().splitlines()
+        if v and v[0].strip().isdigit():
+            total = int(v[0].strip())
     except Exception:
         pass
-    return 0
+    return own, total
 
 
 def run_one(path: Path, make, backend: str, runs: int) -> dict:
@@ -161,7 +169,8 @@ def run_one(path: Path, make, backend: str, runs: int) -> dict:
     d = dict(asked=rec.get("asked"), session=rec.get("session"), backend=rec.get("backend"),
              placement=rec.get("placement") or {}, cpu_share=rec.get("cpu_share"), reasons=rec.get("reasons") or [],
              open_s=round(t_open, 2), first_ms=round(first * 1000, 1),
-             ms=round(float(np.median(ts)) * 1000, 2) if ts else None, vram_mb=vram_mb())
+             ms=round(float(np.median(ts)) * 1000, 2) if ts else None)
+    d["vram_mb"], d["gpu_used_mb"] = vram_mb()
     del s
     return d, [np.asarray(o) for o in out]
 

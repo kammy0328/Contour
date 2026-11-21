@@ -120,20 +120,26 @@ def test_the_child_analysis_is_started_without_a_window(monkeypatch, tmp_path):
 
 
 def test_the_worker_entry_runs_the_job_and_loads_nothing_of_the_window():
+    # (what the child found is written out at once: on Windows a process that loaded the GPU runtime can end with
+    # an error code after its work is done, and what was still waiting to be written would be lost with it)
     code = ("import sys, runpy\n"
             "sys.argv = ['app.py', '--worker', 'batch', '--help']\n"
             "try:\n"
             "    runpy.run_path(%r, run_name='__main__')\n"
             "except SystemExit as e:\n"
-            "    print('RC', e.code, 'QT', any(m.startswith('PySide6') for m in sys.modules))\n") % str(ROOT / "app.py")
-    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120, cwd=str(ROOT),
-                       env=dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1"), encoding="utf-8", errors="replace")
-    out = r.stdout + r.stderr
-    assert "RC 0 QT False" in out, out[-800:]
+            "    sys.stdout.flush()\n"
+            "    print('RC', e.code, 'QT', sorted(m for m in sys.modules if m.startswith('PySide6'))[:3], flush=True)\n"
+            ) % str(ROOT / "app.py")
+    kw = dict(capture_output=True, text=True, timeout=180, cwd=str(ROOT), encoding="utf-8", errors="replace",
+              env=dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1"))
+    r = subprocess.run([sys.executable, "-c", code], **kw)
+    out = (r.stdout or "") + (r.stderr or "")
+    assert "RC 0 QT []" in out, f"exit {r.returncode}: {out[-1500:]}"
     assert "analyze" in out and "prescan" in out, "the batch tool's own help"
     code2 = code.replace("'batch', '--help'", "'nothing'")
-    r = subprocess.run([sys.executable, "-c", code2], capture_output=True, text=True, timeout=120, cwd=str(ROOT))
-    assert "RC 2 QT False" in r.stdout + r.stderr
+    r = subprocess.run([sys.executable, "-c", code2], **kw)
+    out = (r.stdout or "") + (r.stderr or "")
+    assert "RC 2 QT []" in out, f"exit {r.returncode}: {out[-1500:]}"
 
 
 def _alive(pid: int) -> bool:
