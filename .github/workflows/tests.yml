@@ -25,4 +25,4 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: |
           ffmpeg -version | head -1
-          python -m pytest -q tests
+          python -m pytest -q -rf tests

@@ -80,7 +80,7 @@ jobs:
         shell: bash
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python -m pytest -q tests
+        run: python -m pytest -q -rf tests
 
       - uses: actions/upload-artifact@v4
         if: always()

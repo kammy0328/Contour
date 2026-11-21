@@ -75,10 +75,18 @@ def qapp():
     return app
 
 
+_EXIT = {}
+
+
 def pytest_sessionfinish(session, exitstatus):
+    _EXIT["status"] = int(exitstatus)
+
+
+def pytest_unconfigure(config):
     """The tests' result is what the run says. Qt objects that live to the interpreter's exit have aborted the process
-    after the last test on CI (malloc(): unaligned tcache chunk, exit 134, 478 passed), so on CI the run ends here."""
-    if os.environ.get("GITHUB_ACTIONS"):
+    after the last test on CI (malloc(): unaligned tcache chunk, exit 134, 478 passed), so on CI the run ends here, after
+    the report is written."""
+    if os.environ.get("GITHUB_ACTIONS") and "status" in _EXIT:
         sys.stdout.flush()
         sys.stderr.flush()
-        os._exit(int(exitstatus))
+        os._exit(_EXIT["status"])
