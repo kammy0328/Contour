@@ -1234,11 +1234,13 @@ def _raw_cached(cut, tracker, s: int, cache):
     from collections import OrderedDict
     lru = tracker.__dict__.get("_steady_lru")
     sig = _sig(cut, tracker)
-    # the session clears its mask cache whenever an edit changes masks: start over then too
-    if lru is None or tracker.__dict__.get("_steady_sig") != sig or (cache is not None and len(cache) == 0):
+    # the session clears its mask cache whenever an edit changes masks: start over then too (a cache that kept the
+    # bodies' entries over a tracking change says so: kept_over_tracks). The bodies' motions between frames stay:
+    # each is kept with what the tracks said of its two frames (_body_motion)
+    if lru is None or tracker.__dict__.get("_steady_sig") != sig \
+            or (cache is not None and (len(cache) == 0 or cache.pop("__new__", False))):
         lru = tracker.__dict__["_steady_lru"] = OrderedDict()
         tracker.__dict__["_steady_sig"] = sig
-        tracker.__dict__.pop("_bflow", None)        # (the body's motion between frames: measured with the owners of then)
     if s in lru:
         lru.move_to_end(s)
         return lru[s]
@@ -1522,14 +1524,15 @@ def _steady_bskin(cut, tracker, st, rf: RetouchFrame, j, cache) -> Optional[dict
     # it does not depend on the sliders: kept with the frame's other masks (a slider being dragged asks for it again
     # and again, and the motion of four neighbours is not measured each time)
     key = (t, j.pid, "bskin+", "")
-    if cache is not None and key in cache:
-        return cache[key]["pm"]
+    tok = _body_tok(tracker, st, j.p, t, STEADY_R, j.body.get("key"))
+    got = _cache_look(cache, key, tok)
+    if got is not _MISS:
+        return got["pm"]
     out = BS.pack_mask(_steady_bskin_make(cut, tracker, st, rf, j, cache, BS.unpack_mask(raw), box))
     if out is None:
         out = raw
     if cache is not None and len(cache) > 0:
-        cache[key] = dict(maps={"m": out["m"]}, thumb=None, pm=out)
-        cache["__bytes__"] = cache.get("__bytes__", 0) + _nbytes(cache[key])
+        _cache_put(cache, key, dict(maps={"m": out["m"]}, thumb=None, pm=out), tok)
     return out
 
 
@@ -1598,8 +1601,11 @@ def _body_motion(tracker, j, t: int, s: int, box_t, box_s) -> Optional[dict]:
         tracker.__dict__["_bflow_sig"] = sig
     lo, hi = (t, s) if t < s else (s, t)
     key = (j.pid, lo, hi)
+    tok = _motion_tok(tracker, lo, hi)
     with _BFLOW_LOCK:
         got = lru.get(key)
+        if got is not None and got[0] != tok:
+            got = None                              # (measured with other owners: a tracking update since)
         if got is not None:
             lru.move_to_end(key)
     if got is None:
@@ -1612,13 +1618,21 @@ def _body_motion(tracker, j, t: int, s: int, box_t, box_s) -> Optional[dict]:
             w_t = w_s = None
         with _tm("body.motion"):
             a, b = BS.motion_pair(_gray(px, t), _gray(px, s), box_t, box_s, w_t, w_s)
-        got = (a, b) if t < s else (b, a)
+        got = (tok,) + ((a, b) if t < s else (b, a))
         with _BFLOW_LOCK:
             lru[key] = got
+            lru.move_to_end(key)
             n = BFLOW_LRU * max(1, len({k[0] for k in lru}))
             while len(lru) > n:
                 lru.popitem(last=False)
-    return got[0] if t < s else got[1]
+    return got[1] if t < s else got[2]
+
+
+def _motion_tok(tracker, lo: int, hi: int) -> tuple:
+    """What a body's motion between two frames was measured with besides the pictures: the owners of both frames'
+    pixels, which the tracks of those frames give (bodyskin.track_token)."""
+    st = tracker.store
+    return (BS.track_token(st, lo, lo), BS.track_token(st, hi, hi))
 
 
 MOTION_PAIRS = 4        # motions of the bodies of a frame measured side by side (1: each when it is asked for, one after
@@ -1640,6 +1654,11 @@ def _body_motions_ahead(cut, tracker, st, rf: RetouchFrame, cache) -> None:
         box = (j.body or {}).get("box") if j.body else None
         if box is None or j.body.get("mask") is None:
             continue
+        # (a frame whose steadied area and spots are kept asks for no motion at all)
+        tok = _body_tok(tracker, st, j.p, t, STEADY_R, j.body.get("key"))
+        if _cache_look(cache, (t, j.pid, "bskin+", ""), tok) is not _MISS and \
+                (getattr(j, "bdet", None) is None or _cache_look(cache, (t, j.pid, "bdet+", f"{j.body_size:.3f}"), tok) is not _MISS):
+            continue
         for d in range(1, STEADY_R + 1):
             for s_ in (t - d, t + d):
                 if not (0 <= s_ < N and bool(st.present[j.p, s_]) and st.connected(s_, t)):
@@ -1649,7 +1668,7 @@ def _body_motions_ahead(cut, tracker, st, rf: RetouchFrame, cache) -> None:
                 key = (j.pid, min(t, s_), max(t, s_))
                 with _BFLOW_LOCK:
                     known = lru is not None and tracker.__dict__.get("_bflow_sig") == tracker.__dict__.get("_steady_sig") \
-                        and key in lru
+                        and key in lru and lru[key][0] == _motion_tok(tracker, key[1], key[2])
                 if known or any(e[0] == key for e in todo):
                     continue
                 js = next((x for x in rs.jobs if x.pid == j.pid), None) if rs is not None else None
@@ -1682,7 +1701,8 @@ def _body_motions_ahead(cut, tracker, st, rf: RetouchFrame, cache) -> None:
         tracker.__dict__["_bflow_sig"] = sig
     with _BFLOW_LOCK:
         for (key, _j, s_, _b, _bs), (a, b) in zip(todo, got):
-            lru[key] = (a, b) if t < s_ else (b, a)
+            lru[key] = (_motion_tok(tracker, key[1], key[2]),) + ((a, b) if t < s_ else (b, a))
+            lru.move_to_end(key)
         n = BFLOW_LRU * max(1, len({k[0] for k in lru}))
         while len(lru) > n:
             lru.popitem(last=False)
@@ -1697,8 +1717,10 @@ def _steady_bdet(cut, tracker, st, rf: RetouchFrame, j, cache) -> dict:
     if STEADY_R < 1 or not j.body:
         return own
     key = (t, j.pid, "bdet+", f"{j.body_size:.3f}")
-    if cache is not None and key in cache:
-        return cache[key]
+    tok = _body_tok(tracker, st, j.p, t, STEADY_R, j.body.get("key"))
+    got = _cache_look(cache, key, tok)
+    if got is not _MISS:
+        return got
     nb = _body_neighbours(cut, tracker, st, rf, j, cache, both=False)
 
     def where_on(s_, js):
@@ -1724,8 +1746,7 @@ def _steady_bdet(cut, tracker, st, rf: RetouchFrame, j, cache) -> dict:
               for w, s_, js, mo in nb]
     out = BP.fuse(own, others, float(j.body["ref"]), px.sx, px.sy)
     if cache is not None and len(cache) > 0:
-        cache[key] = out
-        cache["__bytes__"] = cache.get("__bytes__", 0) + _nbytes(out)
+        _cache_put(cache, key, out, tok)
     return out
 
 
@@ -1903,18 +1924,92 @@ def _nbytes(m) -> int:
     return int(getattr(m, "nbytes", 0))
 
 
-def _cache_put(cache: Optional[dict], key, m) -> None:
-    """m kept under key in a frame cache (prepare's), within its memory."""
+_CACHE_OWN = ("__bytes__", "__tok__", "__new__")     # a frame cache's own entries: its byte count, what its kept
+                                                    # entries were made from, and that it was just started over
+_MISS = object()
+
+
+def _cache_look(cache: Optional[dict], key, tok=None):
+    """What a frame cache keeps under key, or _MISS. tok: what the entry must have been made from (_body_tok): one
+    made from something else is not there."""
+    if cache is None or key not in cache:
+        return _MISS
+    if tok is not None and (cache.get("__tok__") or {}).get(key) != tok:
+        return _MISS
+    return cache[key]
+
+
+def _cache_put(cache: Optional[dict], key, m, tok=None) -> None:
+    """m kept under key in a frame cache (prepare's), within its memory. tok: what it was made from, kept with it
+    (an entry with one outlives a tracking update: kept_over_tracks)."""
     if cache is None:
         return
+    nb = cache.get("__bytes__", 0)
+    toks = cache.get("__tok__")
+    if key in cache:                                # made again (the tracks changed where it reaches): in its place
+        nb -= _nbytes(cache.pop(key))
+        if toks:
+            toks.pop(key, None)
     cache[key] = m
+    if tok is not None:
+        if toks is None:
+            toks = cache["__tok__"] = {}
+        toks[key] = tok
     # bounded by memory, not by count: at a 1920 proxy every mask is 8 MB, and 400 of them took
     # over 3 GB in the preview
-    nb = cache.get("__bytes__", 0) + _nbytes(m)
-    while (len(cache) > 401 or nb > CACHE_BYTES) and len(cache) > 2:
-        k0 = next(k_ for k_ in cache if k_ != "__bytes__")
+    nb += _nbytes(m)
+    n = len(cache) - sum(1 for k_ in _CACHE_OWN if k_ in cache)
+    while (n > 400 or nb > CACHE_BYTES) and n > 1:
+        k0 = next(k_ for k_ in cache if k_ not in _CACHE_OWN)
         nb -= _nbytes(cache.pop(k0))
+        if toks:
+            toks.pop(k0, None)
+        n -= 1
     cache["__bytes__"] = max(0, nb)
+
+
+def kept_over_tracks(cache: Optional[dict]) -> dict:
+    """The frame cache to go on with after the tracks changed (a joint moved, a person swapped, a range solved
+    again): a new one holding only the entries that were kept with what they were made from, the bodies' areas and
+    spots. Whether each is still good its next use says (_body_tok: the tracks of the frames it reaches, as they
+    are then), so a tracking update makes the body's maps again on the frames it reaches and nowhere else
+    (instruction 2026-11-20 §2). Everything else is made again, as it was with an empty cache."""
+    out: dict = {}
+    try:
+        toks = list(((cache or {}).get("__tok__") or {}).items())
+        kept = {}
+        nb = 0
+        for k_, tk in toks:
+            m = cache.get(k_, _MISS)
+            if m is _MISS:
+                continue
+            out[k_] = m
+            kept[k_] = tk
+            nb += _nbytes(m)
+        if out:
+            out["__tok__"] = kept
+            out["__bytes__"] = nb
+            out["__new__"] = True
+    except Exception:
+        return {}
+    return out
+
+
+def _body_tok(tracker, st, p: int, t: int, reach: int = 0, extra=None) -> tuple:
+    """What a body's area and spots of person p (store index) on frame t were made from besides the picture, short
+    enough to compare at every use: what the tracks say of the frames they read (bodyskin.track_token: the frames
+    round t that the body's size is taken over; reach: and the frames either side a steadied one is made from), and
+    the colour of the person's face in this shot that the area starts from."""
+    r = BS.REF_FRAMES + int(reach)
+    mt = 0
+    try:
+        m = SK.model_for(tracker, p)
+        if m is not None:
+            import zlib
+            mt = zlib.crc32(np.concatenate([np.asarray(x, np.float64).ravel() for x in m]).tobytes())
+    except Exception:
+        mt = -1
+    return (BS.track_token(st, t - r, t + r), mt, extra)
 
 
 BDET_PEOPLE = 4            # people of one frame whose body spots are looked for side by side, each on their own piece
@@ -1924,7 +2019,8 @@ BDET_PEOPLE = 4            # people of one frame whose body spots are looked for
 
 
 def _bdet_people(cut, px, t: int, later: list, cache: Optional[dict]) -> None:
-    """The body spots of the jobs in later [(job, cache key, the frame's picture)]: found, set on the jobs and kept.
+    """The body spots of the jobs in later [(job, cache key, the frame's picture, what they are made from)]: found,
+    set on the jobs and kept.
     Several people: side by side (the same lists, in the people's order: each looks at their own pixels)."""
     failed = object()
 
@@ -1949,11 +2045,11 @@ def _bdet_people(cut, px, t: int, later: list, cache: Optional[dict]) -> None:
             got = list(ex.map(one, later))
     else:
         got = [one(later[0])]
-    for (job, key, _rgb), d in zip(later, got):
+    for (job, key, _rgb, tok), d in zip(later, got):
         if d is failed:
             continue
         job.bdet = d
-        _cache_put(cache, key, d)
+        _cache_put(cache, key, d, tok)
 
 
 def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optional[int] = None) -> Optional[RetouchFrame]:
@@ -2098,12 +2194,13 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                         state["focus_zone"] = fz
             return state
 
-        def get(name, fn, extra=""):
+        def get(name, fn, extra="", tok=None):
             key = (t, person.id, name, extra)
-            if cache is not None and key in cache:
-                return cache[key]
+            got = _cache_look(cache, key, tok)
+            if got is not _MISS:
+                return got
             m = fn()
-            _cache_put(cache, key, m)
+            _cache_put(cache, key, m, tok)
             return m
 
         from ..core.project import scope_set
@@ -2293,19 +2390,22 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 # the clothing the analysis found is part of the area: masks made before it was found (or with
                 # another state of it) are made again
                 ctok = BS.garment_token(tracker)
-                bd = get("bskin", mk_body, f"{bscope}:{ctok}")
+                # ... and so are the tracks: an area is kept with what they said of the frames it was made from, and
+                # is made again when that changed (a tracking update reaches the frames round it, not the cut)
+                btok = _body_tok(tracker, st, p, t)
+                bd = get("bskin", mk_body, f"{bscope}:{ctok}", btok)
                 if bd["pm"] is not None and tuple(bd["pm"]["shape"]) == tuple(shape) and bd["info"]["ref"] > 0:
-                    job.body = dict(bd["info"], mask=bd["pm"])
+                    job.body = dict(bd["info"], mask=bd["pm"], key=f"{bscope}:{ctok}")
                     if v.get("body_blemish", 0) > 1e-4:
                         def mk_bdet():
                             with _tm("body.spots"):
                                 return _bdet_raw(cut, px, t, job, body_base()["rgb"])
                         bkey = f"{bscope}:{ctok}:{job.body_size:.3f}:sn{int(BP.SPOTNET)}h{int(BP.HANDS_HELD)}"
-                        if BDET_PEOPLE > 1 and not (cache is not None and (t, person.id, "bdet", bkey) in cache):
+                        if BDET_PEOPLE > 1 and _cache_look(cache, (t, person.id, "bdet", bkey), btok) is _MISS:
                             # looked for after the loop, every person of the frame side by side (_bdet_people)
-                            bdet_later.append((job, (t, person.id, "bdet", bkey), body_base()["rgb"]))
+                            bdet_later.append((job, (t, person.id, "bdet", bkey), body_base()["rgb"], btok))
                         else:
-                            job.bdet = get("bdet", mk_bdet, bkey)
+                            job.bdet = get("bdet", mk_bdet, bkey, btok)
                         job.bmarks = _body_marks(st, p, t, pp, v)
             except Exception:
                 import traceback

@@ -768,6 +768,235 @@ def test_strength_changes_reuse_the_area_and_the_spots(body, monkeypatch):
     assert n["motion"] - m3 == 2
 
 
+def _made(monkeypatch):
+    """What is made while a test runs: [("area" | "spots", frame), ("motion",), ("steady", frame)]."""
+    from contour.retouch import bodyskin as BS
+    from contour.retouch import engine as RE
+    made = []
+    a0, d0, m0, s0 = BS.body_mask, RE._bdet_raw, BS.motion_pair, RE._steady_bskin_make
+    monkeypatch.setattr(BS, "body_mask", lambda tracker, p, t, *a, **k: (made.append(("area", int(t))), a0(tracker, p, t, *a, **k))[1])
+    monkeypatch.setattr(RE, "_bdet_raw", lambda cut_, px_, t, job, rgb: (made.append(("spots", int(t))), d0(cut_, px_, t, job, rgb))[1])
+    monkeypatch.setattr(BS, "motion_pair", lambda *a, **k: (made.append(("motion",)), m0(*a, **k))[1])
+    monkeypatch.setattr(RE, "_steady_bskin_make",
+                        lambda cut_, tracker, st_, rf, *a, **k: (made.append(("steady", int(rf.t))), s0(cut_, tracker, st_, rf, *a, **k))[1])
+    return made
+
+
+def _all_frames(cut, tr, cache):
+    """Every frame of the scene prepared with this cache: {frame: (the area's piece, its place, the spots, the
+    preview's picture)}."""
+    from contour.retouch import engine as RE
+    out = {}
+    for t in range(B.N):
+        rgb = np.asarray(tr.proxy.frame(t))
+        rf = RE.prepare(cut, tr, t, cache)
+        j = rf.jobs[0]
+        pm = j.body["mask"]
+        out[t] = (np.array(pm["m"]), tuple(pm["box"]), np.array(j.bdet["cands"]), RE.apply_rgb(rgb, rf, tr.proxy.sx))
+    return out
+
+
+def _same_frame(a, b):
+    return a[1] == b[1] and all(np.array_equal(x, y) for x, y in zip((a[0], a[2], a[3]), (b[0], b[2], b[3])))
+
+
+def test_a_tracking_update_makes_the_bodys_maps_again_only_on_the_frames_it_reaches(body, monkeypatch):
+    """Instruction 2026-11-20 §2 (속도): 추적 갱신이나 수동 잡티 수정은 영향 구간만 다시 계산한다. Any tracking edit
+    emptied the session's mask cache: every body area, every list of spots and every motion between frames of the cut
+    was made again as its frame came up, whichever frame the edit was on. They are kept with what the tracks said of
+    the frames they were made from: after a joint moved on one frame the areas and spots of the frames it reaches are
+    made again, the others are the kept ones, and every frame is what a fresh start gives."""
+    from contour.retouch import bodyskin as BS
+    from contour.retouch import engine as RE
+    from contour.track import skeleton as S
+    cut, tr, _calls = body
+    st = tr.store
+    monkeypatch.setattr(BS, "REF_FRAMES", 1)        # (eight frames: the body's size is taken over one frame each side)
+    monkeypatch.setattr(RE, "BFLOW_LRU", 40)        # (and every motion of the scene is kept: ten pairs a person otherwise)
+    assert RE.STEADY_R == 2
+    B.body_on(cut, skin=60, blemish=60, size=B.SPOT_SIZE, scope="arm")      # (the arm: where it is, the joints say)
+    tr.__dict__.pop("_bflow", None)
+    made = _made(monkeypatch)
+    cache = {}
+    first = _all_frames(cut, tr, cache)
+    assert {m for m in made if m[0] == "area"} == {("area", t) for t in range(B.N)}
+    # the wrist is moved on frame 0 (a correction by hand), and the session goes on with what the cache may keep
+    st.final[st.index(0), 0, S.L_WR, :2] += (-30.0, 22.0)
+    kept = RE.kept_over_tracks(cache)
+    assert kept.get("__new__") and any(isinstance(k, tuple) and k[2] == "bskin" for k in kept)
+    assert not [k for k in kept if isinstance(k, tuple) and k[2] not in ("bskin", "bdet", "bskin+", "bdet+")]
+    del made[:]
+    second = _all_frames(cut, tr, kept)
+    assert "__new__" not in kept
+    areas = sorted(t for k, *r in made if k == "area" for t in r)
+    spots = sorted(t for k, *r in made if k == "spots" for t in r)
+    steady = sorted(t for k, *r in made if k == "steady" for t in r)
+    assert areas == [0, 1] and spots == [0, 1], f"made again: areas {areas}, spots {spots} (the edit reaches frames 0 and 1)"
+    assert steady == [0, 1, 2, 3], f"steadied again: {steady} (frames whose neighbours 0 or 1 are)"
+    assert sum(1 for m in made if m[0] == "motion") == 2, "the motions to and from frame 0 alone are measured again"
+    assert not _same_frame(first[0], second[0]), "the edit changed frame 0's area"
+    for t in range(4, B.N):
+        assert _same_frame(first[t], second[t]), f"frame {t} is out of the edit's reach"
+    # all of it is what a fresh start makes
+    for k in ("_steady_lru", "_bflow"):
+        tr.__dict__.pop(k, None)
+    del made[:]
+    fresh = _all_frames(cut, tr, {})
+    assert len([m for m in made if m[0] == "area"]) == B.N
+    for t in range(B.N):
+        assert _same_frame(second[t], fresh[t]), f"frame {t}: kept maps are not what a fresh start makes"
+    # another edit, undone: the bytes counted are the bytes kept (an entry made again takes its old one's place)
+    st.final[st.index(0), 3, S.L_WR, :2] += (5.0, 5.0)
+    kept = RE.kept_over_tracks(kept)
+    _all_frames(cut, tr, kept)
+    counted = sum(RE._nbytes(kept[k]) for k in kept if k not in RE._CACHE_OWN)
+    assert kept["__bytes__"] == counted > 0
+    assert set(kept["__tok__"]) <= set(kept), "what an entry was made from is dropped with it"
+
+
+def test_a_hand_mark_makes_no_area_and_no_spots_again(body, monkeypatch):
+    """The other half of that line: a spot marked by hand (remove / keep) lies on the body part it was made on, on
+    every frame. It is laid on what was found already: nothing is looked for again, on its own frame or any other."""
+    from contour.retouch import bodyskin as BS
+    cut, tr, _calls = body
+    pp = B.body_on(cut, skin=60, blemish=100, size=B.SPOT_SIZE)
+    made = _made(monkeypatch)
+    cache = {}
+    before = _all_frames(cut, tr, cache)
+    del made[:]
+    t0 = 1
+    pp.body_marks = [BS.anchor_mark(tr.store, 0, t0, dict(id="a", kind="remove", t=t0, pts=[list(B.local(B.EL, B.WR, B.MOLE, t0))], r=5.0))]
+    try:
+        after = _all_frames(cut, tr, cache)
+    finally:
+        pp.body_marks = []
+    assert made == [], f"made again for a mark: {made}"
+    c = B.local(B.EL, B.WR, B.MOLE, 2) * tr.proxy.sx
+    assert B.contrast(after[2][3], c, 1.5, 6) < 0.5 * B.contrast(before[2][3], c, 1.5, 6), "the mark took the mole away"
+
+
+def test_the_session_keeps_the_bodys_maps_over_a_tracking_edit(scene, monkeypatch):
+    """The session's side of it: an edit that touches tracking (a joint, a swap, hidden joints) emptied the mask
+    cache. It goes on with the bodies' entries; an edit of the retouch alone leaves the cache as it is."""
+    from contour.core import frames as FR
+    from contour.retouch import engine as RE
+    from contour.track import skeleton as S
+    from contour.ui.session import EditSession
+    prj, cut = scene
+    FR.pool().clear()
+    B.truth_parser(monkeypatch)
+    for p in cut.persons:
+        B.body_on(cut, p.id).body_marks = []
+        cut.params_for(p.id).amounts["skin"].base = 0.0
+    monkeypatch.setattr(RE.BS, "REF_FRAMES", 1)
+    B.body_on(cut, skin=60, blemish=60, size=B.SPOT_SIZE, scope="arm")
+    s = EditSession()
+    s.project = prj
+    s.open_cut(cut)
+    try:
+        made = _made(monkeypatch)
+        for t in (5, 6):
+            assert s.retouch(t) is not None
+        n0 = len([m for m in made if m[0] in ("area", "spots")])
+        assert n0 >= 8
+        was = s._mask_cache
+        s.touch("ret")
+        assert s._mask_cache is was, "a retouch edit leaves the masks"
+        s.tracker.store.final[0, 0, S.L_WR, :2] += (-30.0, 22.0)
+        s.touch()                                   # (a joint committed on frame 0)
+        assert s._mask_cache is not was and s._mask_cache.get("__new__")
+        assert all(k in RE._CACHE_OWN or k[2].startswith(("bskin", "bdet")) for k in s._mask_cache)
+        del made[:]
+        for t in (5, 6):
+            assert s.retouch(t) is not None
+        assert not [m for m in made if m[0] in ("area", "spots", "steady")], f"made again far from the edit: {made}"
+        s.touch("geo")
+        assert "__new__" not in s._mask_cache and len(s._mask_cache) > 3, "a shape edit leaves the masks"
+        # with nothing of a body in it the cache is empty after a tracking edit, as it always was
+        s._mask_cache = {(1, 0, "skin", ""): np.zeros(4, np.uint8), "__bytes__": 4}
+        s.touch("trk")
+        assert s._mask_cache == {}
+    finally:
+        s.open_cut(None)
+        FR.pool().clear()
+
+
+def test_a_cache_keeps_over_a_tracking_update_only_what_says_what_it_was_made_from():
+    from contour.retouch import engine as RE
+    a, b = np.zeros(1000, np.uint8), np.zeros(500, np.uint8)
+    cache = {}
+    RE._cache_put(cache, (3, 0, "skin", ""), a)
+    RE._cache_put(cache, (3, 0, "bskin", "all:c0"), b, tok=(11, 0, None))
+    assert RE._cache_look(cache, (3, 0, "bskin", "all:c0"), (11, 0, None)) is b
+    assert RE._cache_look(cache, (3, 0, "bskin", "all:c0"), (12, 0, None)) is RE._MISS, "made from other tracks: not there"
+    assert RE._cache_look(cache, (3, 0, "skin", "")) is a and RE._cache_look(cache, (4, 0, "skin", "")) is RE._MISS
+    assert cache["__bytes__"] == 1500
+    kept = RE.kept_over_tracks(cache)
+    assert set(kept) == {(3, 0, "bskin", "all:c0"), "__tok__", "__bytes__", "__new__"} and kept["__bytes__"] == 500
+    assert RE.kept_over_tracks({}) == {} and RE.kept_over_tracks(None) == {} and RE.kept_over_tracks({"__bytes__": 0}) == {}
+    plain = {}
+    RE._cache_put(plain, (1, 0, "skin", ""), a)
+    assert RE.kept_over_tracks(plain) == {}, "nothing kept: an empty cache, as it always was"
+    # made again in its place: the count follows, and the oldest entries go first when the cache is full
+    c = np.zeros(700, np.uint8)
+    RE._cache_put(kept, (3, 0, "bskin", "all:c0"), c, tok=(12, 0, None))
+    assert kept["__bytes__"] == 700 and kept["__tok__"][(3, 0, "bskin", "all:c0")] == (12, 0, None)
+    for i in range(450):
+        RE._cache_put(kept, (i, 1, "bdet", ""), b, tok=(i, 0, None))
+    n = len([k for k in kept if k not in RE._CACHE_OWN])
+    assert n == 400 and (3, 0, "bskin", "all:c0") not in kept and (3, 0, "bskin", "all:c0") not in kept["__tok__"]
+    assert kept["__bytes__"] == 400 * 500 and len(kept["__tok__"]) == 400
+
+
+def test_the_parsers_answer_is_kept_for_the_piece_it_was_made_for(monkeypatch):
+    """A tracking update can give a person other pixels on a frame (the pixels no segment claims go to the nearest
+    skeleton): the parser's kept answer was made for the piece they took before."""
+    import types
+    from contour.retouch import bodyskin as BS
+    seen = []
+
+    def probs(crop):
+        seen.append(crop.shape[:2])
+        return np.full((6, 256, 256), 1.0 / 6, np.float32)
+    monkeypatch.setattr(BS, "_probs", probs)
+    tracker = types.SimpleNamespace(store=object(), cut=types.SimpleNamespace(analysis_version=1))
+    rgb = np.zeros((200, 300, 3), np.uint8)
+    own = np.zeros((200, 300), np.float32)
+    own[40:160, 100:180] = 1.0
+    a = BS._parse_cached(tracker, 0, 5, rgb, own)
+    assert a is not None and len(seen) == 1 and a["box"] == BS.parse_box(own)
+    assert BS._parse_cached(tracker, 0, 5, rgb, own) is a and len(seen) == 1, "the same piece: the kept answer"
+    wider = own.copy()
+    wider[40:160, 180:230] = 1.0
+    b = BS._parse_cached(tracker, 0, 5, rgb, wider)
+    assert len(seen) == 2 and b["box"] != a["box"], "another piece: asked again"
+    assert BS._parse_cached(tracker, 0, 5, rgb, wider) is b and len(seen) == 2
+    none = np.zeros_like(own)
+    assert BS._parse_cached(tracker, 0, 6, rgb, none) is None and len(seen) == 2
+
+
+def test_what_the_tracks_say_of_some_frames_as_a_number():
+    from contour.retouch import bodyskin as BS
+    from contour.track.store import TrackStore
+    st = TrackStore(40, [0, 1, 2])
+    st.final[:, :, :, :] = 1.0
+    a = BS.track_token(st, 10, 18)
+    assert a == BS.track_token(st, 10, 18) and a != BS.track_token(st, 11, 19)
+    st.final[1, 9, 3, 0] = 7.0
+    assert BS.track_token(st, 10, 18) == a, "a frame outside says nothing here"
+    for change in (lambda: st.final.__setitem__((1, 14, 3, 0), 7.0), lambda: st.vis.__setitem__((0, 10, 2), 0),
+                   lambda: st.widths.__setitem__((2, 18, 1, 0), 3.0), lambda: st.face.__setitem__((0, 12, 5, 1), 2.0),
+                   lambda: st.hand.__setitem__((0, 12, 5, 1), 2.0), lambda: st.present.__setitem__((2, 17), True),
+                   lambda: st.jump.__setitem__(13, True), lambda: setattr(st, "matte_rev", 4)):
+        change()
+        b = BS.track_token(st, 10, 18)
+        assert b != a, "a change inside the frames must show"
+        a = b
+    st.keep_persons([0, 2])
+    assert BS.track_token(st, 10, 18) != a, "another set of people"
+    assert BS.track_token(st, -5, 3) == BS.track_token(st, 0, 3) and isinstance(BS.track_token(st, 50, 60), int)
+
+
 def test_caches_hold_pieces_and_lists_not_frame_sized_maps(body):
     """What is kept for a person and frame: the piece of the area that is not empty at half precision, and the
     spots as a short list. Nothing of the frame's size, and it is counted in the masks' memory budget."""
@@ -924,21 +1153,87 @@ def test_the_parsers_face_class_is_a_face_only_where_a_head_is(monkeypatch):
     monkeypatch.setattr(BS, "FACE_NEAR", None)
     assert BS.skin_conf(rgb, own, None, parse, None, None, 200.0, heads=nowhere)[0][face].max() < 0.02, "as it was"
     monkeypatch.undo()
-    # alone in the picture it has nothing to learn the colour from: whatever its colour, nothing
+    # alone in the picture (a bare back, 2611 060: no skin of the body class, no face of the cut to bring a colour
+    # along) it teaches the colour itself when that is a colour skin has under ordinary light ...
     only = dict(parse, skin=parse["face"].copy())
     c2, m2, _p, _a = BS.skin_conf(rgb, own, None, only, None, None, 200.0, heads=nowhere)
-    assert m2 is None and float(c2.max()) == 0.0, "the face class away from a head does not teach the skin's colour"
-    monkeypatch.setattr(BS, "FACE_NEAR", None)
-    assert BS.skin_conf(rgb, own, None, only, None, None, 200.0, heads=None)[1] is not None, "as it was: it did"
+    assert m2 is not None and c2[face].min() > 0.9, "a bare back alone in the picture is body skin"
+    # ... a denim jacket's back or a silhouette is not (lngshot 089 P3, 2611 061)
+    yy, xx = np.mgrid[0:h, 0:w]
+    disc = np.hypot(xx - 190, yy - 80) < 34
+    for name, colour in (("denim", (52, 78, 118)), ("a silhouette", (14, 12, 22)), ("under violet light", (120, 70, 190))):
+        other = rgb.copy()
+        other[disc] = colour
+        c3, m3, _p, _a = BS.skin_conf(other, own, None, only, None, None, 200.0, heads=nowhere)
+        assert m3 is None and float(c3.max()) == 0.0, f"{name}: nothing to learn the colour from, nothing retouched"
+    monkeypatch.setattr(BS, "FACE_ALONE", 0)
+    c2, m2, _p, _a = BS.skin_conf(rgb, own, None, only, None, None, 200.0, heads=nowhere)
+    assert m2 is None and float(c2.max()) == 0.0, "1.23 until j2799: it never taught the colour"
     monkeypatch.undo()
-    # the colour brought along (the person's face of the cut) decides: skin of that colour is the body's ...
+    monkeypatch.setattr(BS, "FACE_NEAR", None)
+    assert BS.skin_conf(rgb, own, None, only, None, None, 200.0, heads=None)[1] is not None, "as it was at first: it did"
+    monkeypatch.undo()
+    # the colour brought along (the person's face of the cut) decides before that: skin of that colour is the body's ...
     prior = BS.fit_model(rgb, arm.astype(np.float32))
     assert BS.skin_conf(rgb, own, None, only, None, prior, 200.0, heads=nowhere)[0][face].min() > 0.9
-    # ... a jacket's back is not
+    # ... a jacket's back is not, and neither is a coat of a skin-like colour that is not this person's skin's
     denim = rgb.copy()
-    yy, xx = np.mgrid[0:h, 0:w]
-    denim[np.hypot(xx - 190, yy - 80) < 34] = (52, 78, 118)
+    denim[disc] = (52, 78, 118)
     assert BS.skin_conf(denim, own, None, only, None, prior, 200.0, heads=nowhere)[0][face].max() < 0.02
+    coat = rgb.copy()
+    coat[disc] = (150, 120, 60)
+    assert BS.skin_conf(coat, own, None, only, None, prior, 200.0, heads=nowhere)[0][face].max() < 0.02
+
+
+def test_the_back_of_a_head_does_not_teach_the_skins_colour(monkeypatch):
+    """lngshot 089 P2 (j2799): a person seen from behind in a black cap and a black hoodie. The parser called the
+    back of the head 'face' (a head is there, by the joints), and slivers of the hoodie's back too. The cap taught
+    the skin's colour: black. The hoodie's back, black and 'skin the parser found', was body skin. The face class
+    teaches the colour on this person's own face as the landmarks place it, nowhere else."""
+    from contour.retouch import bodyskin as BS
+    h, w = 240, 320
+    rng = np.random.default_rng(8)
+    yy, xx = np.mgrid[0:h, 0:w]
+    cap = np.hypot(xx - 160, yy - 50) < 30
+    back = (xx >= 90) & (xx < 230) & (yy >= 100) & (yy < 230)
+    sliver = (xx >= 120) & (xx < 200) & (yy >= 150) & (yy < 175)
+    rgb = np.full((h, w, 3), 150, np.uint8)
+    black = cap | back
+    rgb[black] = np.clip(np.array((16, 16, 18)) + rng.normal(0, 2, (int(black.sum()), 3)), 0, 255).astype(np.uint8)
+    own = (black).astype(np.float32)
+    S = 256
+    def m(sel, v=255):
+        return cv2.resize(np.where(sel, v, 0).astype(np.uint8), (S, S), interpolation=cv2.INTER_AREA)
+    parse = dict(box=(0, 0, w, h), skin=m(cap | sliver), face=m(cap | sliver), hair=m(np.zeros_like(cap)),
+                 cloth=m(back & ~sliver))
+    heads = np.zeros((h, w), np.float32)
+    cv2.circle(heads, (160, 50), 45, 1.0, -1)
+    inner = cv2.erode(sliver.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+    conf, model, _p, _a = BS.skin_conf(rgb, own, None, parse, None, None, 200.0, heads=heads)
+    assert model is None and float(conf.max()) == 0.0, "nothing of this person teaches a skin colour: nothing is body skin"
+    monkeypatch.setattr(BS, "FACE_TEACH", "near")
+    conf, model, _p, _a = BS.skin_conf(rgb, own, None, parse, None, None, 200.0, heads=heads)
+    assert model is not None and conf[inner].min() > 0.9, "1.23 until j2799: the cap taught black, the hoodie was skin"
+    monkeypatch.undo()
+    # a face that is one (the landmarks place it) teaches as before: the neck below it, of its colour, is body skin
+    skin_c = np.array((204, 152, 128))
+    face = np.hypot(xx - 160, yy - 50) < 30
+    neck = (xx >= 140) & (xx < 180) & (yy >= 78) & (yy < 100)
+    rgb2 = np.full((h, w, 3), 150, np.uint8)
+    rgb2[back] = (16, 16, 18)
+    sel = face | neck
+    rgb2[sel] = np.clip(skin_c + rng.normal(0, 3, (int(sel.sum()), 3)), 0, 255).astype(np.uint8)
+    own2 = (face | neck | back).astype(np.float32)
+    # (the parser: the face is 'face', the neck below it got half a share of skin: found, not sure enough to teach)
+    parse2 = dict(box=(0, 0, w, h), skin=np.maximum(m(face), m(neck, 150)), face=m(face), hair=m(np.zeros_like(cap)),
+                  cloth=m(back))
+    own_face = np.zeros((h, w), np.float32)
+    cv2.circle(own_face, (160, 50), 34, 1.0, -1)
+    n_in = cv2.erode(neck.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    conf, model, _p, _a = BS.skin_conf(rgb2, own2, None, parse2, None, None, 200.0, heads=heads, face_own=own_face)
+    assert model is not None and conf[n_in].min() > 0.9 and conf[face].max() < 0.02, "the face teaches, the neck is body skin"
+    conf, model, _p, _a = BS.skin_conf(rgb2, own2, None, parse2, None, None, 200.0, heads=heads, face_own=None)
+    assert model is None and float(conf.max()) == 0.0, "with no landmarks on it the 'face' is not trusted with the colour"
 
 
 def test_where_heads_are():
@@ -991,16 +1286,25 @@ def test_a_piece_of_the_persons_pixels_no_joint_reaches_is_not_the_body(body, mo
     own[10:14, 60:64] = 1.0                 # a speck
     placed = np.zeros_like(own)
     placed[10:30, 10:20] = 1.0
-    out = BS.own_islands(own, placed)
+    out, weak = BS.own_islands(own, placed)
+    assert out is own and weak.dtype == np.float32, "the pieces apart are told, the person's pixels stay"
+    assert float(weak[5:40, 5:30].max()) == 0.0 and float(weak[45:58, 70:95].min()) == 1.0 and float(weak[10:14, 60:64].min()) == 1.0
+    monkeypatch.setattr(BS, "ISLAND_ELSE", "out")
+    out, weak = BS.own_islands(own, placed)
+    assert weak is None, "1.23 until j2799: such a piece was nobody's"
     assert np.array_equal(out[5:40, 5:30], own[5:40, 5:30]) and float(out[42:, 60:].max()) == 0.0 and float(out[8:16, 58:66].max()) == 0.0
     placed[50:54, 80:90] = 1.0              # a joint-placed part on it (a forearm beyond somebody's shoulder): held
-    out = BS.own_islands(own, placed)
+    out, _w = BS.own_islands(own, placed)
     assert np.array_equal(out[45:58, 70:95], own[45:58, 70:95]) and float(out[8:16, 58:66].max()) == 0.0
-    none = BS.own_islands(own, np.zeros_like(own))
-    assert float(none[5:40, 5:30].min()) == 1.0 and float(none[42:, 60:].max()) == 0.0, "no joint at all: the largest alone"
+    monkeypatch.undo()
+    out, weak = BS.own_islands(own, placed)
+    assert float(weak[45:58, 70:95].max()) == 0.0 and float(weak[10:14, 60:64].min()) == 1.0, "held: not apart"
+    none, weak = BS.own_islands(own, np.zeros_like(own))
+    assert float(weak[5:40, 5:30].max()) == 0.0 and float(weak[45:58, 70:95].min()) == 1.0, "no joint at all: all but the largest"
     one = np.zeros((20, 20), np.float32)
     one[2:18, 2:18] = 1.0
-    assert BS.own_islands(one, np.zeros_like(one)) is one, "one piece: as it is"
+    got = BS.own_islands(one, np.zeros_like(one))
+    assert got[0] is one and got[1] is None, "one piece: as it is"
     # on the scene: a disc of the skin's colour in a corner, the parser calling it skin, the matte giving it to the person
     cut, tr, _ = body
     px = tr.proxy
@@ -1023,15 +1327,45 @@ def test_a_piece_of_the_persons_pixels_no_joint_reaches_is_not_the_body(body, mo
         return o, x
     monkeypatch.setattr(BS, "ownership", owned)
     p0 = tr.store.index(0)
+    # the stick had a share of skin of 0.6 from the parser: skin it 'found', not surely skin, and apart from the person
+    parse0 = BS._parse_cached
+
+    def half(tracker, p_, t_, rgb_, own_):
+        pr = parse0(tracker, p_, t_, rgb_, own_)
+        if pr is None:
+            return None
+        x0, y0, x1, y1 = pr["box"]
+        S_ = pr["skin"].shape[0]
+        d_ = cv2.resize(disc[int(y0):int(y1), int(x0):int(x1)].astype(np.uint8), (S_, S_), interpolation=cv2.INTER_AREA) > 0
+        return dict(pr, skin=np.where(d_, 153, pr["skin"]).astype(np.uint8))
+    inner = _inside(disc, 4)
+    body_sel = _inside(k == B.SKIN_K, 4)
+    monkeypatch.setattr(BS, "_parse_cached", half)
     m1, _i = BS.body_mask(tr, p0, t, rgb, body_scope_set("all"), None)
     monkeypatch.setattr(BS, "ISLANDS", False)
     m0, _i = BS.body_mask(tr, p0, t, rgb, body_scope_set("all"), None)
-    inner = _inside(disc, 4)
     assert float(m0[inner].min()) > 0.9, "1.23's first build: the disc is body skin"
-    assert float(m1[inner].max()) < 0.02, "apart from the person, no joint on it: as it is"
-    body_sel = _inside(k == B.SKIN_K, 4)
+    assert float(m1[inner].max()) < 0.02, "apart from the person, no joint on it, not surely skin: as it is"
     # (the colour is learnt without the disc's pixels now: the same skin to a hundredth)
     assert float(np.abs(m1 - m0)[body_sel].max()) < 0.01 and float(m1[body_sel].mean()) > 0.7, "the person's own skin as before"
+    monkeypatch.setattr(BS, "ISLANDS", True)
+    monkeypatch.setattr(BS, "_parse_cached", parse0)
+    # a hand whose arm is outside the picture (lngshot 034, j2799: half of that person's area was the hand, and the
+    # rule above left it as it is): the parser is sure it is skin, its colour is the person's own
+    m2, _i = BS.body_mask(tr, p0, t, rgb, body_scope_set("all"), None)
+    assert float(m2[inner].min()) > 0.9, "apart from the person, surely skin, of the person's colour: theirs"
+    assert float(np.abs(m2 - m0)[body_sel].max()) < 0.01, "the person's own skin as before"
+    monkeypatch.setattr(BS, "ISLAND_ELSE", "out")
+    m3, _i = BS.body_mask(tr, p0, t, rgb, body_scope_set("all"), None)
+    assert float(m3[inner].max()) < 0.02, "1.23 until j2799: no piece apart was the person's"
+    monkeypatch.setattr(BS, "ISLAND_ELSE", "sure")
+    # ... of another colour (somebody's glove, a prop of a colour skin could have): not theirs
+    other = rgb.copy()
+    other[disc] = np.clip(np.array((150, 120, 60)) + rng.normal(0, 3, (int(disc.sum()), 3)), 0, 255).astype(np.uint8)
+    tr.__dict__.pop("_bparse", None)
+    m4, _i = BS.body_mask(tr, p0, t, other, body_scope_set("all"), None)
+    assert float(m4[inner].max()) < 0.02, "the colour learnt from the rest of the person does not agree"
+    assert float(m4[body_sel].mean()) > 0.7, "and it taught nothing: the person's own skin as before"
 
 
 def test_what_the_parser_is_not_sure_of_is_skin_only_beside_skin_it_found(monkeypatch):

@@ -183,6 +183,8 @@ class EditSession:
                 self._cache = OrderedDict(other._cache)
                 self._frames = OrderedDict(other._frames)
                 self._mask_cache = dict(other._mask_cache)
+                if isinstance(self._mask_cache.get("__tok__"), dict):   # (the cache's own table: its own copy too)
+                    self._mask_cache["__tok__"] = dict(self._mask_cache["__tok__"])
                 self._last_field = None
                 self.vers = dict(other.vers)
                 self.cut_key, self.src_key, self._origin = other.cut_key, other.src_key, other._origin
@@ -240,11 +242,23 @@ class EditSession:
             for k in kinds:
                 self.vers[k] = PC.new_revision()
             if "trk" in kinds:
-                self._mask_cache = {}
+                self._mask_cache = self._masks_after_tracking()
             # entries keyed by stale versions simply stop being hit; drop the obviously stale ones
             for key in [k for k in self._cache if not self._valid(k)]:
                 self._cache.pop(key, None)
         self.dirty = True
+
+    def _masks_after_tracking(self) -> dict:
+        """The mask cache to go on with when tracking changed: empty, but for the bodies' areas and spots, which are
+        kept with what the tracks said of the frames they were made from and made again only where that changed
+        (retouch.engine.kept_over_tracks; instruction 2026-11-20 §2)."""
+        if not self._mask_cache:
+            return {}
+        try:
+            from ..retouch.engine import kept_over_tracks
+            return kept_over_tracks(self._mask_cache)
+        except Exception:
+            return {}
 
     def _valid(self, key) -> bool:
         kind = key[0]
