@@ -73,3 +73,12 @@ def qapp():
     from contour.ui import theme
     theme.apply(app)
     return app
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """The tests' result is what the run says. Qt objects that live to the interpreter's exit have aborted the process
+    after the last test on CI (malloc(): unaligned tcache chunk, exit 134, 478 passed), so on CI the run ends here."""
+    if os.environ.get("GITHUB_ACTIONS"):
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(int(exitstatus))
