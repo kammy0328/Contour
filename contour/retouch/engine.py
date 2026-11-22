@@ -5487,6 +5487,325 @@ def _grain(shape, size_px: float, seed: int) -> np.ndarray:
     return n
 
 
+# --------------------------------------------------------------------------- the last pass (2611 IWALY, user 2026-11-23: "콧구멍, 코라인, 볼록잡티, 점, 팔라인, 자갈턱 무조건 해결")
+# After every stage: what the user does not want changed is given back from the picture as it came in, whatever stage changed it.
+FINAL_NOSE = 0.0           # 0..1: the nose (its bridge, side walls, wings and nostrils) keeps its shape: the change of every stage there wider than the skin's
+                           # texture (FINAL_NOSE_SIG of the face width) is taken back; the texture's thinning stays
+FINAL_NOSE_WING = 0.45     # the wings' outer points pushed out by this share of the nose base's width
+FINAL_NOSE_PAD = 0.035     # the nose's area grown by this share of the face width (soft over the same)
+FINAL_NOSE_SIG = 0.008
+FINAL_MOLE = 0.0           # 0..1: small dark round spots that are not redder than the skin round them (moles), found on the picture as it came in, are given back
+FINAL_MOLE_DEPTH = (0.08, 0.16)
+FINAL_MOLE_RED = (0.006, 0.016)
+FINAL_MOLE_SIZE = 0.03
+FINAL_BUMP = 0.0           # 0..1: a raised spot (a small bright top with a dark side) on the face's skin is filled from the skin round it
+FINAL_BUMP_SIZE = 0.035    # of the face width: the largest bump
+FINAL_BUMP_LIGHT = (0.025, 0.05)   # relative brightness of its top over the skin round it
+FINAL_BUMP_MAXLIGHT = 0.30         # brighter than this: a glint, left
+FINAL_LONG = 0.0           # 0..1: long straight thin dark lines (an arm's outline, hair strands, a strap's shadow) inside an armpit zone or on the body's skin are given back in full
+FINAL_LONG_SPAN = 0.30
+FINAL_LONG_ELONG = 4.0
+FINAL_LONG_THR = 0.025
+FINAL_NASO = 0.0           # 0..1: the nasolabial folds (팔자주름) and the shade at the mouth's corners: in a zone made from the landmarks alone (the nose wing to the mouth's
+                           # corner and on below it, FINAL_NASO_W of the face width wide), what is darker than its surroundings at the fold's scale (FINAL_NASO_BAND) is lifted;
+                           # hair strands (far darker, thin) and the nose / the lips are left. Works where the skin mask or the fold finder missed the fold (a turned, tilted, blurred face)
+FINAL_NASO_W = 0.10
+FINAL_NASO_BAND = (0.004, 0.06)
+FINAL_NASO_MAXDARK = 0.18  # darker than this (relative to the local level) at the fine scale: a strand or a feature, left
+FINAL_CHIN = 0.0           # 0..1: a pebbled chin: the pits and bumps between FINAL_CHIN_BAND of the face width taken out on the chin (the broad shape and the finest texture stay)
+FINAL_CHIN_BAND = (0.006, 0.035)
+
+
+def _nose_area(lm: np.ndarray, shape, wf: float) -> Optional[np.ndarray]:
+    """0..1: the nose with its side walls (inner eye corners to the wings), its wings and nostrils, grown by FINAL_NOSE_PAD (lm in px of shape)."""
+    if lm is None or lm.shape[0] < 48 or not np.isfinite(lm[[27, 28, 29, 30, 31, 32, 33, 34, 35, 39, 42], :2]).all():
+        return None
+    L = np.asarray(lm[:, :2], np.float64)
+    pts = [L[27:36], L[[39, 42]]]
+    bw = float(np.linalg.norm(L[35] - L[31]))
+    c = 0.5 * (L[31] + L[35])
+    for i in (31, 35):
+        d = L[i] - c
+        n = float(np.linalg.norm(d))
+        if n > 1e-6:
+            pts.append((L[i] + d / n * FINAL_NOSE_WING * bw)[None])
+    # the nostrils' lower rim: a little below the base
+    dn = L[33] - L[27]
+    nd = float(np.linalg.norm(dn))
+    if nd > 1e-6:
+        pts.append((L[[31, 33, 35]] + dn / nd * 0.12 * bw))
+    P = np.vstack(pts)
+    pad = max(2, int(round(FINAL_NOSE_PAD * wf)))
+    x0, y0 = int(max(0, P[:, 0].min() - 3 * pad)), int(max(0, P[:, 1].min() - 3 * pad))
+    x1, y1 = int(min(shape[1], P[:, 0].max() + 3 * pad)), int(min(shape[0], P[:, 1].max() + 3 * pad))
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return None
+    m = np.zeros((y1 - y0, x1 - x0), np.uint8)
+    cv2.fillConvexPoly(m, cv2.convexHull(np.round(P - [x0, y0]).astype(np.int32)), 255)
+    m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * pad + 1, 2 * pad + 1)))
+    out = np.zeros(shape, np.float32)
+    out[y0:y1, x0:x1] = np.clip(cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.6 * pad)), 0, 1)
+    return out
+
+
+def _final_moles(Y0: np.ndarray, Cr0: np.ndarray, region: np.ndarray, wf: float) -> Optional[np.ndarray]:
+    """0..1: moles on the picture as it came in (Y0, Cr0 at Y's size), inside region (> 0.05)."""
+    r = _roi(region, int(0.05 * wf) + 6)
+    if r is None:
+        return None
+    y0, y1, x0, x1 = r
+    roi = Y0[y0:y1, x0:x1].astype(np.float32)
+    rb = cv2.GaussianBlur(roi, (0, 0), 0.8)
+    base = cv2.GaussianBlur(roi, (0, 0), max(2.0, 0.03 * wf)) + 0.02
+    km = max(3, int(round(FINAL_MOLE_SIZE * wf)) | 1)
+    bh = cv2.morphologyEx(rb, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (km, km))) / base
+    dep = _ss(FINAL_MOLE_DEPTH[0], FINAL_MOLE_DEPTH[1], bh)
+    # round spots, not lines (a line's blackhat runs on along it): the spot's area at half its depth is compact
+    cand = (dep > 0.5).astype(np.uint8) & (region[y0:y1, x0:x1] > 0.05).astype(np.uint8)
+    n, lab, st, _c = cv2.connectedComponentsWithStats(cand, connectivity=8)
+    if n <= 1:
+        return None
+    keep = np.zeros(n, bool)
+    smax = FINAL_MOLE_SIZE * wf
+    cr = Cr0[y0:y1, x0:x1].astype(np.float32)
+    crd = cv2.GaussianBlur(cr, (0, 0), 1.2) - cv2.GaussianBlur(cr, (0, 0), max(2.0, 0.03 * wf))
+    for i in range(1, n):
+        w_, h_, a_ = st[i, 2], st[i, 3], st[i, 4]
+        if max(w_, h_) > smax or a_ < 3:
+            continue
+        if max(w_, h_) > 2.5 * max(1, min(w_, h_)):
+            continue
+        sel = lab == i
+        if float(np.median(crd[sel])) > FINAL_MOLE_RED[1]:
+            continue
+        keep[i] = True
+    if not keep.any():
+        return None
+    m = keep[lab].astype(np.float32) * (1.0 - _ss(FINAL_MOLE_RED[0], FINAL_MOLE_RED[1], crd))
+    k = max(3, int(round(0.006 * wf)) | 1)
+    m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    out = np.zeros(Y0.shape, np.float32)
+    out[y0:y1, x0:x1] = np.clip(cv2.GaussianBlur(m, (0, 0), max(0.8, 0.003 * wf)) * 1.2, 0, 1)
+    return out
+
+
+def _final_bumps(Y0: np.ndarray, region: np.ndarray, wf: float):
+    """(mask 0..1, fill level) of raised spots on Y0 inside region: a small top brighter than the skin round it with a darker side. None: none."""
+    r = _roi(region, int(FINAL_BUMP_SIZE * wf) + 6)
+    if r is None:
+        return None
+    y0, y1, x0, x1 = r
+    roi = Y0[y0:y1, x0:x1].astype(np.float32)
+    rb = cv2.GaussianBlur(roi, (0, 0), 0.8)
+    base = cv2.GaussianBlur(roi, (0, 0), max(2.0, 0.03 * wf)) + 0.02
+    kb = max(3, int(round(FINAL_BUMP_SIZE * wf)) | 1)
+    se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kb, kb))
+    th = cv2.morphologyEx(rb, cv2.MORPH_TOPHAT, se) / base
+    bh = cv2.morphologyEx(rb, cv2.MORPH_BLACKHAT, se) / base
+    top = _ss(FINAL_BUMP_LIGHT[0], FINAL_BUMP_LIGHT[1], th) * (th < FINAL_BUMP_MAXLIGHT)
+    cand = ((top > 0.5) & (region[y0:y1, x0:x1] > 0.3)).astype(np.uint8)
+    n, lab, st, cen = cv2.connectedComponentsWithStats(cand, connectivity=8)
+    if n <= 1:
+        return None
+    keep = np.zeros(n, bool)
+    smax = FINAL_BUMP_SIZE * wf
+    shade = cv2.dilate((bh > 0.5 * FINAL_BUMP_LIGHT[0]).astype(np.uint8), np.ones((3, 3), np.uint8))
+    for i in range(1, n):
+        w_, h_, a_ = st[i, 2], st[i, 3], st[i, 4]
+        if max(w_, h_) > smax or a_ < 3:
+            continue
+        # a dark side next to the top (the bump's own shade): within the bump's size round it
+        cx, cy = int(cen[i, 0]), int(cen[i, 1])
+        rr = int(max(w_, h_)) + 2
+        win = shade[max(0, cy - rr):cy + rr + 1, max(0, cx - rr):cx + rr + 1]
+        if win.sum() < 2:
+            continue
+        keep[i] = True
+    if not keep.any():
+        return None
+    m = keep[lab].astype(np.uint8)
+    k = max(3, int(round(0.4 * FINAL_BUMP_SIZE * wf)) | 1)
+    m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    # the shade beside it belongs to the bump too
+    m = np.maximum(m, (cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))) & (bh > 0.5 * FINAL_BUMP_LIGHT[0]).astype(np.uint8)))
+    fill = cv2.inpaint(np.clip(roi * 65535.0, 0, 65535).astype(np.uint16), (m > 0).astype(np.uint8), max(3, k), cv2.INPAINT_TELEA).astype(np.float32) / 65535.0
+    ms = np.clip(cv2.GaussianBlur(m.astype(np.float32), (0, 0), max(0.8, 0.15 * k)) * 1.5, 0, 1)
+    M_ = np.zeros(Y0.shape, np.float32)
+    F_ = Y0.astype(np.float32, copy=True)
+    M_[y0:y1, x0:x1] = ms
+    F_[y0:y1, x0:x1] = fill
+    return M_, F_
+
+
+def _final_long_lines(Y0: np.ndarray, region: np.ndarray, wf: float) -> Optional[np.ndarray]:
+    """0..1: long straight thin dark lines of Y0 inside region (> 0.05)."""
+    r = _roi(region, int(FINAL_LONG_SPAN * wf) + 8)
+    if r is None:
+        return None
+    y0, y1, x0, x1 = r
+    roi = Y0[y0:y1, x0:x1].astype(np.float32)
+    w = max(1.5, ARMPIT_W * wf)
+    rb = cv2.GaussianBlur(roi, (0, 0), max(0.7, 0.3 * w))
+    k = max(3, int(round(3.0 * w)) | 1)
+    base = cv2.GaussianBlur(roi, (0, 0), max(2.0, 2.0 * w)) + 0.02
+    bh = cv2.morphologyEx(rb, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))) / base
+    cand = ((bh > FINAL_LONG_THR) & (region[y0:y1, x0:x1] > 0.05)).astype(np.uint8)
+    n, lab, st, _c = cv2.connectedComponentsWithStats(cand, connectivity=8)
+    keep = np.zeros(n, bool)
+    span_min = FINAL_LONG_SPAN * wf
+    for i in range(1, n):
+        if max(st[i, 2], st[i, 3]) < 0.5 * span_min or st[i, 4] < 8:
+            continue
+        ys, xs = np.nonzero(lab[st[i, 1]:st[i, 1] + st[i, 3], st[i, 0]:st[i, 0] + st[i, 2]] == i)
+        pts = np.c_[xs, ys].astype(np.float64)
+        ev = np.linalg.eigvalsh(np.cov((pts - pts.mean(0)).T))
+        length, width = 4.0 * float(np.sqrt(max(ev[1], 1e-9))), 4.0 * float(np.sqrt(max(ev[0], 1e-9)))
+        if length >= span_min and length >= FINAL_LONG_ELONG * max(width, 1.0):
+            keep[i] = True
+    if not keep.any():
+        return None
+    H = keep[lab].astype(np.uint8)
+    kd = max(3, int(round(2.0 * w)) | 1)
+    H = cv2.dilate(H, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kd, kd))).astype(np.float32)
+    out = np.zeros(Y0.shape, np.float32)
+    out[y0:y1, x0:x1] = np.clip(cv2.GaussianBlur(H, (0, 0), max(1.0, 0.7 * w)) * 1.3, 0, 1)
+    return out
+
+
+def _final_chin(Y: np.ndarray, lm: np.ndarray, skin: np.ndarray, wf: float, k: float) -> np.ndarray:
+    """The pits and bumps of a pebbled chin taken out: the band FINAL_CHIN_BAND of the luma, on the chin's zone of the skin."""
+    z = chin_zone(Y.shape, lm, wf)
+    if z is None:
+        return Y
+    r = _roi(z, int(0.1 * wf) + 8)
+    if r is None:
+        return Y
+    y0, y1, x0, x1 = r
+    roi = Y[y0:y1, x0:x1].astype(np.float32)
+    m = z[y0:y1, x0:x1] * np.clip(skin[y0:y1, x0:x1], 0, 1) * float(k)
+    s0, s1 = max(0.8, FINAL_CHIN_BAND[0] * wf), max(2.0, FINAL_CHIN_BAND[1] * wf)
+    band = cv2.GaussianBlur(roi, (0, 0), s0) - cv2.GaussianBlur(roi, (0, 0), s1)
+    out = Y.astype(np.float32, copy=True)
+    out[y0:y1, x0:x1] = roi - m * band
+    return out
+
+
+def _naso_zone(lm: np.ndarray, shape, wf: float) -> Optional[np.ndarray]:
+    """0..1: both nasolabial folds and the mouth's corners, from the landmarks (px of shape): a thick line from beside each nose wing to the mouth's corner
+    and on a little below it, without the nose (with its wings) and the lips."""
+    if lm is None or lm.shape[0] < 68 or not np.isfinite(lm[[27, 31, 33, 35, 48, 54, 51, 57, 8], :2]).all():
+        return None
+    L = np.asarray(lm[:, :2], np.float64)
+    bw = float(np.linalg.norm(L[35] - L[31]))
+    c = 0.5 * (L[31] + L[35])
+    down = L[8] - L[27]
+    down = down / max(float(np.linalg.norm(down)), 1e-6)
+    w = max(3, int(round(FINAL_NASO_W * wf)))
+    m = np.zeros(shape, np.uint8)
+    for wing, corner in ((31, 48), (35, 54)):
+        d = L[wing] - c
+        d = d / max(float(np.linalg.norm(d)), 1e-6)
+        a = L[wing] + d * 0.55 * bw - down * 0.10 * bw      # beside the wing, a little above its base
+        b = L[corner] + d * 0.15 * bw                         # the mouth's corner, a little outside
+        e = b + down * 0.35 * bw                              # and on below it
+        for p0, p1 in ((a, b), (b, e)):
+            cv2.line(m, tuple(int(round(v)) for v in p0), tuple(int(round(v)) for v in p1), 255, w, cv2.LINE_AA)
+    # without the nose and the lips
+    nose = _nose_area(lm, shape, wf)
+    lips = np.zeros(shape, np.uint8)
+    cv2.fillConvexPoly(lips, cv2.convexHull(np.round(L[48:60]).astype(np.int32)), 255)
+    kl = max(3, int(round(0.03 * wf)) | 1)
+    lips = cv2.dilate(lips, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kl, kl)))
+    out = cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.25 * w))
+    out = out * (1.0 - cv2.GaussianBlur(lips.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.01 * wf)))
+    if nose is not None:
+        out = out * (1.0 - nose)
+    return np.clip(out, 0, 1).astype(np.float32)
+
+
+def _final_naso(Y: np.ndarray, Y0: np.ndarray, lm: np.ndarray, wf: float, k: float) -> np.ndarray:
+    """The folds' dark band lifted inside _naso_zone (see FINAL_NASO)."""
+    z = _naso_zone(lm, Y.shape, wf)
+    if z is None:
+        return Y
+    r = _roi(z, int(FINAL_NASO_BAND[1] * wf * 3) + 8)
+    if r is None:
+        return Y
+    y0, y1, x0, x1 = r
+    roi = Y[y0:y1, x0:x1].astype(np.float32)
+    s0, s1 = max(0.8, FINAL_NASO_BAND[0] * wf), max(3.0, FINAL_NASO_BAND[1] * wf)
+    lo = cv2.GaussianBlur(roi, (0, 0), s1)
+    band = cv2.GaussianBlur(roi, (0, 0), s0) - lo
+    # strands and features: far darker than the level at the fine scale, on the picture as it came in
+    r0 = Y0[y0:y1, x0:x1].astype(np.float32)
+    fine = (cv2.GaussianBlur(r0, (0, 0), max(2.0, 0.02 * wf)) - cv2.GaussianBlur(r0, (0, 0), 0.8)) / (cv2.GaussianBlur(r0, (0, 0), max(2.0, 0.02 * wf)) + 0.02)
+    keep = _ss(FINAL_NASO_MAXDARK, 1.6 * FINAL_NASO_MAXDARK, fine)
+    keep = cv2.dilate(keep, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    m = z[y0:y1, x0:x1] * (1.0 - keep) * float(k)
+    out = Y.astype(np.float32, copy=True)
+    out[y0:y1, x0:x1] = roi - m * np.minimum(band, 0.0)
+    return out
+
+
+def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
+    """The last pass (FINAL_*): see the constants. Y0/Cb0/Cr0: the planes as they came in."""
+    if not (FINAL_NOSE > 1e-4 or FINAL_MOLE > 1e-4 or FINAL_BUMP > 1e-4 or FINAL_LONG > 1e-4 or FINAL_CHIN > 1e-4 or FINAL_NASO > 1e-4):
+        return Y, Cb, Cr
+    hY, wY = Y.shape
+    hC, wC = Cb.shape
+    Cr0Y = Cr0 if Cr0.shape == Y.shape else cv2.resize(Cr0, (wY, hY), interpolation=cv2.INTER_LINEAR)
+    give = np.zeros(Y.shape, np.float32)          # full give-back (luma and colour)
+    for job in rf.jobs:
+        try:
+            wf = job.wf_src * y_per_src if job.wf_src > 0 else 0.11 * max(job.scale, 200.0) * y_per_src
+            lmY = None if job.face is None else np.asarray(job.face, np.float32)[:, :2] * y_per_src
+            skin = M(job.masks["skin"], (hY, wY)) if "skin" in job.masks else None
+            if FINAL_NOSE > 1e-4 and lmY is not None and job.wf_src > 0:
+                nm = _nose_area(lmY, (hY, wY), wf)
+                if nm is not None:
+                    nm = nm * float(np.clip(FINAL_NOSE, 0, 1))
+                    s_ = max(1.0, FINAL_NOSE_SIG * wf)
+                    r_ = _roi(nm, int(3 * s_) + 2)
+                    if r_ is not None:
+                        a0, a1, b0, b1 = r_
+                        d_ = Y[a0:a1, b0:b1] - Y0[a0:a1, b0:b1]
+                        Y[a0:a1, b0:b1] = Y[a0:a1, b0:b1] - nm[a0:a1, b0:b1] * cv2.GaussianBlur(d_, (0, 0), s_)
+                    nC = M(nm, (hC, wC))
+                    Cb = Cb + nC * (Cb0 - Cb)
+                    Cr = Cr + nC * (Cr0 - Cr)
+            if FINAL_MOLE > 1e-4 and skin is not None and job.wf_src > 0:
+                mm = _final_moles(Y0, Cr0Y, skin, wf)
+                if mm is not None:
+                    give = np.maximum(give, mm * float(np.clip(FINAL_MOLE, 0, 1)))
+            if FINAL_LONG > 1e-4:
+                reg = None
+                if "armpit" in job.masks:
+                    reg = M(job.masks["armpit"], (hY, wY))
+                if reg is not None:
+                    lm_ = _final_long_lines(Y0, reg, wf if job.wf_src > 0 else (float(job.wf_arm) * y_per_src if job.wf_arm > 0 else wf))
+                    if lm_ is not None:
+                        give = np.maximum(give, lm_ * float(np.clip(FINAL_LONG, 0, 1)))
+            if FINAL_BUMP > 1e-4 and skin is not None and job.wf_src > 0:
+                bb = _final_bumps(Y0, skin, wf)
+                if bb is not None:
+                    bm, bf = bb
+                    bm = bm * float(np.clip(FINAL_BUMP, 0, 1))
+                    Y = Y + bm * (np.minimum(bf, Y) - Y)
+            if FINAL_NASO > 1e-4 and lmY is not None and job.wf_src > 0:
+                Y = _final_naso(Y, Y0, lmY, wf, float(np.clip(FINAL_NASO, 0, 1)))
+            if FINAL_CHIN > 1e-4 and lmY is not None and skin is not None:
+                Y = _final_chin(Y, lmY, skin, wf, float(np.clip(FINAL_CHIN, 0, 1)))
+        except Exception:
+            import traceback
+            traceback.print_exc()
+    if give.max() > 1e-3:
+        Y = Y + give * (Y0 - Y)
+        gC = M(give, (hC, wC))
+        Cb = Cb + gC * (Cb0 - Cb)
+        Cr = Cr + gC * (Cr0 - Cr)
+    return Y, Cb, Cr
+
+
 def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame, y_per_src: float,
                 linear_light: bool = False, src: Optional[dict] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Y 0..1, Cb/Cr centred on 0 (any resolution each). y_per_src: Y-plane px per source px.
@@ -5501,6 +5820,7 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
     Y = Y.astype(np.float32, copy=True)
     Cb = Cb.astype(np.float32, copy=True)
     Cr = Cr.astype(np.float32, copy=True)
+    Y_in, Cb_in, Cr_in = Y.copy(), Cb.copy(), Cr.copy()
 
     def M(m, shape):
         if m.shape == shape:
@@ -6174,6 +6494,7 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                         for ci, Cx in enumerate((Cb, Cr)):
                             nc = _grain((c1 - c0, d1 - d0), sizec * 1.3, seed + 7 + ci)
                             Cx[c0:c1, d0:d1] += mC[c0:c1, d0:d1] * nc * (0.016 * cg)
+    Y, Cb, Cr = _final_pass(Y, Cb, Cr, Y_in, Cb_in, Cr_in, rf, y_per_src, M)
     return Y, Cb, Cr
 
 
