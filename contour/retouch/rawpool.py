@@ -25,7 +25,7 @@ import time
 from typing import Dict, List, Optional
 
 BLOCK = 6            # frames given to one helper in a row
-AHEAD = 18           # frames made (or being made) ahead of the last one taken, at most
+AHEAD = 10           # frames made (or being made) ahead of the last one taken, at most (a raw 4K frame is 130 to 200 MB)
 
 
 def _engine_settings(RE) -> dict:
