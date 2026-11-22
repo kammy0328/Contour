@@ -5852,8 +5852,16 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
                     nC = M(nm, (hC, wC))
                     Cb = Cb + nC * (Cb0 - Cb)
                     Cr = Cr + nC * (Cr0 - Cr)
-            if FINAL_MOLE > 1e-4 and skin is not None and job.wf_src > 0:
-                mm = _final_moles(Y0, Cr0Y, skin, wf, lmY)
+            # where moles and bumps are looked for: the skin, and the landmarks' outline of the face (the skin mask leaves out spots of a strong
+            # colour or a hard edge as "things": c029 f4's bump lay outside it)
+            spot_reg = skin
+            if lmY is not None and job.wf_src > 0 and np.isfinite(lmY[0:27]).all():
+                hull_ = np.zeros((hY, wY), np.uint8)
+                cv2.fillConvexPoly(hull_, cv2.convexHull(np.round(lmY[0:27]).astype(np.int32)), 255)
+                hull_ = hull_.astype(np.float32) / 255.0
+                spot_reg = hull_ if skin is None else np.maximum(skin, hull_)
+            if FINAL_MOLE > 1e-4 and spot_reg is not None and job.wf_src > 0:
+                mm = _final_moles(Y0, Cr0Y, spot_reg, wf, lmY)
                 if mm is not None:
                     give = np.maximum(give, mm * float(np.clip(FINAL_MOLE, 0, 1)))
             if FINAL_LONG > 1e-4:
@@ -5864,8 +5872,8 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
                     lm_ = _final_long_lines(Y0, reg, wf if job.wf_src > 0 else (float(job.wf_arm) * y_per_src if job.wf_arm > 0 else wf))
                     if lm_ is not None:
                         give = np.maximum(give, lm_ * float(np.clip(FINAL_LONG, 0, 1)))
-            if FINAL_BUMP > 1e-4 and skin is not None and job.wf_src > 0:
-                bb = _final_bumps(Y0, skin, wf, lmY, Y)
+            if FINAL_BUMP > 1e-4 and spot_reg is not None and job.wf_src > 0:
+                bb = _final_bumps(Y0, spot_reg, wf, lmY, Y)
                 if bb is not None:
                     bm, bf = bb
                     bm = bm * float(np.clip(FINAL_BUMP, 0, 1))
