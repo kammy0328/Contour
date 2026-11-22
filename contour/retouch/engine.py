@@ -4350,6 +4350,11 @@ NASO_REACH = 0.07           # the same in the nasolabial stage. 2611 IWALY c029,
                             # of a per cent. Smaller = the fold is taken closer to the wing (the wing itself, inside the landmarks' hull, stays held)
 ALA_KEEP = 1.0              # share of the nose wing's own exclusion (_ala_mask) kept in the fold's band (1 = as before; the band is made at the
                             # preparation of the frame)
+NOSE_SIDES = False          # 2611 IWALY c029 f4/f124, c010 f4/f15, c001 f92 (2026-11-22, user: "코 라인 밝아진 오류", "콧구멍 사라지고 코라인이 덜 선명해진 오류"): the nose's own
+                            # outline (the shaded side wall from the inner eye corner down to the wing, the nostril's rim) was lifted by the nasolabial stage: the held hull
+                            # was that of the bridge's middle line and the nose's base only (landmarks 27..35), so on a turned face its side wall lay outside it. True = the
+                            # hull also takes the inner eye corners (39, 42) and the wings' outer points pushed out by NOSE_SIDES_WING of the base's width
+NOSE_SIDES_WING = 0.12
 NOSE_REACH = 0.07           # how far past the nose's outline the nose is held (0.14 held the top of the fold
                             # beside the nostril too, which a frown deepens)
 EXT_GUARD = (0.03, 0.10)    # 2611 IWALY c010 (2026-11-22, own review of the user's frame 00:00:58:12): the fold stages worked up to the face's outer edge: on a face turned
@@ -4835,7 +4840,18 @@ def nose_hold(lm: Optional[np.ndarray], shape, scale: float, wf: float, reach: O
     rch = NOSE_REACH if reach is None else float(reach)
 
     def make():
-        hull = cv2.convexHull(np.round(lm[27:36, :2] * scale).astype(np.int32))
+        pts = np.array(lm[27:36, :2], np.float64)
+        if NOSE_SIDES and lm.shape[0] >= 48 and np.isfinite(lm[[39, 42], :2]).all():
+            base_w = float(np.linalg.norm(lm[35, :2] - lm[31, :2]))
+            c_ = 0.5 * (lm[31, :2] + lm[35, :2])
+            wing = []
+            for i_ in (31, 35):
+                d_ = lm[i_, :2] - c_
+                n_ = float(np.linalg.norm(d_))
+                if n_ > 1e-6:
+                    wing.append(lm[i_, :2] + d_ / n_ * NOSE_SIDES_WING * base_w)
+            pts = np.vstack([pts, lm[[39, 42], :2]] + ([np.array(wing)] if wing else []))
+        hull = cv2.convexHull(np.round(pts * scale).astype(np.int32))
         k = max(3, int(round(rch * wf)) | 1)
         sig = max(1.0, 0.02 * wf)
         x0, y0, x1, y1 = _window(shape, hull.reshape(-1, 2), k + 8 * sig + 4)
@@ -4847,7 +4863,7 @@ def nose_hold(lm: Optional[np.ndarray], shape, scale: float, wf: float, reach: O
         m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
         out[y0:y1, x0:x1] = 1.0 - cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0), sig)
         return out
-    return _cached("nose" if reach is None else f"nose{rch:.4f}", lm, shape, scale, wf, make)
+    return _cached(("nose" if reach is None else f"nose{rch:.4f}") + ("s%.3f" % NOSE_SIDES_WING if NOSE_SIDES else ""), lm, shape, scale, wf, make)
 
 
 def _exterior_guard(exY: np.ndarray, lm: Optional[np.ndarray], shape, y_per_src: float, wf: float, band: np.ndarray) -> Optional[np.ndarray]:
