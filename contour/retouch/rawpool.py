@@ -25,7 +25,7 @@ import time
 from typing import Dict, List, Optional
 
 BLOCK = 6            # frames given to one helper in a row
-AHEAD = 10           # frames made (or being made) ahead of the last one taken, at most (a raw 4K frame is 130 to 200 MB)
+AHEAD = 6            # frames made (or being made) ahead of the last one taken, at most (a raw 4K frame is 130 to 370 MB); CONTOUR_RAW_AHEAD
 
 
 def _engine_settings(RE) -> dict:
@@ -114,6 +114,10 @@ class RawPool:
         self.last_taken = -1                      # index of the last frame taken
         self.busy: Dict[int, int] = {}            # helper -> frames it has still to send
         self.closed = False
+        try:
+            self.ahead = max(BLOCK, int(os.environ.get("CONTOUR_RAW_AHEAD", "") or AHEAD))
+        except ValueError:
+            self.ahead = AHEAD
         self.stats = dict(made=0, taken=0, local=0, wait_s=0.0, bytes=0)
         self.err: List[str] = []
         d = tempfile.mkdtemp(prefix="contour_raw_")
@@ -156,7 +160,7 @@ class RawPool:
                 return
             if self.busy.get(k, 0) > 0 or p.poll() is not None:
                 continue
-            if self.next_block - self.last_taken > AHEAD:
+            if self.next_block - self.last_taken > self.ahead:
                 return
             blk = self.frames[self.next_block:self.next_block + BLOCK]
             self.next_block += len(blk)

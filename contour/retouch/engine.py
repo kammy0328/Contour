@@ -5525,6 +5525,7 @@ FINAL_NASO = 0.0           # 0..1: the nasolabial folds (팔자주름) and the s
                            # corner and on below it, FINAL_NASO_W of the face width wide), what is darker than its surroundings at the fold's scale (FINAL_NASO_BAND) is lifted;
                            # hair strands (far darker, thin) and the nose / the lips are left. Works where the skin mask or the fold finder missed the fold (a turned, tilted, blurred face)
 FINAL_NASO_W = 0.10
+FINAL_NASO_DEEP = (0.13, 0.20)   # see _final_naso
 FINAL_NASO_NOSE_GAP = 0.04  # of the face width: the zone stays this far from the nose (soft)
 FINAL_NASO_BAND = (0.004, 0.06)
 FINAL_NASO_EDGE = 0.10     # of the face width: the zone stays this far inside the landmarks' outline of the face
@@ -5854,6 +5855,13 @@ def _final_naso(Y: np.ndarray, Y0: np.ndarray, lm: np.ndarray, wf: float, k: flo
     gx_, gy_ = cv2.Sobel(rq, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(rq, cv2.CV_32F, 0, 1, ksize=3)
     step = np.hypot(gx_, gy_) / 8.0 * max(2.0, 0.02 * wf) / (cv2.GaussianBlur(r0, (0, 0), max(2.0, 0.02 * wf)) + 0.02)
     keep = np.maximum(keep, _ss(0.20, 0.35, step))
+    # a band far darker than its surroundings is a thing lying on the face (a hair strand across the mouth's corner: c029 f66), not a fold's shade:
+    # deeper than FINAL_NASO_DEEP of the local level it is left, with a margin of a fold's width round it
+    rel = np.maximum(-band, 0.0) / (lo + 0.02)
+    deep = _ss(FINAL_NASO_DEEP[0], FINAL_NASO_DEEP[1], rel)
+    kd = max(3, int(round(0.03 * wf)) | 1)
+    deep = cv2.dilate(deep, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kd, kd)))
+    keep = np.maximum(keep, cv2.GaussianBlur(deep, (0, 0), max(1.0, 0.01 * wf)))
     keep = cv2.dilate(keep, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
     m = z[y0:y1, x0:x1] * (1.0 - keep) * float(k)
     out = Y.astype(np.float32, copy=True)
