@@ -5523,6 +5523,8 @@ FINAL_NASO_EDGE = 0.10     # of the face width: the zone stays this far inside t
 FINAL_NASO_MAXDARK = 0.18  # darker than this (relative to the local level) at the fine scale: a strand or a feature, left
 FINAL_CHIN = 0.0           # 0..1: a pebbled chin: the pits and bumps between FINAL_CHIN_BAND of the face width taken out on the chin (the broad shape and the finest texture stay)
 FINAL_CHIN_BAND = (0.006, 0.035)
+FINAL_CHIN_LIGHT = 0.015     # see _final_chin (None: both sides alike)
+FINAL_CHIN_LIGHT_MAX = 0.03
 
 
 def _nose_points_ok(L: np.ndarray, wf: float) -> np.ndarray:
@@ -5761,6 +5763,12 @@ def _final_chin(Y: np.ndarray, lm: np.ndarray, skin: np.ndarray, wf: float, k: f
     m = z[y0:y1, x0:x1] * np.clip(skin[y0:y1, x0:x1], 0, 1) * float(k)
     s0, s1 = max(0.8, FINAL_CHIN_BAND[0] * wf), max(2.0, FINAL_CHIN_BAND[1] * wf)
     band = cv2.GaussianBlur(roi, (0, 0), s0) - cv2.GaussianBlur(roi, (0, 0), s1)
+    if FINAL_CHIN_LIGHT is not None:
+        # the light side (bumps, a sheen) only up to a scale of FINAL_CHIN_LIGHT of the face width and FINAL_CHIN_LIGHT_MAX deep: the chin's broad
+        # highlight is its shape (c010 f0); the pits (the dark side) go whole
+        s2 = max(s0 + 0.5, FINAL_CHIN_LIGHT * wf)
+        b2 = cv2.GaussianBlur(roi, (0, 0), s0) - cv2.GaussianBlur(roi, (0, 0), s2)
+        band = np.where(band > 0, np.clip(np.minimum(band, np.maximum(b2, 0.0)), 0.0, FINAL_CHIN_LIGHT_MAX), band)
     out = Y.astype(np.float32, copy=True)
     out[y0:y1, x0:x1] = roi - m * band
     return out
