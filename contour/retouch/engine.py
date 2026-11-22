@@ -742,9 +742,14 @@ NECK_DARK = (0.40, 0.58)    # of the face's own skin brightness: the neck mask f
 NECK_SHADE_MIN = 0.045     # of the face width: narrower stretches the colour model leaves out stay out (hair, a chain)
 
 
+NECK_PROTECT = 1.0         # how far the hair strands and paint the skin mask leaves out are kept out of the neck's mask (0 = as before:
+                           # the mask blurs the skin probability, a strand a few pixels wide is blurred away, and the neck-line filler
+                           # lifted hairs lying over the neck as if they were creases: cut IWALY_c050)
+
+
 def neck_mask(lm: np.ndarray, kp: np.ndarray, widths, shape, sx: float, sy: float, prob: np.ndarray,
               alpha, fth: float = 1.5, rgb: Optional[np.ndarray] = None, hands: Optional[np.ndarray] = None,
-              parse: Optional[dict] = None) -> np.ndarray:
+              parse: Optional[dict] = None, protect: Optional[np.ndarray] = None) -> np.ndarray:
     """The neck: from the underside of the jaw down to the neck base, as wide as the neck.
 
     Built from the face first (the jaw line and which way is down), because the shoulders are often the least
@@ -810,6 +815,10 @@ def neck_mask(lm: np.ndarray, kp: np.ndarray, widths, shape, sx: float, sy: floa
         except Exception:
             pass
     f = f * pc
+    if protect is not None and NECK_PROTECT > 0 and protect.shape == f.shape:
+        # what the skin mask cut out of the face (a hair strand lying over the neck, paint) stays out of the neck too: the blur above
+        # closes a hole a few pixels wide
+        f = f * (1.0 - NECK_PROTECT * np.clip(protect, 0.0, 1.0))
     if alpha is not None:
         f = f * alpha
     if rgb is not None and f.max() > 0.01:
@@ -2193,8 +2202,8 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                     fmaps = _parse_now(state["rgb"], lm)
                 state["parse"] = fmaps
                 state["model"] = SK.frame_model_for(tracker, p, t, state["rgb"], lm, centre)
-                state["prob"] = SK.face_skin_probability(state["rgb"], state["model"], lm if fw > 0.3 else None,
-                                                         fmaps if fw > 0.3 else None)
+                state["prob"], state["protect"] = SK.face_skin_and_protect(state["rgb"], state["model"], lm if fw > 0.3 else None,
+                                                                          fmaps if fw > 0.3 else None)
                 state["prob0"] = state["prob"]      # before the cover and the focus zone: what the skin mask starts from too
                 if lm is not None:
                     # an arm, a leg or a hand in front of the face: skin coloured, but not this face's skin
@@ -2276,7 +2285,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 if "neck" in regions and lm is not None:
                     b_ = base()
                     nk = neck_mask(lm, kpb, wdb, shape, px.sx, px.sy, b_["prob"], b_["alpha"], fth, b_["rgb"], None,
-                                   b_.get("parse"))
+                                   b_.get("parse"), protect=b_.get("protect"))
                 br = body_regions(regions, kpb, hd, shape, px.sx, px.sy, nk, fth)
                 state["body"] = br
             return state["body"]
@@ -2404,7 +2413,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                         hl.append(h_)
                     hnd = np.concatenate(hl, 0) if hl else None
                     return neck_mask(lm, kpn, wdn, shape, px.sx, px.sy, b_["prob"], b_["alpha"], fth,
-                                     b_["rgb"], hnd, b_.get("parse"))
+                                     b_["rgb"], hnd, b_.get("parse"), protect=b_.get("protect"))
                 nm_ = get("neck", mk_neck, f"{fth:.2f}")
                 if nm_.max() > 0.01:
                     job.masks["neck"] = nm_ * fw

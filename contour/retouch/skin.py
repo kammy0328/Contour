@@ -468,6 +468,13 @@ def _parse_fill(rgb_u8: np.ndarray, lm: np.ndarray, parse: dict) -> Optional[np.
 
 
 def face_skin_probability(rgb_u8: np.ndarray, model, lm: Optional[np.ndarray], parse: Optional[dict] = None) -> np.ndarray:
+    return face_skin_and_protect(rgb_u8, model, lm, parse)[0]
+
+
+def face_skin_and_protect(rgb_u8: np.ndarray, model, lm: Optional[np.ndarray], parse: Optional[dict] = None):
+    """(the face's skin probability, the soft map of what the retouch leaves alone on it: hair strands over the skin and face
+    paint, 0..1, or None). The map is what has been cut out of the probability; the neck mask blurs the probability (a strand is
+    a few pixels wide) and needs the map itself to keep a strand out."""
     gate = None
     if parse is not None and lm is not None and np.isfinite(lm[[0, 16], :2]).all():
         gate = parse_gate(parse, float(np.hypot(*(lm[16, :2] - lm[0, :2]))))
@@ -487,7 +494,7 @@ def face_skin_probability(rgb_u8: np.ndarray, model, lm: Optional[np.ndarray], p
     pm = soft_paint(rgb_u8, lm) if lm is not None else None
     if pm is not None:
         out = out * (1.0 - pm)
-    return out.astype(np.float32)
+    return out.astype(np.float32), pm
 
 
 def _face_skin_probability(rgb_u8: np.ndarray, model, lm: Optional[np.ndarray], gate=None, tex=None) -> np.ndarray:
@@ -538,6 +545,13 @@ _LK: dict = {}
 STRAND_LO, STRAND_HI = 0.012, 0.026
 STRAND_SEEN = 2.5      # code values (of 255) a strand must differ from the skin beside it to be kept
 NECK_LINE_MAX = 0.15   # dark lines on the neck fainter than this (of the skin's brightness) are neck lines
+# 2611 IWALY c050 (2026-11-22): a faint hair or a thin necklace chain lying diagonally on the neck was handed back
+# to the neck line removal as a neck line and lifted (the chain went pale, a hair strand broke). A neck line is a short,
+# soft, curved valley; a hair or a chain is a long straight thin line (its pieces are 8-12 times as long as wide, the
+# neck lines and tendons it was confused with 2-5). A piece that long and that straight stays a strand.
+NECK_STRAND_GUARD = True
+NECK_STRAND_ELONG = 6.5    # at least this many times longer than wide (the ratio of the piece's two principal axes)
+NECK_STRAND_SPAN = 0.30    # and at least this long (of the face width)
 PAINT_SEEN = 5.0       # the same for a drawn line
 
 
@@ -692,6 +706,15 @@ def soft_paint(rgb_u8: np.ndarray, lm: Optional[np.ndarray]) -> Optional[np.ndar
     return _neck_lines_back(out, rgb_u8, lm, Wf)
 
 
+def _elongation(sub: np.ndarray) -> float:
+    """How many times longer than wide a piece is (the ratio of the two principal axes of its pixels; 1 = round)."""
+    ys, xs = np.nonzero(sub)
+    if len(xs) < 4:
+        return 1.0
+    ev = np.linalg.eigvalsh(np.cov(np.vstack([xs, ys]).astype(np.float64)))
+    return float(np.sqrt(max(ev[1], 1e-9) / max(ev[0], 1e-9)))
+
+
 def _neck_lines_back(out: np.ndarray, rgb_u8: np.ndarray, lm: np.ndarray, Wf: float) -> np.ndarray:
     """Below the jaw a faint thin dark line is a neck line, not a hair. Taken for a strand it was cut out of the
     skin, and the neck line removal never saw it."""
@@ -733,6 +756,8 @@ def _neck_lines_back(out: np.ndarray, rgb_u8: np.ndarray, lm: np.ndarray, Wf: fl
         span = float(np.hypot(bw, bh_))
         gl = float(np.percentile(th[y0:y0 + bh_, x0:x0 + bw][cv2.dilate(sub.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0], 97))
         if dk > lt and dk < NECK_LINE_MAX and span < 0.6 * Wf and gl < 0.25:
+            if NECK_STRAND_GUARD and span >= NECK_STRAND_SPAN * Wf and _elongation(sub) >= NECK_STRAND_ELONG:
+                continue                                       # a long straight thin line: a hair, a chain; it stays a strand
             drop[i] = True
     if drop.any():
         gone = cv2.dilate(drop[lab].astype(np.uint8), np.ones((5, 5), np.uint8))
