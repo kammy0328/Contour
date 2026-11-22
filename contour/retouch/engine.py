@@ -1673,11 +1673,19 @@ def _raw_cached(cut, tracker, s: int, cache):
     if s in lru:
         lru.move_to_end(s)
         return lru[s]
-    with _tm("raw"):
-        rf = _prepare_raw(cut, tracker, s, cache)
-    if rf is not None:
-        for j in rf.jobs:
-            j.masks = {k: v.astype(np.float16) for k, v in j.masks.items()}
+    pool = tracker.__dict__.get("_raw_pool")             # (rawpool: the raw frames made ahead in helper processes, for the render)
+    got = None
+    if pool is not None:
+        with _tm("raw.pool"):
+            got = pool.take(s)
+    if got is not None:
+        rf = got
+    else:
+        with _tm("raw"):
+            rf = _prepare_raw(cut, tracker, s, cache)
+        if rf is not None:
+            for j in rf.jobs:
+                j.masks = {k: v.astype(np.float16) for k, v in j.masks.items()}
     lru[s] = rf
     while len(lru) > STEADY_LRU:
         lru.popitem(last=False)

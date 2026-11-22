@@ -289,6 +289,20 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
     if parallel and n_workers > 1 and getattr(RE.BTN, "KNEE_ENV", False):
         knee_look = RE.KneeLook(lambda t_: RE.prepare(cut, tracker, t_), lambda t_: F.build_input(cut, tracker, t_), prep_lock, a, b, tracker.proxy)
 
+    # the raw frames (each frame's masks on their own, most of the serial stage) made ahead in helper processes when the environment asks for them
+    # (CONTOUR_RAW_PROCS): retouch.rawpool. What a frame gets is the same; a frame no helper made is made here as before.
+    from ..retouch import rawpool as RP
+    raw_pool = RP.start_for_render(project, cut, tracker, a, b)
+
+    def stop_raw():
+        st_ = RP.stop_for_render(tracker) if raw_pool is not None else None
+        if st_ is not None:
+            try:
+                rep.raw_pool = st_
+            except Exception:
+                pass
+            rep.accel = (rep.accel + " · " if rep.accel else "") + f"준비 도우미 {st_.get('helpers')}개 ({st_.get('taken')}/{st_.get('taken', 0) + st_.get('local', 0)})"
+
     def process(t_, planes_):
         if knee_look is not None:
             rf_, fi_ = knee_look.get(t_)
@@ -366,6 +380,7 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
         except Exception:
             if knee_look is not None:
                 knee_look.stop()
+            stop_raw()
             pool.shutdown(wait=False, cancel_futures=True)
             reader.close()
             if writer and ext_writer is None:
@@ -407,12 +422,14 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
                 alpha_out = np.clip(F.warp_planes([ta], [(1, 1)], fr, 1.0)[0], 0, 1) if not fr.empty() else ta
             write_frame(t, outp, fr, alpha_out)
     except Exception:
+        stop_raw()
         reader.close()
         if writer and ext_writer is None:
             writer.abort()
         for w in matte_writers.values():
             w.abort()
         raise
+    stop_raw()
     reader.close()
     if not rep.cancelled and rep.frames < n:
         # the source ended early: a shorter file is not this cut (in an edited timeline every later shot would move)
