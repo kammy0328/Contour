@@ -25,6 +25,25 @@ def main() -> None:
     sys.path[:] = path
     for m in [m for m in sys.modules if m == "contour" or m.startswith("contour.")]:
         del sys.modules[m]
+    # every ffmpeg this helper starts reads with few threads (ffmpeg's default is one per logical CPU: each of a cut's piece readers then keeps
+    # about 1 GB of frames in flight; two helpers took 30 GB that way on a six-people cut)
+    try:
+        import subprocess
+        nthr = str(max(1, int(os.environ.get("CONTOUR_FF_DEC_THREADS", "1") or 1)))
+        _init = subprocess.Popen.__init__
+
+        def _lean(self, args, *a, **k):
+            try:
+                if isinstance(args, (list, tuple)) and args and os.path.basename(str(args[0])).lower().startswith("ffmpeg") and "-threads" not in args and "-i" in args:
+                    args = list(args)
+                    i_ = args.index("-i")
+                    args[i_:i_] = ["-threads", nthr]
+            except Exception:
+                pass
+            _init(self, args, *a, **k)
+        subprocess.Popen.__init__ = _lean
+    except Exception:
+        traceback.print_exc()
     out = sys.stdout.buffer
     inp = sys.stdin.buffer
     sys.stdout = sys.stderr                       # (prints of the app go to the log, not into the pipe)
@@ -59,6 +78,10 @@ def main() -> None:
             setattr(s_, k, v)
         except Exception:
             pass
+    try:
+        s_.frame_cache_mb = int(os.environ.get("CONTOUR_HELPER_POOL_MB", "512") or 512)      # (the helper reads each frame once)
+    except Exception:
+        pass
     try:
         MD.configure_ffmpeg()
     except Exception:

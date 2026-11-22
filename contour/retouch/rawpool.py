@@ -103,7 +103,13 @@ class RawPool:
 
     def __init__(self, project, cut, frames: List[int], n: int, log_dir: Optional[str] = None):
         from . import engine as RE
-        self.frames = list(frames)
+        frames = list(frames)
+        # CONTOUR_RAW_SHARE=1: the render itself makes every (n + 1)th run of BLOCK frames (they are simply not given to the helpers: take() says
+        # "not here" for them at once), so n helpers and the render make the raw frames n + 1 abreast
+        if os.environ.get("CONTOUR_RAW_SHARE", "0") not in ("", "0"):
+            nn = max(1, int(n))
+            frames = [s for i, s in enumerate(frames) if (i // BLOCK) % (nn + 1) != nn]
+        self.frames = frames
         self.pos = {s: i for i, s in enumerate(self.frames)}
         self.n = max(1, int(n))
         self.lock = threading.Condition()
