@@ -36,6 +36,11 @@ def main() -> None:
             traceback.print_exc()
     import warnings
     warnings.simplefilter("ignore")
+    try:
+        import cv2
+        cv2.setNumThreads(int(os.environ.get("CONTOUR_HELPER_THREADS", "3") or 3))
+    except Exception:
+        pass
     import numpy as np
     from contour.core import settings as SE
     from contour.core import media as MD

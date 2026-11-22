@@ -129,6 +129,10 @@ class RawPool:
         env = dict(os.environ)
         env["PYTHONPATH"] = os.pathsep.join(spec["sys_path"])
         env["CONTOUR_RAW_PROCS"] = "0"
+        # each helper's own threads (OpenCV, the BLAS of numpy) kept few: a helper per core group, not every helper on every core
+        hthr = str(max(1, int(os.environ.get("CONTOUR_HELPER_THREADS", "3") or 3)))
+        for k_ in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS", "CONTOUR_HELPER_THREADS"):
+            env[k_] = hthr
         self.procs = []
         self.logs = []
         for k in range(self.n):
