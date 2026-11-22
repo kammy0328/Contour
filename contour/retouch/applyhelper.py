@@ -92,6 +92,7 @@ def main() -> None:
         _, t, planes, rf = msg
         t0 = time.time()
         try:
+            RE.masks_f32(rf)
             res = RE.apply_planes(planes, subs, maxv, pf, rf, 1.0, disp, rng)
             send(("out", t, [x for x in res]))
             print(time.strftime("%H:%M:%S"), f"f{t} {time.time() - t0:.1f} s", flush=True)

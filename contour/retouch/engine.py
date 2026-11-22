@@ -6,6 +6,7 @@ planes: 4:2:2 / 4:4:4 YUV, or float RGB), so what you see is what renders.
 """
 from __future__ import annotations
 
+import os
 import threading
 import zlib
 from dataclasses import dataclass, field
@@ -3026,6 +3027,14 @@ def knee_probe(rf: Optional["RetouchFrame"], px) -> Dict[tuple, float]:
     return out
 
 
+def masks_f32(rf: Optional["RetouchFrame"]) -> None:
+    """The masks of a prepared picture as float32 again (KneeLook keeps them in float16 while the picture waits): called by whoever applies the picture."""
+    if rf is None:
+        return
+    for j_ in rf.jobs:
+        j_.masks = {k_: (v_.astype(np.float32) if getattr(v_, "dtype", None) == np.float16 else v_) for k_, v_ in j_.masks.items()}
+
+
 def knee_gains_apply(rf: Optional["RetouchFrame"], gain_of) -> None:
     """Lay the strength each knee of a prepared picture may be corrected with on it: gain_of(person id, side) -> 0..1."""
     if rf is None:
@@ -3052,7 +3061,14 @@ class KneeLook:
         self.prepare, self.build_input, self.lock, self.a, self.b, self.px = prepare, build_input, lock, int(a), int(b), px
         self.step = step
         self.reach = BTN.env_reach(step)
-        self.lead = max(int(lead if lead is not None else self.reach + 12), self.reach + 2)
+        # how far ahead: the pictures the render's threads work on at once need their look ahead (reach), no more. Every prepared picture waiting here
+        # holds its masks (hundreds of MB with six people), so the lead is kept to that (it was reach + 12: 17 pictures, 12 GB on c005) and the masks
+        # wait in float16 (get() gives them back as float32)
+        try:
+            nw_ = max(1, int(os.environ.get("CONTOUR_RENDER_THREADS", "4") or 4))
+        except ValueError:
+            nw_ = 4
+        self.lead = max(int(lead if lead is not None else self.reach + nw_ + 2), self.reach + 2)
         self.cv = threading.Condition()
         self.items: Dict[int, tuple] = {}
         self.sup: Dict[int, dict] = {}
@@ -3084,6 +3100,9 @@ class KneeLook:
                     rf = self.prepare(t)
                     fi = self.build_input(t)
                 sup = knee_probe(rf, self.px) if rf is not None else {}
+                if rf is not None:
+                    for j_ in rf.jobs:
+                        j_.masks = {k_: (v_.astype(np.float16) if getattr(v_, "dtype", None) == np.float32 else v_) for k_, v_ in j_.masks.items()}
                 with self.cv:
                     self.items[t] = (rf, fi)
                     self.sup[t] = sup

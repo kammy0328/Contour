@@ -323,7 +323,10 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
                 fi_ = F.build_input(cut, tracker, t_)
         if rf_ is not None and not rf_.empty():
             res_ = apply_pool.apply(t_, planes_, rf_) if apply_pool is not None else None
-            planes_ = res_ if res_ is not None else RE.apply_planes(planes_, subs, maxv, pf, rf_, 1.0, disp_, info.color_range)
+            if res_ is None:
+                RE.masks_f32(rf_)
+                res_ = RE.apply_planes(planes_, subs, maxv, pf, rf_, 1.0, disp_, info.color_range)
+            planes_ = res_
         fr_ = F.compute_field(fi_, W, H, grid_step)
         if not warper[1] and not fr_.empty():
             with prep_lock:
