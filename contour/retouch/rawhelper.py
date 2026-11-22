@@ -119,7 +119,7 @@ def main() -> None:
                 rf = RE._prepare_raw(cut, tr, int(s), None)
                 if rf is not None:
                     for j in rf.jobs:
-                        j.masks = {k: v.astype(np.float16) for k, v in j.masks.items()}
+                        j.masks = {k: (RE._mask_pack(v) if getattr(v, "dtype", None) == np.float32 else v.astype(np.float16)) for k, v in j.masks.items()}
                 b = pickle.dumps(("raw", int(s), rf, 0), protocol=pickle.HIGHEST_PROTOCOL)
                 _send_bytes(out, b)
                 print(time.strftime("%H:%M:%S"), f"f{s} {time.time() - t0:.1f} s {len(b) / 1e6:.1f} MB", flush=True)

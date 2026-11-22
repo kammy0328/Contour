@@ -1681,6 +1681,8 @@ def _raw_cached(cut, tracker, s: int, cache):
             got = pool.take(s)
     if got is not None:
         rf = got
+        for j in rf.jobs:                   # (a helper sends the masks packed: here they are what this function keeps, whole float16 arrays)
+            j.masks = {k: _mask_unpack(v, np.float16) for k, v in j.masks.items()}
     else:
         with _tm("raw"):
             rf = _prepare_raw(cut, tracker, s, cache)
@@ -3027,12 +3029,49 @@ def knee_probe(rf: Optional["RetouchFrame"], px) -> Dict[tuple, float]:
     return out
 
 
+class _PackedMask:
+    """A float32 mask kept small while its picture waits: the box of its non-zero part, in float16 (a person's mask is zero over most of the frame)."""
+    __slots__ = ("shape", "y0", "x0", "a")
+
+    def __init__(self, shape, y0, x0, a):
+        self.shape, self.y0, self.x0, self.a = shape, y0, x0, a
+
+    def __getstate__(self):
+        return (self.shape, self.y0, self.x0, self.a)
+
+    def __setstate__(self, st):
+        self.shape, self.y0, self.x0, self.a = st
+
+
+def _mask_pack(v):
+    if not isinstance(v, np.ndarray) or v.ndim != 2 or v.dtype != np.float32:
+        return v
+    rows = np.flatnonzero(v.any(1))
+    if rows.size == 0:
+        return _PackedMask(v.shape, 0, 0, np.zeros((0, 0), np.float16))
+    cols = np.flatnonzero(v.any(0))
+    y0, y1, x0, x1 = int(rows[0]), int(rows[-1]) + 1, int(cols[0]), int(cols[-1]) + 1
+    return _PackedMask(v.shape, y0, x0, v[y0:y1, x0:x1].astype(np.float16))
+
+
+def _mask_unpack(v, dtype=np.float32):
+    if isinstance(v, _PackedMask):
+        out = np.zeros(v.shape, dtype)
+        if v.a.size:
+            out[v.y0:v.y0 + v.a.shape[0], v.x0:v.x0 + v.a.shape[1]] = v.a
+        return out
+    if dtype == np.float32 and getattr(v, "dtype", None) == np.float16:
+        return v.astype(np.float32)
+    return v
+
+
 def masks_f32(rf: Optional["RetouchFrame"]) -> None:
-    """The masks of a prepared picture as float32 again (KneeLook keeps them in float16 while the picture waits): called by whoever applies the picture."""
+    """The masks of a prepared picture as float32 again (KneeLook keeps them packed while the picture waits: _mask_pack): called by whoever applies
+    the picture."""
     if rf is None:
         return
     for j_ in rf.jobs:
-        j_.masks = {k_: (v_.astype(np.float32) if getattr(v_, "dtype", None) == np.float16 else v_) for k_, v_ in j_.masks.items()}
+        j_.masks = {k_: _mask_unpack(v_) for k_, v_ in j_.masks.items()}
 
 
 def knee_gains_apply(rf: Optional["RetouchFrame"], gain_of) -> None:
@@ -3102,7 +3141,7 @@ class KneeLook:
                 sup = knee_probe(rf, self.px) if rf is not None else {}
                 if rf is not None:
                     for j_ in rf.jobs:
-                        j_.masks = {k_: (v_.astype(np.float16) if getattr(v_, "dtype", None) == np.float32 else v_) for k_, v_ in j_.masks.items()}
+                        j_.masks = {k_: _mask_pack(v_) for k_, v_ in j_.masks.items()}
                 with self.cv:
                     self.items[t] = (rf, fi)
                     self.sup[t] = sup
