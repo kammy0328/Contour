@@ -5494,6 +5494,8 @@ FINAL_NOSE = 0.0           # 0..1: the nose (its bridge, side walls, wings and n
 FINAL_NOSE_WING = 0.38     # the wings' outer points pushed out by this share of the nose base's width
 FINAL_NOSE_PAD = 0.025     # the nose's area grown by this share of the face width (soft over the same)
 FINAL_NOSE_SIG = 0.008
+FINAL_NOSE_HF = 0.006      # of the change finer than FINAL_NOSE_SIG, the part beyond this (display luma) is taken back too: an edge of the
+                           # nose (a wing's crease) the retouch smoothed comes back whole, so no light seam is left beside it (c029 f4)
 FINAL_MOLE = 0.0           # 0..1: small dark round spots that are not redder than the skin round them (moles), found on the picture as it came in, are given back
 FINAL_MOLE_DEPTH = (0.09, 0.14)   # a candidate from the first, kept when its darkest point is past the second (relative to the skin round it)
 FINAL_MOLE_RED = 0.012     # its median Cr over the skin round it at most this (redder: a pimple's mark, which goes)
@@ -5515,6 +5517,7 @@ FINAL_NASO = 0.0           # 0..1: the nasolabial folds (팔자주름) and the s
                            # corner and on below it, FINAL_NASO_W of the face width wide), what is darker than its surroundings at the fold's scale (FINAL_NASO_BAND) is lifted;
                            # hair strands (far darker, thin) and the nose / the lips are left. Works where the skin mask or the fold finder missed the fold (a turned, tilted, blurred face)
 FINAL_NASO_W = 0.10
+FINAL_NASO_NOSE_GAP = 0.04  # of the face width: the zone stays this far from the nose (soft)
 FINAL_NASO_BAND = (0.004, 0.06)
 FINAL_NASO_EDGE = 0.10     # of the face width: the zone stays this far inside the landmarks' outline of the face
 FINAL_NASO_MAXDARK = 0.18  # darker than this (relative to the local level) at the fine scale: a strand or a feature, left
@@ -5532,6 +5535,16 @@ def _nose_points_ok(L: np.ndarray, wf: float) -> np.ndarray:
     for i in (39, 42):
         ok[i] = float(np.linalg.norm(L[i] - t)) <= 0.45 * wf
     return ok
+
+
+def _nose_give_back(Y: np.ndarray, Y0: np.ndarray, w: np.ndarray, s: float) -> np.ndarray:
+    """Y less w times the change wider than the texture (blur of sigma s) and the part of the finer change beyond FINAL_NOSE_HF."""
+    d = Y - Y0
+    lp = cv2.GaussianBlur(d, (0, 0), s)
+    hf = d - lp
+    t = float(FINAL_NOSE_HF)
+    back = lp + (hf - np.clip(hf, -t, t)) if t >= 0 else lp
+    return Y - w * back
 
 
 def _nose_area(lm: np.ndarray, shape, wf: float) -> Optional[np.ndarray]:
@@ -5793,6 +5806,12 @@ def _naso_zone(lm: np.ndarray, shape, wf: float) -> Optional[np.ndarray]:
         hull = cv2.erode(hull, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ke, ke)))
         out = out * cv2.GaussianBlur(hull.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.3 * ke))
     if nose is not None:
+        # kept clear of the nose by a soft gap: the wing's crease right beside it is the nose's shape, and lifting it up to the nose's edge leaves a
+        # light seam along the wing (c029 f4)
+        g = int(round(FINAL_NASO_NOSE_GAP * wf))
+        if g > 0:
+            nb = cv2.dilate((nose > 0.02).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * g + 1, 2 * g + 1))).astype(np.float32)
+            nose = np.maximum(nose, cv2.GaussianBlur(nb, (0, 0), max(1.0, 0.5 * g)))
         out = out * (1.0 - nose)
     return np.clip(out, 0, 1).astype(np.float32)
 
@@ -5847,8 +5866,7 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
                     r_ = _roi(nm, int(3 * s_) + 2)
                     if r_ is not None:
                         a0, a1, b0, b1 = r_
-                        d_ = Y[a0:a1, b0:b1] - Y0[a0:a1, b0:b1]
-                        Y[a0:a1, b0:b1] = Y[a0:a1, b0:b1] - nm[a0:a1, b0:b1] * cv2.GaussianBlur(d_, (0, 0), s_)
+                        Y[a0:a1, b0:b1] = _nose_give_back(Y[a0:a1, b0:b1], Y0[a0:a1, b0:b1], nm[a0:a1, b0:b1], s_)
                     nC = M(nm, (hC, wC))
                     Cb = Cb + nC * (Cb0 - Cb)
                     Cr = Cr + nC * (Cr0 - Cr)
