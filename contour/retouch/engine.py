@@ -4407,6 +4407,7 @@ EXT_OUTLINE = True          # 2611 IWALY c003 (2026-11-22, user, 00:00:39:17, th
                             # skin (the exclusion is 0 on it, so there is no "exterior" to keep the band from), the band of the fold reached the wall beside the cheek and the fold stages lifted the
                             # wall's pixels next to the face's edge by up to 6.6 % of the brightness (a light strip along the whole cheek). The landmarks' own outline of the face (jaw line and
                             # forehead arc) lay within 2 px of the real edge there: the band is held to it as well (the same distances as EXT_GUARD, inside the outline). False = the parser's exterior only
+FOLD_BASE = {"nasolabial": 0.06, "mouth_lines": 0.06}   # share of a fold's band filled where no fold is found (2611 IWALY c029/c010/c001, user: "팔자주름 제거 안 되어 있음": soft folds the finder misses)
 SMALL_WF = (110.0, 200.0)   # face width (px) below which a fold band is softened as a whole
 SMALL_FOLD = 0.45           # how much of the band, at the smallest
 NOSE_SKIN = 1.0            # share of the skin smoothing left on the nose (v3: all of it; the narrow smoothing keeps its shape)
@@ -4809,6 +4810,55 @@ def _armpit_line_hold(Y: np.ndarray, mA: np.ndarray, wA: float, wfA: float, axes
         return None
     H = np.clip(cv2.GaussianBlur(H, (0, 0), max(0.8, 0.4 * wA)) * 1.4, 0, 1).astype(np.float32)
     out = np.zeros(Y.shape, np.float32)
+    out[y0:y1, x0:x1] = H
+    return out
+
+
+ARMPIT_LONG_KEEP = 0.0     # 0 = off. 2611 IWALY c029 f69/f136/f159/f103, c010 f4/f22 (2026-11-22, user's deck: an arm's line "사라진 오류", "연해진", hair strands and the
+                           # stray hairs on the back retouched, a garment's shadow line gone): the armpit stage's line lifter takes every thin valley in its zone for a crease. An
+                           # armpit's creases are short; an arm's outline, a hair strand or a strap's shadow is a long straight line. Every thin dark line of the picture before the
+                           # stage that is longer than ARMPIT_LONG_SPAN face widths and ARMPIT_LONG_ELONG times longer than wide is given back (its detail finer than the line's width)
+ARMPIT_LONG_SPAN = 0.40
+ARMPIT_LONG_ELONG = 5.0
+ARMPIT_LONG_THR = 0.03     # how much darker than what lies round it (relative) a line must be to be looked at
+
+
+def _armpit_long_lines(Y0: np.ndarray, m: np.ndarray, wA: float, wf: float) -> Optional[np.ndarray]:
+    """0..1: the long straight thin dark lines of Y0 (hair strands, an arm's outline, a strap's shadow) inside m (> 0.05). None: none."""
+    r = _roi(m, int(ARMPIT_LONG_SPAN * wf) + 8)
+    if r is None:
+        return None
+    y0, y1, x0, x1 = r
+    roi = Y0[y0:y1, x0:x1].astype(np.float32)
+    mm = m[y0:y1, x0:x1] > 0.05
+    if not mm.any():
+        return None
+    rb = cv2.GaussianBlur(roi, (0, 0), max(0.7, 0.3 * wA))
+    k = max(3, int(round(3.0 * wA)) | 1)
+    base = cv2.GaussianBlur(roi, (0, 0), max(2.0, 2.0 * wA)) + 0.02
+    bh = cv2.morphologyEx(rb, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))) / base
+    cand = ((bh > ARMPIT_LONG_THR) & cv2.dilate(mm.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)).astype(np.uint8)
+    n, lab, st, _c = cv2.connectedComponentsWithStats(cand, connectivity=8)
+    keep = np.zeros(n, bool)
+    span_min = ARMPIT_LONG_SPAN * wf
+    for i in range(1, n):
+        if max(st[i, 2], st[i, 3]) < 0.5 * span_min or st[i, 4] < 8:
+            continue
+        ys, xs = np.nonzero(lab[st[i, 1]:st[i, 1] + st[i, 3], st[i, 0]:st[i, 0] + st[i, 2]] == i)
+        pts = np.c_[xs, ys].astype(np.float64)
+        cv_ = np.cov((pts - pts.mean(0)).T)
+        ev = np.linalg.eigvalsh(cv_)
+        length = 4.0 * float(np.sqrt(max(ev[1], 1e-9)))
+        width = 4.0 * float(np.sqrt(max(ev[0], 1e-9)))
+        if length >= span_min and length >= ARMPIT_LONG_ELONG * max(width, 1.0):
+            keep[i] = True
+    if not keep.any():
+        return None
+    H = keep[lab].astype(np.uint8)
+    kd = max(3, int(round(1.0 * wA)) | 1)
+    H = cv2.dilate(H, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kd, kd))).astype(np.float32)
+    H = np.clip(cv2.GaussianBlur(H, (0, 0), max(1.0, 0.5 * wA)) * 1.3, 0, 1)
+    out = np.zeros(Y0.shape, np.float32)
     out[y0:y1, x0:x1] = H
     return out
 
@@ -5786,6 +5836,15 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                             except Exception:
                                 import traceback
                                 traceback.print_exc()
+                        if ARMPIT_LONG_KEEP > 1e-4:
+                            # long straight lines (an arm's outline, hair, a strap's shadow) are not creases: given back from the picture before the stage
+                            try:
+                                Hn_ = _armpit_long_lines(Y_arm0, mA_hold, wA, wfA)
+                                if Hn_ is not None:
+                                    Y = _line_restore(Y, Y_arm0, Hn_ * float(np.clip(ARMPIT_LONG_KEEP, 0.0, 1.0)), max(2.0, 3.0 * wA))
+                            except Exception:
+                                import traceback
+                                traceback.print_exc()
             except Exception:
                 import traceback
                 traceback.print_exc()
@@ -5806,7 +5865,8 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                 # face lit from the side that flattened the cheek's shading, which looked painted over)
                 # a small face (a wide shot): the fold is only a few pixels wide and is not found, so its band
                 # is softened as a whole (lighter, not wiped)
-                base_ = 0.06 + (SMALL_FOLD - 0.06) * float(1.0 - _ss(SMALL_WF[0], SMALL_WF[1], np.array(wf)))
+                b0_ = float(FOLD_BASE.get(key, 0.06))
+                base_ = b0_ + max(0.0, SMALL_FOLD - b0_) * float(1.0 - _ss(SMALL_WF[0], SMALL_WF[1], np.array(wf)))
                 # the face's outer edge (hair, background) is not worked on: the cheek's contour is shading, not a fold (EXT_GUARD)
                 gx_ = _exterior_guard(exY, job.face, (hY, wY), y_per_src, wf, band) if (ex is not None and job.face is not None) else None
                 # and the landmarks' outline of the face (the parser's exterior does not see a wall of the skin's colour)
