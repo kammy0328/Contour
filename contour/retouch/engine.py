@@ -5491,8 +5491,8 @@ def _grain(shape, size_px: float, seed: int) -> np.ndarray:
 # After every stage: what the user does not want changed is given back from the picture as it came in, whatever stage changed it.
 FINAL_NOSE = 0.0           # 0..1: the nose (its bridge, side walls, wings and nostrils) keeps its shape: the change of every stage there wider than the skin's
                            # texture (FINAL_NOSE_SIG of the face width) is taken back; the texture's thinning stays
-FINAL_NOSE_WING = 0.45     # the wings' outer points pushed out by this share of the nose base's width
-FINAL_NOSE_PAD = 0.035     # the nose's area grown by this share of the face width (soft over the same)
+FINAL_NOSE_WING = 0.38     # the wings' outer points pushed out by this share of the nose base's width
+FINAL_NOSE_PAD = 0.025     # the nose's area grown by this share of the face width (soft over the same)
 FINAL_NOSE_SIG = 0.008
 FINAL_MOLE = 0.0           # 0..1: small dark round spots that are not redder than the skin round them (moles), found on the picture as it came in, are given back
 FINAL_MOLE_DEPTH = (0.09, 0.14)   # a candidate from the first, kept when its darkest point is past the second (relative to the skin round it)
