@@ -950,6 +950,38 @@ def armpit_hold_axes(st, p: int, t: int, sx: float, sy: float, info, wts, span: 
     return out
 
 
+ARMPIT_WEDGE = False        # 2611 IWALY c029 f4/f5/f6/f69/f136/f159 (2026-11-22, user's deck: the arm, a palm, a shoulder, the back and an arm's outline retouched "for no reason", the
+                            # arm blurred, its line gone): the zone was a disc round a point under the shoulder joint, and took the shoulder's top, the outer arm, the back and a hand
+                            # held in front of the body with it. True = only the wedge between the upper arm and the torso: on the torso's side of the upper arm's axis (shoulder to
+                            # elbow), on the arm's side of the torso's axis (shoulder to hip) and below the shoulder joint, each with a soft margin of ARMPIT_WEDGE_M shoulder widths
+ARMPIT_WEDGE_M = (0.04, 0.10)   # (outside .. inside) of the shoulder width: the margin over which each side of the wedge fades from 0 to 1
+
+
+def _armpit_wedge(shape, s_, d, tip, sw):
+    """0..1 at shape: the wedge between the upper arm (s_ -> tip) and the torso (s_ -> s_ + d), soft by ARMPIT_WEDGE_M * sw."""
+    h, w = shape[:2]
+    gy, gx = np.mgrid[0:h, 0:w].astype(np.float32)
+    ux, uy = gx - float(s_[0]), gy - float(s_[1])
+    a = np.asarray(tip, np.float64) - np.asarray(s_, np.float64)
+    na = float(np.hypot(*a))
+    nd = float(np.hypot(*d))
+    if na < 1e-3 or nd < 1e-3:
+        return np.ones(shape[:2], np.float32)
+    a = a / na
+    dn = np.asarray(d, np.float64) / nd
+    lo, hi = float(ARMPIT_WEDGE_M[0]) * sw, float(ARMPIT_WEDGE_M[1]) * sw
+    # signed distance from the arm's axis, positive on the torso's side
+    sa = float(np.sign(a[0] * dn[1] - a[1] * dn[0]) or 1.0)
+    da = sa * (a[0] * uy - a[1] * ux)
+    # signed distance from the torso's axis, positive on the arm's side
+    st_ = float(np.sign(dn[0] * a[1] - dn[1] * a[0]) or 1.0)
+    dt = st_ * (dn[0] * uy - dn[1] * ux)
+    # below the shoulder joint along the torso
+    dd = ux * dn[0] + uy * dn[1]
+    g = _ss(-lo, hi, da) * _ss(-hi, lo, dt) * _ss(-lo, lo, dd)
+    return g.astype(np.float32)
+
+
 def armpit_region(kp: np.ndarray, shape, sx: float, sy: float, parts: bool = False, info: Optional[list] = None):
     """The skin under the arms (0..1): a zone under each shoulder joint, on the way to the hip. parts: the two sides as a list (a side without a zone is zeros).
     info: a list that gets (side, centre, radius, shoulder width) of every zone made (proxy px)."""
@@ -989,7 +1021,13 @@ def armpit_region(kp: np.ndarray, shape, sx: float, sy: float, parts: bool = Fal
         else:
             cv2.circle(m, (int(round(c[0])), int(round(c[1]))), rad, 255, -1, cv2.LINE_AA)
             sig = max(0.06 * sw, 0.10 * rad)
-        out.append(_feather(m, sig))
+        zf = _feather(m, sig)
+        if ARMPIT_WEDGE and tip is not None:
+            try:
+                zf = zf * _armpit_wedge(shape, s_, d, tip, sw)
+            except Exception:
+                pass
+        out.append(zf)
         n_ok += 1
         if info is not None:
             info.append((side, (float(c[0]), float(c[1])), float(rad), float(sw)))
@@ -3804,6 +3842,7 @@ def _det_raw(cut, px, t: int, job, lm: np.ndarray, rgb_u8: np.ndarray) -> Option
     lmd[:, 0] = (lmd[:, 0] - x0f) * fx
     lmd[:, 1] = (lmd[:, 1] - y0f) * fy
     wf_d = wf_p * fx
+    _det_cfg()
     maps = DT.detect(Y, Cb, Cr, to_pic(sk), to_pic(nk), wf_d, spot_size(job, wf_d), neck_axis(lmd), lmd,
                      net=_spot_net(job, img.astype(np.float32) / 255.0, wf_d))
     th = cv2.resize(Y, (max(4, wd // 4), max(4, hd // 4)), interpolation=cv2.INTER_AREA)
@@ -3899,6 +3938,7 @@ def _det_now(job, Y, Cb, Cr, wf: float, y_per_src: float, M) -> dict:
     rgb = None
     if _spot_net_wanted(job):
         rgb = ycc_to_rgb(Y, cbY, crY)
+    _det_cfg()
     return DT.detect(Y, cbY, crY, skin, neck, wf, spot_size(job, wf), neck_axis(lm), lm,
                      net=_spot_net(job, rgb, wf))
 
@@ -4475,6 +4515,53 @@ def _eye_structure(rb: np.ndarray, base: np.ndarray, lm: np.ndarray, scale: floa
         st = _ss(EYE_DEPTH[0], EYE_DEPTH[1], bh / base)
         out = np.maximum(out, zone * st)
     return out if out.any() else None
+
+
+DET_BUMP_MAX = None         # 2611 IWALY c029 f4 (2026-11-22, user: "빨간색 같은 잡티는 아예 지워져야해"): a raised spot whose top catches the light was taken for a glint
+DET_GLINT = None            # (detect.BUMP_MAX / detect.GLINT) and left; None = the detector's own values. (lo, hi) of the relative brightness over the skin
+
+
+def _det_cfg():
+    if DET_BUMP_MAX is not None:
+        DT.BUMP_MAX = tuple(DET_BUMP_MAX)
+    if DET_GLINT is not None:
+        DT.GLINT = tuple(DET_GLINT)
+
+
+MOLE_KEEP = 0.0             # 2611 IWALY c029 f4 (2026-11-22, user: "점 연해졌는데 살려야함"): a small dark spot that is not redder than the skin round it (a mole,
+                            # a beauty mark) is left to this share by the blemish fill (0 = off: as before; a pimple or its mark is redder and still goes)
+MOLE_DEPTH = (0.10, 0.20)   # how much darker than the skin round it (relative) a spot must be to count as a mole
+MOLE_RED = (0.005, 0.014)   # how much redder (Cr over the skin round it) a dark spot may be and still count as a mole: from the first to the second it fades out
+MOLE_SIZE = 0.03            # of the face width: the largest mole
+
+
+def _mole_like(Y, Cb, Cr, reg, wf):
+    """0..1 at Y resolution: small dark round spots that are not redder than the skin round them (moles), inside reg. None: none."""
+    r = _roi(reg, int(0.1 * wf) + 6)
+    if r is None:
+        return None
+    y0, y1, x0, x1 = r
+    hY, wY = Y.shape
+    roi = Y[y0:y1, x0:x1].astype(np.float32)
+    rb = cv2.GaussianBlur(roi, (0, 0), 1.0)
+    base = cv2.GaussianBlur(roi, (0, 0), max(2.0, 0.045 * wf)) + 0.02
+    km = max(3, int(round(MOLE_SIZE * wf)) | 1)
+    bh = cv2.morphologyEx(rb, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (km, km))) / base
+    dep = _ss(MOLE_DEPTH[0], MOLE_DEPTH[1], bh)
+    dep = dep * (cv2.GaussianBlur(dep, (0, 0), max(1.0, 0.012 * wf)) < 0.5)      # spots, not lines or patches
+    if not (dep > 0.05).any():
+        return None
+    crf = Cr.astype(np.float32)
+    if crf.shape != Y.shape:
+        crf = cv2.resize(crf, (wY, hY), interpolation=cv2.INTER_LINEAR)
+    cr = crf[y0:y1, x0:x1]
+    crd = cv2.GaussianBlur(cr, (0, 0), 1.5) - cv2.GaussianBlur(cr, (0, 0), max(2.0, 0.045 * wf))
+    notred = 1.0 - _ss(MOLE_RED[0], MOLE_RED[1], crd)
+    m = dep * notred
+    m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    out = np.zeros(Y.shape, np.float32)
+    out[y0:y1, x0:x1] = np.clip(cv2.GaussianBlur(m, (0, 0), 1.0) * 1.3, 0, 1)
+    return out
 
 
 def _hold_maps(Y: np.ndarray, Cb: Optional[np.ndarray], Cr: Optional[np.ndarray], m: np.ndarray, wf: float,
@@ -5443,6 +5530,14 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                 if nm_ in job.masks:
                     reg = M(job.masks[nm_], (hY, wY)) if reg is None else np.maximum(reg, M(job.masks[nm_], (hY, wY)))
             dk_ = det["dark"]
+            if MOLE_KEEP > 0 and reg is not None:
+                try:
+                    mk_ = _mole_like(Y, Cb, Cr, reg, wf)
+                    if mk_ is not None:
+                        dk_ = dk_ * (1.0 - float(np.clip(MOLE_KEEP, 0, 1)) * mk_)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
             S_ = np.maximum(dk_, det["bump"])
             R_ = det["red"]
             if prot_ is not None:

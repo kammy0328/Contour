@@ -54,6 +54,7 @@ LINE_DEEP = 0.2             # a valley this much darker than the skin anywhere a
 RUN_GAP = 0.01              # of the face width: gaps this long in a valley's run are bridged
 TWO_SIDED = (0.3, 0.65)      # share of a valley's depth it must also have against its darker side (a shadow's foot has none)
 BUMP_MAX = (0.16, 0.26)     # a bright dot this much over the skin (relative) is glitter, a glint, a drop: not a bump
+GLINT = (0.22, 0.40)        # a small bright dot this much over the skin (relative) is protected from every fill (a glint, glitter)
 DARK_MAX = (0.45, 0.65)     # a dot this much darker than the skin is a thing (a stud, a painted dot), not a blemish
 
 
@@ -448,7 +449,7 @@ def protect(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, region: np.ndarray, w
     # a glint: far brighter than the skin, and small
     th = cv2.morphologyEx(rq, cv2.MORPH_TOPHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kn, kn)))
     glint = cv2.dilate(th / (base + 0.02), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * kd + 1, 2 * kd + 1)))
-    thing = np.maximum(_ss(0.22, 0.40, deep), _ss(0.22, 0.40, glint))
+    thing = np.maximum(_ss(0.22, 0.40, deep), _ss(GLINT[0], GLINT[1], glint))
     # colour: grey against the skin, or another hue
     cb = Cb[y0:y1, x0:x1].astype(np.float32)
     cr = Cr[y0:y1, x0:x1].astype(np.float32)
