@@ -294,7 +294,18 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
     from ..retouch import rawpool as RP
     raw_pool = RP.start_for_render(project, cut, tracker, a, b)
 
+    # the retouch of each frame done in helper processes when the environment asks for them (CONTOUR_APPLY_PROCS): retouch.applypool
+    from ..retouch import applypool as AP
+    apply_pool = AP.start_for_render(subs, maxv, pf, disp_, info.color_range) if parallel and n_workers > 1 else None
+
     def stop_raw():
+        if apply_pool is not None:
+            try:
+                sa_ = apply_pool.close()
+                rep.apply_pool = sa_
+                rep.accel = (rep.accel + " · " if rep.accel else "") + f"보정 도우미 {sa_.get('helpers')}개 ({sa_.get('done')}/{sa_.get('done', 0) + sa_.get('local', 0)})"
+            except Exception:
+                pass
         st_ = RP.stop_for_render(tracker) if raw_pool is not None else None
         if st_ is not None:
             try:
@@ -310,8 +321,9 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
             with prep_lock:                    # tracker caches are not shared between threads
                 rf_ = RE.prepare(cut, tracker, t_)
                 fi_ = F.build_input(cut, tracker, t_)
-        if rf_ is not None:
-            planes_ = RE.apply_planes(planes_, subs, maxv, pf, rf_, 1.0, disp_, info.color_range)
+        if rf_ is not None and not rf_.empty():
+            res_ = apply_pool.apply(t_, planes_, rf_) if apply_pool is not None else None
+            planes_ = res_ if res_ is not None else RE.apply_planes(planes_, subs, maxv, pf, rf_, 1.0, disp_, info.color_range)
         fr_ = F.compute_field(fi_, W, H, grid_step)
         if not warper[1] and not fr_.empty():
             with prep_lock:
