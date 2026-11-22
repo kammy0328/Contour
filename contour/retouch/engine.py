@@ -5495,12 +5495,17 @@ FINAL_NOSE_WING = 0.45     # the wings' outer points pushed out by this share of
 FINAL_NOSE_PAD = 0.035     # the nose's area grown by this share of the face width (soft over the same)
 FINAL_NOSE_SIG = 0.008
 FINAL_MOLE = 0.0           # 0..1: small dark round spots that are not redder than the skin round them (moles), found on the picture as it came in, are given back
-FINAL_MOLE_DEPTH = (0.08, 0.16)
-FINAL_MOLE_RED = (0.006, 0.016)
+FINAL_MOLE_DEPTH = (0.09, 0.14)   # a candidate from the first, kept when its darkest point is past the second (relative to the skin round it)
+FINAL_MOLE_RED = 0.012     # its median Cr over the skin round it at most this (redder: a pimple's mark, which goes)
+FINAL_MOLE_ALONE = 0.06    # of the face width: at most one other candidate this near (pits of rough skin come many together)
 FINAL_MOLE_SIZE = 0.03
 FINAL_BUMP = 0.0           # 0..1: a raised spot (a small bright top with a dark side) on the face's skin is filled from the skin round it
 FINAL_BUMP_SIZE = 0.035    # of the face width: the largest bump
-FINAL_BUMP_LIGHT = (0.025, 0.05)   # relative brightness of its top over the skin round it
+FINAL_BUMP_LIGHT = (0.06, 0.08)    # relative brightness of its top over the skin round it (candidate, kept)
+FINAL_BUMP_TOP = 0.025     # of the face width: the largest bright top
+FINAL_BUMP_SHADE = 0.03    # its darker side: at least this much darker than the skin round it (relative), within the top's size
+FINAL_BUMP_ALONE = 0.05
+FINAL_BUMP_BUSY = 0.12      # share of a ring round it that may hold other light or dark marks
 FINAL_BUMP_MAXLIGHT = 0.30         # brighter than this: a glint, left
 FINAL_LONG = 0.0           # 0..1: long straight thin dark lines (an arm's outline, hair strands, a strap's shadow) inside an armpit zone or on the body's skin are given back in full
 FINAL_LONG_SPAN = 0.30
@@ -5511,9 +5516,22 @@ FINAL_NASO = 0.0           # 0..1: the nasolabial folds (팔자주름) and the s
                            # hair strands (far darker, thin) and the nose / the lips are left. Works where the skin mask or the fold finder missed the fold (a turned, tilted, blurred face)
 FINAL_NASO_W = 0.10
 FINAL_NASO_BAND = (0.004, 0.06)
+FINAL_NASO_EDGE = 0.10     # of the face width: the zone stays this far inside the landmarks' outline of the face
 FINAL_NASO_MAXDARK = 0.18  # darker than this (relative to the local level) at the fine scale: a strand or a feature, left
 FINAL_CHIN = 0.0           # 0..1: a pebbled chin: the pits and bumps between FINAL_CHIN_BAND of the face width taken out on the chin (the broad shape and the finest texture stay)
 FINAL_CHIN_BAND = (0.006, 0.035)
+
+
+def _nose_points_ok(L: np.ndarray, wf: float) -> np.ndarray:
+    """bool per landmark index: the nose's points (27..35) and the inner eye corners (39, 42) that lie where a nose's would (near the nose tip, 30): on a turned
+    face the far side's points are put anywhere (c001 f92: the nose base points under the far eye)"""
+    ok = np.zeros(len(L), bool)
+    t = L[30]
+    for i in range(27, 36):
+        ok[i] = float(np.linalg.norm(L[i] - t)) <= 0.30 * wf
+    for i in (39, 42):
+        ok[i] = float(np.linalg.norm(L[i] - t)) <= 0.45 * wf
+    return ok
 
 
 def _nose_area(lm: np.ndarray, shape, wf: float) -> Optional[np.ndarray]:
@@ -5521,20 +5539,26 @@ def _nose_area(lm: np.ndarray, shape, wf: float) -> Optional[np.ndarray]:
     if lm is None or lm.shape[0] < 48 or not np.isfinite(lm[[27, 28, 29, 30, 31, 32, 33, 34, 35, 39, 42], :2]).all():
         return None
     L = np.asarray(lm[:, :2], np.float64)
-    pts = [L[27:36], L[[39, 42]]]
-    bw = float(np.linalg.norm(L[35] - L[31]))
-    c = 0.5 * (L[31] + L[35])
-    for i in (31, 35):
-        d = L[i] - c
-        n = float(np.linalg.norm(d))
-        if n > 1e-6:
-            pts.append((L[i] + d / n * FINAL_NOSE_WING * bw)[None])
-    # the nostrils' lower rim: a little below the base
-    dn = L[33] - L[27]
-    nd = float(np.linalg.norm(dn))
-    if nd > 1e-6:
-        pts.append((L[[31, 33, 35]] + dn / nd * 0.12 * bw))
-    P = np.vstack(pts)
+    ok = _nose_points_ok(L, wf)
+    pts = [L[[i for i in range(27, 36) if ok[i]]]] + [L[[i for i in (39, 42) if ok[i]]]]
+    base = [i for i in (31, 32, 33, 34, 35) if ok[i]]
+    if len(base) >= 2:
+        c = L[base].mean(0)
+        bw = max(float(np.linalg.norm(L[base[-1]] - L[base[0]])), 0.12 * wf)
+        for i in (31, 35):
+            if ok[i]:
+                d = L[i] - c
+                n = float(np.linalg.norm(d))
+                if n > 1e-6:
+                    pts.append((L[i] + d / n * FINAL_NOSE_WING * bw)[None])
+        # the nostrils' lower rim: a little below the base
+        dn = c - L[27] if ok[27] else c - L[30]
+        nd = float(np.linalg.norm(dn))
+        if nd > 1e-6:
+            pts.append((L[base] + dn / nd * 0.12 * bw))
+    P = np.vstack([p_ for p_ in pts if len(p_)])
+    if len(P) < 3:
+        return None
     pad = max(2, int(round(FINAL_NOSE_PAD * wf)))
     x0, y0 = int(max(0, P[:, 0].min() - 3 * pad)), int(max(0, P[:, 1].min() - 3 * pad))
     x1, y1 = int(min(shape[1], P[:, 0].max() + 3 * pad)), int(min(shape[0], P[:, 1].max() + 3 * pad))
@@ -5548,8 +5572,34 @@ def _nose_area(lm: np.ndarray, shape, wf: float) -> Optional[np.ndarray]:
     return out
 
 
-def _final_moles(Y0: np.ndarray, Cr0: np.ndarray, region: np.ndarray, wf: float) -> Optional[np.ndarray]:
-    """0..1: moles on the picture as it came in (Y0, Cr0 at Y's size), inside region (> 0.05)."""
+def _feature_holes(lm: np.ndarray, shape, wf: float) -> np.ndarray:
+    """bool: the eyes, brows, lips and nostrils (their landmarks' hulls) grown by 0.03 face widths: not skin spots."""
+    m = np.zeros(shape, np.uint8)
+    e = np.zeros(shape, np.uint8)
+    L = np.round(np.asarray(lm)[:, :2]).astype(np.int32)
+    for idx in (range(48, 60), range(17, 22), range(22, 27), range(31, 36)):
+        cv2.fillConvexPoly(m, cv2.convexHull(L[list(idx)]), 255)
+    for idx in (range(36, 42), range(42, 48)):
+        cv2.fillConvexPoly(e, cv2.convexHull(L[list(idx)]), 255)
+    k = max(3, int(0.06 * wf) | 1)
+    ke = max(3, int(0.16 * wf) | 1)          # the eyes with their lashes, lids and catchlights
+    return (cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))) > 0) | (cv2.dilate(e, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ke, ke))) > 0)
+
+
+def _alone(cen: np.ndarray, ids: list, wf: float, iso: float) -> list:
+    """the ids whose centre has at most one other spot candidate (cen[1:]) within iso face widths: rough skin's pits come many together"""
+    allc = cen[1:]
+    out = []
+    for i in ids:
+        d = np.hypot(*(allc - cen[i]).T)
+        if int((d < iso * wf).sum()) - 1 <= 1:
+            out.append(i)
+    return out
+
+
+def _final_moles(Y0: np.ndarray, Cr0: np.ndarray, region: np.ndarray, wf: float, lm: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
+    """0..1: moles on the picture as it came in (Y0, Cr0 at Y's size), inside region (> 0.5): small, round, alone, FINAL_MOLE_DEPTH darker than the skin round them,
+    not redder than it (a pimple's mark is)."""
     r = _roi(region, int(0.05 * wf) + 6)
     if r is None:
         return None
@@ -5559,38 +5609,38 @@ def _final_moles(Y0: np.ndarray, Cr0: np.ndarray, region: np.ndarray, wf: float)
     base = cv2.GaussianBlur(roi, (0, 0), max(2.0, 0.03 * wf)) + 0.02
     km = max(3, int(round(FINAL_MOLE_SIZE * wf)) | 1)
     bh = cv2.morphologyEx(rb, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (km, km))) / base
-    dep = _ss(FINAL_MOLE_DEPTH[0], FINAL_MOLE_DEPTH[1], bh)
-    # round spots, not lines (a line's blackhat runs on along it): the spot's area at half its depth is compact
-    cand = (dep > 0.5).astype(np.uint8) & (region[y0:y1, x0:x1] > 0.05).astype(np.uint8)
-    n, lab, st, _c = cv2.connectedComponentsWithStats(cand, connectivity=8)
+    cand = (bh > FINAL_MOLE_DEPTH[0]) & (region[y0:y1, x0:x1] > 0.5)
+    if lm is not None:
+        lmr = np.asarray(lm, np.float32)[:, :2] - [x0, y0]
+        cand &= ~_feature_holes(lmr, roi.shape, wf)
+    n, lab, st, cen = cv2.connectedComponentsWithStats(cand.astype(np.uint8), connectivity=8)
     if n <= 1:
         return None
-    keep = np.zeros(n, bool)
-    smax = FINAL_MOLE_SIZE * wf
     cr = Cr0[y0:y1, x0:x1].astype(np.float32)
     crd = cv2.GaussianBlur(cr, (0, 0), 1.2) - cv2.GaussianBlur(cr, (0, 0), max(2.0, 0.03 * wf))
+    ok = []
     for i in range(1, n):
         w_, h_, a_ = st[i, 2], st[i, 3], st[i, 4]
-        if max(w_, h_) > smax or a_ < 3:
-            continue
-        if max(w_, h_) > 2.5 * max(1, min(w_, h_)):
+        if max(w_, h_) > FINAL_MOLE_SIZE * wf or a_ < 3 or max(w_, h_) > 2.5 * max(1, min(w_, h_)):
             continue
         sel = lab == i
-        if float(np.median(crd[sel])) > FINAL_MOLE_RED[1]:
+        if float(bh[sel].max()) < FINAL_MOLE_DEPTH[1] or float(np.median(crd[sel])) > FINAL_MOLE_RED:
             continue
-        keep[i] = True
-    if not keep.any():
+        ok.append(i)
+    keep = _alone(cen, ok, wf, FINAL_MOLE_ALONE)
+    if not keep:
         return None
-    m = keep[lab].astype(np.float32) * (1.0 - _ss(FINAL_MOLE_RED[0], FINAL_MOLE_RED[1], crd))
-    k = max(3, int(round(0.006 * wf)) | 1)
-    m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    m = np.isin(lab, keep).astype(np.uint8)
+    k = max(3, int(round(0.008 * wf)) | 1)
+    m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))).astype(np.float32)
     out = np.zeros(Y0.shape, np.float32)
-    out[y0:y1, x0:x1] = np.clip(cv2.GaussianBlur(m, (0, 0), max(0.8, 0.003 * wf)) * 1.2, 0, 1)
+    out[y0:y1, x0:x1] = np.clip(cv2.GaussianBlur(m, (0, 0), max(0.8, 0.003 * wf)) * 1.3, 0, 1)
     return out
 
 
-def _final_bumps(Y0: np.ndarray, region: np.ndarray, wf: float):
-    """(mask 0..1, fill level) of raised spots on Y0 inside region: a small top brighter than the skin round it with a darker side. None: none."""
+def _final_bumps(Y0: np.ndarray, region: np.ndarray, wf: float, lm: Optional[np.ndarray] = None, Ycur: Optional[np.ndarray] = None):
+    """(mask 0..1, fill) of raised spots on Y0 inside region (> 0.5): a small top FINAL_BUMP_LIGHT brighter than the skin round it (not a glint), alone, with a darker side
+    within its own size. The fill is the skin round it (inpainted). None: none."""
     r = _roi(region, int(FINAL_BUMP_SIZE * wf) + 6)
     if r is None:
         return None
@@ -5602,36 +5652,49 @@ def _final_bumps(Y0: np.ndarray, region: np.ndarray, wf: float):
     se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kb, kb))
     th = cv2.morphologyEx(rb, cv2.MORPH_TOPHAT, se) / base
     bh = cv2.morphologyEx(rb, cv2.MORPH_BLACKHAT, se) / base
-    top = _ss(FINAL_BUMP_LIGHT[0], FINAL_BUMP_LIGHT[1], th) * (th < FINAL_BUMP_MAXLIGHT)
-    cand = ((top > 0.5) & (region[y0:y1, x0:x1] > 0.3)).astype(np.uint8)
-    n, lab, st, cen = cv2.connectedComponentsWithStats(cand, connectivity=8)
+    cand = (th > FINAL_BUMP_LIGHT[0]) & (region[y0:y1, x0:x1] > 0.5)
+    if lm is not None:
+        lmr = np.asarray(lm, np.float32)[:, :2] - [x0, y0]
+        cand &= ~_feature_holes(lmr, roi.shape, wf)
+    n, lab, st, cen = cv2.connectedComponentsWithStats(cand.astype(np.uint8), connectivity=8)
     if n <= 1:
         return None
-    keep = np.zeros(n, bool)
-    smax = FINAL_BUMP_SIZE * wf
-    shade = cv2.dilate((bh > 0.5 * FINAL_BUMP_LIGHT[0]).astype(np.uint8), np.ones((3, 3), np.uint8))
+    ok = []
     for i in range(1, n):
         w_, h_, a_ = st[i, 2], st[i, 3], st[i, 4]
-        if max(w_, h_) > smax or a_ < 3:
+        if max(w_, h_) > FINAL_BUMP_TOP * wf or a_ < 3:
             continue
-        # a dark side next to the top (the bump's own shade): within the bump's size round it
-        cx, cy = int(cen[i, 0]), int(cen[i, 1])
-        rr = int(max(w_, h_)) + 2
-        win = shade[max(0, cy - rr):cy + rr + 1, max(0, cx - rr):cx + rr + 1]
-        if win.sum() < 2:
+        sel = lab == i
+        tmax = float(th[sel].max())
+        if tmax < FINAL_BUMP_LIGHT[1] or tmax > FINAL_BUMP_MAXLIGHT:
             continue
-        keep[i] = True
-    if not keep.any():
+        cx, cy = cen[i]
+        rr = int(max(w_, h_)) + 3
+        win = bh[max(0, int(cy) - rr):int(cy) + rr + 1, max(0, int(cx) - rr):int(cx) + rr + 1]
+        if win.size == 0 or float(win.max()) < FINAL_BUMP_SHADE:
+            continue
+        # calm skin round it (hair, lashes, a hand's edge are busy): few other light or dark marks in a ring of three times its size
+        R = 3 * rr
+        ring_t = th[max(0, int(cy) - R):int(cy) + R + 1, max(0, int(cx) - R):int(cx) + R + 1]
+        ring_b = bh[max(0, int(cy) - R):int(cy) + R + 1, max(0, int(cx) - R):int(cx) + R + 1]
+        busy = float(((ring_t > 0.5 * FINAL_BUMP_LIGHT[0]) | (ring_b > 0.5 * FINAL_BUMP_LIGHT[0])).mean())
+        if busy > FINAL_BUMP_BUSY:
+            continue
+        ok.append(i)
+    keep = _alone(cen, ok, wf, FINAL_BUMP_ALONE)
+    if not keep:
         return None
-    m = keep[lab].astype(np.uint8)
+    m = np.isin(lab, keep).astype(np.uint8)
     k = max(3, int(round(0.4 * FINAL_BUMP_SIZE * wf)) | 1)
-    m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
-    # the shade beside it belongs to the bump too
-    m = np.maximum(m, (cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))) & (bh > 0.5 * FINAL_BUMP_LIGHT[0]).astype(np.uint8)))
-    fill = cv2.inpaint(np.clip(roi * 65535.0, 0, 65535).astype(np.uint16), (m > 0).astype(np.uint8), max(3, k), cv2.INPAINT_TELEA).astype(np.float32) / 65535.0
-    ms = np.clip(cv2.GaussianBlur(m.astype(np.float32), (0, 0), max(0.8, 0.15 * k)) * 1.5, 0, 1)
+    # the bump's own shade (its darker side) next to the top goes with it
+    near = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1)))
+    m = np.maximum(m, (near > 0) & (bh > 0.4 * FINAL_BUMP_SHADE)).astype(np.uint8)
+    md = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(3, k // 2 | 1), max(3, k // 2 | 1))))
+    src_ = roi if Ycur is None else Ycur[y0:y1, x0:x1].astype(np.float32)      # filled from the picture as it is now (the skin round it is retouched)
+    fill = cv2.inpaint(np.clip(src_ * 65535.0, 0, 65535).astype(np.uint16), md, max(3, k), cv2.INPAINT_TELEA).astype(np.float32) / 65535.0
+    ms = np.clip(cv2.GaussianBlur(md.astype(np.float32), (0, 0), max(0.8, 0.2 * k)) * 1.4, 0, 1)
     M_ = np.zeros(Y0.shape, np.float32)
-    F_ = Y0.astype(np.float32, copy=True)
+    F_ = (Y0 if Ycur is None else Ycur).astype(np.float32, copy=True)
     M_[y0:y1, x0:x1] = ms
     F_[y0:y1, x0:x1] = fill
     return M_, F_
@@ -5696,13 +5759,17 @@ def _naso_zone(lm: np.ndarray, shape, wf: float) -> Optional[np.ndarray]:
     if lm is None or lm.shape[0] < 68 or not np.isfinite(lm[[27, 31, 33, 35, 48, 54, 51, 57, 8], :2]).all():
         return None
     L = np.asarray(lm[:, :2], np.float64)
-    bw = float(np.linalg.norm(L[35] - L[31]))
-    c = 0.5 * (L[31] + L[35])
+    okn = _nose_points_ok(L, wf)
+    bw = float(np.linalg.norm(L[35] - L[31])) if (okn[31] and okn[35]) else 0.15 * wf
+    c = L[33] if okn[33] else L[30]
     down = L[8] - L[27]
     down = down / max(float(np.linalg.norm(down)), 1e-6)
     w = max(3, int(round(FINAL_NASO_W * wf)))
     m = np.zeros(shape, np.uint8)
+    ok = okn
     for wing, corner in ((31, 48), (35, 54)):
+        if not ok[wing] or float(np.linalg.norm(L[corner] - L[wing])) > 0.6 * wf:
+            continue
         d = L[wing] - c
         d = d / max(float(np.linalg.norm(d)), 1e-6)
         a = L[wing] + d * 0.55 * bw - down * 0.10 * bw      # beside the wing, a little above its base
@@ -5718,6 +5785,13 @@ def _naso_zone(lm: np.ndarray, shape, wf: float) -> Optional[np.ndarray]:
     lips = cv2.dilate(lips, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kl, kl)))
     out = cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.25 * w))
     out = out * (1.0 - cv2.GaussianBlur(lips.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.01 * wf)))
+    # inside the face's outline only, away from it (the cheek's contour against hair or the background is shade, not a fold)
+    if np.isfinite(L[0:17]).all():
+        hull = np.zeros(shape, np.uint8)
+        cv2.fillConvexPoly(hull, cv2.convexHull(np.round(np.vstack([L[0:17], L[17:27]])).astype(np.int32)), 255)
+        ke = max(3, int(round(FINAL_NASO_EDGE * wf)) | 1)
+        hull = cv2.erode(hull, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ke, ke)))
+        out = out * cv2.GaussianBlur(hull.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.3 * ke))
     if nose is not None:
         out = out * (1.0 - nose)
     return np.clip(out, 0, 1).astype(np.float32)
@@ -5774,7 +5848,7 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
                     Cb = Cb + nC * (Cb0 - Cb)
                     Cr = Cr + nC * (Cr0 - Cr)
             if FINAL_MOLE > 1e-4 and skin is not None and job.wf_src > 0:
-                mm = _final_moles(Y0, Cr0Y, skin, wf)
+                mm = _final_moles(Y0, Cr0Y, skin, wf, lmY)
                 if mm is not None:
                     give = np.maximum(give, mm * float(np.clip(FINAL_MOLE, 0, 1)))
             if FINAL_LONG > 1e-4:
@@ -5786,11 +5860,11 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
                     if lm_ is not None:
                         give = np.maximum(give, lm_ * float(np.clip(FINAL_LONG, 0, 1)))
             if FINAL_BUMP > 1e-4 and skin is not None and job.wf_src > 0:
-                bb = _final_bumps(Y0, skin, wf)
+                bb = _final_bumps(Y0, skin, wf, lmY, Y)
                 if bb is not None:
                     bm, bf = bb
                     bm = bm * float(np.clip(FINAL_BUMP, 0, 1))
-                    Y = Y + bm * (np.minimum(bf, Y) - Y)
+                    Y = Y + bm * (bf - Y)
             if FINAL_NASO > 1e-4 and lmY is not None and job.wf_src > 0:
                 Y = _final_naso(Y, Y0, lmY, wf, float(np.clip(FINAL_NASO, 0, 1)))
             if FINAL_CHIN > 1e-4 and lmY is not None and skin is not None:
