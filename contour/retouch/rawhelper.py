@@ -12,11 +12,19 @@ import traceback
 
 def main() -> None:
     here = os.path.dirname(os.path.abspath(__file__))
-    sys.path[:] = [p for p in sys.path if os.path.abspath(p or ".") != here]      # (this file's folder is not a top-level package folder)
+    root = os.path.dirname(os.path.dirname(here))          # the folder that holds this contour package: it comes first, whatever else is on the path
     spec = pickle.load(open(sys.argv[1], "rb"))
-    for p in reversed(spec.get("sys_path") or []):
-        if p not in sys.path:
-            sys.path.insert(0, p)
+    want = [root] + list(spec.get("sys_path") or []) + list(sys.path)
+    seen, path = set(), []
+    for p in want:
+        k = os.path.normcase(os.path.abspath(p or "."))
+        if k in seen or k == os.path.normcase(here):            # (this file's folder is not a top-level package folder)
+            continue
+        seen.add(k)
+        path.append(p)
+    sys.path[:] = path
+    for m in [m for m in sys.modules if m == "contour" or m.startswith("contour.")]:
+        del sys.modules[m]
     out = sys.stdout.buffer
     inp = sys.stdin.buffer
     sys.stdout = sys.stderr                       # (prints of the app go to the log, not into the pipe)
