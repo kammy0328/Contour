@@ -15,6 +15,7 @@ Saved as cuts/<id>/cache/facelayer.npz. The renderer falls back to the old per-f
 """
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Callable, Dict, Optional
 
@@ -396,6 +397,9 @@ class FaceLayer:
         return c if np.isfinite(c).all() else None
 
 
+_LOAD_LOCK = threading.Lock()      # (the people of a frame ask side by side: retouch.engine.PREP_THREADS: the file is read once)
+
+
 def load(tracker) -> Optional[FaceLayer]:
     """Cached on the tracker; reloaded when the file changes."""
     f = path_for(tracker)
@@ -406,13 +410,17 @@ def load(tracker) -> Optional[FaceLayer]:
     cur = getattr(tracker, "_facelayer", None)
     if cur is not None and getattr(tracker, "_facelayer_mt", None) == mt:
         return cur
-    try:
-        fl = FaceLayer(f)
-    except Exception:
-        fl = None
-    tracker._facelayer = fl
-    tracker._facelayer_mt = mt
-    return fl
+    with _LOAD_LOCK:
+        cur = getattr(tracker, "_facelayer", None)
+        if cur is not None and getattr(tracker, "_facelayer_mt", None) == mt:
+            return cur
+        try:
+            fl = FaceLayer(f)
+        except Exception:
+            fl = None
+        tracker._facelayer = fl
+        tracker._facelayer_mt = mt
+        return fl
 
 
 def wanted_face_providers() -> set:

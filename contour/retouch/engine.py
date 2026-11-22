@@ -1937,16 +1937,22 @@ def _nbytes(m) -> int:
 _CACHE_OWN = ("__bytes__", "__tok__", "__new__")     # a frame cache's own entries: its byte count, what its kept
                                                     # entries were made from, and that it was just started over
 _MISS = object()
+_CACHE_LOCK = threading.RLock()                     # the people of a frame are prepared side by side (PREP_THREADS): the frame
+                                                    # cache's book-keeping (its byte count, its tokens, what it lets go of) is
+                                                    # changed by one of them at a time
 
 
 def _cache_look(cache: Optional[dict], key, tok=None):
     """What a frame cache keeps under key, or _MISS. tok: what the entry must have been made from (_body_tok): one
     made from something else is not there."""
-    if cache is None or key not in cache:
+    if cache is None:
         return _MISS
-    if tok is not None and (cache.get("__tok__") or {}).get(key) != tok:
-        return _MISS
-    return cache[key]
+    with _CACHE_LOCK:
+        if key not in cache:
+            return _MISS
+        if tok is not None and (cache.get("__tok__") or {}).get(key) != tok:
+            return _MISS
+        return cache[key]
 
 
 def _cache_put(cache: Optional[dict], key, m, tok=None) -> None:
@@ -1954,28 +1960,29 @@ def _cache_put(cache: Optional[dict], key, m, tok=None) -> None:
     (an entry with one outlives a tracking update: kept_over_tracks)."""
     if cache is None:
         return
-    nb = cache.get("__bytes__", 0)
-    toks = cache.get("__tok__")
-    if key in cache:                                # made again (the tracks changed where it reaches): in its place
-        nb -= _nbytes(cache.pop(key))
-        if toks:
-            toks.pop(key, None)
-    cache[key] = m
-    if tok is not None:
-        if toks is None:
-            toks = cache["__tok__"] = {}
-        toks[key] = tok
-    # bounded by memory, not by count: at a 1920 proxy every mask is 8 MB, and 400 of them took
-    # over 3 GB in the preview
-    nb += _nbytes(m)
-    n = len(cache) - sum(1 for k_ in _CACHE_OWN if k_ in cache)
-    while (n > 400 or nb > CACHE_BYTES) and n > 1:
-        k0 = next(k_ for k_ in cache if k_ not in _CACHE_OWN)
-        nb -= _nbytes(cache.pop(k0))
-        if toks:
-            toks.pop(k0, None)
-        n -= 1
-    cache["__bytes__"] = max(0, nb)
+    with _CACHE_LOCK:
+        nb = cache.get("__bytes__", 0)
+        toks = cache.get("__tok__")
+        if key in cache:                                # made again (the tracks changed where it reaches): in its place
+            nb -= _nbytes(cache.pop(key))
+            if toks:
+                toks.pop(key, None)
+        cache[key] = m
+        if tok is not None:
+            if toks is None:
+                toks = cache["__tok__"] = {}
+            toks[key] = tok
+        # bounded by memory, not by count: at a 1920 proxy every mask is 8 MB, and 400 of them took
+        # over 3 GB in the preview
+        nb += _nbytes(m)
+        n = len(cache) - sum(1 for k_ in _CACHE_OWN if k_ in cache)
+        while (n > 400 or nb > CACHE_BYTES) and n > 1:
+            k0 = next(k_ for k_ in cache if k_ not in _CACHE_OWN)
+            nb -= _nbytes(cache.pop(k0))
+            if toks:
+                toks.pop(k0, None)
+            n -= 1
+        cache["__bytes__"] = max(0, nb)
 
 
 def kept_over_tracks(cache: Optional[dict]) -> dict:
@@ -2022,6 +2029,9 @@ def _body_tok(tracker, st, p: int, t: int, reach: int = 0, extra=None) -> tuple:
     return (BS.track_token(st, t - r, t + r), mt, extra)
 
 
+PREP_THREADS = 1           # people of one frame whose masks are made side by side (_prepare_raw: the face's maps and masks, the body's area, the
+                           # spots: each person's own, from the picture and the tracks). 1: one after the other, as ever. A batch sets it where the
+                           # computer has cores to spare: the masks of one picture were the one thing a render did on a single core (j2815)
 BDET_PEOPLE = 4            # people of one frame whose body spots are looked for side by side, each on their own piece
                            # of the original (looking is most of what a frame of an export costs once the areas are
                            # made on the people's own pieces: 0.3 to 1 s a person, one after the other: j2796).
@@ -2062,6 +2072,38 @@ def _bdet_people(cut, px, t: int, later: list, cache: Optional[dict]) -> None:
         _cache_put(cache, key, d, tok)
 
 
+def _prime(tracker, st, px, t: int, people) -> None:
+    """What the people of a frame all ask the tracker for, asked once, here, before they are made side by side (PREP_THREADS): the frame's owners, its
+    picture and matte and clothing map, the face layer, the colour model of each person present. What the tracker makes on its first ask is then made
+    once, by this thread, and the people only find it. Nothing here changes what anybody gets: the same asks, made a moment earlier."""
+    def ask(fn):
+        try:
+            fn()
+        except Exception:
+            pass
+    ask(lambda: tracker.labels(t))
+    ask(lambda: tracker.matte.get(t))
+    ask(lambda: px.frame(t))
+    ask(lambda: _prime_face_layer(tracker))
+    ask(lambda: _prime_cloth(tracker, t))
+    for q in people:
+        try:
+            if st.has(q.id) and st.present[st.index(q.id), t]:
+                SK.model_for(tracker, st.index(q.id))
+        except Exception:
+            pass
+
+
+def _prime_face_layer(tracker) -> None:
+    from ..track import facelayer as FL
+    FL.load(tracker)
+
+
+def _prime_cloth(tracker, t: int) -> None:
+    from ..track import skincloth as SC
+    SC.get(tracker, t)
+
+
 def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optional[int] = None) -> Optional[RetouchFrame]:
     """One frame's masks on their own (see prepare). only: just this person, skin shown even at 0."""
     st = tracker.store
@@ -2070,22 +2112,25 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
     px = tracker.proxy
     jobs = []
     bdet_later = []                 # (job, cache key, the frame's picture): body spots still to be looked for
-    rgb_u8 = None
-    rgb_f = None
     people = cut.targets() if only is None else [q for q in cut.persons if q.id == only]
     doubles = _double_faces(st, tracker, t)
-    for person in people:
+
+    def one_person(person):
+        """One person's job of this frame: (the job or None, [(job, cache key, the frame's picture, what it is made from): body spots still to be
+        looked for]). A person's masks are made from the picture, the tracks and the caches (kept under the person's own keys) and from nothing
+        another person makes, so the people of a frame can be made side by side (PREP_THREADS)."""
+        bdet_here = []
         if not st.has(person.id):
-            continue
+            return None, bdet_here
         p = st.index(person.id)
         if not st.present[p, t]:
-            continue
+            return None, bdet_here
         pp = cut.params_for(person.id)
         v = {k: pp.amount(k, t) / 100.0 for k in RETOUCH_KEYS}
         if only is not None:
             v["skin"] = max(v["skin"], 0.5)
         if not any(abs(x) > 1e-4 for x in v.values()):
-            continue
+            return None, bdet_here
         face = None
         fw = 0.0
         fw_doubt = False
@@ -2418,7 +2463,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                         bkey = f"{bscope}:{ctok}:{job.body_size:.3f}:sn{int(BP.SPOTNET)}h{int(BP.HANDS_HELD)}"
                         if BDET_PEOPLE > 1 and _cache_look(cache, (t, person.id, "bdet", bkey), btok) is _MISS:
                             # looked for after the loop, every person of the frame side by side (_bdet_people)
-                            bdet_later.append((job, (t, person.id, "bdet", bkey), body_base()["rgb"], btok))
+                            bdet_here.append((job, (t, person.id, "bdet", bkey), body_base()["rgb"], btok))
                         else:
                             job.bdet = get("bdet", mk_bdet, bkey, btok)
                         job.bmarks = _body_marks(st, p, t, pp, v)
@@ -2452,7 +2497,21 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                     pr_ = pr_ * state["alpha"]
                 job.veto = cv2.resize(pr_, (max(1, pr_.shape[1] // 4), max(1, pr_.shape[0] // 4)),
                                       interpolation=cv2.INTER_AREA).astype(np.float16)
-            jobs.append(job)
+            return job, bdet_here
+        return None, bdet_here
+
+    n_thr = max(1, min(int(PREP_THREADS), len(people)))
+    if n_thr > 1:
+        _prime(tracker, st, px, t, people)
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=n_thr, thread_name_prefix="prep") as ex:
+            made = list(ex.map(one_person, people))             # (in the people's order: what comes out is what one after the other gives)
+    else:
+        made = [one_person(q) for q in people]
+    for job_, later_ in made:
+        if job_ is not None:
+            jobs.append(job_)
+        bdet_later.extend(later_)
     if bdet_later:
         _bdet_people(cut, px, t, bdet_later, cache)
     if not jobs:
@@ -3484,17 +3543,22 @@ def neck_axis(lm: Optional[np.ndarray]):
 
 
 _MCACHE: dict = {}
+_MC_LOCK = threading.Lock()         # (people of a frame are prepared side by side: PREP_THREADS)
 
 
 def _cached(name: str, lm: np.ndarray, shape, scale: float, wf: float, make):
     """The face masks below depend only on the landmarks and the frame size; they are asked for more than once
     per face per frame (by several retouch steps), and are made once."""
     key = (name, np.asarray(lm[:, :2], np.float32).tobytes(), tuple(shape), float(scale), float(wf))
-    hit = _MCACHE.get(key)
+    with _MC_LOCK:
+        hit = _MCACHE.get(key)
     if hit is None:
         if len(_MCACHE) > 48:
-            _MCACHE.clear()
-        hit = _MCACHE[key] = make()
+            with _MC_LOCK:
+                _MCACHE.clear()
+        hit = make()                # (made outside the lock: the same mask made twice by two threads is the same mask)
+        with _MC_LOCK:
+            _MCACHE[key] = hit
     return hit
 
 

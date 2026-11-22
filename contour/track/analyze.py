@@ -1,6 +1,7 @@
 """Analysis orchestration for one cut and the edit-time re-solve logic."""
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -20,6 +21,8 @@ from ..core.project import PERSON_COLORS, Cut, Person, Project
 from ..core.proxy import MatteStore, Proxy
 from ..warp import body as B
 from .modelpkg import cut_models as _cut_models
+
+_LABEL_LOCK = threading.RLock()        # CutTracker.labels: what it lets go of from its small cache, one at a time
 
 Progress = Optional[Callable[[float, str], None]]
 
@@ -282,9 +285,13 @@ class CutTracker:
         if lab is None:
             seg = self.seglab.get(t) if self.seglab.exists() else None
             lab = self.labels_from(t, seg, lambda: self.matte.get(t))
-            if len(self._label_cache) > 48:
-                self._label_cache.pop(next(iter(self._label_cache)))
-            self._label_cache[t] = lab
+            with _LABEL_LOCK:                       # (the people of a frame ask side by side: retouch.engine.PREP_THREADS)
+                while len(self._label_cache) > 48:
+                    try:
+                        self._label_cache.pop(next(iter(self._label_cache)))
+                    except (StopIteration, KeyError, RuntimeError):
+                        break
+                self._label_cache[t] = lab
         return lab
 
     def labels_from(self, t: int, seg, alpha) -> np.ndarray:

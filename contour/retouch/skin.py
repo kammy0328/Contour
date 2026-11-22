@@ -9,6 +9,7 @@ Filter = edge-preserving guided filter: the large-scale tone is evened out, a ch
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -1157,7 +1158,16 @@ def person_alpha(tracker, t: int, p: int, size: Tuple[int, int]) -> Optional[np.
     return cv2.resize(m, size, interpolation=cv2.INTER_LINEAR)
 
 
+_MODEL_LOCK = threading.RLock()     # the people of a frame are prepared side by side (engine.PREP_THREADS): the models kept on the tracker are made
+                                    # and let go of by one at a time
+
+
 def model_for(tracker, p: int):
+    with _MODEL_LOCK:
+        return _model_for(tracker, p)
+
+
+def _model_for(tracker, p: int):
     cache = getattr(tracker, "_skin_models", None)
     if cache is None:
         cache = tracker._skin_models = {}
@@ -1196,12 +1206,13 @@ def frame_model_for(tracker, p: int, t: int, rgb_u8: np.ndarray, lm_px: Optional
         return (np.asarray(centre[:2], np.float64), icov, float(centre[2]))
     if lm_px is None or not np.isfinite(lm_px[:, :2]).all():
         return base
-    cache = getattr(tracker, "_skin_fmodels", None)
-    if cache is None:
-        cache = tracker._skin_fmodels = {}
-    key = (p, t)
-    if key in cache:
-        return cache[key]
+    with _MODEL_LOCK:
+        cache = getattr(tracker, "_skin_fmodels", None)
+        if cache is None:
+            cache = tracker._skin_fmodels = {}
+        key = (p, t)
+        if key in cache:
+            return cache[key]
     fm = build_skin_model([rgb_u8], [lm_px])
     if fm is None:
         res = base
@@ -1214,9 +1225,13 @@ def frame_model_for(tracker, p: int, t: int, rgb_u8: np.ndarray, lm_px: Optional
             grow = max(1.0, float(np.trace(c_fr) / max(np.trace(c_base), 1e-6)))
             icov = np.linalg.inv(c_base * grow)
         res = (fm[0], icov, fm[2])
-    cache[key] = res
-    while len(cache) > 600:
-        cache.pop(next(iter(cache)))
+    with _MODEL_LOCK:
+        cache[key] = res
+        while len(cache) > 600:
+            try:
+                cache.pop(next(iter(cache)))
+            except (StopIteration, KeyError, RuntimeError):
+                break
     return res
 
 

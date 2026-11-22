@@ -7,6 +7,7 @@ detector's. No model file, or any failure: the rule detector's maps stand."""
 from __future__ import annotations
 
 import sys
+import threading
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -24,6 +25,7 @@ MODEL = Path(__file__).resolve().parent.parent / "track" / "data" / "spotnet_v1.
 
 _sess = None
 _failed = False
+_SLOCK = threading.Lock()       # (the people of a frame look for spots side by side: the session is made once)
 
 
 def available() -> bool:
@@ -33,12 +35,14 @@ def available() -> bool:
 def _session():
     global _sess, _failed
     if _sess is None and not _failed:
-        try:
-            from ..track import models as MD
-            _sess = MD.session(MODEL)
-        except Exception as e:
-            sys.stderr.write(f"SPOTNET OFF: {str(e)[:200]}\n")
-            _failed = True
+        with _SLOCK:
+            if _sess is None and not _failed:
+                try:
+                    from ..track import models as MD
+                    _sess = MD.session(MODEL)
+                except Exception as e:
+                    sys.stderr.write(f"SPOTNET OFF: {str(e)[:200]}\n")
+                    _failed = True
     return _sess
 
 
