@@ -710,7 +710,62 @@ def _knee_rescue_read(Y, Cb, Cr, skin, centre, axis, half: float):
     return rd
 
 
+KNEE_ROI = 10.0           # > 0: every knee is worked on a piece of the picture this many half widths of the leg round it (its area, its ring out to RING[1] and
+                          # the furthest slide lie within 8), not on the whole frame: the same numbers, a fraction of the time and memory on a 4K frame with
+                          # several people's knees. 0: the whole frame for every knee, as it was
+
+
 def _knee_tone_v2(Y, Cb, Cr, skin, knees, k, cs, gains=None):
+    if not (KNEE_ROI > 0):
+        return _knee_tone_v2_full(Y, Cb, Cr, skin, knees, k, cs, gains)
+    hY, wY = Y.shape
+    hC, wC = Cb.shape
+    same = (hC, wC) == (hY, wY)
+    fy, fx = hC / float(hY), wC / float(wY)
+    sy = int(round(1.0 / fy)) if fy < 1 else 1          # luma rows per chroma row
+    sx = int(round(1.0 / fx)) if fx < 1 else 1
+    dY = dCb = dCr = None
+    for ki_, (centre, axis, half) in enumerate(knees):
+        half = float(half)
+        if not (half > 1.5):
+            continue
+        R = int(KNEE_ROI * half) + 16
+        x0, x1 = max(0, int(centre[0]) - R), min(wY, int(centre[0]) + R + 1)
+        y0, y1 = max(0, int(centre[1]) - R), min(hY, int(centre[1]) + R + 1)
+        if not same:
+            x0, y0 = x0 - x0 % sx, y0 - y0 % sy
+            x1, y1 = min(wY, x1 + (-x1) % sx), min(hY, y1 + (-y1) % sy)
+        if x1 - x0 < 8 or y1 - y0 < 8:
+            continue
+        if same:
+            cb_, cr_ = Cb[y0:y1, x0:x1], Cr[y0:y1, x0:x1]
+            c0y, c1y, c0x, c1x = y0, y1, x0, x1
+        else:
+            c0y, c1y, c0x, c1x = y0 // sy, min(hC, -(-y1 // sy)), x0 // sx, min(wC, -(-x1 // sx))
+            cb_, cr_ = Cb[c0y:c1y, c0x:c1x], Cr[c0y:c1y, c0x:c1x]
+        ys_ = Y[y0:y1, x0:x1]
+        sk_ = None if skin is None else skin[y0:y1, x0:x1]
+        g_ = None if gains is None else [gains[ki_] if ki_ < len(gains) else None]
+        yo, cbo, cro = _knee_tone_v2_full(ys_, cb_, cr_, sk_, [((float(centre[0]) - x0, float(centre[1]) - y0), axis, half)], k, cs, g_)
+        if yo is not ys_:
+            if dY is None:
+                dY = np.zeros((hY, wY), np.float32)
+            dY[y0:y1, x0:x1] = _merge(dY[y0:y1, x0:x1], (yo - ys_).astype(np.float32))
+        if cbo is not cb_:
+            if dCb is None:
+                dCb = np.zeros((hC, wC), np.float32)
+            dCb[c0y:c1y, c0x:c1x] = _merge(dCb[c0y:c1y, c0x:c1x], (cbo - cb_).astype(np.float32))
+        if cro is not cr_:
+            if dCr is None:
+                dCr = np.zeros((hC, wC), np.float32)
+            dCr[c0y:c1y, c0x:c1x] = _merge(dCr[c0y:c1y, c0x:c1x], (cro - cr_).astype(np.float32))
+    Yo = Y if dY is None else (Y + dY).astype(np.float32)
+    Cbo = Cb if dCb is None else (Cb + dCb).astype(np.float32)
+    Cro = Cr if dCr is None else (Cr + dCr).astype(np.float32)
+    return Yo, Cbo, Cro
+
+
+def _knee_tone_v2_full(Y, Cb, Cr, skin, knees, k, cs, gains=None):
     """The knee tone with its read of the leg weighed (knee_reliability): every knee reads the picture as it came (not what
     another knee changed), changes it by as much as the read can be trusted, and where two knees change the same pixel the
     larger change stays. A knee that is not trusted is read again with a shorter model (knee_rescue) and that read is taken when it is trusted more."""
