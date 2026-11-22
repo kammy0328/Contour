@@ -4391,6 +4391,9 @@ NASO_REACH = 0.07           # the same in the nasolabial stage. 2611 IWALY c029,
                             # of a per cent. Smaller = the fold is taken closer to the wing (the wing itself, inside the landmarks' hull, stays held)
 ALA_KEEP = 1.0              # share of the nose wing's own exclusion (_ala_mask) kept in the fold's band (1 = as before; the band is made at the
                             # preparation of the frame)
+NASO_DEEP_NOSE = 0.0        # 2611 IWALY c010 f15, c001 f92 (2026-11-22, user: "콧구멍 사라지고 코라인이 덜 선명해진 오류", the nose wing retouched): the nasolabial stage lifted the nostril's
+                            # shade on a turned face (the landmarks' hull missed it). 1 = what the skin smoothing holds as deep (compact, far darker than the skin) is held within NASO_DEEP_REACH of the nose
+NASO_DEEP_REACH = 0.15
 NOSE_SIDES = False          # 2611 IWALY c029 f4/f124, c010 f4/f15, c001 f92 (2026-11-22, user: "코 라인 밝아진 오류", "콧구멍 사라지고 코라인이 덜 선명해진 오류"): the nose's own
                             # outline (the shaded side wall from the inner eye corner down to the wing, the nostril's rim) was lifted by the nasolabial stage: the held hull
                             # was that of the bridge's middle line and the nose's base only (landmarks 27..35), so on a turned face its side wall lay outside it. True = the
@@ -5877,6 +5880,15 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                 mY = np.clip(bandg * (base_ + 0.95 * found), 0, 1)
                 if key == "nasolabial":
                     nh_ = nose_hold(job.face, (hY, wY), y_per_src, wf, None if NASO_REACH == NOSE_REACH else NASO_REACH)
+                    if NASO_DEEP_NOSE > 1e-4 and hd_ is not None and hd_.shape == (hY, wY):
+                        # the nostrils and the shade under the nose's wings (compact, far darker than the skin) near the nose are its shape
+                        try:
+                            nz_ = nose_hold(job.face, (hY, wY), y_per_src, wf, NASO_DEEP_REACH)
+                            if nz_ is not None:
+                                dh_ = np.clip(hd_ * (1.0 - nz_) * float(NASO_DEEP_NOSE), 0, 1)
+                                nh_ = (1.0 - dh_) if nh_ is None else nh_ * (1.0 - dh_)
+                        except Exception:
+                            pass
                     if nh_ is not None:
                         mY = mY * nh_
                 if he_ is not None:
