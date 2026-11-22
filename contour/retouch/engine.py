@@ -955,6 +955,7 @@ ARMPIT_WEDGE = False        # 2611 IWALY c029 f4/f5/f6/f69/f136/f159 (2026-11-22
                             # held in front of the body with it. True = only the wedge between the upper arm and the torso: on the torso's side of the upper arm's axis (shoulder to
                             # elbow), on the arm's side of the torso's axis (shoulder to hip) and below the shoulder joint, each with a soft margin of ARMPIT_WEDGE_M shoulder widths
 ARMPIT_WEDGE_M = (0.04, 0.10)   # (outside .. inside) of the shoulder width: the margin over which each side of the wedge fades from 0 to 1
+ARMPIT_WEDGE_T = (0.45, 0.25)   # (0 at .. 1 at) shoulder widths INTO the torso past its axis (the shoulder joint lies inside the body: the fold shows on the torso's side of that axis, c010 f23 0.15 sw)
 
 
 def _armpit_wedge(shape, s_, d, tip, sw):
@@ -978,7 +979,7 @@ def _armpit_wedge(shape, s_, d, tip, sw):
     dt = st_ * (dn[0] * uy - dn[1] * ux)
     # below the shoulder joint along the torso
     dd = ux * dn[0] + uy * dn[1]
-    g = _ss(-lo, hi, da) * _ss(-hi, lo, dt) * _ss(-lo, lo, dd)
+    g = _ss(-lo, hi, da) * _ss(-float(ARMPIT_WEDGE_T[0]) * sw, -float(ARMPIT_WEDGE_T[1]) * sw, dt) * _ss(-lo, lo, dd)
     return g.astype(np.float32)
 
 
