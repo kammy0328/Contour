@@ -81,6 +81,7 @@ class Job:
     skin: Optional[SK.SkinJob] = None
     masks: Dict[str, np.ndarray] = field(default_factory=dict)   # proxy resolution, float32 0..1
     wf_src: float = 0.0                    # face width, source px
+    wf_arm: float = 0.0                    # the armpit stage's own size reference (a face width, source px: ARMPIT_FACE_PER_RADIUS times its zone's radius) for a person whose face is not in the picture
     blemish_size: float = 0.5              # 0..1 largest spot taken by the blemish removal
     sharp_q: float = 1.0                   # this frame's skin sharpness over that of the frames round it
     # where the skin's flaws are (detect.py), found once per frame and held steady through time (1.19):
@@ -95,6 +96,7 @@ class Job:
     bdet: Optional[dict] = None            # the body's spot candidates of this frame (retouch.bodyspots)
     bmarks: Optional[list] = None          # the operator's body spot marks as they lie on this frame
     tone: Optional[dict] = None            # where the knees and the belly are (retouch.bodytone.person_geometry), source px
+    arm_axes: Optional[list] = None        # the armpit stage's hanging arms (ARMPIT_LINE_HOLD): [(the upper arm's angle from the vertical in degrees, weight 0..1, zone centre x, y, zone radius)] in proxy px
 
 
 @dataclass
@@ -199,7 +201,7 @@ def wrinkle_masks(lm: np.ndarray, shape, prob: np.ndarray, which: str, fth: floa
                    cv2.LINE_AA, 2)
     cz = np.clip(_feather(cz, 0.035 * Wf) * 1.5, 0, 1)
     soft = np.clip(cv2.GaussianBlur(prob, (0, 0), max(1.0, 0.02 * Wf)) * 1.5, 0, 1)
-    out = np.clip(f * 1.3, 0, 1) * soft * (1 - lipf) * (1 - cz) * (1 - np.clip(ala * 1.2, 0, 1))
+    out = np.clip(f * 1.3, 0, 1) * soft * (1 - lipf) * (1 - cz) * (1 - ALA_KEEP * np.clip(ala * 1.2, 0, 1))
     if paint is not None:
         # face paint, drawn lines and hair strands across the cheek are dark lines too: never "folds" to fill.
         # But a deep smile line is a thin dark line too, and lies along the band: those are the fold itself
@@ -593,37 +595,407 @@ def limb_cover(st, t: int, lm: np.ndarray, shape, sx: float, sy: float) -> Optio
 
 ARMPIT = 0.0          # 0 = off. Skin retouch on the armpits too (cut 055: raised arms, user 2026-11-14); the render script
 ARMPIT_PIDS = None    # switches it on per cut, for every person or only for these ids
-ARMPIT_R = 0.30       # reach round the shoulder joint, in shoulder widths: the fold of a raised arm lies inside it
-ARMPIT_ALONG = 0.06   # centre moved this far from the joint along the upper arm
+ARMPIT_R = 0.30       # (the first version's zone) reach round the shoulder joint, in shoulder widths
+ARMPIT_ALONG = 0.06   # (the first version's zone) centre moved this far from the joint along the upper arm
+ARMPIT_RAISE = None   # None = the zone of both sides always. A number: only the side whose arm is raised (the elbow's height below the
+                      # shoulder over the upper arm's length is under it: 1 = hanging down, 0 = out to the side, < 0 = up)
+ARMPIT_FOLD = 0.0     # 0 = off. The armpit's own creases (2611 IWALY c010, 2026-11-22, user: 겨드랑이 주름 제거): the thin fold where the arm
+                      # meets the chest is taken out like a neck line, inside the armpit's skin, at this share (0..1)
+ARMPIT_W = 0.018      # of the face width: the width of the crease looked for
+ARMPIT_SMALL_WF = (90.0, 150.0)   # 2611 IWALY c003 (2026-11-22, own review of a one-frame test): a wide shot's people (faces 67..110 px wide) have no creases to find: the line finder takes the grain, the strands of long
+                                  # hair lying over the arm and the garment's seams for creases, and the armpit stage lifted hair strands there by up to 11 % of the brightness. Face width (px) below the first value: this
+                                  # stage is off; above the second: in full (None = in full everywhere)
+NECK_SMALL_WF = (75.0, 130.0)     # the same for the neck lines and the goose bumps (c003: a strand of hair lying at the neck's edge on a face 67 px wide was lifted; the user's green mark at the jaw, 00:00:39:17)
+ARMPIT_HAIR_REACH = 0.012         # 2611 IWALY c029 f96 / c010 f0 (2026-11-22, own review of the armpit stage on large faces): long hair lying over the shoulder is skin to the armpit's colour test (blond hair has
+                                  # the skin's hue and its brightness), so the thin-line filler lifted dark strand gaps in it by up to 6 % of the brightness and the fold flattener evened out its light and
+                                  # dark clumps by up to 4 %. The armpit's creases are looked for on skin only: what the body parser calls hair (and the garment masks call clothes or hair) is left out of the
+                                  # stage's mask, this share of the person's size round it as well (0 = off)
+ARMPIT_LINES_MAX = 0.005          # a safety net for what the parser misses (a seam, strands over bare skin, a parser that cannot run): the armpit's own creases are a handful of short lines (c010: 130 px of
+                                  # lift at a face 260 px wide), so when more than this share of the face width squared is lifted the finder is looking at texture, not at creases, and the stage
+                                  # (the lifts and the fold flattening) is taken back, fully at 2.5 times that. 0 = off
+ARMPIT_LINES_MAX_BIG = None        # None = ARMPIT_LINES_MAX at every face size. A number: the share a close-up's armpit gets (the share grows from ARMPIT_LINES_MAX to this one as the face goes from the first to the second width in ARMPIT_LINES_BIG_WF)
+ARMPIT_LINES_BIG_WF = (150.0, 250.0)
+ARMPIT_THIN = None                # 2611 IWALY c010 f0 (2026-11-22, user: 겨드랑이 주름 제거): the line filler takes a valley for a crease when it is thin against its own surroundings (THIN_LO, THIN_HI = 0.4, 0.7). The armpit's creases run
+                                  # on into the shade under the arm, where the valley lies in a broad dark band: it is thin to a lesser degree there and the filler left the lower half of the crease as it was.
+                                  # (lo, hi) for the armpit in place of that pair (None = THIN_LO, THIN_HI)
+ARMPIT_CLOTH_OUT = True           # 2611 IWALY c010 f0 (2026-11-22, own check of the front-left person: the armpit zone lay on a black dress, and the stage's line finder lifted and flattened the dress's folds by up to 2 %
+                                  # of the brightness): the body parser's clothes / accessories class is left out of the armpit stage's mask like its hair class (False: hair only)
+ARMPIT_FACE_REF = 0.85            # ... and the cloth gate (NECK_CLOTH_GATE) of the stage goes by at least this share of the person's own face skin's brightness, not by the mask's own pixels alone: a
+                                  # zone that is all dark cloth was its own reference and let itself through (0 = the mask's own pixels only)
+ARMPIT_BAND = 0.0                 # 2611 IWALY c010 f0 (user: 겨드랑이 주름 제거): after the valley is filled, the crease's flanks (the light lip beside the dark valley) are brought down to the skin's own level
+                                  # too: inside the lines the finder found (CREASE_BAND_THR) and CREASE_BAND_HW of the line width on either side, the picture's soft level is replaced by what the skin
+                                  # round the band holds (CREASE_BAND_SIG of the line width wide), at this share (the fine grain stays). 0 = off
+CREASE_BAND_THR, CREASE_BAND_HW, CREASE_BAND_SIG = 0.3, 1.6, 2.2
+ARMPIT_FOLD_INSET = 0.0           # 2611 IWALY c029 f86 (2026-11-22, own review of the second render): the fold flattener of the armpit stage (_fold_flat: an edge-keeping filter 0.08 of the face width wide, whose edge threshold is the neck's)
+                                  # took the arm's outline for a soft fold where the skin (0.40 of the brightness) meets the wall behind it (0.52..0.57): the skin along the outline came out up to 5 % lighter and the wall just outside it up to
+                                  # 5 % darker, and a dark stripe of the wall ended 26 px short of the arm (the armpit's mask reaches beyond the skin by the width of the person's matte). The flattener now works only inside the body's
+                                  # skin area (the one the body smoothing uses), kept this share of the face width away from its edge, fading in over the same distance. 0 = as before
+ARMPIT_FLAT = 1.0                 # the share of the flattener's own change that is kept in the armpit stage (1 = in full, 0 = the thin-line lifts and the crease's flanks only)
+ARMPIT_FLAT_EPS = 1.0             # 2611 IWALY c029 f117 / f8 (2026-11-22, user's checked stills): the armpit's hollow is a soft fold (a lens-shaped shade, an oval's outline), fainter and wider than a neck's ring: the flattener's edge threshold (FOLD_EPS)
+ARMPIT_FLAT_R = 1.0               # times this, and the width of its edge-keeping filter (FOLD_R) times this, in the armpit stage only (1 = as the neck's rings)
+ARMPIT_LIFT_INSET = 0.0           # of the face width: the thin-line lifts and the crease's flanks of the armpit stage work only inside the body's skin area, this far from its outline (c029 f86: the end of a dark stripe of the wall
+                                  # next to the arm was lifted over 26 px and the arm's own dark rim by up to 4 %). 0 = as before (the stage's mask only)
+ARMPIT_EDGE_CLOSE = 0.02          # of the face width: a crack or a hole in the body's skin area narrower than twice this (a crease, a strand over the skin) is closed before the outline is looked for
+ARMPIT_CORE = None                # (lo, hi) or None: the armpit's mask is cut at its soft margin, mask * smoothstep(lo, hi, mask): the margin of the person's matte is where the wall's colour passes the stage's colour test at a third of
+                                  # the weight (c029 f86..f90: the wall beside the arm lifted by 2..4 %, a stripe of it bitten), and a weight below the lower edge is no armpit. Unlike the body-skin inset it does not
+                                  # keep away from shadow (a crease between the arm and the chest lies at the edge of the body skin's colour model). None = the mask as it is
+ARMPIT_LIFT_GAIN = 1.0            # 2611 IWALY c010 f0 (2026-11-22, user: 겨드랑이 주름 제거; own check of the one-frame test: about a quarter of the crease's contrast was still there). The line filler
+                                  # fills a thin valley from a copy of the picture blurred over a pixel or two, which is shallower than the valley itself, and the score at the valley's flanks is under 1. This
+                                  # many times the fill, held to the valley's own depth (it never fills more than the skin beside it: no light line is made). 1 = as the neck lines
+# 2611 IWALY c029 / c010 (2026-11-22, user, on the stills he checked): the armpit stage is for the OPEN armpits only (the arm held away from the body, the fold where it meets the chest), nowhere else:
+# at c029 f86 / f96 (the arm hanging along the body, its edge against the wall) there is nothing to retouch, and at c010 f23 the arm's own line above the fold (green) has to stay while the fold (red) goes.
+ARMPIT_OPEN = None                # (lo, hi) degrees or None (= every arm): the upper arm's angle from the torso's axis (shoulder to hip), median over ARMPIT_OPEN_SPAN frames each side. Weight 0 at lo and under, 1 at hi and over.
+                                  # A hanging arm is 0..20 deg (c029 f86 / f96: 16..7), the open ones the user checked 33..58 (c010 f23 33, c029 f79 58, f117 56)
+ARMPIT_OPEN_SPAN = 2
+ARMPIT_RADIAL = None              # (lo, hi) or None: the zone's own weight falls from 1 at lo to 0 at hi times its radius (the fold lies near the zone's centre, 0.3..0.6 of the radius in the stills the user checked; c010 f23's arm line
+                                  # he wants kept lies at 0.76). None = the whole disc as before
+ARMPIT_NEAR_CLOTH = None          # (near, far) of the face width or None: the fold stage works near the garment's edge (the armhole: the folds the user checked lie 0..0.30 face widths from it, the arm line he wants kept 0.6 and more):
+                                  # weight 1 within near of the nearest hair / clothes / garment pixel, 0 beyond far. None = anywhere in the zone
+ARMPIT_CLOSE = 0.0                # of the face width: the fold is a dark valley, and the armpit's mask (the skin's brightness split, the clothes gate) leaves it out as if it were cloth, so the lifts never saw it. A hole or a
+                                  # bay in the stage's mask narrower than twice this is closed before the lifts and the flattener (0 = as before)
+ARMPIT_PIT_W = None               # of the face width or None: a second pass of the thin-line filler at this width (the fold is wider than a crease line: 0.04 of the face = 13 px at 330)
+ARMPIT_FINE = True                # False: the armpit's thin-line filler does without the long-line (strand) finder (the one that also finds hair strands). 2611 IWALY c010 f23 (2026-11-22, user: the arm's own line, green, stays; the fold, red, goes): a
+                                  # long soft line along the arm is a long faint dark line to that finder, and the filler took it out with the folds. The valley finder alone looks only at what is short, deep and curved
+                                  # across (a crease). True = as the neck lines
+ARMPIT_LINE_HOLD = 0.0            # 0 = off. 2611 IWALY c010 f23 (2026-11-22, user: the arm's own line, green, stays; the fold, red, goes): where the upper arm hangs (ARMPIT_LINE_HANG) the armpit stage leaves the arm's
+                                  # own line, a long thin dark line lying along the upper arm, as it was. The stage's fillers and its flattener cannot tell it from a crease (both are a thin dark valley); what
+                                  # tells it is its direction and its length: a valley within ARMPIT_LINE_TOL degrees of the upper arm's direction that goes on for ARMPIT_LINE_LEN of the face width. Found on the picture
+                                  # before the stage, and given back after it: inside the line (and where it goes on faintly, ARMPIT_LINE_EXT) the picture's detail finer than ARMPIT_LINE_SIG line widths is the source's again,
+                                  # the soft light and shade under it is the retouched one. This share (0..1) of it is given back
+ARMPIT_LINE_HANG = (24.0, 30.0)   # degrees: the upper arm's angle from the picture's vertical (median over ARMPIT_OPEN_SPAN frames each side); the hold is in full at the first value and under, 0 at the second and over.
+                                  # An arm held away from the body (c010 f0 33, c029 f79 62, f117 52, f8 60) has creases in its armpit, a hanging one (c010 f23 21) has the arm's line
+ARMPIT_LINE_TOL = 20.0            # degrees: a valley whose direction differs from the upper arm's by this much or less is the arm's line, 0 at 15 degrees more
+ARMPIT_LINE_LEN = 0.20            # of the face width: the length along the arm over which a line is judged (the mean of the finder's score along it)
+ARMPIT_LINE_THR = (0.03, 0.08)    # that mean's (lo, hi): 0 under lo, 1 over hi
+ARMPIT_LINE_EXT = 0.25            # of the face width: a held line is followed this far along the arm where it gets too faint for the finder (valley, direction as above)
+ARMPIT_LINE_SIG = 3.0             # of the crease width (ARMPIT_W of the face width): the detail finer than this is given back, the broader light and shade stays the stage's
+ARMPIT_LINE_GSPAN = 2             # frames each side: the hold's weight (how far the arm hangs, ARMPIT_LINE_HANG) of a frame is the largest of those of the frames t - GSPAN .. t + GSPAN of the same shot, so that a short lift
+                                  # of a hanging arm (c010 f26-28: the pose reads 28 degrees for three frames between 21 and 24) does not take the arm's line out for those frames and give it back after them. 0 = the frame's own
+ARMPIT_ONE_SHOULDER = False      # a person cut by the frame's edge (one shoulder in the picture): the zone from that shoulder and its elbow, the shoulder width taken as ARMPIT_ONE_SHOULDER_SW times the upper arm, the axis straight down
+ARMPIT_ONE_SHOULDER_SW = 1.4
+ARMPIT_FACE_PER_RADIUS = 2.07     # the face width a zone of this radius goes with (measured on c029 / c010: 2.0..2.2), for a person whose face is not in the picture (Job.wf_arm)
 
 
-def armpit_region(kp: np.ndarray, shape, sx: float, sy: float, parts: bool = False):
-    """Round both shoulder joints (0..1): the skin under a raised arm. parts: the two sides as a list."""
-    if kp is None:
-        return None
+def _small_face_gate(wf: float, rng) -> float:
+    """0..1: how much of a stage that needs a face of some size is worked: 0 below rng[0], 1 above rng[1]."""
+    if rng is None:
+        return 1.0
+    return float(_ss(float(rng[0]), float(rng[1]), np.array(float(wf))))
+
+
+def _skin_inner(m: np.ndarray, close_px: float, inset_px: float) -> np.ndarray:
+    """The body's skin area m (0..1) as a weight that is 0 outside it and keeps inset_px away from its outline (the arm's edge against the wall, cloth or hair), fading in over about the same distance.
+    A crack or a hole in the area narrower than 2 * close_px (a crease, a strand lying over the skin) is no outline: it is closed first. A frame's own border is no outline either."""
+    r_ = _roi(m, 2)
+    if r_ is None:
+        return np.zeros(m.shape, np.float32)
+    c_ = max(0, int(round(close_px)))
+    e_ = max(2, int(round(inset_px)))
+    pad = c_ + e_ + 3
+    y0, y1, x0, x1 = r_
+    y0, x0 = max(0, y0 - pad), max(0, x0 - pad)
+    y1, x1 = min(m.shape[0], y1 + pad), min(m.shape[1], x1 + pad)
+    core = (m[y0:y1, x0:x1] > 0.5).astype(np.uint8)
+    if c_ >= 1:
+        core = cv2.morphologyEx(core, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * c_ + 1, 2 * c_ + 1)))
+    core = cv2.erode(core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * e_ + 1, 2 * e_ + 1)))
+    soft = np.clip(cv2.GaussianBlur(core.astype(np.float32), (0, 0), max(1.0, 0.5 * e_)) * 1.25, 0, 1)
+    out = np.zeros(m.shape, np.float32)
+    out[y0:y1, x0:x1] = soft
+    return out
+
+
+def _close_soft(m: np.ndarray, r: int) -> np.ndarray:
+    """The mask m (0..1) with its holes and bays narrower than 2 r + 1 px closed (a grey-scale closing: the valleys of a soft mask are filled, nothing grows outward). m where r < 1."""
+    if r < 1:
+        return m
+    rr = _roi(m, r + 3)
+    if rr is None:
+        return m
+    y0, y1, x0, x1 = rr
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+    sub = np.ascontiguousarray(m[y0:y1, x0:x1], dtype=np.float32)
+    c = cv2.morphologyEx(sub, cv2.MORPH_CLOSE, k)
+    out = np.array(m, dtype=np.float32, copy=True)
+    out[y0:y1, x0:x1] = np.maximum(sub, c)
+    return out
+
+
+def _armpit_without_hair(ap: np.ndarray, tracker, t: int, p: int, rgb_u8: np.ndarray, shape, wf_p: float = 0.0) -> np.ndarray:
+    """The armpit skin ap (0..1) with this person's hair and garments taken out of it (ARMPIT_HAIR_REACH): hair is what the body parser calls hair, and clothes what it calls clothes or accessories
+    (ARMPIT_CLOTH_OUT; the same NOT_SKIN thresholds the body skin mask goes by), a garment is what the clothing / hair masks of the analysis call so. A share of the person's size round them goes too (the parser's edge is a few pixels
+    off at the picture's own size). ap itself where neither is known.
+    wf_p (the face width, proxy px) with ARMPIT_NEAR_CLOTH: the weight also falls with the distance from that hair / clothes / garment (1 within the first share of the face width, 0 beyond the second)."""
+    if ap is None:
+        return ap
+    reach_on = bool(ARMPIT_HAIR_REACH and ARMPIT_HAIR_REACH > 0)
+    prox_on = ARMPIT_NEAR_CLOTH is not None and float(wf_p) > 1.0
+    if not reach_on and not prox_on:
+        return ap
+    h, w = int(shape[0]), int(shape[1])
+    ns = None
+    size = None
+    try:
+        own, _o = BS.ownership(tracker, t, p, (w, h), others=False)
+        if own is not None and float(own.max()) > 0.3:
+            size = float(np.sqrt(max(1.0, float((own > 0.3).sum()))))
+            pr = BS._parse_cached(tracker, p, t, rgb_u8, own)
+            if pr is not None and "hair" in pr:
+                no_ = BS._place(pr, "hair", (h, w))
+                if ARMPIT_CLOTH_OUT and "cloth" in pr:
+                    no_ = np.maximum(no_, BS._place(pr, "cloth", (h, w)))
+                ns = BS._ss(BS.NOT_SKIN[0], BS.NOT_SKIN[1], no_)
+    except Exception:
+        ns = None
+    try:
+        g = BS.garments(tracker, t, p, (w, h))
+        if g is not None:
+            g = np.asarray(g, np.float32)
+            ns = g if ns is None else np.maximum(ns, g)
+    except Exception:
+        pass
+    if ns is None:
+        return ap
+    if size is None:
+        size = float(np.sqrt(max(1.0, float((ap > 0.3).sum())))) * 3.0
+    reach = max(2, int(round(ARMPIT_HAIR_REACH * size))) if reach_on else 0
+    pad = 3 * reach + 4
+    if prox_on:
+        pad = max(pad, int(float(ARMPIT_NEAR_CLOTH[1]) * float(wf_p)) + 8)
+    r = _roi(ap, pad)
+    if r is None:
+        return ap
+    y0, y1, x0, x1 = r
+    nz = np.ascontiguousarray(ns[y0:y1, x0:x1], dtype=np.float32)
+    if reach_on:
+        nz = cv2.dilate(nz, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * reach + 1, 2 * reach + 1)))
+        nz = np.clip(cv2.GaussianBlur(nz, (0, 0), max(1.0, 0.5 * reach)) * 1.25, 0, 1)
+    else:
+        nz = np.zeros_like(nz)
+    keep = 1.0 - nz
+    if prox_on:
+        nsr = ns[y0:y1, x0:x1] > 0.5
+        if bool(nsr.any()):                              # (nothing to measure from where no hair or clothes were found: no distance weight)
+            dist = cv2.distanceTransform((~nsr).astype(np.uint8), cv2.DIST_L2, 3)
+            keep = keep * (1.0 - _ss(float(ARMPIT_NEAR_CLOTH[0]) * float(wf_p), float(ARMPIT_NEAR_CLOTH[1]) * float(wf_p), dist)).astype(np.float32)
+    out = np.zeros_like(ap)
+    out[y0:y1, x0:x1] = ap[y0:y1, x0:x1] * keep
+    return out
+
+
+def _lines_budget(dY: np.ndarray, m: np.ndarray, wf: float):
+    """(map, log): how much of the armpit stage is kept (1 .. 0, at m's size) after its thin-line filler lifted dY, piece by piece of the mask m (ARMPIT_LINES_MAX): the creases of an armpit
+    are a handful of short lines; more lifted pixels in one armpit than that share of the face width squared is the finder reading texture (hair, seams, grain) and not creases.
+    Each armpit (each separate piece of the mask) is judged on its own: hair over one shoulder takes nothing from the crease of the other. map is None where every piece is kept
+    in full; log: [(lifted px, budget px, kept)] of the pieces that are not."""
+    if not ARMPIT_LINES_MAX or ARMPIT_LINES_MAX <= 0 or not wf > 1:
+        return None, []
+    r = _roi(m, 4)
+    if r is None:
+        return None, []
+    y0, y1, x0, x1 = r
+    n, lab = cv2.connectedComponents((m[y0:y1, x0:x1] > 0.05).astype(np.uint8), connectivity=8)
+    if n < 2:
+        return None, []
+    cnt = np.bincount(lab.ravel(), weights=(dY[y0:y1, x0:x1] > 0.01).ravel().astype(np.float64), minlength=n)
+    lm_ = float(ARMPIT_LINES_MAX)
+    if ARMPIT_LINES_MAX_BIG is not None and float(ARMPIT_LINES_MAX_BIG) > lm_:
+        # a close-up's armpit has real, long creases (c029, a face 390 px wide: 1700..2100 px lifted at f85..f90, 0.011..0.014 of the face width squared, the budget of a wide shot's 0.005 took the whole stage back
+        # for those frames and gave it again after them): the share grows with the face from the wide shot's to this one
+        lm_ = lm_ + (float(ARMPIT_LINES_MAX_BIG) - lm_) * float(_ss(float(ARMPIT_LINES_BIG_WF[0]), float(ARMPIT_LINES_BIG_WF[1]), np.array(float(wf))))
+    B = lm_ * float(wf) * float(wf)
+    keep = (1.0 - _ss(B, 2.5 * B, cnt.astype(np.float32))).astype(np.float32)
+    keep[0] = 1.0
+    if float(keep.min()) > 0.999:
+        return None, []
+    out = np.ones(m.shape, np.float32)
+    out[y0:y1, x0:x1] = keep[lab]
+    return out, [(int(cnt[i]), B, float(keep[i])) for i in range(1, n) if keep[i] <= 0.999]
+# 2611 IWALY c010 f0 (2026-11-22, user): the first version put the zone round the shoulder JOINT, and let it in only for a raised arm; the crease the
+# user marked lies 200 px under the joint, where the arm meets the chest (the elbow of that arm was 0.83 of the upper arm's length below the
+# shoulder: "hanging"). The armpit is under the joint, on the way down to the hip: ARMPIT_DOWN of the way from the shoulder joint to the hip of its
+# side, the zone's radius that share of that length. Whether there is an armpit to see is for the picture to say (armpit_skin: no skin in the zone, no
+# armpit), not the pose.
+ARMPIT_DOWN = 0.20    # the zone's centre: this share of the way from the shoulder joint to the hip (1.7 shoulder widths where the hip is not known)
+ARMPIT_REACH = 0.14   # its radius, of the shoulder-to-hip length
+
+
+def _armpit_points(kp: np.ndarray, sx: float, sy: float) -> np.ndarray:
+    """The joints that are believed (confidence > 0.2) in the proxy's px, the others NaN."""
     P = np.full((kp.shape[0], 2), np.nan)
     ok = np.isfinite(kp[:, :2]).all(1)
     if kp.shape[1] > 2:
         ok &= np.nan_to_num(kp[:, 2]) > 0.2
     P[ok] = kp[ok, :2] * [sx, sy]
+    return P
+
+
+def _armpit_axis(P: np.ndarray, side: int):
+    """(shoulder, axis, shoulder width, tip) of one side (0 = left, 1 = right): the shoulder joint; the axis from it to the hip (where the hip is not under it, 1.7 shoulder widths straight down the body); the shoulder width
+    the zone goes by (the distance of the two shoulders; with only one of them in the picture ARMPIT_ONE_SHOULDER_SW times its upper arm); the elbow (else the wrist). None where the side has no zone."""
+    sh, el, wr, hp_i = ((S.L_SH, S.L_EL, S.L_WR, S.L_HIP), (S.R_SH, S.R_EL, S.R_WR, S.R_HIP))[side]
     ls, rs = P[S.L_SH], P[S.R_SH]
-    if not (np.isfinite(ls).all() and np.isfinite(rs).all()):
+    s_ = P[sh]
+    if not np.isfinite(s_).all():
         return None
-    sw = float(np.hypot(*(ls - rs)))
+    tip = P[el] if np.isfinite(P[el]).all() else (P[wr] if np.isfinite(P[wr]).all() else None)
+    both = bool(np.isfinite(ls).all() and np.isfinite(rs).all())
+    if both:
+        sw = float(np.hypot(*(ls - rs)))
+    else:
+        if not ARMPIT_ONE_SHOULDER or tip is None:
+            return None
+        sw = float(ARMPIT_ONE_SHOULDER_SW) * float(np.hypot(*(tip - s_)))
     if sw < 8:
         return None
+    d = None
+    if np.isfinite(P[hp_i]).all():
+        d = P[hp_i] - s_
+        if float(np.hypot(*d)) < 0.8 * sw:
+            d = None                                    # a hip that is not under its shoulder: not believed
+    if d is None:
+        if both:
+            nv = np.array([-(ls - rs)[1], (ls - rs)[0]], np.float64)
+            nv = nv / max(float(np.hypot(*nv)), 1e-6)
+            if nv[1] < 0:
+                nv = -nv
+        else:
+            nv = np.array([0.0, 1.0])
+        d = nv * 1.7 * sw
+    return s_, d, sw, tip
+
+
+def armpit_open_weights(st, p: int, t: int, sx: float, sy: float, rng, span: int = 2):
+    """[left, right]: how open each armpit is (0..1, ARMPIT_OPEN): the angle between the upper arm (shoulder to elbow, else to wrist) and the torso's axis (shoulder to hip), the median over the frames
+    t - span .. t + span of the same shot, 0 at rng[0] and under, 1 at rng[1] and over. An arm whose angle is not known (no elbow, no shoulder) is 0."""
+    N = st.final.shape[1]
+    seg = [s for s in range(max(0, t - span), min(N, t + span + 1)) if bool(st.present[p, s]) and (s == t or st.connected(s, t))]
+    if t not in seg:
+        seg.append(t)
+    angs = ([], [])
+    for s in seg:
+        P = _armpit_points(st.final[p, s], sx, sy)
+        for side in (0, 1):
+            a_ = _armpit_axis(P, side)
+            if a_ is None or a_[3] is None:
+                continue
+            s_, d, _sw, tip = a_
+            dd = tip - s_
+            nn, nd = float(np.hypot(*dd)), float(np.hypot(*d))
+            if nn < 1e-3 or nd < 1e-3:
+                continue
+            angs[side].append(float(np.degrees(np.arccos(np.clip(float(dd @ d) / (nn * nd), -1.0, 1.0)))))
     out = []
-    for sh, el in ((S.L_SH, S.L_EL), (S.R_SH, S.R_EL)):
+    for side in (0, 1):
+        if not angs[side]:
+            out.append(0.0)
+        else:
+            out.append(float(_ss(float(rng[0]), float(rng[1]), np.array(float(np.median(angs[side]))))))
+    return out
+
+
+def armpit_hold_axes(st, p: int, t: int, sx: float, sy: float, info, wts, span: int = 2):
+    """The armpit zones whose arm hangs (ARMPIT_LINE_HANG): [(the upper arm's angle from the picture's vertical in degrees (+ = the elbow on the picture's right), weight 0..1, zone centre x, y, zone radius)] in proxy px,
+    one per zone of info (side, centre, radius, shoulder width) that is open (wts, ARMPIT_OPEN) and whose arm hangs. The arm's direction is the median over the frames t - span .. t + span of the same shot.
+    The weight is the largest of the frames t - ARMPIT_LINE_GSPAN .. t + ARMPIT_LINE_GSPAN (each with the median of its own span), see ARMPIT_LINE_GSPAN."""
+    N = st.final.shape[1]
+    gsp = int(max(0, int(ARMPIT_LINE_GSPAN)))
+    frames = [s for s in range(max(0, t - span - gsp), min(N, t + span + gsp + 1)) if bool(st.present[p, s]) and (s == t or st.connected(s, t))]
+    if t not in frames:
+        frames.append(t)
+        frames.sort()
+    dirs_at = {}
+    for s in frames:
+        P = _armpit_points(st.final[p, s], sx, sy)
+        one = [None, None]
+        for side in (0, 1):
+            a_ = _armpit_axis(P, side)
+            if a_ is None or a_[3] is None:
+                continue
+            dd = a_[3] - a_[0]
+            nn = float(np.hypot(*dd))
+            if not np.isfinite(nn) or nn < 1e-3:
+                continue
+            one[side] = dd / nn
+        dirs_at[s] = one
+
+    def med_dir(c: int, side: int):
+        ds = [dirs_at[s][side] for s in frames if abs(s - c) <= span and dirs_at[s][side] is not None]
+        if not ds:
+            return None
+        v_ = np.median(np.array(ds), axis=0)
+        nv_ = float(np.hypot(*v_))
+        return None if (not np.isfinite(nv_) or nv_ < 1e-3) else v_ / nv_
+
+    def hang(v_) -> float:
+        return 1.0 - float(_ss(float(ARMPIT_LINE_HANG[0]), float(ARMPIT_LINE_HANG[1]), np.array(float(np.degrees(np.arccos(np.clip(float(v_[1]), -1.0, 1.0)))))))
+
+    out = []
+    for (side, c, rad, _sw) in info:
+        if wts is not None and (side >= len(wts) or wts[side] <= 1e-3):
+            continue
+        v = med_dir(t, side)
+        if v is None:
+            continue
+        g = hang(v)
+        for c2 in frames:
+            if c2 == t or abs(c2 - t) > gsp:
+                continue
+            v2 = med_dir(c2, side)
+            if v2 is not None:
+                g = max(g, hang(v2))
+        if g <= 1e-3:
+            continue
+        out.append((float(np.degrees(np.arctan2(float(v[0]), float(v[1])))), g, float(c[0]), float(c[1]), float(rad)))
+    return out
+
+
+def armpit_region(kp: np.ndarray, shape, sx: float, sy: float, parts: bool = False, info: Optional[list] = None):
+    """The skin under the arms (0..1): a zone under each shoulder joint, on the way to the hip. parts: the two sides as a list (a side without a zone is zeros).
+    info: a list that gets (side, centre, radius, shoulder width) of every zone made (proxy px)."""
+    if kp is None:
+        return None
+    P = _armpit_points(kp, sx, sy)
+    out = []
+    n_ok = 0
+    for side in (0, 1):
+        a_ = _armpit_axis(P, side)
+        if a_ is None:
+            if parts:
+                out.append(np.zeros(shape, np.float32))
+            continue
+        s_, d, sw, tip = a_
+        if ARMPIT_RAISE is not None:
+            el = S.L_EL if side == 0 else S.R_EL
+            if tip is None:
+                if parts:
+                    out.append(np.zeros(shape, np.float32))
+                continue
+            dd = tip - s_
+            nn = float(np.hypot(*dd))
+            if nn < 1e-3 or float(dd[1]) / nn >= (ARMPIT_RAISE if np.isfinite(P[el]).all() else ARMPIT_RAISE - 0.25):
+                if parts:
+                    out.append(np.zeros(shape, np.float32))
+                continue
+        n = float(np.hypot(*d))
+        c = s_ + ARMPIT_DOWN * d
         m = np.zeros(shape, np.uint8)
-        c = P[sh].copy()
-        if np.isfinite(P[el]).all():
-            d = P[el] - P[sh]
-            n = float(np.hypot(*d))
-            if n > 1e-3:
-                c = c + d / n * min(n, ARMPIT_ALONG * sw)
-        cv2.circle(m, (int(round(c[0])), int(round(c[1]))), max(1, int(round(ARMPIT_R * sw))), 255, -1, cv2.LINE_AA)
-        out.append(_feather(m, 0.06 * sw))
-    return out if parts else np.maximum(out[0], out[1])
+        rad = max(2, int(round(ARMPIT_REACH * n)))
+        if ARMPIT_RADIAL is not None:
+            # the weight falls from 1 at lo to 0 at hi times the radius: a disc of the middle radius, feathered over the width between them
+            lo_, hi_ = float(ARMPIT_RADIAL[0]), float(ARMPIT_RADIAL[1])
+            cv2.circle(m, (int(round(c[0])), int(round(c[1]))), max(2, int(round(0.5 * (lo_ + hi_) * rad))), 255, -1, cv2.LINE_AA)
+            sig = max(1.0, (hi_ - lo_) * rad / 3.0)
+        else:
+            cv2.circle(m, (int(round(c[0])), int(round(c[1]))), rad, 255, -1, cv2.LINE_AA)
+            sig = max(0.06 * sw, 0.10 * rad)
+        out.append(_feather(m, sig))
+        n_ok += 1
+        if info is not None:
+            info.append((side, (float(c[0]), float(c[1])), float(rad), float(sw)))
+    if not n_ok or not out:
+        return [] if parts else None
+    return out if parts else np.maximum.reduce(out)
 
 
 def armpit_skin(rgb_u8: np.ndarray, zone: np.ndarray, alpha: Optional[np.ndarray], prob: np.ndarray) -> Optional[np.ndarray]:
@@ -2298,7 +2670,26 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 state["armpit"] = None
                 try:
                     kpa, _wa = _steady_body(st, p, t)
-                    zones = armpit_region(kpa, shape, px.sx, px.sy, parts=True)
+                    zinfo_ = []
+                    zones = armpit_region(kpa, shape, px.sx, px.sy, parts=True, info=zinfo_)
+                    # only the armpits that are open (ARMPIT_OPEN): the arm held away from the body. Closed, there is no fold to take out
+                    wts_ = None
+                    if zones and ARMPIT_OPEN is not None:
+                        wts_ = armpit_open_weights(st, p, t, px.sx, px.sy, ARMPIT_OPEN, int(ARMPIT_OPEN_SPAN))
+                    try:
+                        import os as _os_dbg
+                        if _os_dbg.environ.get("IWALY_ARMPIT_DEBUG"):
+                            print("ARMPIT zones t=%d pid=%d: open weights %s, zones (side, centre, radius, shoulder width) %s" % (
+                                t, int(person.id), None if wts_ is None else [round(x, 2) for x in wts_], [(i_[0], (round(i_[1][0]), round(i_[1][1])), round(i_[2]), round(i_[3])) for i_ in zinfo_]), flush=True)
+                    except Exception:
+                        pass
+                    if zones and ARMPIT_LINE_HOLD > 1e-4:
+                        # the hanging arms among the open ones: their own line is left as it is (ARMPIT_LINE_HOLD)
+                        try:
+                            job.arm_axes = armpit_hold_axes(st, p, t, px.sx, px.sy, zinfo_, wts_, int(ARMPIT_OPEN_SPAN)) or None
+                        except Exception:
+                            import traceback
+                            traceback.print_exc()
                     if zones:
                         b_ = base()
                         ap = None
@@ -2324,16 +2715,42 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                                 al_ = ma_ if al_ is None else np.maximum(al_, ma_)
                         except Exception:
                             pass
-                        for zone in zones:
+                        for zi_, zone in enumerate(zones):
+                            if wts_ is not None and (zi_ >= len(wts_) or wts_[zi_] <= 1e-3):
+                                continue
                             a1 = armpit_skin(b_["rgb"], zone, al_, b_["prob"])
                             if a1 is not None:
+                                if wts_ is not None:
+                                    a1 = (a1 * np.float32(wts_[zi_])).astype(np.float32)
                                 ap = a1 if ap is None else np.maximum(ap, a1)
                         if ap is not None:
                             state["armpit"] = (ap * float(min(1.0, ARMPIT))).astype(np.float32)
+                            # a person whose face is not in the picture: the stage's size reference from its zone (source px)
+                            try:
+                                rs_ = [zi[2] for zi_i, zi in enumerate(zinfo_) if wts_ is None or wts_[zi[0]] > 1e-3]
+                                if rs_ and px.sx > 0:
+                                    job.wf_arm = float(ARMPIT_FACE_PER_RADIUS) * max(rs_) / float(px.sx)
+                            except Exception:
+                                pass
                 except Exception:
                     import traceback
                     traceback.print_exc()
             return state["armpit"]
+
+        def armpit_fold():
+            """The armpit skin the fold stage works on: armpit() without this person's hair and garments (ARMPIT_HAIR_REACH), or None."""
+            ap0 = armpit()
+            if ap0 is None:
+                return None
+            if "armpit_fold" not in state:
+                state["armpit_fold"] = ap0
+                try:
+                    wfp_ = (float(job.wf_src) if job.wf_src > 0 else float(job.wf_arm)) * float(px.sx)
+                    state["armpit_fold"] = _armpit_without_hair(ap0, tracker, t, p, base()["rgb"], shape, wfp_)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+            return state["armpit_fold"]
 
         tone_on = any(abs(v.get(k, 0)) > 1e-4 for k in ("skin_bright", "skin_warm", "skin_sat", "grain", "redness"))
         if tone_on:
@@ -2362,6 +2779,13 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             if m.max() > 0.01:
                 job.skin = sj
                 job.masks["skin"] = m
+            if arm_on and ARMPIT_FOLD > 1e-4:
+                try:
+                    ap2_ = armpit_fold()
+                    if ap2_ is not None and float(ap2_.max()) > 0.05:
+                        job.masks["armpit"] = ap2_
+                except Exception:
+                    pass
         if v.get("blemish", 0) > 1e-4 or v.get("shine", 0) > 1e-4:
             def mk_skinx():
                 b = base()
@@ -2783,11 +3207,259 @@ FOLD_LEVEL = 1.25          # 2611 cut 024 again (2026-11-18): at 강하게 the s
                            # dimple at the mouth corner (2611 cut 011) that left a dark notch, so lips and nostrils
                            # are kept out of the reference and the band fades out well before them.
 FOLD_LEVEL_SIG = (0.008, 0.12)  # fine .. broad scale kept (share of the face width)
-FOLD_LEVEL_CAP = (0.08, 0.03)   # most lift / most darkening (0..1 luma)
+FOLD_LEVEL_CAP = (0.08, 0.008)  # most lift / most darkening (0..1 luma). 2611 IWALY c001 (2026-11-22, user): on a profile the fold's band
+                                # runs over the cheek and the jaw, and evening out the middle scale pressed the cheek's soft highlight down by
+                                # up to 1.7 % (0.03 here): the cheek looked darker. A fold is only ever lightened; the little darkening left
+                                # is what keeps a dimple's edge from standing out
 FOLD_LEVEL_EXCL = (0.08, 0.04)  # the band fades out this far from the lips and nostrils (dilation, blur; face width)
 FOLD_LEVEL_EDGE = (0.02, 0.03)  # the same round hair strands and sharp edges in the band
+# 2611 IWALY c029 f96, c010 f0 (2026-11-22, user, 팔자주름이 보정이 안 됨): on a young face the fold from the nose wing to the mouth corner is a soft step in
+# the cheek's shading, 1 to 3 % deep: the fold's steps above (the valley fill, the closing, the evening of the middle scale) took 0.5 to 1 % of it (the
+# middle scale's lift capped at 0.8 %, faded out over a tenth of the face round the nose and the lips, and round every edge). The nasolabial fold's own
+# values, over the general ones (the mouth lines keep theirs): a stronger share of the broad steps, the evening's cap raised, the fades shorter.
+# None = the general values for the nasolabial fold too.
+NASO_FOLD = {"broad": 1.1, "broad_cap": 0.08, "level": 1.7, "excl": (0.05, 0.02), "edge": (0.012, 0.02), "cap": (0.10, 0.004)}
 NECK_LEVEL = 1.25          # the same on the neck (cut 024: the rings and the broad band across the neck stayed)
 NECK_LEVEL_SIG = (0.008, 0.10)
+NECK_LEVEL_CAP = (0.08, 0.008)   # the neck's own cap of the evening (the nasolabial fold's is raised above: the neck keeps this)
+
+# 2611 IWALY c029 (2026-11-22, user, 00:01:50:19): a black sleeve cuff under the chin lay inside the neck's mask (the colour model
+# and the steadied masks let dark brown through) and the neck stages lifted it by a quarter of its own brightness, in the shape of the
+# mask's straight edge. The neck stages now go by the picture too: where it is far darker than the skin the mask covers, they stop.
+NECK_CLOTH_GATE = (0.36, 0.55)    # of the neck's own skin brightness (a high percentile of the picture under its mask): the stages fade out
+                                  # between these. A neck in shade is 0.6 to 0.9 of its lit side, black cloth and hair under 0.45. None = off
+NECK_CLOTH_Q = 75.0
+
+
+def _skin_level(Y: np.ndarray, m: np.ndarray, q: float = NECK_CLOTH_Q) -> float:
+    """The skin's brightness under m (0..1): a high percentile of Y where m is above a half; 0 where there is too little of it to say."""
+    r = _roi(m, 6)
+    if r is None:
+        return 0.0
+    y0, y1, x0, x1 = r
+    sel = m[y0:y1, x0:x1] > 0.5
+    if int(sel.sum()) < 40:
+        return 0.0
+    return float(np.percentile(cv2.GaussianBlur(Y[y0:y1, x0:x1].astype(np.float32), (0, 0), 1.2)[sel], q))
+
+
+def _skin_gate(Y: np.ndarray, m: np.ndarray, lo: float, hi: float, q: float = NECK_CLOTH_Q, ref_min: float = 0.0) -> Optional[np.ndarray]:
+    """0..1 at Y's size: 0 where Y is far darker than the skin that m covers (a sleeve, hair, a dark top), 1 on the skin itself and
+    wherever m has nothing. The skin's level is a high percentile of Y under the mask, so a mask that is half cloth still finds it.
+    ref_min: the level is at least this (the person's own face when m may be all cloth)."""
+    r = _roi(m, 6)
+    if r is None:
+        return None
+    y0, y1, x0, x1 = r
+    sel = m[y0:y1, x0:x1] > 0.5
+    if int(sel.sum()) < 40:
+        return None
+    Ys = cv2.GaussianBlur(Y[y0:y1, x0:x1].astype(np.float32), (0, 0), 1.2)
+    ref = max(float(np.percentile(Ys[sel], q)), float(ref_min))
+    if ref < 0.02:
+        return None
+    out = np.ones(Y.shape, np.float32)
+    out[y0:y1, x0:x1] = _ss(lo * ref, hi * ref, Ys)
+    return out
+
+
+# 2611 IWALY c029 (2026-11-22, user, 00:01:50:19, "mask error" at the black sleeve cuff under the chin) - the skin smoothing itself. Its bands are taken
+# down by a factor wherever the mask reaches, and a black cuff against skin is a step as big as the skin's own brightness, with a soft edge (an out of
+# focus cuff: 25 px from black to skin): the bands of the edge are taken down too, which blurs it (a lighter line along the black's edge, a darker band on
+# the skin beside it, +2.2 % and -2.6 % of the brightness), and the mask (soft edged, steadied through time) reaches ten pixels into the cloth. Now,
+# outside the face's outline (the face is held by its own maps and kept as it was), beside cloth and hair:
+#  - the cloth's CORE is found by the picture (darker than the middle of SKIN_CLOTH_GATE of the skin's own brightness, wider than a few pixels: a strand
+#    or a chain is not cloth), and the edge's RAMP: what lies within SKIN_CLOTH_REACH of the core and is darker than SKIN_CLOTH_RAMP of the skin's level beside it
+#  - the smoothing is faded out there (zone, soft edged), and
+#  - its input has the zone replaced by the skin's own level taken from the skin beside it (a blur weighted by what is not in the zone), faded in the same
+#    way, so that there is no step or ramp for the bands to take down; what comes out is added to the picture as it was (the cloth keeps its own pixels).
+# None = off
+SKIN_CLOTH_GATE = (0.20, 0.38)    # of the skin's own brightness (a high percentile of the picture under the mask): the cloth's core is darker than the middle of these
+SKIN_CLOTH_REACH = 0.016          # of the picture's height (35 px at 2160): how far from the core the ramp is looked for
+SKIN_CLOTH_RAMP = 0.90            # the ramp: darker than this much of the skin's level beside the cloth
+SKIN_CLOTH_THIN = 0.004           # of the face's width: cloth that is not wider than this (twice) is a strand or a chain, not cloth
+SKIN_CLOTH_SOFT = 0.004           # of the picture's height: the fade of the zone's edge
+SKIN_CLOTH_FILL = 0.01            # of the picture's height: the reach of the fill
+
+
+def _cloth_zone(Y: np.ndarray, m: np.ndarray, wf: float) -> Optional[np.ndarray]:
+    """0..1 at Y's size: 1 on the cloth (or hair) beside the skin m covers and on the ramp of its edge, soft edged, 0 on the skin; None where there is none"""
+    r = _roi(m, 6)
+    if r is None:
+        return None
+    y0, y1, x0, x1 = r
+    sel = m[y0:y1, x0:x1] > 0.5
+    if int(sel.sum()) < 40:
+        return None
+    ref = float(np.percentile(cv2.GaussianBlur(Y[y0:y1, x0:x1].astype(np.float32), (0, 0), 1.2)[sel], NECK_CLOTH_Q))
+    if ref < 0.02:
+        return None
+    hh = Y.shape[0]
+    reach = max(6, int(round(SKIN_CLOTH_REACH * hh)))
+    sg = max(2.0, SKIN_CLOTH_SOFT * hh)
+    pad = reach + int(3 * sg) + 4
+    w0, w1 = max(0, y0 - pad), min(Y.shape[0], y1 + pad)
+    v0, v1 = max(0, x0 - pad), min(Y.shape[1], x1 + pad)
+    Ys = cv2.GaussianBlur(Y[w0:w1, v0:v1].astype(np.float32), (0, 0), 1.2)
+    core = Ys < 0.5 * (SKIN_CLOTH_GATE[0] + SKIN_CLOTH_GATE[1]) * ref
+    kt = max(1, int(round(SKIN_CLOTH_THIN * wf)))
+    if kt > 1:
+        core = cv2.morphologyEx(core.astype(np.uint8), cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * kt + 1, 2 * kt + 1))) > 0
+    if not core.any():
+        return None
+    dist = cv2.distanceTransform((~core).astype(np.uint8), cv2.DIST_L2, 3)
+    lit = _ss(0.80 * ref, 0.97 * ref, Ys)
+    sl = max(8.0, 0.02 * hh)
+    lvl = (cv2.GaussianBlur(Ys * lit, (0, 0), sl) + 0.02 * ref) / (cv2.GaussianBlur(lit, (0, 0), sl) + 0.02)     # the skin's level beside the cloth
+    zone = (core | ((dist <= reach) & (Ys < SKIN_CLOTH_RAMP * lvl))).astype(np.float32)
+    out = np.zeros(Y.shape, np.float32)
+    out[w0:w1, v0:v1] = np.clip(2.0 * cv2.GaussianBlur(zone, (0, 0), sg), 0.0, 1.0)
+    return out
+
+
+def _cloth_input(I: np.ndarray, dk: np.ndarray) -> np.ndarray:
+    """I with the cloth's zone dk replaced by the level of the skin beside it (a blur of I weighted by what is not in the zone), by dk. I itself where there is no zone."""
+    bad = dk > 0.01
+    ys = np.flatnonzero(bad.any(1))
+    if not len(ys):
+        return I
+    xs = np.flatnonzero(bad.any(0))
+    s = max(6.0, SKIN_CLOTH_FILL * I.shape[0])
+    pad = int(3 * s) + 3
+    y0, y1 = max(0, int(ys[0]) - pad), min(I.shape[0], int(ys[-1]) + pad + 1)
+    x0, x1 = max(0, int(xs[0]) - pad), min(I.shape[1], int(xs[-1]) + pad + 1)
+    Ic = I[y0:y1, x0:x1].astype(np.float32)
+    dc = dk[y0:y1, x0:x1].astype(np.float32)
+    w = (1.0 - dc) ** 3
+    num = cv2.GaussianBlur(Ic * w, (0, 0), s)
+    den = cv2.GaussianBlur(w, (0, 0), s)
+    fill = np.where(den > 1e-3, num / np.maximum(den, 1e-3), Ic)
+    out = I.astype(np.float32, copy=True)
+    out[y0:y1, x0:x1] = (1.0 - dc) * Ic + dc * fill
+    return out
+
+
+# 2611 IWALY c001 (2026-11-22, user, 00:00:31:14, the green ellipse on the cheek: "it gets darker"). On a face turned to a profile or three quarters the landmarks' outline of the face
+# (jaw line, forehead arc) lies out over the hair beside the cheek, and the cloth zone above was kept out of that outline: the hair's edge (hair 0.11, skin 0.35..0.5 of the picture's
+# brightness, a step of the skin's own size) reached the skin smoothing as it is, whose bands are taken down across it: a band of skin along the hair, 10 to 20 px wide, came out 1.5 %
+# darker (and the hair's edge softer). Now the zone is kept inside the outline too wherever the exterior (hair, the background, cloth: what the exclusion holds that is not a feature,
+# and not wider than a strand or a brow: SKIN_CLOTH_EXT) is near, which is as far as the zone itself reaches (the core's ramp and its fade). Away from the exterior nothing changes: a
+# dark thing inside the face (a brow, an eye, a nostril, a mole) is no cloth. False = the zone stops at the outline as before.
+SKIN_CLOTH_INFACE = True
+SKIN_CLOTH_EXT = 0.10        # of the face width: the exterior is what is wider than this (a brow is not: it is thinner; hair, the background and cloth are wider)
+
+
+def _exterior_near(exY: Optional[np.ndarray], lm: Optional[np.ndarray], shape, y_per_src: float, wf: float, m: np.ndarray, near: float, soft: float) -> Optional[np.ndarray]:
+    """0..1 at `shape`: 1 within `near` px of the face's exterior (hair, the background, cloth: what the exclusion exY holds that is not a feature (feature_exclusion), wider than
+    SKIN_CLOTH_EXT of the face width), fading out over `soft` px beyond it; 0 elsewhere. Worked out round the skin mask m only. None where there is no exterior near it (or it cannot be made)."""
+    if exY is None or lm is None:
+        return None
+    try:
+        r = _roi(m, int(near + soft) + 6)
+        if r is None:
+            return None
+        y0, y1, x0, x1 = r
+        lmc = np.array(lm, np.float32, copy=True)
+        if not np.isfinite(lmc[:, :2]).all():
+            return None
+        lmc[:, :2] = lmc[:, :2] * float(y_per_src) - np.array([x0, y0], np.float32)
+        fx = feature_exclusion(lmc, (y1 - y0, x1 - x0))
+        nonf = np.clip(np.clip(exY[y0:y1, x0:x1].astype(np.float32), 0, 1) - fx, 0.0, 1.0)
+        ext = (nonf > 0.5).astype(np.uint8)
+        ko = max(3, int(round(SKIN_CLOTH_EXT * wf)) | 1)
+        ext = cv2.morphologyEx(ext, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ko, ko)))
+        if not bool(ext.any()):
+            return None
+        d = cv2.distanceTransform((1 - ext).astype(np.uint8), cv2.DIST_L2, 3)
+        out = np.zeros(shape[:2], np.float32)
+        out[y0:y1, x0:x1] = 1.0 - _ss(float(near), float(near) + float(soft), d)
+        return out
+    except Exception:
+        return None
+
+
+# 2611 IWALY c003, c010 (2026-11-22, user, 00:00:39:17 and 00:00:58:12): "the retouch of the neck is too strong, the neck's bones cannot be seen".
+# The neck lines' broad steps (the flattening of the soft folds, the ring filling, the levelling, the found folds) work on the middle scale, and the
+# neck's own build (the tendons, the collarbone, the hollow between them, the shadow under the chin) is middle scale too: on a small neck they took
+# 1.5 to 3.5 % of the picture's brightness out of it (the structure's own contrast is 3 to 8 %), under a jaw in shade up to 9 %. Now
+#  - these steps change a place only where the structure there lies ACROSS the neck, as the rings do (its brightness changes along the neck's axis):
+#    the tendons run along it, a hollow or a bone's relief has no one direction, and both are left as they are (NECK_ACROSS: the cosine between the
+#    neck's axis and the direction the brightness changes most in, from where .. in full; NECK_ACROSS_COH: the same for how one-directional the
+#    structure is). None = off
+#  - the whole of the neck lines' change of a pixel is capped (NECK_CAP: most lighter, most darker; luma 0..1), softly: a crease is 1 to 3 % deep
+NECK_ACROSS = (0.45, 0.80)
+NECK_ACROSS_COH = (0.20, 0.50)
+NECK_CAP = (0.015, 0.006)
+# ... and (2026-11-22, the same review, after the first fix: c010's neck still moved by up to 1.8 % and the shadow under the chin was lifted by 3 to 6 %):
+#  - the broad steps are made at half of their value (NECK_BROAD): a neck of a young person has no soft rings to take out, and what the broad steps
+#    find on it is its own modelling (the hollow above the collarbone, the shadow the chin throws). The thin creases are filled in full.
+#  - the broad steps fade in below the jaw (NECK_UNDER_CHIN: from this distance from the jaw line to this one, in face widths; None = off): the
+#    underside of a raised chin is a broad shadow, not a fold
+NECK_BROAD = 0.5
+NECK_UNDER_CHIN = (0.05, 0.30)
+
+
+def jaw_under(lm: Optional[np.ndarray], shape, scale: float, wf: float, reach) -> Optional[np.ndarray]:
+    """0 on the jaw line, 1 at reach[1] face widths from it (smooth in between; reach[0] is where it starts to rise): what is only to be changed
+    away from the jaw. lm in source px, scale = px of `shape` per source px, wf in px of `shape`."""
+    if lm is None or not np.isfinite(lm[2:15, :2]).all():
+        return None
+
+    def make():
+        pts = np.round(lm[2:15, :2] * scale).astype(np.int32)
+        far = reach[1] * wf
+        x0, y0, x1, y1 = _window(shape, pts, far + 6)
+        out = np.ones(shape[:2], np.float32)
+        if x1 <= x0 or y1 <= y0:
+            return out
+        m = np.zeros((y1 - y0, x1 - x0), np.uint8)
+        cv2.polylines(m, [pts - np.array([x0, y0], np.int32)], False, 255, 1, cv2.LINE_AA)
+        d = cv2.distanceTransform((m < 128).astype(np.uint8), cv2.DIST_L2, 3)
+        out[y0:y1, x0:x1] = _ss(reach[0] * wf, reach[1] * wf, d).astype(np.float32)
+        return out
+    return _cached("jawunder_%.3f_%.3f" % (reach[0], reach[1]), lm, shape, scale, wf, make)
+
+
+def _across_weight(Y: np.ndarray, m: np.ndarray, axis, wf: float) -> Optional[np.ndarray]:
+    """0..1 at Y's size: where the structure of Y under the mask m (the neck) lies across the neck's axis (its brightness changes most along the axis, and
+    in one direction), 1 outside the mask's region. None where there is no axis or no mask."""
+    if axis is None:
+        return None
+    r = _roi(m, int(0.12 * wf) + 6)
+    if r is None:
+        return None
+    y0, y1, x0, x1 = r
+    roi = Y[y0:y1, x0:x1].astype(np.float32)
+    s = max(1.0, 0.012 * wf)
+    Ys = cv2.GaussianBlur(roi, (0, 0), s)
+    gx = cv2.Sobel(Ys, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(Ys, cv2.CV_32F, 0, 1, ksize=3)
+    sg = max(2.0, 0.06 * wf)
+    jxx = cv2.GaussianBlur(gx * gx, (0, 0), sg)
+    jyy = cv2.GaussianBlur(gy * gy, (0, 0), sg)
+    jxy = cv2.GaussianBlur(gx * gy, (0, 0), sg)
+    coh = np.sqrt((jxx - jyy) ** 2 + 4.0 * jxy * jxy) / (jxx + jyy + 1e-9)
+    th = 0.5 * np.arctan2(2.0 * jxy, jxx - jyy)                      # the direction the brightness changes most in
+    c = np.abs(np.cos(th) * float(axis[0]) + np.sin(th) * float(axis[1]))
+    out = np.ones(Y.shape, np.float32)
+    out[y0:y1, x0:x1] = (_ss(NECK_ACROSS[0], NECK_ACROSS[1], c) * _ss(NECK_ACROSS_COH[0], NECK_ACROSS_COH[1], coh)).astype(np.float32)
+    return out
+
+
+def _cap_change(Y0: np.ndarray, Y1: np.ndarray, m: np.ndarray, cap) -> np.ndarray:
+    """Y1 with its change against Y0 capped softly (most lighter cap[0], most darker cap[1]) inside the region of the mask m: small changes pass as they are,
+    large ones are pressed towards the cap (c * (1 - exp(-d / c)))."""
+    r = _roi(m, 6)
+    if r is None:
+        return Y1
+    y0, y1, x0, x1 = r
+    a = Y0[y0:y1, x0:x1].astype(np.float32)
+    d = Y1[y0:y1, x0:x1].astype(np.float32) - a
+    up, dn = max(float(cap[0]), 1e-4), max(float(cap[1]), 1e-4)
+    dc = np.where(d > 0, up * (1.0 - np.exp(-np.maximum(d, 0.0) / up)), -dn * (1.0 - np.exp(-np.maximum(-d, 0.0) / dn))).astype(np.float32)
+    out = Y1.astype(np.float32, copy=True)
+    out[y0:y1, x0:x1] = a + dc
+    return out
 
 
 def _masked_blur(Y: np.ndarray, w: np.ndarray, sx: float, sy: float) -> np.ndarray:
@@ -2796,16 +3468,17 @@ def _masked_blur(Y: np.ndarray, w: np.ndarray, sx: float, sy: float) -> np.ndarr
     return np.where(den > 1e-3, num / np.maximum(den, 1e-3), Y).astype(np.float32)
 
 
-def _even_mid(roi: np.ndarray, w: np.ndarray, wf: float, sig) -> np.ndarray:
+def _even_mid(roi: np.ndarray, w: np.ndarray, wf: float, sig, cap=None) -> np.ndarray:
     """What evens out the middle scale of roi: the broad level minus the level at the fine scale (both measured on
-    w only), capped."""
+    w only), capped (cap = (most lift, most darkening); default FOLD_LEVEL_CAP)."""
+    cp = FOLD_LEVEL_CAP if cap is None else cap
     mid = _masked_blur(roi, w, sig[0] * wf, sig[0] * wf)
     low = _masked_blur(roi, w, sig[1] * wf, sig[1] * wf)
-    return np.clip(low - mid, -FOLD_LEVEL_CAP[1], FOLD_LEVEL_CAP[0])
+    return np.clip(low - mid, -cp[1], cp[0])
 
 
 def _fold_level(Y: np.ndarray, band: np.ndarray, skin: np.ndarray, excl: Optional[np.ndarray], wf: float,
-                k: float, edges: Optional[np.ndarray] = None) -> np.ndarray:
+                k: float, edges: Optional[np.ndarray] = None, fade_excl=None, fade_edge=None, cap=None) -> np.ndarray:
     """Even out a fold's soft shading inside its band (luma): the fold's own scale goes, the face's broad modelling
     and the skin's fine texture stay. Lips, nostrils and eyes (excl) are out of the reference, and the band fades
     out before them."""
@@ -2822,19 +3495,21 @@ def _fold_level(Y: np.ndarray, band: np.ndarray, skin: np.ndarray, excl: Optiona
         e = np.clip(excl[y0:y1, x0:x1].astype(np.float32), 0, 1)
         d_ = max(3, int(0.03 * wf) | 1)
         w = w * (1.0 - cv2.dilate(e, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d_, d_))))
-        d2 = max(3, int(FOLD_LEVEL_EXCL[0] * wf) | 1)
+        fx_ = FOLD_LEVEL_EXCL if fade_excl is None else fade_excl
+        d2 = max(3, int(fx_[0] * wf) | 1)
         e2 = cv2.dilate(e, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d2, d2)))
-        b = b * (1.0 - np.clip(cv2.GaussianBlur(e2, (0, 0), max(1.0, FOLD_LEVEL_EXCL[1] * wf)), 0, 1))
+        b = b * (1.0 - np.clip(cv2.GaussianBlur(e2, (0, 0), max(1.0, fx_[1] * wf)), 0, 1))
     if edges is not None:
         # a strand of hair or a sharp edge in the band is left as it is, and the skin round it is evened less the
         # nearer it is: lifted right up to it, a dark strand stood out as a notch (2611 cut 011)
         h = np.clip(edges[y0:y1, x0:x1].astype(np.float32), 0, 1)
         w = w * (1.0 - h)
-        d3 = max(3, int(FOLD_LEVEL_EDGE[0] * wf) | 1)
+        fe_ = FOLD_LEVEL_EDGE if fade_edge is None else fade_edge
+        d3 = max(3, int(fe_[0] * wf) | 1)
         h = cv2.dilate(h, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d3, d3)))
-        b = b * (1.0 - np.clip(cv2.GaussianBlur(h, (0, 0), max(1.0, FOLD_LEVEL_EDGE[1] * wf)), 0, 1))
+        b = b * (1.0 - np.clip(cv2.GaussianBlur(h, (0, 0), max(1.0, fe_[1] * wf)), 0, 1))
     out = Y.astype(np.float32, copy=True)
-    out[y0:y1, x0:x1] = roi + k * b * _even_mid(roi, w, wf, FOLD_LEVEL_SIG)
+    out[y0:y1, x0:x1] = roi + k * b * _even_mid(roi, w, wf, FOLD_LEVEL_SIG, cap)
     return out
 
 
@@ -2849,7 +3524,7 @@ def _neck_level(Y: np.ndarray, m: np.ndarray, hold: Optional[np.ndarray], wf: fl
     y0, y1, x0, x1 = r
     roi = Y[y0:y1, x0:x1].astype(np.float32)
     mm = np.clip(m[y0:y1, x0:x1].astype(np.float32), 0, 1)
-    d = _even_mid(roi, (mm > 0.3).astype(np.float32), wf, NECK_LEVEL_SIG)
+    d = _even_mid(roi, (mm > 0.3).astype(np.float32), wf, NECK_LEVEL_SIG, NECK_LEVEL_CAP)
     if hold is not None:
         mm = mm * hold[y0:y1, x0:x1]
     out = Y.astype(np.float32, copy=True)
@@ -3670,8 +4345,22 @@ def _things(Y: np.ndarray, m: np.ndarray, wf: float, Cb: Optional[np.ndarray] = 
     return out
 
 
+NASO_REACH = 0.07           # the same in the nasolabial stage. 2611 IWALY c029, c010 (2026-11-22, user): the groove down from the nose wing is
+                            # the top of the nasolabial fold and has to be retouched; held as "nose" out to 0.07 of the face width it got a third
+                            # of a per cent. Smaller = the fold is taken closer to the wing (the wing itself, inside the landmarks' hull, stays held)
+ALA_KEEP = 1.0              # share of the nose wing's own exclusion (_ala_mask) kept in the fold's band (1 = as before; the band is made at the
+                            # preparation of the frame)
 NOSE_REACH = 0.07           # how far past the nose's outline the nose is held (0.14 held the top of the fold
                             # beside the nostril too, which a frown deepens)
+EXT_GUARD = (0.03, 0.10)    # 2611 IWALY c010 (2026-11-22, own review of the user's frame 00:00:58:12): the fold stages worked up to the face's outer edge: on a face turned
+                            # three quarters the band of the fold reaches the cheek's contour, where the skin falls off into the shade by the hair and the finder takes that
+                            # shading for a fold, and the contour was lifted (+0.04..0.07 in a band along the hair). Within this distance of the exterior (hair, background:
+                            # what the exclusion holds that is not a feature) the band fades out: from where (of the face width) .. to where fully in. None = off
+EXT_OPEN = 0.03             # of the face width: what is thinner than this (a strand of hair across the cheek) is not the exterior (EXT_GUARD); 0 = every piece counts
+EXT_OUTLINE = True          # 2611 IWALY c003 (2026-11-22, user, 00:00:39:17, the green mark at the jaw "mask error"): on a small face (67 px wide) against a beige wall the colour model takes the wall for
+                            # skin (the exclusion is 0 on it, so there is no "exterior" to keep the band from), the band of the fold reached the wall beside the cheek and the fold stages lifted the
+                            # wall's pixels next to the face's edge by up to 6.6 % of the brightness (a light strip along the whole cheek). The landmarks' own outline of the face (jaw line and
+                            # forehead arc) lay within 2 px of the real edge there: the band is held to it as well (the same distances as EXT_GUARD, inside the outline). False = the parser's exterior only
 SMALL_WF = (110.0, 200.0)   # face width (px) below which a fold band is softened as a whole
 SMALL_FOLD = 0.45           # how much of the band, at the smallest
 NOSE_SKIN = 1.0            # share of the skin smoothing left on the nose (v3: all of it; the narrow smoothing keeps its shape)
@@ -3715,6 +4404,72 @@ def _fs_forehead(lm: np.ndarray, shape, scale: float, wf: float) -> Optional[np.
     if not m.any():
         return None
     return np.clip(cv2.GaussianBlur(m.astype(np.float32), (0, 0), max(1.0, 0.02 * wf)), 0, 1)
+
+
+# 2611 IWALY c001 (2026-11-22, user, 00:00:31:14): on a profile the eye's landmarks sit right but the eye is foreshortened, so the
+# skin mask's hole (an ellipse of the eye's width) is smaller than the lashes, the lid lines and the corners are: the smoothing took the
+# inner corner's dark crease and the lids' lines for skin flaws (the corner by 6 %). Inside a zone round each eye, every compact dark
+# thing (clearly darker than the skin round it) is now held, whatever its contrast against the whole face.
+EYE_HOLD = 1.0
+EYE_ZONE = (1.2, 0.80, 0.45)      # of the eye's width: along the eye from its middle (past the corners), above it, below it (j2817i: was (0.80, 0.50, 0.24), see the note below)
+EYE_DEPTH = (0.05, 0.12)          # depth against the skin level round it: from where it is held .. in full (j2817i: was (0.07, 0.16))
+EYE_KERNEL = 0.34                 # of the eye's width: the widest dark part (a lash fan, a lid line, a corner) that is held
+# 2611 IWALY c001 (2026-11-22, user, 00:00:31:14, again): on a profile the eye's two corner landmarks come together (11 px apart on a face 253 px wide,
+# the eye itself 60 px wide): the zone above, and the kernel that picks the dark parts, were sized by that and covered a fifth of the eye, so the
+# lash fan and the outer corner stayed inside the skin smoothing's mask and were lightened by up to 6 % of the picture's brightness. The eye is never
+# taken narrower than this share of the face's width (a frontal eye is 0.19 to 0.22 of it).
+EYE_MIN_W = 0.21
+# the zone is held in full inside this share of its (elliptical) radius and fades out to its edge (0.375 = what it was: 1.6 - 1.6 r). A fade that begins
+# at a third of the way out left the lash fan's tips and the lower lid's line (just outside the zone's full part) held by a tenth of what they are worth
+# 2611 IWALY c001 (2026-11-22, the same frame, own check of the fix): the lash fan of a profile's eye reaches further than the zone above (two small hot spots at the eye's
+# corner, up to 2.3 % of the brightness, were left): the zone is wider and higher (1.2 along the eye, 0.80 above, 0.45 below), held in full to 0.7 of its radius, and the dark
+# parts are held from a smaller depth on (EYE_DEPTH). On the one-frame test the spots are gone (1.4 % at most) and the skin round the eye is as it was
+EYE_FULL = 0.7
+
+
+def _eye_structure(rb: np.ndarray, base: np.ndarray, lm: np.ndarray, scale: float, org, wf: float) -> Optional[np.ndarray]:
+    """0..1 at rb's size (a piece of the picture starting at org = (x0, y0)): the dark structure of the eyes, found in the picture
+    inside a zone round each eye from the landmarks (36-41, 42-47)."""
+    h, w = rb.shape
+    out = np.zeros((h, w), np.float32)
+    P = np.asarray(lm, np.float32)[:, :2] * scale - np.array([org[0], org[1]], np.float32)
+    if not np.isfinite(P[36:48]).all():
+        return None
+    dn0 = None
+    if np.isfinite(P[[8, 27]]).all():
+        dn0 = P[8] - P[27]
+    # the line the eyes lie on (outer corner to outer corner), for an eye whose own corners have come together
+    eye_line = None
+    if np.isfinite(P[[36, 45]]).all() and float(np.hypot(*(P[45] - P[36]))) > 4.0:
+        eye_line = (P[45] - P[36]) / float(np.hypot(*(P[45] - P[36])))
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    for idx in (range(36, 42), range(42, 48)):
+        e = P[list(idx)]
+        c = e.mean(0)
+        ew = float(np.hypot(*(e[3] - e[0])))
+        ew_min = EYE_MIN_W * float(wf)
+        if ew >= 0.55 * ew_min:
+            ax = (e[3] - e[0]) / max(ew, 1e-6)
+        elif eye_line is not None:
+            ax = eye_line                                   # corners together: the eyes' own line gives the direction
+        else:
+            continue
+        ew = max(ew, ew_min)
+        dn = np.array([-ax[1], ax[0]], np.float32)
+        if dn0 is not None and float(dn @ dn0) < 0:
+            dn = -dn
+        u = (xx - c[0]) * ax[0] + (yy - c[1]) * ax[1]              # along the eye
+        v = (xx - c[0]) * dn[0] + (yy - c[1]) * dn[1]              # down (towards the mouth)
+        ru = EYE_ZONE[0] * ew
+        rv = np.where(v < 0, EYE_ZONE[1], EYE_ZONE[2]) * ew
+        zone = np.clip((1.0 - np.sqrt((u / ru) ** 2 + (v / rv) ** 2)) / max(1.0 - EYE_FULL, 1e-3), 0.0, 1.0)
+        if not zone.any():
+            continue
+        k = max(5, int(round(EYE_KERNEL * ew)) | 1)
+        bh = cv2.morphologyEx(rb, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+        st = _ss(EYE_DEPTH[0], EYE_DEPTH[1], bh / base)
+        out = np.maximum(out, zone * st)
+    return out if out.any() else None
 
 
 def _hold_maps(Y: np.ndarray, Cb: Optional[np.ndarray], Cr: Optional[np.ndarray], m: np.ndarray, wf: float,
@@ -3765,6 +4520,13 @@ def _hold_maps(Y: np.ndarray, Cb: Optional[np.ndarray], Cr: Optional[np.ndarray]
         except Exception:
             pass
     deep = np.maximum(deep, mole)
+    if EYE_HOLD > 0 and lm is not None and np.isfinite(np.asarray(lm)[36:48, :2]).all():
+        try:
+            eh_ = _eye_structure(rb, base, lm, scale, (x0, y0), wf)
+            if eh_ is not None:
+                deep = np.maximum(deep, np.clip(EYE_HOLD, 0, 1) * eh_)
+        except Exception:
+            pass
     yb = cv2.GaussianBlur(roi, (0, 0), max(1.0, 0.01 * wf))
     g = np.hypot(cv2.Sobel(yb, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(yb, cv2.CV_32F, 0, 1, ksize=3)) / 8.0
     edge = _ss(*HOLD_EDGE, g * (0.05 * wf) / np.maximum(cv2.GaussianBlur(yb, (0, 0), max(2.0, 0.03 * wf)), 0.03))
@@ -3837,26 +4599,132 @@ def neck_zone(lm: Optional[np.ndarray], shape, scale: float, wf: float) -> Optio
     return _cached("neckzone", lm, shape, scale, wf, make)
 
 
-def _fold_flat(Y: np.ndarray, m: np.ndarray, wf: float, k: float) -> np.ndarray:
+def _fold_flat(Y: np.ndarray, m: np.ndarray, wf: float, k: float, eps_mul: float = 1.0, r_mul: float = 1.0) -> np.ndarray:
     """The soft folds of a neck (rings across it, wider and fainter than a line): the faint light and dark
     bands between the size of the skin's texture and a twelfth of the face are taken out with an edge-keeping
     filter, so the strong shading of the neck's own build (tendons, the jaw's shadow) is an edge and stays, and
-    the broad light and shade is given back. The skin's fine texture is not touched."""
-    r = _roi(m, int(0.25 * wf) + 4)
+    the broad light and shade is given back. The skin's fine texture is not touched.
+    eps_mul / r_mul: the edge threshold and the width of the edge-keeping filter, as multiples of FOLD_EPS / FOLD_R (the armpit's hollow is softer and wider than a neck's ring)."""
+    r = _roi(m, int(0.25 * wf * max(1.0, float(r_mul))) + 4)
     if r is None or k < 1e-4:
         return Y
     y0, y1, x0, x1 = r
     roi = Y[y0:y1, x0:x1].astype(np.float32)
     mm = m[y0:y1, x0:x1].astype(np.float32)
     loc = cv2.GaussianBlur(roi, (0, 0), max(2.0, 0.1 * wf))
-    eps = FOLD_EPS * np.clip(loc / 0.45, 0.15, 2.0) ** 2
+    eps = FOLD_EPS * float(eps_mul) * np.clip(loc / 0.45, 0.15, 2.0) ** 2
     b1 = SK.guided_self(roi, max(1, int(round(0.008 * wf))), eps)
-    b2 = SK.guided_self(b1, max(2, int(round(FOLD_R * wf))), eps)
+    b2 = SK.guided_self(b1, max(2, int(round(FOLD_R * float(r_mul) * wf))), eps)
     d = b2 - b1
     sig = max(3.0, 0.16 * wf)
     low = cv2.GaussianBlur(d * mm, (0, 0), sig) / np.maximum(cv2.GaussianBlur(mm, (0, 0), sig), 0.05)
     out = Y.astype(np.float32, copy=True)
     out[y0:y1, x0:x1] = roi + k * mm * (d - np.clip(low, -0.2, 0.2))
+    return out
+
+
+def _line_kernel(L: float, ang_deg: float) -> np.ndarray:
+    """A one pixel wide line of length L px at ang_deg from the picture's vertical (x right, y down), as a kernel that sums to 1."""
+    th = np.radians(float(ang_deg))
+    ux, uy = float(np.sin(th)), float(np.cos(th))
+    half = int(L / 2.0) + 2
+    k = np.zeros((2 * half + 1, 2 * half + 1), np.float32)
+    cv2.line(k, (int(round(half - ux * L / 2.0)), int(round(half - uy * L / 2.0))), (int(round(half + ux * L / 2.0)), int(round(half + uy * L / 2.0))), 1.0, 1)
+    return k / max(float(k.sum()), 1.0)
+
+
+def _armpit_line_hold(Y: np.ndarray, mA: np.ndarray, wA: float, wfA: float, axes, fp: float):
+    """Where the arm's own line lies (0..1, ARMPIT_LINE_HOLD): a long thin dark valley that runs along a hanging upper arm. Looked for on the picture before the armpit stage, with the filler's own valley finder
+    (what the filler would take out) kept to the valleys whose direction is the upper arm's (ARMPIT_LINE_TOL) and judged by its mean along the arm (ARMPIT_LINE_LEN): a crease is short or lies across the arm.
+    axes: [(the upper arm's angle from the vertical in degrees, weight, zone centre x, y, radius)] in proxy px, fp: proxy px to this plane's px. Returns the map of the plane's size, or None."""
+    r = _roi(mA, int(3 * wA) + 6)
+    if r is None or not axes:
+        return None
+    y0, y1, x0, x1 = r
+    roi = Y[y0:y1, x0:x1].astype(np.float32)
+    mm = mA[y0:y1, x0:x1].astype(np.float32)
+    # the filler's valley score (_crease_lift)
+    sig_s = max(0.5, 0.25 * wA)
+    sig_l = max(2.0, 2.4 * wA)
+    Ys = cv2.GaussianBlur(roi, (0, 0), sig_s)
+    wsk = (mm > 0.05).astype(np.float32)
+    b0 = _gm(Ys, wsk, sig_l)
+    dev = Ys - b0
+    tex = np.sqrt(np.maximum(_gm(dev * dev, wsk, sig_l), 0)) + 0.004
+    w = wsk * np.exp(-(np.clip(-dev, 0, None) / tex) ** 2)
+    tex = np.sqrt(np.maximum(_gm(dev * dev, w, sig_l), 0)) + 0.004
+    base = _gm(Ys, w, sig_l)
+    D = np.clip(base - Ys, 0, 0.25)
+    Yh = cv2.GaussianBlur(roi, (0, 0), max(0.7, 0.6 * wA))
+    Ixx = cv2.Sobel(Yh, cv2.CV_32F, 2, 0, ksize=3)
+    Iyy = cv2.Sobel(Yh, cv2.CV_32F, 0, 2, ksize=3)
+    Ixy = cv2.Sobel(Yh, cv2.CV_32F, 1, 1, ksize=3)
+    tr = Ixx + Iyy
+    disc_ = np.sqrt((Ixx - Iyy) ** 2 + 4 * Ixy * Ixy)
+    l1 = 0.5 * (tr + disc_)
+    l2 = 0.5 * (tr - disc_)
+    line = np.where(l1 > 1e-6, 1 - _ss(0.25, 0.6, np.abs(l2) / np.maximum(l1, 1e-6)), 0.0).astype(np.float32)
+    score = _ss(1.0, 2.6, D / tex) * _ss(0.004, 0.02, D) * line
+    kn = max(3, int(round(1.6 * wA)) | 1)
+    kw = max(kn + 4, int(round(6.0 * wA)) | 1)
+    bn = cv2.morphologyEx(Ys, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kn, kn)))
+    bw = cv2.morphologyEx(Ys, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kw, kw)))
+    tlo_, thi_ = (THIN_LO, THIN_HI) if ARMPIT_THIN is None else (float(ARMPIT_THIN[0]), float(ARMPIT_THIN[1]))
+    score = score * _ss(tlo_, thi_, cv2.GaussianBlur(bn, (0, 0), sig_s * 2) / (cv2.GaussianBlur(bw, (0, 0), sig_s * 2) + 1e-4))
+    if ARMPIT_FINE:
+        try:
+            fine = SK._strand_map(np.clip(roi, 0, 1) * 255.0, wA / 0.018, dark_only=True, gain=1.6)
+            if fine is not None:
+                score = np.maximum(score, fine)
+        except Exception:
+            pass
+    score = score.astype(np.float32)
+    # the direction of the valley: across it is the direction of the strongest curvature
+    th = 0.5 * np.arctan2(2 * Ixy, Ixx - Iyy) + np.pi / 2.0
+    ang = (np.degrees(np.arctan2(np.cos(th), np.sin(th))) + 90.0) % 180.0 - 90.0
+    gy, gx = np.mgrid[y0:y1, x0:x1].astype(np.float32)
+    H = np.zeros(roi.shape, np.float32)
+    lo_, hi_ = float(ARMPIT_LINE_THR[0]), float(ARMPIT_LINE_THR[1])
+    tol = float(ARMPIT_LINE_TOL)
+    for ax_deg, gate, cx, cy, rad in axes:
+        if gate <= 1e-3:
+            continue
+        dz = np.hypot(gx - cx * fp, gy - cy * fp) / max(1.0, rad * fp)
+        disc = (1.0 - _ss(1.0, 1.35, dz)).astype(np.float32)
+        da = np.abs(ang - float(ax_deg)) % 180.0
+        da = np.minimum(da, 180.0 - da)
+        sa = (score * (1.0 - _ss(tol, tol + 15.0, da)) * disc).astype(np.float32)
+        if float(sa.max()) < 0.15:
+            continue
+        S2 = cv2.filter2D(sa, -1, _line_kernel(max(5.0, ARMPIT_LINE_LEN * wfA), ax_deg))
+        core = (sa > 0.15).astype(np.float32)
+        rd = max(1, int(round(0.5 * wA)))
+        near = cv2.dilate(core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rd + 1, 2 * rd + 1)))
+        Hi = (_ss(lo_, hi_, S2) * near).astype(np.float32)
+        if ARMPIT_LINE_EXT and ARMPIT_LINE_EXT > 0:
+            # where the line gets too faint for the finder it goes on along the arm: a valley of the same direction next to a held part
+            ke = (_line_kernel(max(5.0, ARMPIT_LINE_EXT * wfA), ax_deg) > 0).astype(np.uint8)
+            He = cv2.dilate(Hi, ke) * (D > 0.004) * (1.0 - _ss(tol + 10.0, tol + 30.0, da)) * disc
+            Hi = np.maximum(Hi, He.astype(np.float32))
+        H = np.maximum(H, Hi * float(gate))
+    if float(H.max()) < 1e-3:
+        return None
+    H = np.clip(cv2.GaussianBlur(H, (0, 0), max(0.8, 0.4 * wA)) * 1.4, 0, 1).astype(np.float32)
+    out = np.zeros(Y.shape, np.float32)
+    out[y0:y1, x0:x1] = H
+    return out
+
+
+def _line_restore(Y: np.ndarray, Ysrc: np.ndarray, H: np.ndarray, sig: float) -> np.ndarray:
+    """Y with the detail finer than sig of Ysrc given back where H (0..1) is: Y + H * (hp(Ysrc) - hp(Y)), hp = the picture minus its Gaussian blur of sig. The soft light and shade stays Y's."""
+    r = _roi(H, int(3 * sig) + 2)
+    if r is None:
+        return Y
+    y0, y1, x0, x1 = r
+    a = Y[y0:y1, x0:x1].astype(np.float32)
+    b = Ysrc[y0:y1, x0:x1].astype(np.float32)
+    out = Y.astype(np.float32, copy=True)
+    out[y0:y1, x0:x1] = a + H[y0:y1, x0:x1] * ((b - cv2.GaussianBlur(b, (0, 0), sig)) - (a - cv2.GaussianBlur(a, (0, 0), sig)))
     return out
 
 
@@ -3886,6 +4754,59 @@ def frown_zone(lm: Optional[np.ndarray], shape, scale: float, wf: float) -> Opti
     return _cached("frown", lm, shape, scale, wf, make)
 
 
+# 2611 IWALY c001 (2026-11-22, user, 00:00:31:14: the red circle on the eye, "mask error"): on a three-quarter view the brow and nose landmarks sit on the eye, so the frown zone
+# (their hull) lay over the eye's outer half and its lash fan, and the thin-line filler took every lash for a crease and lifted it by up to 7 % of the picture's brightness (the
+# skin smoothing itself never more than 2 %). The ground round an eye is no ground of the thin-line fillers: LASH_REACH of the face width from the eye's own hole in the skin
+# mask (the hole that holds the eye landmarks' centre), held in full to 0.6 of that and fading out at the reach. 0 = off.
+LASH_REACH = 0.12
+LASH_HOLE_MAX = 0.45      # a hole wider or higher than this share of the face width is no single eye (it has run into the hair or the background): there is no lash ground then
+
+
+def _lash_zone(ex: Optional[np.ndarray], lm: Optional[np.ndarray], shape, scale: float, wf: float) -> Optional[np.ndarray]:
+    """0..1 at shape: the ground within LASH_REACH of the face width from each eye's own hole in ex (1 = not skin: the parser's eyes, brows, lips, hair, plus the features' polygons),
+    where the thin-line fillers leave every dark strand alone (a lash is a thin dark line on the skin too). The eye's hole is the one that holds the centre of its landmarks 36-41 /
+    42-47 (or lies within a twelfth of the face of it); None where there is no such hole or ex is not there."""
+    if LASH_REACH <= 0 or ex is None or lm is None or not wf > 8:
+        return None
+    P_ = np.asarray(lm, np.float32)[:, :2] * scale
+    if not np.isfinite(P_[36:48]).all():
+        return None
+    h, w = int(shape[0]), int(shape[1])
+    reach = LASH_REACH * wf
+    R = int(round(0.5 * LASH_HOLE_MAX * wf + reach + 0.05 * wf))
+    out = None
+    for idx in (range(36, 42), range(42, 48)):
+        c = P_[list(idx)].mean(0)
+        cx, cy = int(round(float(c[0]))), int(round(float(c[1])))
+        if not (0 <= cx < w and 0 <= cy < h):
+            continue
+        x0, x1 = max(0, cx - R), min(w, cx + R + 1)
+        y0, y1 = max(0, cy - R), min(h, cy + R + 1)
+        if x1 - x0 < 8 or y1 - y0 < 8:
+            continue
+        hole = (np.asarray(ex[y0:y1, x0:x1], np.float32) > 0.5).astype(np.uint8)
+        if not hole.any():
+            continue
+        nl, lab = cv2.connectedComponents(hole, connectivity=8)
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        near = (hole > 0) & (((xx - cx) ** 2 + (yy - cy) ** 2) <= (0.08 * wf) ** 2)
+        if not near.any():
+            continue
+        labs, cnt = np.unique(lab[near], return_counts=True)
+        comp = lab == int(labs[int(np.argmax(cnt))])
+        ys, xs = np.nonzero(comp)
+        if (xs.max() - xs.min() + 1) > LASH_HOLE_MAX * wf or (ys.max() - ys.min() + 1) > LASH_HOLE_MAX * wf:
+            continue
+        if xs.min() <= 0 or ys.min() <= 0 or xs.max() >= comp.shape[1] - 1 or ys.max() >= comp.shape[0] - 1:
+            continue
+        dist = cv2.distanceTransform((~comp).astype(np.uint8), cv2.DIST_L2, 3)
+        z = (1.0 - _ss(0.6 * reach, reach, dist)).astype(np.float32)
+        if out is None:
+            out = np.zeros((h, w), np.float32)
+        out[y0:y1, x0:x1] = np.maximum(out[y0:y1, x0:x1], z)
+    return out
+
+
 SKIN_THINGS_OFF_FACE = True
 SKIN_EDGE_FREE = True
 
@@ -3905,14 +4826,17 @@ def _face_zone(lm: Optional[np.ndarray], shape, scale: float, wf: float) -> Opti
     return _cached("facezone", lm, shape, scale, wf, make)
 
 
-def nose_hold(lm: Optional[np.ndarray], shape, scale: float, wf: float) -> Optional[np.ndarray]:
+def nose_hold(lm: Optional[np.ndarray], shape, scale: float, wf: float, reach: Optional[float] = None) -> Optional[np.ndarray]:
     """1 off the nose, 0 on it (soft): the lines down the sides of the nose are its shape. No line filler may
-    lift them (on a soft or motion-blurred face they are all that is left of the nose)."""
+    lift them (on a soft or motion-blurred face they are all that is left of the nose). reach: how far past the
+    nose's outline it is held, of the face width (default NOSE_REACH)."""
     if lm is None or not np.isfinite(lm[27:36, :2]).all():
         return None
+    rch = NOSE_REACH if reach is None else float(reach)
+
     def make():
         hull = cv2.convexHull(np.round(lm[27:36, :2] * scale).astype(np.int32))
-        k = max(3, int(round(NOSE_REACH * wf)) | 1)
+        k = max(3, int(round(rch * wf)) | 1)
         sig = max(1.0, 0.02 * wf)
         x0, y0, x1, y1 = _window(shape, hull.reshape(-1, 2), k + 8 * sig + 4)
         out = np.ones(shape[:2], np.float32)
@@ -3923,7 +4847,64 @@ def nose_hold(lm: Optional[np.ndarray], shape, scale: float, wf: float) -> Optio
         m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
         out[y0:y1, x0:x1] = 1.0 - cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0), sig)
         return out
-    return _cached("nose", lm, shape, scale, wf, make)
+    return _cached("nose" if reach is None else f"nose{rch:.4f}", lm, shape, scale, wf, make)
+
+
+def _exterior_guard(exY: np.ndarray, lm: Optional[np.ndarray], shape, y_per_src: float, wf: float, band: np.ndarray) -> Optional[np.ndarray]:
+    """0 at the face's outer edge, 1 from EXT_GUARD[1] of the face width in (soft), at this resolution, for what a fold's band may work on. The exterior is what the exclusion
+    (exY: features and what is not skin) holds that is not a feature (feature_exclusion: eyes, lips, nostrils): hair, the background, a hand. None where there is no exterior
+    near the band (or it cannot be made)."""
+    if not EXT_GUARD or exY is None or lm is None:
+        return None
+    try:
+        g0, g1 = float(EXT_GUARD[0]), float(EXT_GUARD[1])
+        r = _roi(band, int(g1 * wf) + 6)
+        if r is None:
+            return None
+        y0, y1, x0, x1 = r
+        lmc = np.array(lm, np.float32, copy=True)
+        if not np.isfinite(lmc[:, :2]).all():
+            return None
+        lmc[:, :2] = lmc[:, :2] * float(y_per_src) - np.array([x0, y0], np.float32)
+        fx = feature_exclusion(lmc, (y1 - y0, x1 - x0))
+        nonf = np.clip(np.clip(exY[y0:y1, x0:x1].astype(np.float32), 0, 1) - fx, 0.0, 1.0)
+        ext = nonf > 0.5
+        if EXT_OPEN > 0 and bool(ext.any()):
+            ko = max(3, int(round(EXT_OPEN * wf)) | 1)
+            ext = cv2.morphologyEx(ext.astype(np.uint8), cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ko, ko))) > 0
+        if not bool(ext.any()):
+            return None
+        d = cv2.distanceTransform((~ext).astype(np.uint8), cv2.DIST_L2, 3)
+        out = np.ones(shape[:2], np.float32)
+        out[y0:y1, x0:x1] = _ss(g0 * wf, g1 * wf, d)
+        return out
+    except Exception:
+        return None
+
+
+def _outline_guard(lm: Optional[np.ndarray], shape, y_per_src: float, wf: float, band: np.ndarray) -> Optional[np.ndarray]:
+    """0 outside the face's outline from the landmarks (jaw line and forehead arc) and at it, 1 from EXT_GUARD[1] of the face width inside, at this resolution, for what a fold's band may work on:
+    the parser's exterior (_exterior_guard) is blind where the background has the skin's colour (a beige wall). None where it cannot be made (EXT_OUTLINE off, no landmarks)."""
+    if not EXT_GUARD or not EXT_OUTLINE or lm is None or not wf > 8:
+        return None
+    try:
+        g0, g1 = float(EXT_GUARD[0]), float(EXT_GUARD[1])
+        fz = _face_zone(lm, shape, y_per_src, wf)
+        if fz is None:
+            return None
+        r = _roi(band, int(g1 * wf) + 6)
+        if r is None:
+            return None
+        y0, y1, x0, x1 = r
+        inside = (np.asarray(fz)[y0:y1, x0:x1] > 0.5).astype(np.uint8)
+        if not bool(inside.any()):
+            return None
+        d = cv2.distanceTransform(inside, cv2.DIST_L2, 3)
+        out = np.ones(shape[:2], np.float32)
+        out[y0:y1, x0:x1] = _ss(g0 * wf, g1 * wf, d)
+        return out
+    except Exception:
+        return None
 
 
 def neck_dir(mY: np.ndarray, lm: Optional[np.ndarray], scale: float):
@@ -3943,9 +4924,13 @@ def neck_dir(mY: np.ndarray, lm: Optional[np.ndarray], scale: float):
 
 
 def _crease_lift(Y, Cb, Cr, mY, k: float, width: float, axis=None, hold: Optional[np.ndarray] = None,
-                 fine_lines: bool = True, extra: Optional[np.ndarray] = None):
+                 fine_lines: bool = True, extra: Optional[np.ndarray] = None, gain: float = 1.0, thin_rng=None, band: float = 0.0):
     """Fill thin dark creases (neck lines): a dark valley, curved strongly across and hardly along, darker than
     the skin around it by more than its texture. Only the crease's shading is lifted; broad shading stays.
+    gain: this many times the fill, held to the valley's depth against the skin beside it (and to what is held as a thing): a valley is filled up to its skin's level at most.
+    thin_rng: (lo, hi) in place of THIN_LO, THIN_HI: how thin against its own surroundings a valley must be to count as a crease (a valley that lies in a broad shade is thin to a lesser degree)
+    band: (0..1) a crease is a dark valley with a light lip beside it, and filling the valley leaves the lip as a line: round the lines found (CREASE_BAND_THR), CREASE_BAND_HW of the line width on either
+    side, the soft level of the picture is replaced by what the skin round that band holds, at this share; the grain finer than a pixel stays
 
     axis: the direction the neck runs in. A neck line lies across the neck; the shading of the neck's own
     build (the tendons and the hollow between them, the edge of the jaw's shadow) runs along it, and was lifted
@@ -3985,7 +4970,8 @@ def _crease_lift(Y, Cb, Cr, mY, k: float, width: float, axis=None, hold: Optiona
     kw = max(kn + 4, int(round(6.0 * width)) | 1)
     bn = cv2.morphologyEx(Ys, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kn, kn)))
     bw = cv2.morphologyEx(Ys, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kw, kw)))
-    thin = _ss(THIN_LO, THIN_HI, cv2.GaussianBlur(bn, (0, 0), sig_s * 2) / (cv2.GaussianBlur(bw, (0, 0), sig_s * 2) + 1e-4))
+    tlo_, thi_ = (THIN_LO, THIN_HI) if thin_rng is None else (float(thin_rng[0]), float(thin_rng[1]))
+    thin = _ss(tlo_, thi_, cv2.GaussianBlur(bn, (0, 0), sig_s * 2) / (cv2.GaussianBlur(bw, (0, 0), sig_s * 2) + 1e-4))
     score = score * thin
     if axis is not None:
         # the direction of strongest curvature is across the valley: for a fold lying across the neck that is
@@ -4051,8 +5037,26 @@ def _crease_lift(Y, Cb, Cr, mY, k: float, width: float, axis=None, hold: Optiona
             thing = np.maximum(thing, cv2.dilate(_ss(*PAINT_DC, dc), sed))      # paint, tattoo, drawn lines
     except Exception:
         pass
-    lift = lift * (1.0 - np.clip(cv2.GaussianBlur(thing, (0, 0), max(1.0, 0.5 * width)) * 1.5, 0, 1))
+    free = 1.0 - np.clip(cv2.GaussianBlur(thing, (0, 0), max(1.0, 0.5 * width)) * 1.5, 0, 1)
+    lift = lift * free
+    if gain is not None and abs(float(gain) - 1.0) > 1e-3:
+        lift = np.minimum(float(gain) * lift, np.maximum(D, D2) * free)
     Yo[y0:y1, x0:x1] = roi + k * lift
+    if band and band > 1e-4:
+        crease_ = (sp if fine is None else np.maximum(sp, fs)) * free
+        core_ = (crease_ > CREASE_BAND_THR).astype(np.float32)
+        if float(core_.max()) > 0:
+            Ycur = Yo[y0:y1, x0:x1]
+            hw_ = max(2, int(round(CREASE_BAND_HW * width)))
+            bm_ = cv2.dilate(core_, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * hw_ + 1, 2 * hw_ + 1)))
+            b_ = np.clip(cv2.GaussianBlur(bm_, (0, 0), max(1.0, 0.5 * width)) * 1.3, 0, 1) * mm
+            wgt_ = (1.0 - np.clip(cv2.GaussianBlur(bm_, (0, 0), 1.0), 0, 1)) * wsk
+            si_ = max(2.0, CREASE_BAND_SIG * width)
+            den_ = cv2.GaussianBlur(wgt_, (0, 0), si_)
+            lpi_ = cv2.GaussianBlur(Ycur * wgt_, (0, 0), si_) / np.maximum(den_, 1e-4)
+            conf_ = np.clip(den_ / 0.25, 0, 1)
+            lpy_ = cv2.GaussianBlur(Ycur, (0, 0), 1.0)
+            Yo[y0:y1, x0:x1] = Ycur + float(band) * b_ * conf_ * (lpi_ - lpy_)
     return Yo, Cb, Cr
 
 
@@ -4458,6 +5462,27 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
         if "skin" in job.masks and v["skin"] > 1e-4 and job.skin is not None:
             mY = M(job.masks["skin"], (hY, wY))
             mC = M(job.masks["skin"], (hC, wC))
+            # the cloth's zone beside the skin (SKIN_CLOTH_GATE): 1 on cloth, hair and the ramp of their edge outside the face's outline, 0 elsewhere; None when there is none
+            dkz_ = None
+            if SKIN_CLOTH_GATE is not None:
+                try:
+                    dkz_ = _cloth_zone(Y, mY, wf)
+                    if dkz_ is not None:
+                        fzg_ = _face_zone(job.face, (hY, wY), y_per_src, wf) if job.face is not None else None
+                        if fzg_ is not None:
+                            fzc_ = np.clip(fzg_, 0.0, 1.0)
+                            nxg_ = None
+                            if SKIN_CLOTH_INFACE:
+                                # inside the face's outline the zone stays where the exterior (hair, background, cloth) is near: the outline of a turned face lies over the hair
+                                rch_ = max(6, int(round(SKIN_CLOTH_REACH * hY)))
+                                sgm_ = max(2.0, SKIN_CLOTH_SOFT * hY)
+                                nxg_ = _exterior_near(M(job.masks["excl"], (hY, wY)) if job.masks.get("excl") is not None else None, job.face, (hY, wY), y_per_src, wf,
+                                                      mY, rch_ + 2.0 * sgm_ + 4.0, sgm_)
+                            dkz_ = dkz_ * (1.0 - fzc_ if nxg_ is None else 1.0 - fzc_ * (1.0 - nxg_))
+                        if float(dkz_.max()) < 0.02:
+                            dkz_ = None
+                except Exception:
+                    dkz_ = None
             try:
                 th_ = _things(Y, mY, wf, Cb, Cr)
                 if th_ is not None and SKIN_THINGS_OFF_FACE and job.face is not None:
@@ -4507,6 +5532,9 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                         SK._TLS.shape = nhs_          # the wide passes of the texture smoothing spare the nose
             except Exception:
                 pass
+            if dkz_ is not None:
+                mY = mY * (1.0 - dkz_)
+                mC = mC * M(1.0 - dkz_, (hC, wC))
             r = SK.radius_px(job.skin, y_per_src)
             try:
                 if getattr(SK, "PIT", 0) > 0 and hasattr(SK, "_TLS"):
@@ -4515,6 +5543,8 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                         pm_ = pm_ * (1.0 - np.clip(ho_, 0, 1))
                     if thp_ is not None:
                         pm_ = pm_ * (1.0 - np.clip(thp_, 0, 1))
+                    if dkz_ is not None:
+                        pm_ = pm_ * (1.0 - dkz_)
                     SK._TLS.pitm = pm_.astype(np.float32)
             except Exception:
                 pass
@@ -4523,10 +5553,14 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                 SK._TLS.sq = float(getattr(job, "sharp_q", 1.0))   # the footage's sharpness against its surroundings
             if src is not None and src["Y"].shape == Y.shape:
                 Ys0 = src["Y"]
-                Ys1 = SK.smooth_channel(Ys0, mY, job.skin.strength, job.keep, r, relative=True)
+                # the smoothing's input: the cloth replaced by the skin's own level beside it (SKIN_CLOTH_GATE); its change is added to the picture itself
+                Ysi = Ys0 if dkz_ is None else _cloth_input(Ys0, dkz_)
+                Ys1 = SK.smooth_channel(Ysi, mY, job.skin.strength, job.keep, r, relative=True)
                 if GRAIN_KEEP:
-                    Ys1 = _keep_fine(Ys0, Ys1, mY)
-                dS = Ys1 - Ys0
+                    Ys1 = _keep_fine(Ysi, Ys1, mY)
+                dS = Ys1 - Ysi
+                if Ysi is not Ys0:
+                    Ys1 = Ys0 + dS
                 src["Y"] = Ys1
                 src["dY"] += dS
                 Y = Y + src["Jy"] * dS
@@ -4535,9 +5569,12 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                     Cr = Cr + src["Jcr"] * dS
             else:
                 Y0_ = Y
-                Y = SK.smooth_channel(Y, mY, job.skin.strength, job.keep, r, relative=True)
+                Yi_ = Y if dkz_ is None else _cloth_input(Y, dkz_)
+                Y = SK.smooth_channel(Yi_, mY, job.skin.strength, job.keep, r, relative=True)
                 if GRAIN_KEEP:
-                    Y = _keep_fine(Y0_, Y, mY)
+                    Y = _keep_fine(Yi_, Y, mY)
+                if Yi_ is not Y0_:
+                    Y = Y0_ + (Y - Yi_)
             rc = max(1, int(round(r * cs)))
             Cb = SK.smooth_channel(Cb, mC, job.skin.strength * SKIN_CHROMA, 0.0, rc, eps=0.0004)
             Cr = SK.smooth_channel(Cr, mC, job.skin.strength * SKIN_CHROMA, 0.0, rc, eps=0.0004)
@@ -4551,6 +5588,85 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                     mB = mB * (1.0 - np.clip(M(job.masks["skin"], (hY, wY)), 0, 1))
                 with _tm("apply.body_smooth"):
                     Y, Cb, Cr = _body_smooth(Y, Cb, Cr, mB, job, y_per_src, cs, src)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+        # 1c. the armpit's creases (ARMPIT_FOLD): the thin fold where a raised arm meets the chest, inside the armpit's own skin
+        if ARMPIT_FOLD > 1e-4 and "armpit" in job.masks and v.get("skin", 0) > 1e-4:
+            try:
+                mA = np.clip(M(job.masks["armpit"], (hY, wY)), 0, 1)
+                if ARMPIT_CORE is not None:
+                    mA = mA * _ss(float(ARMPIT_CORE[0]), float(ARMPIT_CORE[1]), mA)
+                if NECK_CLOTH_GATE is not None:
+                    fref_ = 0.0
+                    if ARMPIT_FACE_REF and "skin" in job.masks:
+                        fref_ = ARMPIT_FACE_REF * _skin_level(Y, np.clip(M(job.masks["skin"], (hY, wY)), 0, 1))
+                    cg_ = _skin_gate(Y, mA, *NECK_CLOTH_GATE, ref_min=fref_)
+                    if cg_ is not None:
+                        mA = mA * cg_
+                # the size the stage goes by: the face's width, else (the face is not in the picture) the one that goes with its zone (Job.wf_arm)
+                wfA = wf if job.wf_src > 0 else (float(job.wf_arm) * y_per_src if job.wf_arm > 0 else wf)
+                if ARMPIT_CLOSE and ARMPIT_CLOSE > 0:
+                    # the fold is a dark valley the mask's brightness / clothes tests leave out: holes and bays narrower than twice this are closed
+                    mA = _close_soft(mA, max(2, int(round(ARMPIT_CLOSE * wfA))))
+                kA = float(np.clip(ARMPIT_FOLD, 0, 1)) * _small_face_gate(wfA, ARMPIT_SMALL_WF)
+                try:
+                    import os as _os_dbg
+                    if _os_dbg.environ.get("IWALY_ARMPIT_DEBUG"):
+                        print("ARMPIT apply pid=%d: face width %.0f px (stage size %.0f px, Job.wf_arm %.0f), small-face gate %.2f, mask > 0.5: %d px, > 0.05: %d px" % (
+                            int(job.pid), float(wf), float(wfA), float(job.wf_arm), kA, int((mA > 0.5).sum()), int((mA > 0.05).sum())), flush=True)
+                except Exception:
+                    pass
+                if kA > 1e-4:
+                    with _tm("apply.armpit"):
+                        Y_arm0 = Y                      # the picture as the stage found it (ARMPIT_LINE_HOLD gives the arm's own line back from it)
+                        wA = max(1.5, ARMPIT_W * wfA)
+                        gA = float(ARMPIT_LIFT_GAIN) if ARMPIT_LIFT_GAIN else 1.0
+                        # the stage works inside the body's skin only (ARMPIT_LIFT_INSET for the lifts, ARMPIT_FOLD_INSET for the flattener): the armpit's mask reaches beyond the skin by the width of the person's
+                        # matte, and the finder took the end of a dark stripe of the wall beside the arm for a crease and the outline's own dark rim for a thin line
+                        skin_ok = (bmY is not None and bmY.shape == mA.shape)
+                        if skin_ok and ARMPIT_LIFT_INSET > 1e-6:
+                            mA = mA * _skin_inner(bmY, ARMPIT_EDGE_CLOSE * wfA, ARMPIT_LIFT_INSET * wfA)
+                        mA_hold = mA
+                        Y1, Cb, Cr = _crease_lift(Y, Cb, Cr, mA, kA, wA, None, None, fine_lines=bool(ARMPIT_FINE), gain=gA, thin_rng=ARMPIT_THIN, band=ARMPIT_BAND)
+                        if ARMPIT_THIN is not None or abs(gA - 1.0) > 1e-3 or ARMPIT_BAND:
+                            # the lines budget is judged on what the neck lines' own tests would lift (what it was set against), not on the fuller fill of the armpit's creases
+                            lifted = _crease_lift(Y, Cb, Cr, mA, kA, wA, None, None)[0] - Y
+                        else:
+                            lifted = Y1 - Y
+                        if ARMPIT_PIT_W:
+                            # the fold itself is wider than a crease line: a second pass of the filler at its width
+                            Y1, Cb, Cr = _crease_lift(Y1, Cb, Cr, mA, kA, max(1.5, float(ARMPIT_PIT_W) * wfA), None, None, fine_lines=bool(ARMPIT_FINE), gain=gA, thin_rng=ARMPIT_THIN, band=ARMPIT_BAND)
+                        sA, log_ = _lines_budget(lifted, mA, wfA)
+                        if sA is not None:
+                            for n_, b_, k_ in log_:
+                                print("ARMPIT lines: %d px lifted in one armpit at a face %.0f px wide (budget %.0f): that armpit's stage is kept to %.2f" % (n_, wfA, b_, k_), flush=True)
+                            Y1 = Y + sA * (Y1 - Y)
+                            mA = mA * sA
+                        mF = mA
+                        if skin_ok and ARMPIT_FOLD_INSET > 1e-6:
+                            # the flattener only inside the body's skin, away from its outline (the arm's edge against the wall)
+                            mF = mA * _skin_inner(bmY, ARMPIT_EDGE_CLOSE * wfA, ARMPIT_FOLD_INSET * wfA)
+                        kF = kA * float(np.clip(ARMPIT_FLAT, 0.0, 1.0))
+                        Y = _fold_flat(Y1, mF, wfA, kF, ARMPIT_FLAT_EPS, ARMPIT_FLAT_R) if kF > 1e-4 else Y1
+                        if ARMPIT_LINE_HOLD > 1e-4 and job.arm_axes:
+                            # a hanging arm's own line stays (the lifts and the flattener took it for a crease): given back from the picture before the stage
+                            try:
+                                fp_ = float(wY) / float(job.masks["armpit"].shape[1])
+                                Hl_ = _armpit_line_hold(Y_arm0, mA_hold, wA, wfA, job.arm_axes, fp_)
+                                if Hl_ is not None:
+                                    Y = _line_restore(Y, Y_arm0, Hl_ * float(np.clip(ARMPIT_LINE_HOLD, 0.0, 1.0)), max(2.0, ARMPIT_LINE_SIG * wA))
+                                try:
+                                    import os as _os_dbg
+                                    if _os_dbg.environ.get("IWALY_ARMPIT_DEBUG"):
+                                        print("ARMPIT line hold pid=%d: hanging arms (angle, weight, cx, cy, r) %s, held > 0.5: %d px, > 0.05: %d px" % (
+                                            int(job.pid), [(round(a_[0]), round(a_[1], 2), round(a_[2]), round(a_[3]), round(a_[4])) for a_ in job.arm_axes],
+                                            0 if Hl_ is None else int((Hl_ > 0.5).sum()), 0 if Hl_ is None else int((Hl_ > 0.05).sum())), flush=True)
+                                except Exception:
+                                    pass
+                            except Exception:
+                                import traceback
+                                traceback.print_exc()
             except Exception:
                 import traceback
                 traceback.print_exc()
@@ -4572,27 +5688,38 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                 # a small face (a wide shot): the fold is only a few pixels wide and is not found, so its band
                 # is softened as a whole (lighter, not wiped)
                 base_ = 0.06 + (SMALL_FOLD - 0.06) * float(1.0 - _ss(SMALL_WF[0], SMALL_WF[1], np.array(wf)))
-                mY = np.clip(band * (base_ + 0.95 * found), 0, 1)
+                # the face's outer edge (hair, background) is not worked on: the cheek's contour is shading, not a fold (EXT_GUARD)
+                gx_ = _exterior_guard(exY, job.face, (hY, wY), y_per_src, wf, band) if (ex is not None and job.face is not None) else None
+                # and the landmarks' outline of the face (the parser's exterior does not see a wall of the skin's colour)
+                go_ = _outline_guard(job.face, (hY, wY), y_per_src, wf, band) if job.face is not None else None
+                if go_ is not None:
+                    gx_ = go_ if gx_ is None else np.minimum(gx_, go_)
+                bandg = band if gx_ is None else band * gx_
+                mY = np.clip(bandg * (base_ + 0.95 * found), 0, 1)
                 if key == "nasolabial":
-                    nh_ = nose_hold(job.face, (hY, wY), y_per_src, wf)
+                    nh_ = nose_hold(job.face, (hY, wY), y_per_src, wf, None if NASO_REACH == NOSE_REACH else NASO_REACH)
                     if nh_ is not None:
                         mY = mY * nh_
                 if he_ is not None:
                     mY = mY * (1.0 - he_)
                 Y = _fold_fill(Y, mY, exY, 0.95 * k, max(0.8, sf * wf), max(2.0, ss * wf), True,
                                valley=max(1.5, 1.6 * fw_ * wf))
-                if FOLD_BROAD > 1e-4:
-                    mb_ = band
+                fcf_ = NASO_FOLD if (key == "nasolabial" and NASO_FOLD) else {}
+                fb_ = fcf_.get("broad", FOLD_BROAD)
+                fl_ = fcf_.get("level", FOLD_LEVEL)
+                if fb_ > 1e-4:
+                    mb_ = bandg
                     if key == "nasolabial" and nh_ is not None:
                         mb_ = mb_ * nh_
                     if he_ is not None:
                         mb_ = mb_ * (1.0 - he_)
-                    Y = _fold_broad(Y, mb_, exY, wf, FOLD_BROAD * k, FOLD_BROAD_SCALE[key])
-                if FOLD_LEVEL > 1e-4 and "skin" in job.masks:
-                    mb_ = band
+                    Y = _fold_broad(Y, mb_, exY, wf, fb_ * k, FOLD_BROAD_SCALE[key], fcf_.get("broad_cap", FOLD_BROAD_CAP))
+                if fl_ > 1e-4 and "skin" in job.masks:
+                    mb_ = bandg
                     if key == "nasolabial" and nh_ is not None:
                         mb_ = mb_ * nh_
-                    Y = _fold_level(Y, mb_, M(job.masks["skin"], (hY, wY)), exY, wf, FOLD_LEVEL * k, he_)
+                    Y = _fold_level(Y, mb_, M(job.masks["skin"], (hY, wY)), exY, wf, fl_ * k, he_,
+                                    fcf_.get("excl"), fcf_.get("edge"), fcf_.get("cap"))
                 mC = M(mY, (hC, wC))
                 Cb = _fold_fill(Cb, mC, exC, 0.7 * k, max(0.8, sf * wf * cs), max(1.5, ss * wf * cs), False)
                 Cr = _fold_fill(Cr, mC, exC, 0.7 * k, max(0.8, sf * wf * cs), max(1.5, ss * wf * cs), False)
@@ -4607,6 +5734,12 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                     mfl = mfl * nh_
                 if hd_ is not None:
                     mfl = mfl * (1.0 - np.maximum(hd_, he_))
+                try:
+                    lz_ = _lash_zone(exY, job.face, (hY, wY), y_per_src, wf)
+                    if lz_ is not None:
+                        mfl = mfl * (1.0 - lz_)
+                except Exception:
+                    pass
                 Y, Cb, Cr = _crease_lift(Y, Cb, Cr, mfl, float(np.clip(FACE_LINES, 0, 1)), max(1.5, 0.012 * wf),
                                          None, jaw_hold(job.face, (hY, wY), y_per_src, wf))
             if CHIN_DIMPLE > 1e-4:
@@ -4621,6 +5754,12 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                         mfz = mfz * (1.0 - exY)
                     if hd_ is not None:
                         mfz = mfz * (1.0 - np.maximum(hd_, he_))
+                    try:
+                        lz_ = _lash_zone(exY, job.face, (hY, wY), y_per_src, wf)    # the eye's lash fan is no frown line (LASH_REACH)
+                        if lz_ is not None:
+                            mfz = mfz * (1.0 - lz_)
+                    except Exception:
+                        pass
                     Y, Cb, Cr = _crease_lift(Y, Cb, Cr, mfz, float(np.clip(FROWN_LINES, 0, 1)), max(1.5, 0.014 * wf),
                                              None, None)
             except Exception:
@@ -4650,13 +5789,20 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
             Cb = _lift(Cb, mC, k, max(1.0, sig * cs), keep=0.0)
             Cr = _lift(Cr, mC, k, max(1.0, sig * cs), keep=0.0)
         # 3b. neck lines
-        if "neck" in job.masks and v.get("neck_lines", 0) > 1e-4:
-            k = float(np.clip(v["neck_lines"], 0, 1))
+        if "neck" in job.masks and v.get("neck_lines", 0) > 1e-4 and _small_face_gate(wf, NECK_SMALL_WF) > 1e-4:
+            k = float(np.clip(v["neck_lines"], 0, 1)) * _small_face_gate(wf, NECK_SMALL_WF)
             lmj = job.face
             mN = M(job.masks["neck"], (hY, wY))
             nz_ = neck_zone(lmj, (hY, wY), y_per_src, wf)
             if nz_ is not None:
                 mN = mN * nz_
+            if NECK_CLOTH_GATE is not None:
+                try:
+                    cg_ = _skin_gate(Y, mN, *NECK_CLOTH_GATE)
+                    if cg_ is not None:
+                        mN = mN * cg_
+                except Exception:
+                    pass
             try:
                 nd_, ne_ = _hold_maps(Y, Cb, Cr, mN, wf, lmj, y_per_src)
                 if nd_ is not None:
@@ -4671,7 +5817,15 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
             ex_ = det.get("line") if det else None
             if ex_ is not None and prot_ is not None:
                 ex_ = ex_ * (1.0 - prot_)
+            Y_pre_ = Y
+            acw_ = None
+            if NECK_ACROSS is not None:
+                try:
+                    acw_ = _across_weight(Y, mN, neck_axis(lmj), wf)
+                except Exception:
+                    acw_ = None
             Y, Cb, Cr = _crease_lift(Y, Cb, Cr, mN, k, max(1.5, 0.018 * wf), None, jh_, extra=ex_)
+            Y_cr_ = Y
             if det and det.get("fold") is not None:
                 fo_ = det["fold"] if prot_ is None else det["fold"] * (1.0 - prot_)
                 Y = _fold_any(Y, mN, fo_, jh_, wf, NECK_RING * k)
@@ -4689,19 +5843,40 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                 except Exception:
                     ax2_ = None
                 Y = _neck_level(Y, mN, jh_, wf, NECK_LEVEL * k, ax2_)
+            bw_ = acw_                                                       # the broad steps only where the structure lies across the neck
+            if NECK_BROAD < 0.999:
+                bw_ = NECK_BROAD if bw_ is None else bw_ * NECK_BROAD
+            if NECK_UNDER_CHIN is not None:
+                try:
+                    ju_ = jaw_under(lmj, (hY, wY), y_per_src, wf, NECK_UNDER_CHIN)
+                except Exception:
+                    ju_ = None
+                if ju_ is not None:
+                    bw_ = ju_ if bw_ is None else bw_ * ju_
+            if bw_ is not None:
+                Y = (Y_cr_ + (Y - Y_cr_) * bw_).astype(np.float32)
+            if NECK_CAP is not None:
+                Y = _cap_change(Y_pre_, Y, mN, NECK_CAP)
         # 3b'. goose bumps on the neck: softened, never wiped
-        if "neck" in job.masks and v.get("neck_bumps", 0) > 1e-4:
-            k = float(np.clip(v["neck_bumps"], 0, 1))
+        if "neck" in job.masks and v.get("neck_bumps", 0) > 1e-4 and _small_face_gate(wf, NECK_SMALL_WF) > 1e-4:
+            k = float(np.clip(v["neck_bumps"], 0, 1)) * _small_face_gate(wf, NECK_SMALL_WF)
+            mNb_ = M(job.masks["neck"], (hY, wY))
+            if NECK_CLOTH_GATE is not None:
+                try:
+                    cg_ = _skin_gate(Y, mNb_, *NECK_CLOTH_GATE)
+                    if cg_ is not None:
+                        mNb_ = mNb_ * cg_
+                except Exception:
+                    pass
             if det and "bump" in det:
                 # the raised bumps the detector is sure of go (as with 잡티 제거, but on the neck and at this
                 # slider's strength); the softening below then evens the rest of the texture (review 6c3dcb3: the
                 # slider alone never used the detection)
-                mN_ = M(job.masks["neck"], (hY, wY))
+                mN_ = mNb_
                 Sb_ = det["bump"] * mN_ * ((1.0 - prot_) if prot_ is not None else 1.0)
                 if float(Sb_.max()) > 0.05:
                     Y, Cb, Cr = _spot_fill(Y, Cb, Cr, mN_, Sb_, None, k, spot_size(job, wf), cs)
-            Y, Cb, Cr = _bump_soften(Y, Cb, Cr, M(job.masks["neck"], (hY, wY)), M(job.masks["neck"], (hC, wC)),
-                                     k, wf, cs)
+            Y, Cb, Cr = _bump_soften(Y, Cb, Cr, mNb_, M(mNb_, (hC, wC)), k, wf, cs)
         # 3c. redness
         if "tone" in job.masks and v.get("redness", 0) > 1e-4:
             k = float(np.clip(v["redness"], 0, 1))

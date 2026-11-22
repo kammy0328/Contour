@@ -132,15 +132,16 @@ def _plane_keep(I: np.ndarray, w: np.ndarray, axis, keep: float) -> Optional[np.
     return (lvl + bx * (gx - x0) + by * (gy - y0)).astype(np.float32)
 
 
-def knee_geometry(shape: Tuple[int, int], centre, axis, half: float):
+def knee_geometry(shape: Tuple[int, int], centre, axis, half: float, along: float = 1.0):
     """The elliptical radius of every pixel from a knee (1 = the edge of the ellipse with the semi axes of KNEE_ALONG and
-    KNEE_ACROSS half widths), for a knee at centre (x, y), a leg running along axis (unit, x y) and half its width."""
+    KNEE_ACROSS half widths), for a knee at centre (x, y), a leg running along axis (unit, x y) and half its width.
+    along: the share of KNEE_ALONG the ellipse is long (1; less for a leg whose bare stretch is short, see knee_rescue_geometry)."""
     h, w = shape
     gy, gx = np.mgrid[0:h, 0:w].astype(np.float32)
     dx, dy = gx - float(centre[0]), gy - float(centre[1])
     u = dx * float(axis[0]) + dy * float(axis[1])
     v = -dx * float(axis[1]) + dy * float(axis[0])
-    return np.sqrt((u / (KNEE_ALONG * half)) ** 2 + (v / (KNEE_ACROSS * half)) ** 2).astype(np.float32)
+    return np.sqrt((u / (KNEE_ALONG * float(along) * half)) ** 2 + (v / (KNEE_ACROSS * half)) ** 2).astype(np.float32)
 
 
 def leg_coords(shape: Tuple[int, int], centre, axis):
@@ -157,6 +158,159 @@ LEG_EDGE = (0.62, 0.92)   # across the leg, in half widths: from where a pixel i
 LOCAL_MIN_Y = 0.25         # a leg's skin in a picture is brighter than this (the 75th percentile of the strip) ...
 LOCAL_MIN_CHROMA = 0.012   # ... and its (Cb, Cr) is this far from grey
 CHROMA_SIG = 0.004        # at least: how far (Cb, Cr) may be from the leg's own colour and still be the leg's skin (a dim, flat picture has small colour differences)
+
+
+# 2611 IWALY c003 (2026-11-22, user, 00:00:39:17, "the knee's retouch must be applied"): the tracks put a knee at the top edge of a knee-high sock (or under a hem),
+# 58 px (1.7 half widths) below the knee the leg shows: the skin lies above it. The knee's own area then lay on the sock, hardly any of it was skin
+# (a thirtieth), the read of the leg was not trusted and nothing was changed. The centre of a knee whose own area is mostly not skin is moved along its
+# leg to where the skin is (the area as the skin area has it, kept DARK_RIM away from what is not skin along the leg, as the skin read for the knee is).
+KNEE_SLIDE = 2.2          # the most a knee's centre is moved along the leg, in half widths (0 = off)
+KNEE_SLIDE_FROM = 0.60    # only a knee whose own area is less than this much on skin is moved
+KNEE_SLIDE_GAIN = 0.15    # ... and only to a place whose area is this much more on skin
+KNEE_SLIDE_COST = 0.04    # (per half width moved: the nearer of two alike places)
+
+
+def knee_slide(sk: Optional[np.ndarray], centre, axis, half: float, slide: Optional[float] = None):
+    """The centre of a knee moved along its leg (axis, unit x y) to where the skin is: sk: 0..1 the skin area in a plane, centre (x, y) and half (half the leg's
+    width) in that plane's pixels. -> the centre (the one given where the knee's own area is on skin already, or nowhere does better)."""
+    smax = KNEE_SLIDE if slide is None else float(slide)
+    if smax <= 0 or sk is None or not half > 1.5:
+        return centre
+    h, w = sk.shape
+    cx, cy = float(centre[0]), float(centre[1])
+    R = int((smax + KNEE_ALONG * KNEE_EDGE[1] + DARK_RIM + 0.3) * half) + 4
+    x0, x1 = max(0, int(cx) - R), min(w, int(cx) + R + 1)
+    y0, y1 = max(0, int(cy) - R), min(h, int(cy) + R + 1)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return centre
+    sub = np.clip(np.asarray(sk[y0:y1, x0:x1], np.float32), 0.0, 1.0)
+    f = max(1, int(half // 8))                                   # (looked at on a smaller picture: the area is smooth)
+    if f > 1:
+        sub = cv2.resize(sub, (max(8, (x1 - x0) // f), max(8, (y1 - y0) // f)), interpolation=cv2.INTER_AREA)
+    hs = half / f
+    c0 = ((cx - x0) / f, (cy - y0) / f)
+    ax, ay = float(axis[0]), float(axis[1])
+    r = max(1, int(round(DARK_RIM * hs)))
+    ln = np.zeros((2 * r + 1, 2 * r + 1), np.uint8)
+    cv2.line(ln, (r - int(round(ax * r)), r - int(round(ay * r))), (r + int(round(ax * r)), r + int(round(ay * r))), 1, 1)
+    inner = cv2.erode((sub > 0.5).astype(np.uint8), ln, borderType=cv2.BORDER_CONSTANT, borderValue=1).astype(np.float32)
+    inner = np.minimum(sub, cv2.GaussianBlur(inner, (0, 0), max(0.8, 0.12 * hs)))
+    ds = np.arange(-smax, smax + 1e-6, 0.2)
+    covs = np.zeros(len(ds), np.float64)
+    for i, d in enumerate(ds):
+        c_ = (c0[0] + d * hs * ax, c0[1] + d * hs * ay)
+        e = knee_geometry(inner.shape, c_, (ax, ay), hs)
+        area = 1.0 - _ss(KNEE_EDGE[0], KNEE_EDGE[1], e)
+        _, leg = _leg_strip(inner.shape, c_, (ax, ay), hs)
+        al = area * leg
+        covs[i] = float((al * inner).sum()) / max(float(al.sum()), 1e-6)
+    i0 = int(np.argmin(np.abs(ds)))
+    if covs[i0] >= KNEE_SLIDE_FROM:
+        return centre
+    ib = int(np.argmax(covs - KNEE_SLIDE_COST * np.abs(ds)))
+    if covs[ib] - covs[i0] < KNEE_SLIDE_GAIN:
+        return centre
+    d = float(ds[ib])
+    return (cx + d * half * ax, cy + d * half * ay)
+
+
+# 2611 IWALY c003 (2026-11-22, user, 00:00:39:17, "the knee's retouch must be applied"), the second half of the same knee: the leg's bare stretch there is SHORT (a sock under the
+# knee, a hem over it: 133 px bare at a half width of 34, 2.3 half widths of it with DARK_RIM kept off the cloth at both ends), the knee's own area (3.1 half widths long) and
+# its ring (from 1.6 half widths out) do not fit in it, wherever the knee is moved to (KNEE_SLIDE): the area lies on cloth for the most part and nothing is changed.
+# A knee that is not trusted (reliability under RESCUE_FROM) is looked at again with a SHORTER model: the same ellipse, its length along the leg RESCUE_ALONG times (the
+# longest that has the skin it needs), put where the bare stretch has the most room on both sides, the leg's skin being the area's skin and, in the shade round it, the leg's
+# own colour. The look ahead (knee_support) does the same on the area alone, so that it does not hold back what the tone is able to change.
+KNEE_RESCUE = True
+RESCUE_FROM = 0.5         # a knee is looked at again when its read is trusted less than this
+RESCUE_ALONG = (1.0, 0.85, 0.70, 0.58, 0.45)   # the shares of KNEE_ALONG tried, the longest first (a knee on a stretch too short for the last is left alone)
+RESCUE_SLIDE = 2.6        # the most the knee is moved along the leg, in half widths
+RESCUE_AREA = 0.60        # the shortened knee's own area must be this much on skin (the skin with DARK_RIM kept off the cloth)
+RESCUE_COST_D = 0.04      # of the score per half width the knee is moved
+RESCUE_TWO = 0.5          # the share of the ring's evenness on both sides of the knee in the score (the knee in the middle of the stretch)
+RESCUE_LONG = 0.5         # the share of the model's length (a longer one takes in more of the knee) in the score
+RESCUE_NEAR = 4.0         # the width of colour that is the leg's, in the shade of the knee: this times the median spread of the ring's colour
+RESCUE_SEED = 0.8         # of a half width: the leg's own colour is added to the skin area only this near to the area
+RESCUE_TRUST = 0.9        # a rescued knee is trusted this much of what its own numbers say ...
+RESCUE_GAIN = 0.10        # ... and is taken over the knee as it was read only when it is this much more trusted
+RESCUE_READ = 0.7         # the leg's colour is read from the part of the strip the body skin's area holds to this degree (when it holds enough of it)
+RESCUE_MAD_MIN = 0.004    # the least spread of the leg's colour the lenient reading assumes (a very clean picture has none: a half of the leg in shade is as far from the colour as a few spreads)
+RESCUE_TABLE = None       # a list: every place tried is appended (along, shift, area, ring, two, fits, score), for the desk's debugging
+
+
+def _ringw(e: np.ndarray) -> np.ndarray:
+    """The weight of the ring (0..1) from a knee's elliptical radius."""
+    return (_ss(RING[0], RING[0] + 0.35, e) * (1.0 - _ss(RING[1] - 0.6, RING[1], e))).astype(np.float32)
+
+
+def _knee_window(sk: np.ndarray, centre, half: float, reach: float):
+    """The window of a skin plane round a knee (reach half widths each side), on a smaller picture (the area is smooth): (sub, hs, c0, f): the window, half the leg's
+    width and the knee's centre in its pixels, the reduction. None where the window is too small."""
+    h, w = sk.shape
+    cx, cy = float(centre[0]), float(centre[1])
+    R = int(reach * half) + 4
+    x0, x1 = max(0, int(cx) - R), min(w, int(cx) + R + 1)
+    y0, y1 = max(0, int(cy) - R), min(h, int(cy) + R + 1)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return None
+    sub = np.clip(np.asarray(sk[y0:y1, x0:x1], np.float32), 0.0, 1.0)
+    f = max(1, int(half // 8))
+    if f > 1:
+        sub = cv2.resize(sub, (max(8, (x1 - x0) // f), max(8, (y1 - y0) // f)), interpolation=cv2.INTER_AREA)
+    return sub, half / f, ((cx - x0) / f, (cy - y0) / f), f
+
+
+def _inner_skin(sub: np.ndarray, hs: float, axis) -> np.ndarray:
+    """A skin plane with DARK_RIM (of a half width, hs pixels) kept off what is not skin along the leg (axis): the rim of a sock, a hem, a shoe is not the leg's."""
+    ax, ay = float(axis[0]), float(axis[1])
+    r = max(1, int(round(DARK_RIM * hs)))
+    ln = np.zeros((2 * r + 1, 2 * r + 1), np.uint8)
+    cv2.line(ln, (r - int(round(ax * r)), r - int(round(ay * r))), (r + int(round(ax * r)), r + int(round(ay * r))), 1, 1)
+    inner = cv2.erode((sub > 0.5).astype(np.uint8), ln, borderType=cv2.BORDER_CONSTANT, borderValue=1).astype(np.float32)
+    return np.minimum(sub, cv2.GaussianBlur(inner, (0, 0), max(0.8, 0.12 * hs)))
+
+
+def knee_rescue(sk: Optional[np.ndarray], centre, axis, half: float, slide: Optional[float] = None):
+    """A knee on a short bare stretch of its leg: the model of the knee (the share of KNEE_ALONG its own area is long) that has the skin it needs (the longest that is
+    read from both sides of the stretch), and the place along the leg where the stretch has the most room for it. sk: 0..1 the skin area in a plane, centre (x, y) and half (half the leg's width) in that plane's
+    pixels. -> (x, y, along, info) of the knee as it is put, or None (no skin to be read from, or the stretch is too short even for the shortest model)."""
+    if not KNEE_RESCUE or sk is None or not half > 1.5:
+        return None
+    smax = RESCUE_SLIDE if slide is None else float(slide)
+    win = _knee_window(sk, centre, half, smax + RING[1] * KNEE_ALONG)
+    if win is None:
+        return None
+    sub, hs, c0, f = win
+    ax, ay = float(axis[0]), float(axis[1])
+    inner = _inner_skin(sub, hs, (ax, ay))
+    ds = np.arange(-smax, smax + 1e-6, 0.2)
+    best = None
+    for a in RESCUE_ALONG:
+        for d in ds:
+            c_ = (c0[0] + d * hs * ax, c0[1] + d * hs * ay)
+            e = knee_geometry(inner.shape, c_, (ax, ay), hs, a)
+            area = 1.0 - _ss(KNEE_EDGE[0], KNEE_EDGE[1], e)
+            u_, leg = _leg_strip(inner.shape, c_, (ax, ay), hs)
+            al = area * leg
+            rw = _ringw(e) * leg
+            sa, sr = float(al.sum()), float(rw.sum())
+            if sa < 1e-3 or sr < 1e-3:
+                continue
+            cov_a = float((al * inner).sum()) / sa
+            rin = rw * inner
+            cov_r = float(rin.sum()) / sr
+            up, dn = float(rin[u_ < 0].sum()), float(rin[u_ >= 0].sum())
+            two = 2.0 * min(up, dn) / max(up + dn, 1e-6)
+            ok = cov_a >= RESCUE_AREA and cov_r >= REL_RING[1]
+            sc = cov_a + RESCUE_TWO * two + RESCUE_LONG * float(a) - RESCUE_COST_D * abs(float(d))
+            if RESCUE_TABLE is not None:
+                RESCUE_TABLE.append((float(a), round(float(d), 2), round(cov_a, 3), round(cov_r, 4), round(two, 3), bool(ok), round(sc, 3)))
+            if ok and (best is None or sc > best[0]):
+                best = (sc, float(d), cov_a, cov_r, two, float(a))
+    if best is None:
+        return None
+    d, a = best[1], best[5]
+    return (float(centre[0]) + d * half * ax, float(centre[1]) + d * half * ay, a,
+            dict(along=a, shift=round(d, 2), fit_area=round(best[2], 3), fit_ring=round(best[3], 4), fit_two=round(best[4], 3)))
 
 
 def _skin_like(yref: float, mb: float, mr: float) -> bool:
@@ -190,11 +344,11 @@ def local_zone_skin(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, zone: np.ndar
     return (zone * light * np.exp(-0.5 * (d / sig) ** 2)).astype(np.float32)
 
 
-def local_skin(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, centre, axis, half: float, e: np.ndarray):
-    """The skin of one leg round a knee when the body skin's area is not there (the parser found nothing to hold on to:
-    a dim picture, a colour cast, dark tights): only the leg's own strip, from the joints. -> (area, ring): the strip
-    without the dark (sock, hem, shoe), and the part of it round the knee whose colour is the leg's (what is read from).
-    None where the strip does not show enough of a leg."""
+def _local_skin_parts(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, centre, axis, half: float, e: np.ndarray, lenient: float = 0.0, seed: Optional[np.ndarray] = None):
+    """What local_skin works out, in pieces: a dict of the leg's strip (leg), its light with the rim of what is dark off it (lt), the leg's colour near each pixel
+    (near; near2 with lenient times the spread's width more room, for a half of the leg in shade) and the ring (ring); None where the strip does not show enough
+    of a leg. seed: the body skin's area (0..1) when it is known: the leg's colour is read from the part of the strip it holds (RESCUE_READ of it or more), not from the whole
+    strip, which reaches the wall beside a short leg and takes its flat colour for the leg's."""
     hY, wY = Y.shape
     u, v = leg_coords((hY, wY), centre, axis)
     leg = (1.0 - _ss(LEG_EDGE[0], LEG_EDGE[1], np.abs(v) / half)).astype(np.float32)
@@ -205,6 +359,12 @@ def local_skin(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, centre, axis, half
     yref = float(np.percentile(yb, 75))                    # (a sock, a hem or a shoe in the strip is darker than the leg)
     light = _ss(NOT_SKIN[0], NOT_SKIN[1], Y / max(yref, 1e-4)).astype(np.float32)
     core = band & (light > 0.9)
+    if seed is not None:
+        known = core & (seed > RESCUE_READ)
+        if int(known.sum()) >= 60:
+            core = known
+            yref = float(np.percentile(Y[core], 75))
+            light = _ss(NOT_SKIN[0], NOT_SKIN[1], Y / max(yref, 1e-4)).astype(np.float32)
     if int(core.sum()) < 60:
         return None
     if Cb.shape != (hY, wY):
@@ -219,6 +379,10 @@ def local_skin(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, centre, axis, half
     mad = float(np.median(d[core]))
     sig = max(CHROMA_SIG, 2.5 * mad)
     near = np.exp(-0.5 * (d / sig) ** 2).astype(np.float32)
+    near2 = None
+    if lenient > 0:
+        sig2 = max(2.0 * CHROMA_SIG, float(lenient) * max(mad, RESCUE_MAD_MIN))
+        near2 = np.exp(-0.5 * (d / sig2) ** 2).astype(np.float32)
     # the rim of a sock, a hem, a shoe (its blur, the shade it throws on the leg) is not the leg's skin either
     r = int(max(2, DARK_RIM * half))
     dark = cv2.dilate((light < 0.6).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1)))
@@ -226,7 +390,18 @@ def local_skin(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, centre, axis, half
     lt = (light * rim).astype(np.float32)
     thigh = 1.0 - (1.0 - SHIN_SHARE) * _ss(0.0, 0.5, u / half)     # (the thigh runs up from the knee, the shin down: the shin is read less, it is the one that sits in a sock's shade)
     ring = (leg * lt * near * thigh * _ss(RING[0], RING[0] + 0.35, e) * (1.0 - _ss(RING[1] - 0.6, RING[1], e))).astype(np.float32)
-    return (leg * lt).astype(np.float32), ring
+    return dict(leg=leg, light=light, lt=lt, near=near, near2=near2, ring=ring)
+
+
+def local_skin(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, centre, axis, half: float, e: np.ndarray):
+    """The skin of one leg round a knee when the body skin's area is not there (the parser found nothing to hold on to:
+    a dim picture, a colour cast, dark tights): only the leg's own strip, from the joints. -> (area, ring): the strip
+    without the dark (sock, hem, shoe), and the part of it round the knee whose colour is the leg's (what is read from).
+    None where the strip does not show enough of a leg."""
+    p = _local_skin_parts(Y, Cb, Cr, centre, axis, half, e)
+    if p is None:
+        return None
+    return (p["leg"] * p["lt"]).astype(np.float32), p["ring"]
 
 
 def tone_plane(P: np.ndarray, area: np.ndarray, ring: np.ndarray, half: float, k: float, kind: str,
@@ -346,40 +521,59 @@ def knee_reliability(e: np.ndarray, area: np.ndarray, w_area: np.ndarray, w_ring
                            keep=round(keep, 3), rel=round(rel, 3), half=round(float(half), 1), cx=round(float(centre[0]), 1), cy=round(float(centre[1]), 1))
 
 
+def _cover_at(m: np.ndarray, c0, axis, hh: float, along: float = 1.0) -> float:
+    """How much of the leg's skin a skin area has round a knee put at c0 (the area's pixels, hh = half the leg's width in them): the weighing of knee_reliability's, on the
+    area as it is (0..1)."""
+    h, w = m.shape
+    ax, ay = float(axis[0]), float(axis[1])
+    R = int(RING[1] * KNEE_ALONG * float(along) * hh) + 2
+    x0, x1 = max(0, int(c0[0]) - R), min(w, int(c0[0]) + R + 1)
+    y0, y1 = max(0, int(c0[1]) - R), min(h, int(c0[1]) + R + 1)
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return 0.0
+    sub = np.asarray(m[y0:y1, x0:x1], np.float32)
+    c_ = (c0[0] - x0, c0[1] - y0)
+    e = knee_geometry(sub.shape, c_, (ax, ay), hh, along)
+    area = 1.0 - _ss(KNEE_EDGE[0], KNEE_EDGE[1], e)
+    _, leg = _leg_strip(sub.shape, c_, (ax, ay), hh)
+    ringw = _ringw(e)
+    nom_a = float((area * leg).sum())
+    nom_r = float((ringw * leg).sum())
+    if nom_a < 1e-3 or nom_r < 1e-3:
+        return 0.0
+    cov_a = min(1.0, float((area * leg * sub).sum()) / nom_a)
+    cov_r = min(1.0, float((ringw * leg * sub).sum()) / nom_r)
+    return float(_ss(REL_AREA[0], REL_AREA[1], cov_a) * _ss(REL_RING[0], REL_RING[1], cov_r))
+
+
 def knee_support(m: np.ndarray, scale: float, knees) -> list:
     """How much of the leg's skin one picture's skin area has round each of a person's knees: the same weighing as knee_reliability's, on the area as
-    the analysis made it (before the picture's own colour and brightness are asked: that is made when the picture is worked on).
+    the analysis made it (before the picture's own colour and brightness are asked: that is made when the picture is worked on). A knee on a short bare
+    stretch of its leg (knee_rescue) is looked at with the shorter model, as the tone does.
 
     m: the person's body skin area on the analysis picture (float32 0..1), scale: that picture's pixels per source pixel,
     knees: person_geometry's [(cx, cy, ax, ay, half)] in source px. -> [0..1 for each knee]"""
     out = []
-    h, w = m.shape
     for (cx, cy, ax, ay, half) in knees:
         hh = float(half) * float(scale)
         if not hh > 1.5:
             out.append(0.0)
             continue
         c0 = (float(cx) * scale, float(cy) * scale)
-        R = int(RING[1] * KNEE_ALONG * hh) + 2
-        x0, x1 = max(0, int(c0[0]) - R), min(w, int(c0[0]) + R + 1)
-        y0, y1 = max(0, int(c0[1]) - R), min(h, int(c0[1]) + R + 1)
-        if x1 - x0 < 4 or y1 - y0 < 4:
-            out.append(0.0)
-            continue
-        sub = np.asarray(m[y0:y1, x0:x1], np.float32)
-        c_ = (c0[0] - x0, c0[1] - y0)
-        e = knee_geometry(sub.shape, c_, (ax, ay), hh)
-        area = 1.0 - _ss(KNEE_EDGE[0], KNEE_EDGE[1], e)
-        _, leg = _leg_strip(sub.shape, c_, (ax, ay), hh)
-        ringw = _ss(RING[0], RING[0] + 0.35, e) * (1.0 - _ss(RING[1] - 0.6, RING[1], e))
-        nom_a = float((area * leg).sum())
-        nom_r = float((ringw * leg).sum())
-        if nom_a < 1e-3 or nom_r < 1e-3:
-            out.append(0.0)
-            continue
-        cov_a = min(1.0, float((area * leg * sub).sum()) / nom_a)
-        cov_r = min(1.0, float((ringw * leg * sub).sum()) / nom_r)
-        out.append(float(_ss(REL_AREA[0], REL_AREA[1], cov_a) * _ss(REL_RING[0], REL_RING[1], cov_r)))
+        if KNEE_SLIDE > 0:
+            try:
+                c0 = knee_slide(m, c0, (ax, ay), hh)
+            except Exception:
+                pass
+        s0 = _cover_at(m, c0, (ax, ay), hh)
+        if KNEE_RESCUE and s0 < RESCUE_FROM:
+            try:
+                fit = knee_rescue(m, c0, (ax, ay), hh)
+            except Exception:
+                fit = None
+            if fit is not None:
+                s0 = max(s0, RESCUE_TRUST * _cover_at(m, (fit[0], fit[1]), (ax, ay), hh, fit[2]))
+        out.append(float(s0))
     return out
 
 
@@ -452,10 +646,74 @@ def _merge(d_all: Optional[np.ndarray], d: np.ndarray) -> np.ndarray:
     return np.where(np.abs(d) > np.abs(d_all), d, d_all).astype(np.float32)
 
 
+def _union_skin(Y, Cb, Cr, skin, centre, axis, half: float, e: np.ndarray) -> np.ndarray:
+    """The body skin's area with the leg's own colour added to it where the leg is in the shade or the area has a hole: in the leg's strip, what has the colour the leg's skin has
+    round the knee (a wider spread of it than the ring's, RESCUE_NEAR) and is not dark, within RESCUE_SEED half widths of the area. The area itself where that cannot be read."""
+    sk = np.clip(skin, 0.0, 1.0).astype(np.float32)
+    p = _local_skin_parts(Y, Cb, Cr, centre, axis, half, e, lenient=RESCUE_NEAR, seed=sk)
+    if p is None or p.get("near2") is None:
+        return sk
+    hY, wY = sk.shape
+    R = int((RESCUE_SLIDE + RING[1] * KNEE_ALONG) * half) + 4
+    cx, cy = float(centre[0]), float(centre[1])
+    x0, x1 = max(0, int(cx) - R), min(wY, int(cx) + R + 1)
+    y0, y1 = max(0, int(cy) - R), min(hY, int(cy) + R + 1)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return sk
+    r = max(2, int(RESCUE_SEED * half))
+    core = (sk[y0:y1, x0:x1] > 0.5).astype(np.uint8)
+    seed = cv2.dilate(core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))).astype(np.float32)
+    add = (p["leg"] * p["near2"] * p["light"])[y0:y1, x0:x1] * cv2.GaussianBlur(seed, (0, 0), max(1.0, 0.25 * r))
+    out = sk.copy()
+    out[y0:y1, x0:x1] = np.maximum(sk[y0:y1, x0:x1], add)
+    return out
+
+
+def _knee_read(Y, Cb, Cr, skin, centre, axis, half: float, along: float = 1.0):
+    """One knee read from the picture: (e, area, w_area, w_ring, rel, keep, info) for a knee at centre whose own area is along (the share of KNEE_ALONG) long, or None where
+    there is no area or no skin of the leg to read."""
+    hY, wY = Y.shape
+    e = knee_geometry((hY, wY), centre, axis, half, along)
+    area = 1.0 - _ss(KNEE_EDGE[0], KNEE_EDGE[1], e)
+    if float(area.max()) < 0.05:
+        return None
+    got = None
+    if skin is not None:
+        got = _masked_skin(Y, skin, e, area, half)
+    else:
+        ls = local_skin(Y, Cb, Cr, centre, axis, half, e)
+        if ls is not None and int((ls[1] > 0.5).sum()) >= 60:
+            got = ((area * ls[0]).astype(np.float32), ls[1])
+    if got is None:
+        return None
+    w_area, w_ring = got
+    rel, keep, info = knee_reliability(e, area, w_area, w_ring, centre, axis, half)
+    info["along"] = round(float(along), 3)
+    return e, area, w_area, w_ring, rel, keep, info
+
+
+def _knee_rescue_read(Y, Cb, Cr, skin, centre, axis, half: float):
+    """The knee read with the shorter model on a short bare stretch (knee_rescue, on the area with the leg's own colour added: _union_skin): as _knee_read, or None."""
+    if skin is None:
+        return None
+    hY, wY = Y.shape
+    e0 = knee_geometry((hY, wY), centre, axis, half)
+    sku = _union_skin(Y, Cb, Cr, skin, centre, axis, half, e0)
+    fit = knee_rescue(sku, centre, axis, half)
+    if fit is None:
+        return None
+    rd = _knee_read(Y, Cb, Cr, sku, (fit[0], fit[1]), axis, half, fit[2])
+    if rd is None:
+        return None
+    rd[6].update(rescue=True, shift=fit[3]["shift"], fit_area=fit[3]["fit_area"], fit_ring=fit[3]["fit_ring"], fit_two=fit[3]["fit_two"],
+                 cx=round(float(fit[0]), 1), cy=round(float(fit[1]), 1))
+    return rd
+
+
 def _knee_tone_v2(Y, Cb, Cr, skin, knees, k, cs, gains=None):
     """The knee tone with its read of the leg weighed (knee_reliability): every knee reads the picture as it came (not what
     another knee changed), changes it by as much as the read can be trusted, and where two knees change the same pixel the
-    larger change stays."""
+    larger change stays. A knee that is not trusted is read again with a shorter model (knee_rescue) and that read is taken when it is trusted more."""
     hY, wY = Y.shape
     hC, wC = Cb.shape
     dY = dCb = dCr = None
@@ -468,21 +726,22 @@ def _knee_tone_v2(Y, Cb, Cr, skin, knees, k, cs, gains=None):
             gain = float(np.clip(gains[ki_], 0.0, 1.0))
             if gain < 1e-3:
                 continue
-        e = knee_geometry((hY, wY), centre, axis, half)
-        area = 1.0 - _ss(KNEE_EDGE[0], KNEE_EDGE[1], e)
-        if float(area.max()) < 0.05:
+        if skin is not None and KNEE_SLIDE > 0:
+            try:
+                centre = knee_slide(skin, centre, axis, half)
+            except Exception:
+                pass
+        rd = _knee_read(Y, Cb, Cr, skin, centre, axis, half)
+        if KNEE_RESCUE and skin is not None and (rd is None or rd[4] < RESCUE_FROM):
+            try:
+                rs = _knee_rescue_read(Y, Cb, Cr, skin, centre, axis, half)
+            except Exception:
+                rs = None
+            if rs is not None and (rd is None or RESCUE_TRUST * rs[4] > rd[4] + RESCUE_GAIN):
+                rd = (rs[0], rs[1], rs[2], rs[3], RESCUE_TRUST * rs[4], rs[5], rs[6])
+        if rd is None:
             continue
-        got = None
-        if skin is not None:
-            got = _masked_skin(Y, skin, e, area, half)
-        else:
-            ls = local_skin(Y, Cb, Cr, centre, axis, half, e)
-            if ls is not None and int((ls[1] > 0.5).sum()) >= 60:
-                got = ((area * ls[0]).astype(np.float32), ls[1])
-        if got is None:
-            continue
-        w_area, w_ring = got
-        rel, keep, info = knee_reliability(e, area, w_area, w_ring, centre, axis, half)
+        e, area, w_area, w_ring, rel, keep, info = rd
         info["gain"] = round(gain, 3)
         if DEBUG_INFO is not None:
             DEBUG_INFO.append(info)
