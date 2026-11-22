@@ -54,6 +54,7 @@ LINE_DEEP = 0.2             # a valley this much darker than the skin anywhere a
 RUN_GAP = 0.01              # of the face width: gaps this long in a valley's run are bridged
 TWO_SIDED = (0.3, 0.65)      # share of a valley's depth it must also have against its darker side (a shadow's foot has none)
 BUMP_MAX = (0.16, 0.26)     # a bright dot this much over the skin (relative) is glitter, a glint, a drop: not a bump
+NET_KEEP_RULE_BUMP = False  # True: with the learned detector (large faces) the rule detector's raised spots are kept too (the net missed a lit bump, IWALY c029 f4)
 GLINT = (0.22, 0.40)        # a small bright dot this much over the skin (relative) is protected from every fill (a glint, glitter)
 DARK_MAX = (0.45, 0.65)     # a dot this much darker than the skin is a thing (a stud, a painted dot), not a blemish
 
@@ -520,7 +521,7 @@ def detect(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, skin: Optional[np.ndar
         if nm:
             for k in ("dark", "red", "bump"):
                 if k in nm:
-                    out[k] = nm[k]
+                    out[k] = np.maximum(nm[k], out[k]) if (k == "bump" and NET_KEEP_RULE_BUMP) else nm[k]
     if region is not None:
         out["protect"] = protect(Y, Cb, Cr, region, wf)
     return out

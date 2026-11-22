@@ -4522,7 +4522,12 @@ DET_BUMP_MAX = None         # 2611 IWALY c029 f4 (2026-11-22, user: "빨간색 �
 DET_GLINT = None            # (detect.BUMP_MAX / detect.GLINT) and left; None = the detector's own values. (lo, hi) of the relative brightness over the skin
 
 
+DET_RULE_BUMP = None        # True: detect.NET_KEEP_RULE_BUMP (the rule detector's bumps kept beside the learned detector's)
+
+
 def _det_cfg():
+    if DET_RULE_BUMP is not None:
+        DT.NET_KEEP_RULE_BUMP = bool(DET_RULE_BUMP)
     if DET_BUMP_MAX is not None:
         DT.BUMP_MAX = tuple(DET_BUMP_MAX)
     if DET_GLINT is not None:
@@ -5536,6 +5541,8 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                     mk_ = _mole_like(Y, Cb, Cr, reg, wf)
                     if mk_ is not None:
                         dk_ = dk_ * (1.0 - float(np.clip(MOLE_KEEP, 0, 1)) * mk_)
+                        det = dict(det)
+                        det["red"] = det["red"] * (1.0 - float(np.clip(MOLE_KEEP, 0, 1)) * mk_)
                 except Exception:
                     import traceback
                     traceback.print_exc()
