@@ -361,7 +361,7 @@ class SourceFrames:
 
 
 # ---------------------------------------------------------------------------------------------- pieces of the original
-CROP_READERS = 16           # piece readers kept open at once (faces and, since 1.23, bodies of one cut)
+CROP_READERS = 8            # piece readers kept open at once (faces and, since 1.23, bodies of one cut)
 CROP_GRID = 96          # the piece decoded is the piece asked for, widened to this grid: a face moving a little
                         # keeps its piece (one reader going on) instead of a new reader every frame
 
