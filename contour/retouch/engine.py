@@ -1584,6 +1584,19 @@ def _eye_white_apply_v2(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, mY: np.nd
     se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
     Yc = cv2.morphologyEx(Y.astype(np.float32), cv2.MORPH_CLOSE, se)
     up = np.clip(Yc - Y, 0, EYE_WHITE_V2_CAP[0])
+    # (11/24, INT_c006 f90: a white patch on the iris' rim) the closing lifts the dark ring where the white meets the iris: nothing is filled within a vein's size of the iris
+    # (the eye area's dark part: well under the white's own level)
+    try:
+        sel_ = mY > 0.3
+        if sel_.sum() > 20:
+            ref_ = float(np.percentile(Yc[sel_], 70))
+            dark_ = ((Y < 0.80 * ref_) & (cv2.dilate((mY > 0.05).astype(np.uint8), se) > 0)).astype(np.uint8)
+            dark_ = cv2.morphologyEx(dark_, cv2.MORPH_OPEN, se)          # thin veins are no iris: only what survives an opening at the vein's size
+            if dark_.any():
+                near_ = cv2.dilate(dark_, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (4 * r + 1, 4 * r + 1)))
+                up = up * (1.0 - near_.astype(np.float32))
+    except Exception:
+        pass
     rc = max(1, int(round(r * cs)))
     sec = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rc + 1, 2 * rc + 1))
     Cro = cv2.morphologyEx(Cr.astype(np.float32), cv2.MORPH_OPEN, sec)
