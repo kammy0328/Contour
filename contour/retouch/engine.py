@@ -6607,7 +6607,11 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
                     bm = bm * float(np.clip(FINAL_BUMP, 0, 1))
                     Y = Y + bm * (bf - Y)
             if FINAL_NASO > 1e-4 and lmY is not None and job.wf_src > 0:
-                Y = _final_naso(Y, Y0, lmY, wf, float(np.clip(FINAL_NASO, 0, 1)))
+                kn_ = float(np.clip(FINAL_NASO, 0, 1))
+                if FOLD_PRESENT is not None:
+                    kn_ *= _naso_pres_job(job, Y0, wf, y_per_src)
+                if kn_ > 1e-4:
+                    Y = _final_naso(Y, Y0, lmY, wf, kn_)
             if FOLD_HEAL > 1e-4 and lmY is not None and job.wf_src > 0 and "naso" in job.masks:
                 # a small face's crease, healed (after the nose's give-back: the top of the crease lies inside the nose's area)
                 kh_ = float(np.clip(FOLD_HEAL, 0, 1)) * float(np.clip(job.v.get("nasolabial", 0.0), 0, 1)) * (1.0 - _face_big(job.face, wf, y_per_src))
