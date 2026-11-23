@@ -1572,6 +1572,7 @@ FOCUS_GATE = None      # (lo, hi) or None (= off). 2611 IWALY c025 (2026-11-23, 
                        # slowly again where the focus comes back): the face's edge ratio R (see _focus_r: about 1.0 for a face blurred past help, 1.3 and more for a sharp one) goes
                        # through smoothstep(lo, hi, R): 0 = the person is not worked on in that picture at all (no masks, no retouch), 1 = as without the gate. The values of the
                        # frames t - 1 .. t + 1 are averaged, so the retouch fades in and out over a few frames
+FOCUS_BIG = (150.0, 1.08, 1.16)   # (face width in proxy px from which, lower, upper end) of the gate on the ratio at the fixed scales 0.8 / 2.4 px: c037 front dancer (blurred) 1.06..1.13, sharp big faces 1.16 and more (c025 front 1.16..1.45, c006 1.12..1.46; c006 f102's arm in front of a face: 1.06). None = the face-width scales for every size
 FOCUS_MIN_WF = 24.0    # face width in proxy px below which the focus cannot be judged: the person is kept (weight 1)
 FOCUS_SIG = (0.005, 0.015)    # the two scales of the edge ratio (fine, coarse) of the face width, never under (0.4, 1.2) px
 
@@ -1614,7 +1615,16 @@ def _focus_r(px, lm: np.ndarray, t: int) -> Optional[float]:
         m = np.zeros(Y.shape, np.uint8)
         outline = np.concatenate([pts[0:17], pts[26:16:-1]]) - np.array([x0, y0], np.float32)
         cv2.fillPoly(m, [np.round(outline).astype(np.int32)], 1)
-        return _edge_ratio(Y, m, max(0.4, FOCUS_SIG[0] * wf), max(1.2, FOCUS_SIG[1] * wf))
+        if FOCUS_BIG is not None and wf >= FOCUS_BIG[0]:
+            # a big face: the ratio at two fixed scales (0.8 and 2.4 px), where the one in face widths is too coarse to tell a blurred face from a sharp one (2611 IWALY c037 f6)
+            r = _edge_ratio(Y, m, 0.8, 2.4)
+            lo_, hi_ = FOCUS_BIG[1], FOCUS_BIG[2]
+        else:
+            r = _edge_ratio(Y, m, max(0.4, FOCUS_SIG[0] * wf), max(1.2, FOCUS_SIG[1] * wf))
+            lo_, hi_ = float(FOCUS_GATE[0]), float(FOCUS_GATE[1])
+        if r is None:
+            return None
+        return (float(r) - lo_) / max(1e-6, hi_ - lo_)        # 0 at the gate's lower end, 1 at its upper end (not clipped, so frames average fairly)
     except Exception:
         return None
 
@@ -1644,8 +1654,7 @@ def _focus_w(tracker, st, p: int, t: int, px) -> float:
         vals = [x for x in vals if x is not None]
         if not vals:
             return 1.0
-        x = (float(np.mean(vals)) - float(FOCUS_GATE[0])) / max(1e-6, float(FOCUS_GATE[1]) - float(FOCUS_GATE[0]))
-        x = float(np.clip(x, 0.0, 1.0))
+        x = float(np.clip(float(np.mean([float(np.clip(v_, -1.0, 2.0)) for v_ in vals])), 0.0, 1.0))
         return x * x * (3.0 - 2.0 * x)
     except Exception:
         return 1.0
