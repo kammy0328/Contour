@@ -97,6 +97,7 @@ class Job:
     bdet: Optional[dict] = None            # the body's spot candidates of this frame (retouch.bodyspots)
     bmarks: Optional[list] = None          # the operator's body spot marks as they lie on this frame
     tone: Optional[dict] = None            # where the knees and the belly are (retouch.bodytone.person_geometry), source px
+    focus_w: float = 1.0                   # the share of the retouch this person gets by the focus of its face (FOCUS_GATE), kept so prepare() can apply it again after it reads the slider values
     naso_pres: Optional[float] = None      # how far a nasolabial crease is there on this frame (FOLD_PRESENT), measured once
     arm_axes: Optional[list] = None        # the armpit stage's hanging arms (ARMPIT_LINE_HOLD): [(the upper arm's angle from the vertical in degrees, weight 0..1, zone centre x, y, zone radius)] in proxy px
 
@@ -1655,9 +1656,22 @@ def _focus_w(tracker, st, p: int, t: int, px) -> float:
         if not vals:
             return 1.0
         x = float(np.clip(float(np.mean([float(np.clip(v_, -1.0, 2.0)) for v_ in vals])), 0.0, 1.0))
-        return x * x * (3.0 - 2.0 * x)
+        w_ = x * x * (3.0 - 2.0 * x)
+        import os as _os_f
+        if _os_f.environ.get("IWALY_FOCUS_DEBUG"):
+            print("FOCUS t=%d p=%d scores=%s -> weight %.3f" % (t, p, [round(float(v_), 3) for v_ in vals], w_), flush=True)
+        return w_
     except Exception:
+        import os as _os_f
+        if _os_f.environ.get("IWALY_FOCUS_DEBUG"):
+            import traceback
+            traceback.print_exc()
         return 1.0
+
+
+def _focus_scale(v: dict, w: float) -> dict:
+    """The person's values times the focus weight w: the face's keys only (the body's stay: a face out of focus says nothing of the body)."""
+    return {k: (x if (k.startswith("body_") or k.startswith("knee")) else x * w) for k, x in v.items()}
 
 
 def _parse_visible(tracker, pid: int, t: int, face: np.ndarray, px) -> float:
@@ -1718,6 +1732,8 @@ def prepare(cut, tracker, t: int, cache: Optional[dict] = None, steady: bool = T
             # the slider values are read now, not when the masks were cached
             pp = cut.params_for(j.pid)
             jj.v = {k_: pp.amount(k_, t) / 100.0 for k_ in RETOUCH_KEYS}
+            if float(getattr(j, "focus_w", 1.0)) < 0.999:
+                jj.v = _focus_scale(jj.v, float(j.focus_w))        # (a face out of focus gets less of it, FOCUS_GATE: the values read here would drop that)
             jj.keep = float(np.clip(pp.skin_detail / 100.0, 0, 1))
             jj.grain_size = float(pp.grain_size)
             jj.blemish_size = float(np.clip(getattr(pp, "blemish_size", 50.0) / 100.0, 0, 1))
@@ -2833,6 +2849,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             return None, bdet_here
         pp = cut.params_for(person.id)
         v = {k: pp.amount(k, t) / 100.0 for k in RETOUCH_KEYS}
+        fg_ = 1.0
         if only is not None:
             v["skin"] = max(v["skin"], 0.5)
         elif FOCUS_GATE is not None and st.has_face:
@@ -2841,7 +2858,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             if fg_ < 0.999:
                 if fg_ <= 0.01:
                     return None, bdet_here
-                v = {k: x * fg_ for k, x in v.items()}
+                v = _focus_scale(v, fg_)
         if not any(abs(x) > 1e-4 for x in v.values()):
             return None, bdet_here
         face = None
@@ -2866,6 +2883,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                   blemish_size=float(np.clip(getattr(pp, "blemish_size", 50.0) / 100.0, 0, 1)),
                   body_keep=float(np.clip(getattr(pp, "body_detail", 60.0) / 100.0, 0, 1)),
                   body_size=float(np.clip(getattr(pp, "body_blemish_size", 40.0) / 100.0, 0, 1)))
+        job.focus_w = float(fg_)
         fth = pp.feather_factor() if hasattr(pp, "feather_factor") else 1.5
         if face is not None:
             job.wf_src = float(np.hypot(*(face[16, :2] - face[0, :2])))
