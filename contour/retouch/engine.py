@@ -1708,6 +1708,7 @@ STEADY_ROBUST = True   # a mask that drops out on one or two frames (the parser 
 STEADY_WIN = 0.15      # frame: cut 086 frames 23/27/33, cut 100 frame 4) is pulled to the median of the frames round it
 
 
+STEADY_NAME_THREADS = 0  # masks (names) of one person steadied side by side (0: by the computer's cores and the people steadied at once; 1: one after the other)
 STEADY_THREADS = 0     # people of a frame whose face masks are held steady side by side (0: as PREP_THREADS). Every person's masks are steadied from
                        # that person's own masks alone, so what comes out is what one after the other gives
 
@@ -1752,16 +1753,23 @@ def _steady(cut, tracker, st, rf: RetouchFrame, cache) -> RetouchFrame:
             if s not in raws:
                 raws[s] = _raw_cached(cut, tracker, s, cache)
     n_thr = max(1, min(int(STEADY_THREADS or PREP_THREADS), len(faces)))
+    # the names of one person's masks side by side too: as many threads as the computer has to spare for the people steadied at once
+    try:
+        k_names = int(STEADY_NAME_THREADS) if STEADY_NAME_THREADS else max(1, min(8, (os.cpu_count() or 4) * 3 // (4 * n_thr)))
+    except Exception:
+        k_names = 1
+    if int(STEADY_THREADS or PREP_THREADS) <= 1 and not STEADY_NAME_THREADS:
+        k_names = 1                             # (PREP_THREADS 1: everything one after the other, as it was)
     px = tracker.proxy
     k = np.array([px.sx, px.sy])
     with _tm("steady.faces"):
         if n_thr > 1:
             from concurrent.futures import ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=n_thr, thread_name_prefix="steady") as ex:
-                list(ex.map(lambda j_: _steady_face(k, st, j_, t, N, raws), faces))
+                list(ex.map(lambda j_: _steady_face(k, st, j_, t, N, raws, k_names), faces))
         else:
             for j in faces:
-                _steady_face(k, st, j, t, N, raws)
+                _steady_face(k, st, j, t, N, raws, k_names)
     return rf
 
 
@@ -1783,7 +1791,7 @@ def _steady_asks(st, j, t: int, N: int) -> List[int]:
     return out
 
 
-def _steady_face(k, st, j, t: int, N: int, raws: dict) -> None:
+def _steady_face(k, st, j, t: int, N: int, raws: dict, name_threads: int = 1) -> None:
     """One person's face masks (and score maps) of frame t held steady with that person's masks of the frames round it (raws: those frames). The
     masks are worked through one name at a time (a neighbour's mask is carried here, used and let go), not all the names of all the frames at once:
     the same numbers with a few dozen MB in hand instead of more than a GB a person. k: the analysis picture's scale (sx, sy)."""
@@ -1830,8 +1838,7 @@ def _steady_face(k, st, j, t: int, N: int, raws: dict) -> None:
         v_ = cv2.resize(vv, (w_, h_), interpolation=cv2.INTER_LINEAR)
         wf_ = float(np.hypot(*(Lt[16] - Lt[0])))
         v_ = np.clip(cv2.GaussianBlur(v_, (0, 0), max(1.0, 0.02 * wf_)) * 2.5, 0, 1)
-    out_masks = {}
-    for n in names:
+    def one_name(n):
         o_ = _mask_unpack(j.masks[n])
         fr = [o_]                               # the mask on this frame's geometry: its own, then each neighbour's carried here
         for _, js, A in nbrs:
@@ -1861,7 +1868,16 @@ def _steady_face(k, st, j, t: int, N: int, raws: dict) -> None:
             # where this frame sees no skin, a neighbour's mask may not hold more than this frame's own
             avg = a_ / wsum
             a_ = (o_ + (avg - o_).clip(None, 0) + (avg - o_).clip(0, None) * v_) * wsum
-        out_masks[n] = (a_ / wsum).astype(np.float32)
+        return (a_ / wsum).astype(np.float32)
+
+    # (a mask is steadied from the masks of its own name alone: the names of a person side by side as well, when there are threads to spare)
+    k_thr = max(1, min(len(names), int(name_threads)))
+    if k_thr > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=k_thr, thread_name_prefix="steadyn") as ex:
+            out_masks = dict(zip(names, ex.map(one_name, names)))
+    else:
+        out_masks = {n: one_name(n) for n in names}
     j.masks = out_masks
     if j.det is not None and dets:
         try:
