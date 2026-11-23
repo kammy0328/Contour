@@ -3573,6 +3573,18 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 job.masks["tone"] = tm
         if skin_on:
             m = get("skin", mk_skin, job.scope + (":armpit" if arm_on else ""))
+            if FACE_NOSE_ADD > 1e-4 and lm is not None and m is not None:
+                # (11/24) the nose in the skin area where the skin model left it out (its shiny tip), weighted, inside the person's own matte
+                try:
+                    wfn_ = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
+                    na_ = _nose_area(lm, shape, wfn_)
+                    if na_ is not None:
+                        al_ = base().get("alpha")
+                        if al_ is not None and al_.shape == na_.shape:
+                            na_ = na_ * np.clip(al_, 0, 1)
+                        m = np.maximum(m, (float(FACE_NOSE_ADD) * na_).astype(np.float32))
+                except Exception:
+                    pass
             if m.max() > 0.01:
                 job.skin = sj
                 job.masks["skin"] = m
@@ -4385,8 +4397,42 @@ def _fold_level(Y: np.ndarray, band: np.ndarray, skin: np.ndarray, excl: Optiona
         h = cv2.dilate(h, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d3, d3)))
         b = b * (1.0 - np.clip(cv2.GaussianBlur(h, (0, 0), max(1.0, fe_[1] * wf)), 0, 1))
     out = Y.astype(np.float32, copy=True)
-    out[y0:y1, x0:x1] = roi + k * b * _even_mid(roi, w, wf, FOLD_LEVEL_SIG, cap)
+    d_ = _even_mid(roi, w, wf, FOLD_LEVEL_SIG, cap)
+    if FOLD_LEVEL_LIFT_ONLY:
+        # (11/24 IWALY c016 f38: the levelling darkened the lit cheek beside a turned face's fold: a dark patch with the band's outline)
+        d_ = np.maximum(d_, 0.0)
+    out[y0:y1, x0:x1] = roi + k * b * d_
     return out
+
+
+FOLD_LEVEL_LIFT_ONLY = False   # True: the fold levelling only lifts (a fold is darker than the skin round it; nothing in its band is darkened)
+SKIN_EDGE_KEEP = 0.0      # > 0: the skin smoothing fades in from the skin area's own edge over this many face widths (the jaw's contour
+                          # against the neck's shade was smoothed away: a bright band inside the jaw line and a dark one under it, c016 f38)
+FACE_NOSE_ADD = 0.0       # > 0: the nose (bridge, tip, wings from the landmarks) is added to the skin area at this weight where the skin
+                          # model left it out (a shiny nose tip is not 'skin coloured': the nose was not retouched at all, c016)
+
+
+def _skin_edge_ramp(m: np.ndarray, wf: float) -> np.ndarray:
+    rad = max(2.0, SKIN_EDGE_KEEP * wf)
+    inside = cv2.distanceTransform((m > 0.5).astype(np.uint8), cv2.DIST_L2, 5)
+    t = np.clip(inside / rad, 0.0, 1.0)
+    return cv2.GaussianBlur((t * t * (3.0 - 2.0 * t)).astype(np.float32), (0, 0), max(1.0, 0.25 * rad))
+
+
+def _nose_area(lm: np.ndarray, shape, wf: float) -> Optional[np.ndarray]:
+    try:
+        pts = np.rint(lm[27:36, :2]).astype(np.int32)
+        m = np.zeros(shape, np.uint8)
+        cv2.fillConvexPoly(m, cv2.convexHull(pts), 1)
+        d = max(3, int(0.035 * wf) | 1)
+        m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d)))
+        # the nostrils' shadows are the nose's shape: kept out
+        nost = np.zeros(shape, np.uint8)
+        cv2.fillConvexPoly(nost, cv2.convexHull(np.rint(lm[31:36, :2]).astype(np.int32)), 1)
+        m = m.astype(np.float32) * (1.0 - 0.7 * nost.astype(np.float32))
+        return cv2.GaussianBlur(m, (0, 0), max(1.0, 0.02 * wf))
+    except Exception:
+        return None
 
 
 def _neck_level(Y: np.ndarray, m: np.ndarray, hold: Optional[np.ndarray], wf: float, k: float, axis=None) -> np.ndarray:
@@ -7297,6 +7343,13 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
             if dkz_ is not None:
                 mY = mY * (1.0 - dkz_)
                 mC = mC * M(1.0 - dkz_, (hC, wC))
+            if SKIN_EDGE_KEEP > 1e-4:
+                try:
+                    er_ = _skin_edge_ramp(M(job.masks["skin"], (hY, wY)), wf)
+                    mY = mY * er_
+                    mC = mC * M(er_, (hC, wC))
+                except Exception:
+                    pass
             r = SK.radius_px(job.skin, y_per_src)
             try:
                 if getattr(SK, "PIT", 0) > 0 and hasattr(SK, "_TLS"):

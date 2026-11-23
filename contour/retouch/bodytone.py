@@ -1369,9 +1369,34 @@ def _nblur(X, S, sig):
     return cv2.GaussianBlur(X * S, (0, 0), sig) / np.maximum(den, 1e-4), den
 
 
+# v5 (11/24 c016 v3 feedback: the knee looked smoothed out and its shape showed; the thigh above kept its texture): three bands
+#   grain (finer than K5_GRAIN): never changed
+#   texture (K5_GRAIN .. K5_TEX): softened by K5_TEX_SOFT, on the knee and, weaker, along the leg (thigh and shin): skin texture work
+#   blotch (K5_TEX .. K4_MID): evened as v4 (bruises, mottling), full on the knee, K5_LEG_BLOTCH along the leg
+# The leg zone runs K5_UP half widths up the thigh and K5_DOWN down the shin, so the knee is not a smooth island on a textured leg.
+K5_GRAIN = 0.035            # of a half width (at least 1 px)
+K5_TEX = 0.12               # of a half width (at least 1.6 px)
+K5_TEX_SOFT = 0.40          # share of the texture band taken away (knee); along the leg it is scaled by the leg weight
+K5_LEG = 0.55               # the leg's weight against the knee's (texture and blotch work along the thigh and shin)
+K5_LEG_BLOTCH = 0.6         # share of the blotch evening along the leg (times K5_LEG)
+K5_UP, K5_DOWN, K5_ACROSS = 3.6, 2.6, 1.9   # the leg zone in half widths (up the thigh, down the shin, across)
+K5_SKIN_LUMA = (0.45, 0.70)  # the leg's own skin when the body area is missing: brightness over the leg's (cloth is far darker)
+
+
+def _leg_skin(Yr, owner_r, zone):
+    """The leg's skin read from the picture (the person's own area, not far darker than its bright part): when the body area is missing."""
+    m = (owner_r > 0.5) & (zone > 0.2) if owner_r is not None else (zone > 0.2)
+    if int(m.sum()) < 60:
+        return None
+    yk = float(np.percentile(Yr[m], 70))
+    S = _ss(K5_SKIN_LUMA[0], K5_SKIN_LUMA[1], Yr / max(yk, 1e-4)).astype(np.float32)
+    return S if owner_r is None else S * owner_r
+
+
 def knee_clean(Y, Cb, Cr, skin, owner, knees, k, cs: float = 1.0, gains=None):
-    """The knee's blotches and bruises evened on this person's own skin (KNEE_V4). skin, owner: 0..1 on Y's grid (owner None: all).
-    knees: [((cx, cy), axis, half)] in Y's pixels. gains: [0..1] per knee (look ahead on ownership) or None. -> (Y, Cb, Cr)."""
+    """The knee's blotches and bruises evened and the leg's skin texture softened on this person's own skin (KNEE_V4 / v5).
+    skin, owner: 0..1 on Y's grid (None: read from the picture / all). knees: [((cx, cy), axis, half)] in Y's pixels.
+    gains: [0..1] per knee (look ahead on ownership) or None. -> (Y, Cb, Cr)."""
     k = float(np.clip(float(k) * KNEE_GAIN, 0.0, 1.0))
     if k < 1e-4:
         return Y, Cb, Cr
@@ -1388,80 +1413,85 @@ def knee_clean(Y, Cb, Cr, skin, owner, knees, k, cs: float = 1.0, gains=None):
             gain = float(np.clip(gains[ki], 0.0, 1.0))
         if gain < 1e-3:
             continue
-        R = int(3.0 * half) + 10
+        nrm = max(float(np.hypot(axis[0], axis[1])), 1e-6)
+        ax, ay = axis[0] / nrm, axis[1] / nrm
+        R = int(max(K5_UP, K5_DOWN, K5_ACROSS) * half) + 12
         x0, x1 = max(0, int(centre[0]) - R), min(wY, int(centre[0]) + R + 1)
         y0, y1 = max(0, int(centre[1]) - R), min(hY, int(centre[1]) + R + 1)
         if x1 - x0 < 12 or y1 - y0 < 12:
             continue
         yy, xx = np.mgrid[y0:y1, x0:x1].astype(np.float32)
-        nrm = max(float(np.hypot(axis[0], axis[1])), 1e-6)
-        ax, ay = axis[0] / nrm, axis[1] / nrm
         dx, dy_ = xx - float(centre[0]), yy - float(centre[1])
-        e = np.sqrt(((dx * ax + dy_ * ay) / (K4_ALONG * half)) ** 2 + ((-dx * ay + dy_ * ax) / (K4_ACROSS * half)) ** 2)
-        zone = (1.0 - _ss(K4_EDGE[0], K4_EDGE[1], e)).astype(np.float32)
+        al = (dx * ax + dy_ * ay) / half          # + down the leg (to the ankle), - up the thigh
+        ac = (-dx * ay + dy_ * ax) / half
+        e = np.sqrt((al / K4_ALONG) ** 2 + (ac / K4_ACROSS) ** 2)
+        wk = (1.0 - _ss(K4_EDGE[0], K4_EDGE[1], e)).astype(np.float32)
+        wl = ((1.0 - _ss(K5_UP - 1.0, K5_UP, -al)) * (1.0 - _ss(K5_DOWN - 0.8, K5_DOWN, al))
+              * (1.0 - _ss(K5_ACROSS - 0.6, K5_ACROSS, np.abs(ac)))).astype(np.float32)
+        zone = np.maximum(wk, wl)
         Yr = Y[y0:y1, x0:x1].astype(np.float32)
+        own = None if owner is None else np.clip(owner[y0:y1, x0:x1], 0, 1).astype(np.float32)
+        Sl = _leg_skin(Yr, own, zone)
         if skin is not None:
             S = np.clip(skin[y0:y1, x0:x1], 0, 1).astype(np.float32)
+            if own is not None:
+                S = S * own
+            if Sl is not None:
+                # (the body area can miss the knee for a stretch of frames, a blurred or moving leg: the leg's own skin fills in)
+                S = np.maximum(S, Sl * (1.0 - _ss(0.15, 0.4, float((S * wk).sum()) / max(float(wk.sum()), 1.0))) * 1.0)
+                S = np.maximum(S, 0.0)
         else:
-            cbr = (Cb if not sub else cv2.resize(Cb, (wY, hY), interpolation=cv2.INTER_LINEAR))[y0:y1, x0:x1]
-            crr = (Cr if not sub else cv2.resize(Cr, (wY, hY), interpolation=cv2.INTER_LINEAR))[y0:y1, x0:x1]
-            S = local_zone_skin(Yr, cbr, crr, zone)
-            if S is None:
-                continue
-            S = np.clip(S, 0, 1).astype(np.float32)
-        if owner is not None:
-            S = S * np.clip(owner[y0:y1, x0:x1], 0, 1).astype(np.float32)
-        if float((S * zone).sum()) < 50.0:
+            S = Sl
+        if S is None or float((S * zone).sum()) < 50.0:
             continue
-        # (never cloth: a black sock, shorts or trousers that a skin area takes in are far darker than the knee's skin)
-        core = (S * zone) > 0.5
+        core = (S * wk) > 0.5
         if int(core.sum()) >= 30:
             yk = float(np.median(Yr[core]))
             S = S * _ss(0.35, 0.6, Yr / max(yk, 1e-4)).astype(np.float32)
-            if float((S * zone).sum()) < 50.0:
-                continue
-        # the weight: the zone, faded in from every edge of the skin (nothing that ends in a line)
+        if float((S * zone).sum()) < 50.0:
+            continue
         rad = max(2.0, K4_FEATHER * half)
         inside = cv2.distanceTransform((S > 0.5).astype(np.uint8), cv2.DIST_L2, 5)
         ramp = cv2.GaussianBlur(_ss(0.0, rad, inside).astype(np.float32), (0, 0), max(0.8, 0.3 * rad))
-        Wt = (zone * ramp * S * (k * gain)).astype(np.float32)
-        if float(Wt.max()) < 0.01:
+        base_w = ramp * S * (k * gain)
+        Wb = (np.maximum(wk, K5_LEG * K5_LEG_BLOTCH * wl) * base_w).astype(np.float32)
+        Wt = (np.maximum(wk, K5_LEG * wl) * base_w).astype(np.float32)
+        if float(max(Wb.max(), Wt.max())) < 0.01:
             continue
-        s1, s2 = max(1.2, K4_FINE * half), max(4.0, K4_MID * half)
-        y1_, _ = _nblur(Yr, S, s1)
-        y2_, _ = _nblur(Yr, S, s2)
+        s0, s1, s2 = max(1.0, K5_GRAIN * half), max(1.6, K5_TEX * half), max(4.0, K4_MID * half)
+        y0_ = _nblur(Yr, S, s0)[0]
+        y1_ = _nblur(Yr, S, s1)[0]
+        y2_ = _nblur(Yr, S, s2)[0]
+        tex = y0_ - y1_
         mid = y1_ - y2_
         d = -np.where(mid < 0, (1.0 - K4_DARK_KEEP) * mid, (1.0 - K4_LIGHT_KEEP) * mid).astype(np.float32)
-        d = _soft_cap(d, K4_CAP["luma"]) * Wt
+        d = _soft_cap(d, K4_CAP["luma"]) * Wb - (K5_TEX_SOFT * tex) * Wt
         full = np.zeros((hY, wY), np.float32)
         full[y0:y1, x0:x1] = d
         dY = _merge(dY, full)
-        # colour, on the chroma planes' grid
         if sub:
             sx, sy = wC / float(wY), hC / float(hY)
-            c0, c1, r0, r1 = int(x0 * sx), max(int(x0 * sx) + 2, int(np.ceil(x1 * sx))), int(y0 * sy), max(int(y0 * sy) + 2, int(np.ceil(y1 * sy)))
-            c1, r1 = min(c1, wC), min(r1, hC)
+            c0, r0 = int(x0 * sx), int(y0 * sy)
+            c1, r1 = min(wC, max(c0 + 2, int(np.ceil(x1 * sx)))), min(hC, max(r0 + 2, int(np.ceil(y1 * sy))))
             Sc = cv2.resize(S, (c1 - c0, r1 - r0), interpolation=cv2.INTER_AREA)
-            Wc = cv2.resize(Wt, (c1 - c0, r1 - r0), interpolation=cv2.INTER_AREA)
+            Wc = cv2.resize(Wb, (c1 - c0, r1 - r0), interpolation=cv2.INTER_AREA)
             hc = half * 0.5 * (sx + sy)
         else:
-            c0, c1, r0, r1, Sc, Wc, hc = x0, x1, y0, y1, S, Wt, half
-        B = [P[r0:r1, c0:c1].astype(np.float32) for P in (Cb, Cr)]
-        t1, t2 = max(1.2, K4_FINE * hc), max(4.0, K4_MID * hc)
-        lo1 = [_nblur(b, Sc, t1)[0] for b in B]
-        lo2 = [_nblur(b, Sc, t2)[0] for b in B]
-        # the leg's skin hue round the knee (a wide, skin weighted mean): the broad purple is what lies across it
-        wide = [_nblur(b, Sc, max(6.0, 1.6 * hc))[0] for b in B]
+            c0, c1, r0, r1, Sc, Wc, hc = x0, x1, y0, y1, S, Wb, half
+        Bc = [P[r0:r1, c0:c1].astype(np.float32) for P in (Cb, Cr)]
+        t1, t2 = max(1.6, K5_TEX * hc), max(4.0, K4_MID * hc)
+        lo1 = [_nblur(b_, Sc, t1)[0] for b_ in Bc]
+        lo2 = [_nblur(b_, Sc, t2)[0] for b_ in Bc]
+        wide = [_nblur(b_, Sc, max(6.0, 1.6 * hc))[0] for b_ in Bc]
         ln = np.maximum(np.hypot(wide[0], wide[1]), 1e-6)
         u0, u1 = wide[0] / ln, wide[1] / ln
         perp = -lo2[0] * u1 + lo2[1] * u0
         tgt = [lo1[i] - (1.0 - K4_CHROMA_KEEP) * (lo1[i] - lo2[i]) for i in range(2)]
         tgt = [tgt[0] + K4_HUE_PULL * perp * u1, tgt[1] - K4_HUE_PULL * perp * u0]
-        # no grey: never less saturated than the knee's own smooth colour there
         lt = np.hypot(tgt[0], tgt[1])
         fl = K4_SAT_FLOOR * np.hypot(lo2[0], lo2[1])
-        sc = np.where((lt < fl) & (lt > 1e-6), fl / np.maximum(lt, 1e-6), 1.0).astype(np.float32)
-        tgt = [tgt[i] * sc for i in range(2)]
+        scl = np.where((lt < fl) & (lt > 1e-6), fl / np.maximum(lt, 1e-6), 1.0).astype(np.float32)
+        tgt = [tgt[i] * scl for i in range(2)]
         for i in range(2):
             dc = _soft_cap(tgt[i] - lo1[i], K4_CAP["chroma"]) * Wc
             full = np.zeros((hC, wC), np.float32)
