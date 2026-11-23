@@ -2529,6 +2529,14 @@ def _body_tok(tracker, st, p: int, t: int, reach: int = 0, extra=None) -> tuple:
     return (BS.track_token(st, t - r, t + r), mt, extra)
 
 
+try:
+    MASK_THREADS = int(os.environ.get("CONTOUR_MASK_THREADS", "0") or 0)
+except ValueError:
+    MASK_THREADS = 0
+# MASK_THREADS > 1: the masks of ONE person are made side by side as well (the tone, skin, blemish, under-eye, nasolabial, mouth-line and neck masks and
+# the body's area: each is made from the frame's shared maps and writes nothing shared, so they come out as one after the other gives). A person's
+# masks one after the other were 5 s a frame whatever the number of people: the floor of a render's speed. 0 / 1: one after the other, as ever. Not
+# used while the armpit stage is on (its skin is laid into the shared map by the skin mask).
 PREP_THREADS = 1           # people of one frame whose masks are made side by side (_prepare_raw: the face's maps and masks, the body's area, the
                            # spots: each person's own, from the picture and the tracks). 1: one after the other, as ever. A batch sets it where the
                            # computer has cores to spare: the masks of one picture were the one thing a render did on a single core (j2815)
@@ -2665,8 +2673,13 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             lm[:, 0] *= px.sx
             lm[:, 1] *= px.sy
         state = {}
+        slock = threading.RLock()       # the person's shared maps are made once, by whoever asks first (MASK_THREADS: the makers ask side by side)
 
         def body_base():
+            with slock:
+                return _body_base()
+
+        def _body_base():
             """What the body's area needs of the frame: the picture and the face's colour model of it (none without
             a face). Not the face's own maps: a job with nothing but body values on never asks for them (they were
             0.6 to 0.9 s a person of a 2560 px picture, a quarter of an export's time: j2796). The same picture and
@@ -2682,6 +2695,10 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             return state["bbase"]
 
         def base():
+            with slock:
+                return _base()
+
+        def _base():
             if "rgb" not in state:
                 state["rgb"] = state["bbase"]["rgb"] if "bbase" in state else np.asarray(px.frame(t))
                 state["rgbf"] = state["rgb"].astype(np.float32) / 255.0
@@ -2749,7 +2766,9 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                         state["focus_zone"] = fz
             return state
 
-        def get(name, fn, extra="", tok=None):
+        ahead = {}                      # (name, extra) -> a mask being made ahead on another thread (MASK_THREADS)
+
+        def _get_now(name, fn, extra="", tok=None):
             key = (t, person.id, name, extra)
             got = _cache_look(cache, key, tok)
             if got is not _MISS:
@@ -2758,12 +2777,22 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             _cache_put(cache, key, m, tok)
             return m
 
+        def get(name, fn, extra="", tok=None):
+            f_ = ahead.pop((name, extra), None)
+            if f_ is not None:
+                return f_.result()          # (what it raised is raised here, where the mask is asked for)
+            return _get_now(name, fn, extra, tok)
+
         from ..core.project import scope_set
         regions = scope_set(job.scope)
 
         arm_on = ARMPIT > 0 and (ARMPIT_PIDS is None or person.id in ARMPIT_PIDS)
 
         def body():
+            with slock:
+                return _body()
+
+        def _body():
             """The chosen body regions of this person (neck, shoulders, arms, hands, legs), or None."""
             if not (regions - {"face"}):
                 return None
@@ -2782,6 +2811,10 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             return state["body"]
 
         def armpit():
+            with slock:
+                return _armpit()
+
+        def _armpit():
             """The armpit skin of this person on this frame (0..1), or None."""
             if not arm_on:
                 return None
@@ -2857,6 +2890,10 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             return state["armpit"]
 
         def armpit_fold():
+            with slock:
+                return _armpit_fold()
+
+        def _armpit_fold():
             """The armpit skin the fold stage works on: armpit() without this person's hair and garments (ARMPIT_HAIR_REACH), or None."""
             ap0 = armpit()
             if ap0 is None:
@@ -2872,28 +2909,130 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             return state["armpit_fold"]
 
         tone_on = any(abs(v.get(k, 0)) > 1e-4 for k in ("skin_bright", "skin_warm", "skin_sat", "grain", "redness"))
-        if tone_on:
-            def mk_tone():
-                b = base()
-                return tone_mask(lm, shape, b["prob"], b["alpha"], job.scope, fw, fth, body())
-            tm = get("tone", mk_tone, f"{job.scope}:{fth:.2f}")
-            if tm.max() > 0.01:
-                job.masks["tone"] = tm
         skin_on = v["skin"] > 1e-4
+        skinx_on = v.get("blemish", 0) > 1e-4 or v.get("shine", 0) > 1e-4
+        face_on = lm is not None and fw > 0.05
+        neck_on = face_on and (v.get("neck_lines", 0) > 1e-4 or v.get("neck_bumps", 0) > 1e-4)
+        body_on = any(v.get(k_, 0) > 1e-4 for k_ in BODY_EFFECTS)
+        sj = None
         if skin_on:
             sj = SK.SkinJob(p, float(np.clip(v["skin"], 0, 1)), job.keep, job.scope, face, fw, sc,
                             st.final[p, t, 0:5, :2].copy())
+        kpn = wdn = None
+        if neck_on:
+            kpn, wdn = _steady_body(st, p, t)
 
-            def mk_skin():
-                b = base()
-                m_ = SK.skin_mask(sj, b["rgb"], px.sx, px.sy, b["alpha"], b["model"], b.get("parse"), body(),
-                                  b.get("cover"), prob0=b.get("prob0"))
-                ap_ = armpit()
-                if ap_ is not None:
-                    m_ = np.maximum(m_, ap_)
-                    # the steadied masks go by what this frame takes for skin: the armpit counts
-                    b["prob"] = np.maximum(b["prob"], ap_)
-                return m_
+        # ---- the makers of the masks: each reads the person's shared maps (base(), body(), paint()) and writes nothing shared (but the skin mask
+        # with the armpit stage on), so they can be made one after the other or side by side (MASK_THREADS)
+        def mk_tone():
+            b = base()
+            return tone_mask(lm, shape, b["prob"], b["alpha"], job.scope, fw, fth, body())
+
+        def mk_skin():
+            b = base()
+            m_ = SK.skin_mask(sj, b["rgb"], px.sx, px.sy, b["alpha"], b["model"], b.get("parse"), body(),
+                              b.get("cover"), prob0=b.get("prob0"))
+            ap_ = armpit()
+            if ap_ is not None:
+                m_ = np.maximum(m_, ap_)
+                # the steadied masks go by what this frame takes for skin: the armpit counts
+                b["prob"] = np.maximum(b["prob"], ap_)
+            return m_
+
+        def mk_skinx():
+            b = base()
+            reg = tone_mask(lm, shape, b["prob"], b["alpha"], job.scope, fw, fth, body())
+            if lm is not None:
+                reg = reg * (1 - feature_exclusion(lm, shape))
+            return np.clip(reg * np.clip(b["prob"] * 1.4, 0, 1), 0, 1)
+
+        def paint():
+            with slock:
+                if "paint" not in state:
+                    state["paint"] = SK.paint_mask(base()["rgb"], lm)
+                return state["paint"]
+
+        def pa():
+            b = base()
+            return b["prob"] * (b["alpha"] if b["alpha"] is not None else 1.0)
+
+        def mk_dark():
+            return under_eye_mask(lm, shape, pa(), fth)
+
+        def mk_naso():
+            return wrinkle_masks(lm, shape, pa(), "naso", fth, 1.7, paint())
+
+        def mk_mouthl():
+            return wrinkle_masks(lm, shape, pa(), "mouth", fth, 1.5, paint())
+
+        def mk_neck():
+            b_ = base()
+            # every hand in the picture (anyone's hand can be in front of this neck): tracked hands, else
+            # the whole-body model's hand points where it is sure of them
+            hl = []
+            for q_ in np.nonzero(st.present[:, t])[0]:
+                h_ = st.hand[q_, t] if getattr(st, "has_hands", False) else None
+                if h_ is None or not np.isfinite(h_[:, :2]).any():
+                    h_ = st.hand_raw[q_, t].copy()
+                    h_[~(np.nan_to_num(h_[:, 2]) >= 1.5)] = np.nan
+                hl.append(h_)
+            hnd = np.concatenate(hl, 0) if hl else None
+            return neck_mask(lm, kpn, wdn, shape, px.sx, px.sy, b_["prob"], b_["alpha"], fth,
+                             b_["rgb"], hnd, b_.get("parse"), protect=b_.get("protect"))
+
+        def mk_body_of(bscope_):
+            from ..core.project import body_scope_set as _bss
+            with _tm("body.base"):
+                b = body_base()
+            with _tm("body.area"):
+                m_, info_ = BS.body_mask(tracker, p, t, b["rgb"], _bss(bscope_), b.get("model"))
+            pm_ = BS.pack_mask(m_) if m_ is not None else None
+            pa_ = BS.pack_allow(info_.allow) if pm_ is not None else None
+            maps_ = {"m": pm_["m"]} if pm_ is not None else {}
+            if pa_ is not None:
+                maps_["a"] = pa_["m"]
+            return dict(maps=maps_, thumb=None, pm=pm_,
+                        info=dict(ref=float(info_.ref), model=info_.model, parsed=bool(info_.parsed),
+                                  box=info_.box, allow=pa_, hands=BS.hand_shapes(st, p, t, info_)))
+
+        # ---- MASK_THREADS: the masks asked for below, started now, side by side; get() hands each out where it is asked for (the same masks under the
+        # same names: what is listed here is what the lines below ask for, under the same conditions)
+        exm = None
+        if int(MASK_THREADS) > 1 and not arm_on:
+            plan = []
+            if tone_on:
+                plan.append(("tone", mk_tone, f"{job.scope}:{fth:.2f}", None))
+            if skin_on:
+                plan.append(("skin", mk_skin, job.scope, None))
+            if skinx_on:
+                plan.append(("skinx", mk_skinx, f"{job.scope}:{fth:.2f}", None))
+            if face_on:
+                if v.get("dark_circle", 0) > 1e-4:
+                    plan.append(("dark", mk_dark, f"{fth:.2f}", None))
+                if v["nasolabial"] > 1e-4:
+                    plan.append(("naso", mk_naso, f"{fth:.2f}:w", None))
+                if v["mouth_lines"] > 1e-4:
+                    plan.append(("mouthl", mk_mouthl, f"{fth:.2f}:w", None))
+                if neck_on:
+                    plan.append(("neck", mk_neck, f"{fth:.2f}", None))
+            if body_on:
+                try:
+                    from ..core.project import norm_body_scope as _nbs
+                    bsc_ = _nbs(getattr(pp, "body_scope", "all"))
+                    plan.append(("bskin", (lambda bsc_=bsc_: mk_body_of(bsc_)), f"{bsc_}:{BS.garment_token(tracker)}", _body_tok(tracker, st, p, t)))
+                except Exception:
+                    pass                    # (the body's block below meets the same and deals with it)
+            if len(plan) > 1:
+                from concurrent.futures import ThreadPoolExecutor
+                exm = ThreadPoolExecutor(max_workers=min(int(MASK_THREADS), len(plan)), thread_name_prefix="mask")
+                for n_, fn_, ex_, tk_ in plan:
+                    ahead[(n_, ex_)] = exm.submit(_get_now, n_, fn_, ex_, tk_)
+
+        if tone_on:
+            tm = get("tone", mk_tone, f"{job.scope}:{fth:.2f}")
+            if tm.max() > 0.01:
+                job.masks["tone"] = tm
+        if skin_on:
             m = get("skin", mk_skin, job.scope + (":armpit" if arm_on else ""))
             if m.max() > 0.01:
                 job.skin = sj
@@ -2905,58 +3044,26 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                         job.masks["armpit"] = ap2_
                 except Exception:
                     pass
-        if v.get("blemish", 0) > 1e-4 or v.get("shine", 0) > 1e-4:
-            def mk_skinx():
-                b = base()
-                reg = tone_mask(lm, shape, b["prob"], b["alpha"], job.scope, fw, fth, body())
-                if lm is not None:
-                    reg = reg * (1 - feature_exclusion(lm, shape))
-                return np.clip(reg * np.clip(b["prob"] * 1.4, 0, 1), 0, 1)
+        if skinx_on:
             sx_ = get("skinx", mk_skinx, f"{job.scope}:{fth:.2f}")
             if sx_.max() > 0.01:
                 job.masks["skinx"] = sx_
-        if lm is not None and fw > 0.05:
-            def paint():
-                if "paint" not in state:
-                    state["paint"] = SK.paint_mask(base()["rgb"], lm)
-                return state["paint"]
-
-            def pa():
-                b = base()
-                return b["prob"] * (b["alpha"] if b["alpha"] is not None else 1.0)
+        if face_on:
             if v.get("dark_circle", 0) > 1e-4:
-                job.masks["dark"] = get("dark", lambda: under_eye_mask(lm, shape, pa(), fth), f"{fth:.2f}") * fw
+                job.masks["dark"] = get("dark", mk_dark, f"{fth:.2f}") * fw
             if v.get("shine", 0) > 1e-4:
                 job.masks["hot"] = get("hot", lambda: hot_zone_mask(lm, shape, pa(), fth), f"{fth:.2f}") * fw
             if v["nasolabial"] > 1e-4:
-                job.masks["naso"] = get("naso", lambda: wrinkle_masks(lm, shape, pa(), "naso", fth, 1.7, paint()),
-                                        f"{fth:.2f}:w") * fw
+                job.masks["naso"] = get("naso", mk_naso, f"{fth:.2f}:w") * fw
             if v["mouth_lines"] > 1e-4:
-                job.masks["mouthl"] = get("mouthl", lambda: wrinkle_masks(lm, shape, pa(), "mouth", fth, 1.5,
-                                                                        paint()), f"{fth:.2f}:w") * fw
+                job.masks["mouthl"] = get("mouthl", mk_mouthl, f"{fth:.2f}:w") * fw
             if v["nasolabial"] > 1e-4 or v["mouth_lines"] > 1e-4 or v.get("dark_circle", 0) > 1e-4:
                 def mk_ex():
                     b = base()
                     ex = feature_exclusion(lm, shape)
                     return np.clip(ex + (1 - np.clip(b["prob"] * 1.5, 0, 1)), 0, 1)
                 job.masks["excl"] = get("excl", mk_ex)
-            if v.get("neck_lines", 0) > 1e-4 or v.get("neck_bumps", 0) > 1e-4:
-                kpn, wdn = _steady_body(st, p, t)
-
-                def mk_neck():
-                    b_ = base()
-                    # every hand in the picture (anyone's hand can be in front of this neck): tracked hands, else
-                    # the whole-body model's hand points where it is sure of them
-                    hl = []
-                    for q_ in np.nonzero(st.present[:, t])[0]:
-                        h_ = st.hand[q_, t] if getattr(st, "has_hands", False) else None
-                        if h_ is None or not np.isfinite(h_[:, :2]).any():
-                            h_ = st.hand_raw[q_, t].copy()
-                            h_[~(np.nan_to_num(h_[:, 2]) >= 1.5)] = np.nan
-                        hl.append(h_)
-                    hnd = np.concatenate(hl, 0) if hl else None
-                    return neck_mask(lm, kpn, wdn, shape, px.sx, px.sy, b_["prob"], b_["alpha"], fth,
-                                     b_["rgb"], hnd, b_.get("parse"), protect=b_.get("protect"))
+            if neck_on:
                 nm_ = get("neck", mk_neck, f"{fth:.2f}")
                 if nm_.max() > 0.01:
                     job.masks["neck"] = nm_ * fw
@@ -2975,7 +3082,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 job.masks["teeth"] = get("teeth", lambda: teeth_mask(lm, base()["rgbf"])) * fw
             if v["eye_white"] > 1e-4:
                 job.masks["eyew"] = get("eyew", lambda: eye_white_mask(lm, base()["rgbf"])) * fw
-        if any(v.get(k_, 0) > 1e-4 for k_ in BODY_EFFECTS):
+        if body_on:
             # body skin (1.23): its own area, apart from the face's regions (retouch.bodyskin)
             try:
                 from ..core.project import body_scope_set, norm_body_scope
@@ -2987,18 +3094,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                     job.tone = BTN.person_geometry_t(st.final[p], st.widths[p] if getattr(st, "widths", None) is not None else None, int(t))
 
                 def mk_body():
-                    with _tm("body.base"):
-                        b = body_base()
-                    with _tm("body.area"):
-                        m_, info_ = BS.body_mask(tracker, p, t, b["rgb"], body_scope_set(bscope), b.get("model"))
-                    pm_ = BS.pack_mask(m_) if m_ is not None else None
-                    pa_ = BS.pack_allow(info_.allow) if pm_ is not None else None
-                    maps_ = {"m": pm_["m"]} if pm_ is not None else {}
-                    if pa_ is not None:
-                        maps_["a"] = pa_["m"]
-                    return dict(maps=maps_, thumb=None, pm=pm_,
-                                info=dict(ref=float(info_.ref), model=info_.model, parsed=bool(info_.parsed),
-                                          box=info_.box, allow=pa_, hands=BS.hand_shapes(st, p, t, info_)))
+                    return mk_body_of(bscope)
                 # the clothing the analysis found is part of the area: masks made before it was found (or with
                 # another state of it) are made again
                 ctok = BS.garment_token(tracker)
@@ -3040,6 +3136,8 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 import traceback
                 traceback.print_exc()
                 job.det = None
+        if exm is not None:
+            exm.shutdown(wait=True)
         if job.masks or job.body:
             if "prob" in state:
                 # this frame's own view of what is skin (colour, parser, texture): the steadied masks may not
