@@ -247,6 +247,19 @@ def wrinkle_masks(lm: np.ndarray, shape, prob: np.ndarray, which: str, fth: floa
             k = max(3, int(0.012 * Wf) | 1)
             pk = cv2.dilate(pk, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
             out = out * (1 - np.clip(cv2.GaussianBlur(pk.astype(np.float32), (0, 0), max(0.8, 0.006 * Wf)) * 1.3, 0, 1))
+    if which == "naso" and NASO_WING_TOP > 1e-4:
+        # 2611 IWALY feedback 11/23 (c036 f14, c033 f48, c057: "코까지 보정"): the wide band reaches above the nose wings' level and lifts the wing's side and the cheek beside the bridge
+        # (bright patches next to the nostrils). It fades out from NASO_WING_TOP_FROM (share of the face width) above the wings' level to NASO_WING_TOP_TO.
+        try:
+            ref = (L[31] + L[35]) / 2.0
+            yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+            u = (ref[0] - xx) * down[0] + (ref[1] - yy) * down[1]          # > 0: above the wings' level (towards the eyes)
+            t0, t1 = NASO_WING_TOP_FROM * Wf, NASO_WING_TOP_TO * Wf
+            sm = np.clip((u - t0) / max(t1 - t0, 1e-3), 0.0, 1.0)
+            wgt = 1.0 - float(min(NASO_WING_TOP, 1.0)) * sm * sm * (3.0 - 2.0 * sm)
+            out = (out * wgt).astype(out.dtype)
+        except Exception:
+            pass
     return out
 
 
@@ -4918,6 +4931,9 @@ def _things(Y: np.ndarray, m: np.ndarray, wf: float, Cb: Optional[np.ndarray] = 
 NASO_REACH = 0.07           # the same in the nasolabial stage. 2611 IWALY c029, c010 (2026-11-22, user): the groove down from the nose wing is
                             # the top of the nasolabial fold and has to be retouched; held as "nose" out to 0.07 of the face width it got a third
                             # of a per cent. Smaller = the fold is taken closer to the wing (the wing itself, inside the landmarks' hull, stays held)
+NASO_WING_TOP = 0.0          # 0..1: the nasolabial band fades out above the nose wings' level (see wrinkle_masks); 0 = as before
+NASO_WING_TOP_FROM = 0.012
+NASO_WING_TOP_TO = 0.05
 ALA_KEEP = 1.0              # share of the nose wing's own exclusion (_ala_mask) kept in the fold's band (1 = as before; the band is made at the
                             # preparation of the frame)
 NASO_DEEP_NOSE = 0.0        # 2611 IWALY c010 f15, c001 f92 (2026-11-22, user: "콧구멍 사라지고 코라인이 덜 선명해진 오류", the nose wing retouched): the nasolabial stage lifted the nostril's
