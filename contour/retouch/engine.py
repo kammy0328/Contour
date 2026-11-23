@@ -165,6 +165,7 @@ FOLD_COVER_SHARE = (0.03, 0.25)   # of the band on the limb: no turning down bel
 FOLD_COVER_MARGIN = 0.035  # of the face width: how far round the limb's cover the bands stay off
 
 
+FOLD_FEATHER = 0.0         # of the face width: the fold bands' edge feathered by this (Gaussian), so the fill fades out instead of stopping at a rim (c048, 11/24). 0 = as before
 FOLD_PARSE_GUARD = 0.0     # 0..1: the fold bands stay off what the face parser sees as hair, a hand or clothes in front of the face (2611 IWALY feedback 11/23: c043 f161 hair across the nose and cheek, c045 f0 the fist at the mouth);
                            # the parser's own skin gate (skin.parse_gate: 1 on skin, down to 0.03 on what lies over it). 0 = as before
 NASO_BULGE = 0.10          # how far out (share of the nose-wing-to-mouth-corner distance) the nasolabial band bulges: a smile pushes the fold out over the raised cheek (c048 f47, c051 f0, c033 f48: the fold was not in the band). 0.10 = as before
@@ -7446,6 +7447,11 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                     if k < 1e-4:
                         continue
                 band = M(job.masks[name], (hY, wY))
+                if FOLD_FEATHER > 1e-4:
+                    # (c048 f50, user 11/24: the fill's dark outline) the band's edge feathered: its inside stays whole, its edge fades out over FOLD_FEATHER of the face width
+                    sg_ = max(1.0, float(FOLD_FEATHER) * wf)
+                    band = np.clip(cv2.GaussianBlur(np.clip(band, 0, 1).astype(np.float32), (0, 0), sg_) * 1.25, 0, 1) * np.clip(
+                        cv2.GaussianBlur(np.clip(band, 0, 1).astype(np.float32), (0, 0), 0.5 * sg_) * 2.0, 0, 1)
                 # the fold where it really is in the (wide) search band, plus a little of the band itself
                 found = _fold_find(Y, band, wf, max(1.5, fw_ * wf))
                 # only where a fold is really found (a quarter of the whole band used to be lifted too: on a
