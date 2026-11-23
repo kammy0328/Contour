@@ -196,6 +196,7 @@ DARK_CHROMA = 0.8           # how far the under-eye's colour is taken to the che
 NASO_NOSTRIL_HOLD = 0.0     # of the face width: the nostrils and the nose's base grown by this are out of the nasolabial band (0 = off)
 SKIN_FS_G = None            # (2611 IWALY INT, 11/24: the pebbled skin of INT_c001 / c006 / c007 / c010 stayed) the gains of the skin stage's texture bands (skin.FS_G, finest
                             # to widest), set from here so a batch's settings can carry them; None = skin.FS_G as it is. INT_c006 f90 / INT_c001 f119: (1.35, 0.70, 0.30, 0.20, 0.20, 0.45)
+SKIN_FOREHEAD_HOLD = 0.0    # 0..1: the forehead above the brows kept out of the skin stage (bangs over it: the strands flickered, INT_c005 11/24). 0 = as before
 SKIN_BROW_HOLD = 0.0        # of the face width: the brows grown by this are kept out of the skin stage (0 = off, as before)
 HAND_GUARD_SKIN_IN = 0.04   # of the face width: the skin stage is held off a hand only outside the face's outline moved in by this
 HAND_GUARD_FEATHER = 0.03
@@ -3580,6 +3581,22 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                     bh_ = cv2.dilate(bh_, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kb_, kb_)))
                     bhf_ = cv2.GaussianBlur(bh_.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.5 * SKIN_BROW_HOLD * wfm_))
                     m = (m * (1.0 - bhf_)).astype(m.dtype)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+            if SKIN_FOREHEAD_HOLD > 1e-4 and lm is not None and np.isfinite(lm[[8, 17, 21, 22, 26, 27], :2]).all():
+                # (11/24, INT_c005: bangs cover the forehead, the skin stage on the strands flickered) the forehead above the brows is no skin to smooth
+                try:
+                    L_ = np.asarray(lm[:, :2], np.float64)
+                    wfm_ = float(np.hypot(*(L_[16] - L_[0])))
+                    up_ = L_[27] - L_[8]
+                    up_ = up_ / max(1e-6, float(np.hypot(*up_)))
+                    br_ = L_[17:27] + up_ * (0.012 * wfm_)
+                    poly_ = np.vstack([br_, (br_ + up_ * (0.9 * wfm_))[::-1]])
+                    fh_ = np.zeros(m.shape, np.uint8)
+                    cv2.fillPoly(fh_, [np.round(poly_).astype(np.int32)], 255)
+                    fhf_ = cv2.GaussianBlur(fh_.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.02 * wfm_))
+                    m = (m * (1.0 - float(np.clip(SKIN_FOREHEAD_HOLD, 0, 1)) * fhf_)).astype(m.dtype)
                 except Exception:
                     import traceback
                     traceback.print_exc()
