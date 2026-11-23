@@ -191,6 +191,7 @@ HAND_GUARD = 0.0          # 0..1 (2611 IWALY INT_c003 f48, 11/24: a fist at the 
 HAND_GUARD_MARGIN = 0.07
 HAND_GUARD_REACH = 0.45     # of the forearm (elbow -> wrist): how far past the wrist the hand reaches
 HAND_GUARD_RADIUS = 0.32    # of the forearm: the hand's half width
+NASO_NOSTRIL_HOLD = 0.0     # of the face width: the nostrils and the nose's base grown by this are out of the nasolabial band (0 = off)
 SKIN_BROW_HOLD = 0.0        # of the face width: the brows grown by this are kept out of the skin stage (0 = off, as before)
 HAND_GUARD_SKIN_IN = 0.04   # of the face width: the skin stage is held off a hand only outside the face's outline moved in by this
 HAND_GUARD_FEATHER = 0.03
@@ -3411,7 +3412,21 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             return under_eye_mask(lm, shape, pa(), fth)
 
         def mk_naso():
-            return _hg(_parse_off(_cover_off(wrinkle_masks(lm, shape, pa(), "naso", fth, 1.7 * NASO_WIDE_MUL, paint()), base().get("cover"), lm), base().get("parse"), lm))
+            m_ = _hg(_parse_off(_cover_off(wrinkle_masks(lm, shape, pa(), "naso", fth, 1.7 * NASO_WIDE_MUL, paint()), base().get("cover"), lm), base().get("parse"), lm))
+            if NASO_NOSTRIL_HOLD > 1e-4 and lm is not None and np.isfinite(lm[31:36, :2]).all():
+                # (11/24, INT_c006 f90: a face looking up shows its nostrils; the band's top ran round them and lifted them) the nostrils and the nose's base (31..35 and the
+                # wings' outer points), grown by NASO_NOSTRIL_HOLD of the face width, are out of the band
+                try:
+                    wfm_ = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
+                    nh_ = np.zeros(m_.shape, np.uint8)
+                    cv2.fillConvexPoly(nh_, cv2.convexHull(np.round(lm[[31, 32, 33, 34, 35], :2]).astype(np.int32)), 255)
+                    kn_ = max(3, int(round(NASO_NOSTRIL_HOLD * wfm_)) * 2 + 1)
+                    nh_ = cv2.dilate(nh_, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kn_, kn_)))
+                    m_ = (m_ * (1.0 - cv2.GaussianBlur(nh_.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.4 * NASO_NOSTRIL_HOLD * wfm_)))).astype(m_.dtype)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+            return m_
 
         def mk_mouthl():
             return _hg(_parse_off(_cover_off(wrinkle_masks(lm, shape, pa(), "mouth", fth, 1.5, paint()), base().get("cover"), lm), base().get("parse"), lm))
