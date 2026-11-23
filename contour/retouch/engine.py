@@ -4913,10 +4913,10 @@ FS_FOREHEAD = True
 
 
 
-FOLD_TRUST = 0.0       # the stages made for close-ups that lift a wide area (broad lift, levelling) need the nose's landmarks to lie as a nose's do (_nose_plausible); where they do not (a head
+FOLD_TRUST = 1.0       # the stages made for close-ups that lift a wide area (broad lift, levelling) need the nose's landmarks to lie as a nose's do (_nose_plausible); where they do not (a head
                        # rolled on its side, a turned or covered face, 2611 IWALY c025 f89 / 01:36:10, user: "마스크 경계가 너무 잘 보여, 주변에 어두워진 라인") the band they work in is not where the
                        # crease is, and they lifted a crescent of the cheek by 10 %. This share of them is kept there (0 = off for such a face; the thin valley fill stays)
-FOLD_TOTAL_CAP = (0.04, 0.03)   # most the nasolabial / mouth-line stages together may lift / darken the luma of one picture (display luma): the user's references change a crease by +2.4..5 % and its
+FOLD_TOTAL_CAP = (0.035, 0.025)   # most the nasolabial / mouth-line stages together may lift / darken the luma of one picture (display luma): the user's references change a crease by +2.4..5 % and its
                                 # rim by -1.7..2.8 %, never by 10 %. Soft (c tanh(d / c)), so a plateau has no edge. None = off
 
 
@@ -4942,8 +4942,8 @@ def _naso_presence(Y: np.ndarray, lm, wf: float) -> float:
         return 1.0
     try:
         L = np.asarray(lm, np.float64)[:, :2]
-        if L.shape[0] < 68 or not np.isfinite(L[[31, 33, 35, 48, 54]]).all() or not _nose_plausible(L, wf):
-            return 1.0
+        if L.shape[0] < 68 or not np.isfinite(L[[31, 33, 35, 48, 54]]).all():
+            return 1.0          # (the nose's landmarks are not asked to lie as a nose's do: on most big faces they do not, _nose_plausible)
         pad = int(0.35 * wf) + 4
         x0, x1 = max(0, int(L[27:55, 0].min()) - pad), min(Y.shape[1], int(L[27:55, 0].max()) + pad)
         y0, y1 = max(0, int(L[27:55, 1].min()) - pad), min(Y.shape[0], int(L[27:55, 1].max()) + pad)
