@@ -6474,6 +6474,34 @@ def _feature_holes(lm: np.ndarray, shape, wf: float) -> np.ndarray:
     return (cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))) > 0) | (cv2.dilate(e, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ke, ke))) > 0)
 
 
+FOLD_YAW = None        # (lo, hi) or None (off). 2611 IWALY INT_c002 f38..f45 (11/24, user: 코끝 하이라이트 깜빡, 입술 위 보정): a face turned away (towards a profile) has its fold and
+                      # mouth landmarks squeezed and wrong from frame to frame; the fold stages and the raised-spot fill flickered on and off there. Their strength falls from 1 at a
+                      # turn of `lo` to 0 at `hi` (the turn: |left - right| / (left + right) of the nose tip's distances to the face's outline at the nose's height)
+FINAL_BUMP_LIPS = 0.0   # of the face width (0 = off, as before): how far round the lips the raised-spot fill stays off (the mouth's corner and the lip's highlight are no bumps)
+
+
+def face_turn(lm) -> float:
+    """0 (frontal) .. 1 (profile): the nose tip's distances to the outline points 2 and 14 (68-point landmarks), |a - b| / (a + b). 0 when the points are missing."""
+    try:
+        L = np.asarray(lm, np.float64)[:, :2]
+        if L.shape[0] < 68 or not np.isfinite(L[[2, 14, 30]]).all():
+            return 0.0
+        a, b = float(np.hypot(*(L[30] - L[2]))), float(np.hypot(*(L[30] - L[14])))
+        return abs(a - b) / max(a + b, 1e-6)
+    except Exception:
+        return 0.0
+
+
+def yaw_gate(lm) -> float:
+    """1 .. 0 with the face's turn (FOLD_YAW), 1 when off"""
+    if FOLD_YAW is None or lm is None:
+        return 1.0
+    if __import__("os").environ.get("IWALY_YAW_LOG"):
+        print("face_turn", round(face_turn(lm), 3), flush=True)
+    lo, hi = float(FOLD_YAW[0]), float(FOLD_YAW[1])
+    return float(1.0 - np.clip((face_turn(lm) - lo) / max(hi - lo, 1e-3), 0.0, 1.0))
+
+
 def _alone(cen: np.ndarray, ids: list, wf: float, iso: float) -> list:
     """the ids whose centre has at most one other spot candidate (cen[1:]) within iso face widths: rough skin's pits come many together"""
     allc = cen[1:]
@@ -6544,6 +6572,11 @@ def _final_bumps(Y0: np.ndarray, region: np.ndarray, wf: float, lm: Optional[np.
     if lm is not None:
         lmr = np.asarray(lm, np.float32)[:, :2] - [x0, y0]
         cand &= ~_feature_holes(lmr, roi.shape, wf)
+        if FINAL_BUMP_LIPS > 0.03 and np.isfinite(lmr[48:60]).all():
+            lp_ = np.zeros(roi.shape, np.uint8)
+            cv2.fillConvexPoly(lp_, cv2.convexHull(np.round(lmr[48:60]).astype(np.int32)), 255)
+            kl_ = max(3, int(FINAL_BUMP_LIPS * wf) | 1)
+            cand &= ~(cv2.dilate(lp_, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kl_, kl_))) > 0)
     n, lab, st, cen = cv2.connectedComponentsWithStats(cand.astype(np.uint8), connectivity=8)
     if n <= 1:
         return None
@@ -6905,10 +6938,10 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
                 bb = _final_bumps(Y0, spot_reg, wf, lmY, Y)
                 if bb is not None:
                     bm, bf = bb
-                    bm = bm * float(np.clip(FINAL_BUMP, 0, 1))
+                    bm = bm * float(np.clip(FINAL_BUMP, 0, 1)) * yaw_gate(job.face)
                     Y = Y + bm * (bf - Y)
             if FINAL_NASO > 1e-4 and lmY is not None and job.wf_src > 0:
-                kn_ = float(np.clip(FINAL_NASO, 0, 1))
+                kn_ = float(np.clip(FINAL_NASO, 0, 1)) * yaw_gate(job.face)
                 if FOLD_PRESENT is not None:
                     kn_ *= _naso_pres_job(job, Y0, wf, y_per_src)
                 if kn_ > 1e-4:
@@ -6921,7 +6954,7 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
                         Y = Y_p_ + (1.0 - float(FINAL_NASO_SKIN) * (1.0 - g_)) * (Y - Y_p_)
             if FOLD_HEAL > 1e-4 and lmY is not None and job.wf_src > 0 and "naso" in job.masks:
                 # a small face's crease, healed (after the nose's give-back: the top of the crease lies inside the nose's area)
-                kh_ = float(np.clip(FOLD_HEAL, 0, 1)) * float(np.clip(job.v.get("nasolabial", 0.0), 0, 1)) * (1.0 - _face_big(job.face, wf, y_per_src))
+                kh_ = float(np.clip(FOLD_HEAL, 0, 1)) * float(np.clip(job.v.get("nasolabial", 0.0), 0, 1)) * (1.0 - _face_big(job.face, wf, y_per_src)) * yaw_gate(job.face)
                 if kh_ > 1e-4 and FOLD_PRESENT is not None:
                     kh_ *= _naso_pres_job(job, Y0, wf, y_per_src)
                 if kh_ > 1e-4 and FOLD_BIG_AMOUNT is not None:
@@ -7325,6 +7358,9 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                 k = float(np.clip(v[key], 0, 1))
                 if job.face is not None:
                     k *= 1.0 - (1.0 - MOUTH_OPEN_KEEP) * mouth_open(job.face)
+                    k *= yaw_gate(job.face)
+                    if k < 1e-4:
+                        continue
                     if FOLD_BIG_AMOUNT is not None:
                         # a big face (a close-up): the user's references change it only a little (c025 / c027 / c037: at most about 1.2 %), the fold work is turned down by this share
                         k *= 1.0 - (1.0 - float(FOLD_BIG_AMOUNT)) * float(_ss(FOLD_BIG_WF[0], FOLD_BIG_WF[1], np.array(float(job.wf_src))))
