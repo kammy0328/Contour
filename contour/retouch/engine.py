@@ -4771,6 +4771,32 @@ EXT_OUTLINE = True          # 2611 IWALY c003 (2026-11-22, user, 00:00:39:17, th
                             # forehead arc) lay within 2 px of the real edge there: the band is held to it as well (the same distances as EXT_GUARD, inside the outline). False = the parser's exterior only
 FOLD_BASE = {"nasolabial": 0.06, "mouth_lines": 0.06}   # share of a fold's band filled where no fold is found (2611 IWALY c029/c010/c001, user: "팔자주름 제거 안 되어 있음": soft folds the finder misses)
 SMALL_WF = (110.0, 200.0)   # face width (px) below which a fold band is softened as a whole
+# 2611 IWALY c005 00:00:44:09, c006 00:00:45:07 (2026-11-23, user: "마스크 오류" beside the nose and at the mouth's corner on the faces of full shots, "팔자주름 안 지워져 있어";
+# the user's retouch reference of c006 45:07): on a small face (130 to 190 px wide) the broad lift and the levelling of a fold's band (FOLD_BROAD, FOLD_LEVEL, NASO_FOLD: set
+# for the soft folds of close-ups) lifted a patch two to three times as wide as the fold by up to 15 % (the reference lifts the fold's own shade by 4 to 7 %, the shading of the
+# cheek beside the nose stays), and the chin's stages (CHIN_DIMPLE, FINAL_CHIN: a pebbled chin, seen on close-ups) took the shade under the lower lip for pits. On such a face
+# the valley fill and the last pass take the shade at the mouth's corner as the reference does (c006 45:07, the face in the middle: +7.2 % against the reference's +7.3 %, no
+# patch, an edge softer than the reference's), and the crease itself is healed by FOLD_HEAL (below). So these stages fade in with the size of the face: nothing below FOLD_SIZE[0], in full from FOLD_SIZE[1] (px of the picture; the size is the face's width or
+# 1.3 times the distance from the top of the nose to the chin, whichever is larger: a face seen from the side is narrow, not small). None: at every size, as before.
+FOLD_SIZE = (200.0, 330.0)
+
+
+def _face_big(face, wf: float, scale: float = 1.0) -> float:
+    """0..1: how far a face is large enough for the stages made for close-ups (FOLD_SIZE). face: the landmarks (source px, or None), wf: the face's width and scale: px per
+    source px, both of the picture worked on."""
+    if not FOLD_SIZE:
+        return 1.0
+    size = float(wf)
+    try:
+        if face is not None:
+            L = np.asarray(face, np.float32)[:, :2] * float(scale)
+            if L.shape[0] >= 28 and np.isfinite(L[[8, 27]]).all():
+                size = max(size, 1.3 * float(np.linalg.norm(L[8] - L[27])))
+    except Exception:
+        pass
+    return float(_ss(FOLD_SIZE[0], FOLD_SIZE[1], np.array(size)))
+
+
 SMALL_FOLD = 0.45           # how much of the band, at the smallest
 NOSE_SKIN = 1.0            # share of the skin smoothing left on the nose (v3: all of it; the narrow smoothing keeps its shape)
 HOLD_DEEP = (0.30, 0.45)    # depth (relative to the skin) of a compact dark thing that is shape, not a flaw
@@ -6220,9 +6246,128 @@ def _final_naso(Y: np.ndarray, Y0: np.ndarray, lm: np.ndarray, wf: float, k: flo
     return out
 
 
+# 2611 IWALY c005 00:00:44:09, c006 00:00:45:07 (2026-11-23, user: "팔자주름 안 지워져 있어", "이 부분이 지워져야 하는거야. 팔자 페더 조심하고", with a retouch reference of each): on the
+# small faces of full shots (115 to 190 px wide) the fold is a crease from beside the nose's wing down to the mouth's corner: a dark groove with a light rim on the mouth's side
+# (c005: 0.66 -> 0.535 within 6 px). The references heal exactly that, over its whole length and nothing else: the groove up by 2.4 to 5 %, the rim beside it down by 1.7 to
+# 2.8 %, a soft ramp left, nothing changed 6 to 8 px to either side (measured: what a blur of 0.03 face widths makes of the crease, r 0.86 to 0.92 with the references). Two
+# thirds of that change lie inside what the fold's stages leave alone (the exclusion round the lips and the nostrils, the nose's area of FINAL_NOSE), so the engine never
+# touched the crease and lifted the cheek's shading outside it instead (the patch). FOLD_HEAL: on a small face (the share 1 - _face_big, times the person's 팔자주름 value), in a
+# corridor made from the landmarks (FOLD_HEAL_ZONE: along the line from the nose's wing to the mouth's corner, on the cheek's side of it) and near the fold's band, the scales
+# between FOLD_HEAL_SIG of the face width are evened out, lighter and darker alike, luma and colour; the nose (FOLD_HEAL_HOLD[0] past its outline), the lips, dark features
+# (a nostril, a strand) and hard edges are neither changed nor part of the level. The change is nought where there is no crease, so the corridor's own edge does not show.
+# A face whose nose landmarks do not lie as a nose's (_nose_plausible: c006 45:07, the face in the middle, lying on its side) is left to the other stages. 0 = off.
+FOLD_HEAL = 1.0
+FOLD_HEAL_SIG = (0.007, 0.030)                       # fine .. broad scale (of the face width)
+FOLD_HEAL_CAP = (0.06, 0.045, 0.02)                  # most lift / most darkening of the luma, most change of a colour plane
+FOLD_HEAL_ZONE = ((-0.30, 1.12), (-0.005, 0.125))    # along the wing -> corner line (0 the wing, 1 the corner) / out from it towards the cheek (of the face width)
+FOLD_HEAL_FEATHER = 0.03                             # the corridor's soft edge (of the face width)
+FOLD_HEAL_GROW = 0.05                                # only this near the fold's band (of the face width)
+FOLD_HEAL_HOLD = (0.012, 0.012)                      # the nose is held this far past its outline, the lips this far past theirs (of the face width)
+FOLD_HEAL_EDGE = 0.04                                # and the corridor stays this far inside the landmarks' outline of the face
+
+
+def _nose_plausible(L: np.ndarray, wf: float) -> bool:
+    """The nose's landmarks lie as a nose's do: a bridge (27 -> 30) of a fair length, the base (33) on beyond the tip, the wings (31, 35) apart."""
+    if L.shape[0] < 36 or not np.isfinite(L[[27, 30, 31, 33, 35], :2]).all():
+        return False
+    br = L[30, :2] - L[27, :2]
+    return bool(float(np.linalg.norm(br)) >= 0.16 * wf and float(np.dot(L[33, :2] - L[30, :2], br)) > 0 and float(np.linalg.norm(L[35, :2] - L[31, :2])) >= 0.06 * wf)
+
+
+def _fold_heal(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, Y0: np.ndarray, band: np.ndarray, lm: np.ndarray, wf: float, k: float,
+               nose: Optional[np.ndarray] = None):
+    """The nasolabial crease healed (see FOLD_HEAL). Y0: the luma as it came in (the guards are read from it), band: the fold's band and lm: the landmarks, both at Y's
+    resolution; nose: 1 off the nose, 0 on it (nose_hold) or None. Returns Y, Cb, Cr."""
+    if k < 1e-4 or lm is None or lm.shape[0] < 68:
+        return Y, Cb, Cr
+    L = np.asarray(lm[:, :2], np.float64)
+    if not np.isfinite(L[[31, 33, 35, 48, 54]]).all() or not _nose_plausible(L, wf):
+        return Y, Cb, Cr
+    s0, s1 = max(0.8, FOLD_HEAL_SIG[0] * wf), max(1.5, FOLD_HEAL_SIG[1] * wf)
+    r = _roi(band, int(FOLD_HEAL_GROW * wf + 3 * s1) + 6)
+    if r is None:
+        return Y, Cb, Cr
+    y0, y1, x0, x1 = r
+    r0 = Y0[y0:y1, x0:x1].astype(np.float32)
+    shp = r0.shape
+    L = L - [x0, y0]
+    # the corridor: along the line from each wing to its mouth corner, on the cheek's side of it, soft
+    (t0, t1), (o0, o1) = FOLD_HEAL_ZONE
+    fz = max(1.0, FOLD_HEAL_FEATHER * wf)
+    yy, xx = np.mgrid[0:shp[0], 0:shp[1]]
+    z = np.zeros(shp, np.float32)
+    for wing, corner in ((31, 48), (35, 54)):
+        a, d = L[wing], L[corner] - L[wing]
+        ln = float(np.linalg.norm(d))
+        if ln < 0.08 * wf or ln > 0.6 * wf:
+            continue
+        d = d / ln
+        n = np.array([-d[1], d[0]])
+        if float(np.dot(L[33] - a, n)) > 0:
+            n = -n                                          # out, away from the middle of the nose's base
+        tt = ((xx - a[0]) * d[0] + (yy - a[1]) * d[1]) / ln
+        ss = ((xx - a[0]) * n[0] + (yy - a[1]) * n[1]) / wf
+        ft, fs = fz / ln, fz / wf
+        zz = np.clip((tt - t0) / ft + 0.5, 0, 1) * np.clip((t1 - tt) / ft + 0.5, 0, 1) * np.clip((ss - o0) / fs + 0.5, 0, 1) * np.clip((o1 - ss) / fs + 0.5, 0, 1)
+        z = np.maximum(z, zz.astype(np.float32))
+    if float(z.max()) < 1e-3:
+        return Y, Cb, Cr
+    z = cv2.GaussianBlur(z, (0, 0), 0.6 * fz)
+    # near the fold's band only, and inside the face's outline
+    g = max(3, int(round(FOLD_HEAL_GROW * wf)) * 2 + 1)
+    b = cv2.dilate(np.clip(band[y0:y1, x0:x1].astype(np.float32) * 2.0, 0, 1), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (g, g)))
+    z = z * cv2.GaussianBlur(b, (0, 0), max(1.0, 0.02 * wf))
+    if FOLD_HEAL_EDGE > 0 and np.isfinite(L[0:27]).all():
+        hl = np.zeros(shp, np.uint8)
+        cv2.fillConvexPoly(hl, cv2.convexHull(np.round(L[0:27]).astype(np.int32)), 255)
+        ke = max(3, int(round(FOLD_HEAL_EDGE * wf)) * 2 + 1)
+        hl = cv2.erode(hl, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ke, ke)))
+        z = z * cv2.GaussianBlur(hl.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.5 * FOLD_HEAL_EDGE * wf))
+    # what is no skin to heal: the lips and the nose (tight), dark features (a nostril, a strand of hair) and hard edges, read from the picture as it came in
+    hold = np.zeros(shp, np.uint8)
+    if np.isfinite(L[48:60]).all():
+        cv2.fillConvexPoly(hold, cv2.convexHull(np.round(L[48:60]).astype(np.int32)), 255)
+        kl = max(3, int(round(FOLD_HEAL_HOLD[1] * wf)) * 2 + 1)
+        hold = cv2.dilate(hold, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kl, kl)))
+    hold = hold.astype(np.float32) / 255.0
+    if nose is not None:
+        hold = np.maximum(hold, 1.0 - np.clip(nose[y0:y1, x0:x1].astype(np.float32), 0, 1))
+    f0 = cv2.GaussianBlur(r0, (0, 0), max(2.0, 0.02 * wf))
+    keep = _ss(FINAL_NASO_MAXDARK, 1.6 * FINAL_NASO_MAXDARK, (f0 - cv2.GaussianBlur(r0, (0, 0), 0.8)) / (f0 + 0.02))
+    rq = cv2.GaussianBlur(r0, (0, 0), 1.0)
+    gx_, gy_ = cv2.Sobel(rq, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(rq, cv2.CV_32F, 0, 1, ksize=3)
+    keep = np.maximum(keep, _ss(0.20, 0.35, np.hypot(gx_, gy_) / 8.0 * max(2.0, 0.02 * wf) / (f0 + 0.02)))
+    keep = cv2.dilate(keep, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    keep = np.clip(np.maximum(keep, hold), 0, 1).astype(np.float32)
+    w = 1.0 - keep
+    m = float(k) * z * (1.0 - np.clip(cv2.GaussianBlur(keep, (0, 0), max(0.8, 0.008 * wf)) * 1.5, 0, 1))
+    if float(m.max()) < 1e-3:
+        return Y, Cb, Cr
+    roi = Y[y0:y1, x0:x1].astype(np.float32)
+    Y = Y.astype(np.float32, copy=True)
+    Y[y0:y1, x0:x1] = roi + m * np.clip(_masked_blur(roi, w, s1, s1) - _masked_blur(roi, w, s0, s0), -FOLD_HEAL_CAP[1], FOLD_HEAL_CAP[0])
+    # the colour with it (the references' heal moves it as a blur of the same scale does)
+    cs = Cb.shape[1] / float(Y.shape[1])
+    c0, c1, d0, d1 = int(np.floor(y0 * cs)), int(np.ceil(y1 * cs)), int(np.floor(x0 * cs)), int(np.ceil(x1 * cs))
+    c1, d1 = min(c1, Cb.shape[0]), min(d1, Cb.shape[1])
+    if c1 - c0 >= 4 and d1 - d0 >= 4:
+        if (c1 - c0, d1 - d0) == shp:
+            mC, wC_ = m, w
+        else:
+            mC = cv2.resize(m, (d1 - d0, c1 - c0), interpolation=cv2.INTER_AREA)
+            wC_ = cv2.resize(w, (d1 - d0, c1 - c0), interpolation=cv2.INTER_AREA)
+        cc = float(FOLD_HEAL_CAP[2])
+        Cb = Cb.astype(np.float32, copy=True)
+        Cr = Cr.astype(np.float32, copy=True)
+        for C_ in (Cb, Cr):
+            rc = C_[c0:c1, d0:d1].astype(np.float32)
+            C_[c0:c1, d0:d1] = rc + mC * np.clip(_masked_blur(rc, wC_, s1 * cs, s1 * cs) - _masked_blur(rc, wC_, max(0.6, s0 * cs), max(0.6, s0 * cs)), -cc, cc)
+    return Y, Cb, Cr
+
+
 def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
     """The last pass (FINAL_*): see the constants. Y0/Cb0/Cr0: the planes as they came in."""
-    if not (FINAL_NOSE > 1e-4 or FINAL_MOLE > 1e-4 or FINAL_BUMP > 1e-4 or FINAL_LONG > 1e-4 or FINAL_CHIN > 1e-4 or FINAL_NASO > 1e-4):
+    if not (FINAL_NOSE > 1e-4 or FINAL_MOLE > 1e-4 or FINAL_BUMP > 1e-4 or FINAL_LONG > 1e-4 or FINAL_CHIN > 1e-4 or FINAL_NASO > 1e-4 or FOLD_HEAL > 1e-4):
         return Y, Cb, Cr
     hY, wY = Y.shape
     hC, wC = Cb.shape
@@ -6273,8 +6418,15 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
                     Y = Y + bm * (bf - Y)
             if FINAL_NASO > 1e-4 and lmY is not None and job.wf_src > 0:
                 Y = _final_naso(Y, Y0, lmY, wf, float(np.clip(FINAL_NASO, 0, 1)))
+            if FOLD_HEAL > 1e-4 and lmY is not None and job.wf_src > 0 and "naso" in job.masks:
+                # a small face's crease, healed (after the nose's give-back: the top of the crease lies inside the nose's area)
+                kh_ = float(np.clip(FOLD_HEAL, 0, 1)) * float(np.clip(job.v.get("nasolabial", 0.0), 0, 1)) * (1.0 - _face_big(job.face, wf, y_per_src))
+                if kh_ > 1e-4:
+                    kh_ *= 1.0 - (1.0 - MOUTH_OPEN_KEEP) * mouth_open(job.face)
+                    Y, Cb, Cr = _fold_heal(Y, Cb, Cr, Y0, M(job.masks["naso"], (hY, wY)), lmY, wf, kh_,
+                                           nose_hold(job.face, (hY, wY), y_per_src, wf, FOLD_HEAL_HOLD[0]))
             if FINAL_CHIN > 1e-4 and lmY is not None and skin is not None:
-                Y = _final_chin(Y, lmY, skin, wf, float(np.clip(FINAL_CHIN, 0, 1)))
+                Y = _final_chin(Y, lmY, skin, wf, float(np.clip(FINAL_CHIN, 0, 1)) * _face_big(job.face, wf, y_per_src))
         except Exception:
             import traceback
             traceback.print_exc()
@@ -6696,8 +6848,9 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                 Y = _fold_fill(Y, mY, exY, 0.95 * k, max(0.8, sf * wf), max(2.0, ss * wf), True,
                                valley=max(1.5, 1.6 * fw_ * wf))
                 fcf_ = NASO_FOLD if (key == "nasolabial" and NASO_FOLD) else {}
-                fb_ = fcf_.get("broad", FOLD_BROAD)
-                fl_ = fcf_.get("level", FOLD_LEVEL)
+                big_ = _face_big(job.face, wf, y_per_src)          # (a small face: the valley fill alone, FOLD_SIZE)
+                fb_ = fcf_.get("broad", FOLD_BROAD) * big_
+                fl_ = fcf_.get("level", FOLD_LEVEL) * big_
                 if fb_ > 1e-4:
                     mb_ = bandg
                     if key == "nasolabial" and nh_ is not None:
@@ -6734,7 +6887,7 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                 Y, Cb, Cr = _crease_lift(Y, Cb, Cr, mfl, float(np.clip(FACE_LINES, 0, 1)), max(1.5, 0.012 * wf),
                                          None, jaw_hold(job.face, (hY, wY), y_per_src, wf))
             if CHIN_DIMPLE > 1e-4:
-                Y = _chin_dimple(Y, lmY, skY, wf, float(np.clip(CHIN_DIMPLE, 0, 1)))
+                Y = _chin_dimple(Y, lmY, skY, wf, float(np.clip(CHIN_DIMPLE, 0, 1)) * _face_big(job.face, wf, y_per_src))
         # 2a'. frown lines between the brows and across the top of the nose (thin creases only)
         if FROWN_LINES > 1e-4 and "skin" in job.masks and job.face is not None and v["skin"] > 1e-4:
             try:
