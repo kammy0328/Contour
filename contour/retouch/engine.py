@@ -185,6 +185,35 @@ def _parse_off(m: np.ndarray, parse, lm) -> np.ndarray:
         return m
 
 
+HAND_GUARD = 0.0          # 0..1 (2611 IWALY INT_c003 f48, 11/24: a fist at the chin; the limb cover missed it, the fold bands and the neck lines lifted the shadows round it into bright
+                          # patches that jump from frame to frame): the fold bands (nasolabial, mouth lines) and the neck-line mask stay off every hand's area in the picture, taken
+                          # from the hands' own keypoints (tracked, else the whole-body model's sure points), grown by HAND_GUARD_MARGIN of the face width
+HAND_GUARD_MARGIN = 0.07
+HAND_GUARD_FEATHER = 0.03
+
+
+def _hand_area(hands, shape, sx: float, sy: float, wf: float) -> Optional[np.ndarray]:
+    """0..1 at `shape`: the hull of each hand's keypoints (source px; sx, sy to the mask), grown by HAND_GUARD_MARGIN * wf (wf in mask px) and soft."""
+    if not hands:
+        return None
+    h, w = shape
+    out = np.zeros((h, w), np.uint8)
+    for hp in hands:
+        if hp is None:
+            continue
+        q = np.asarray(hp, np.float64)
+        q = q[np.isfinite(q[:, :2]).all(1)][:, :2] if q.ndim == 2 else None
+        if q is None or len(q) < 3:
+            continue
+        q = q * [sx, sy]
+        cv2.fillConvexPoly(out, cv2.convexHull(np.round(q).astype(np.int32)), 255)
+    if not out.any():
+        return None
+    r = max(1, int(round(HAND_GUARD_MARGIN * wf)))
+    out = cv2.dilate(out, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1)))
+    return np.clip(cv2.GaussianBlur(out.astype(np.float32) / 255.0, (0, 0), max(1.0, HAND_GUARD_FEATHER * wf)) * 1.2, 0, 1)
+
+
 def _cover_off(m: np.ndarray, cover: Optional[np.ndarray], lm: np.ndarray) -> np.ndarray:
     """The fold band without the part on or next to a limb in front of the face (FOLD_COVER_GUARD)."""
     _dc = __import__('os').environ.get('IWALY_DUMP_COVER_MASKS')
@@ -1456,7 +1485,16 @@ def teeth_mask(lm: np.ndarray, rgb_f: np.ndarray) -> np.ndarray:
     return _feather(reg * wy * ws, 0.004 * Wf)
 
 
+EYE_WHITE_V2 = 0.0   # 0/1 (2611 IWALY INT, user 2026-11-24: "핏줄만 제거, 눈썹이나 다른 곳으로 번지면 안 되고, 흔적 없이 깨끗한 흰자"): the sclera found by its red channel (the veins
+                     # are red and stay in the mask; the v1 mask weighted by brightness and low saturation left the veins themselves out), inside the eye's own landmarks only, and the
+                     # veins filled from the white round them (dark -> up to the local white, red -> down to the white's own chroma) instead of lifting / bleaching the whole white
+EYE_WHITE_V2_SHRINK = 0.88     # the eye's landmark polygon shrunk towards its middle by this (the lid's edge and the lash line stay out)
+EYE_WHITE_V2_LIFT = 0.015      # a gentle overall lift of the white (share of the way to 1)
+
+
 def eye_white_mask(lm: np.ndarray, rgb_f: np.ndarray) -> np.ndarray:
+    if EYE_WHITE_V2 > 1e-4:
+        return _eye_white_mask_v2(lm, rgb_f)
     h, w = rgb_f.shape[:2]
     L = lm[:, :2]
     Wf = float(np.hypot(*(L[16] - L[0])))
@@ -1479,6 +1517,64 @@ def eye_white_mask(lm: np.ndarray, rgb_f: np.ndarray) -> np.ndarray:
         ws = 1 - np.clip((sat - 0.25) / 0.2, 0, 1)
         out = np.maximum(out, reg * wy * ws)
     return _feather(out, 0.003 * Wf)
+
+
+def _eye_white_mask_v2(lm: np.ndarray, rgb_f: np.ndarray) -> np.ndarray:
+    """The sclera of both eyes (EYE_WHITE_V2): inside each eye's landmark polygon (shrunk), the pixels whose red channel is high (the white and its red veins; the iris, the pupil
+    and the lashes are low in red), opened a little so a lash or the iris' rim does not join; 0..1, soft only by a pixel or two (nothing outside the eye)."""
+    h, w = rgb_f.shape[:2]
+    L = lm[:, :2]
+    if not np.isfinite(L[36:48]).all():
+        return np.zeros((h, w), np.float32)
+    Wf = float(np.hypot(*(L[16] - L[0])))
+    R = rgb_f[..., 0].astype(np.float32)
+    out = np.zeros((h, w), np.float32)
+    for idx in (slice(36, 42), slice(42, 48)):
+        e = L[idx]
+        c = e.mean(0)
+        m = np.zeros((h, w), np.uint8)
+        _poly(m, c + (e - c) * EYE_WHITE_V2_SHRINK)
+        inside = m > 0
+        if inside.sum() < 12:
+            continue
+        rs = R[inside]
+        lo, hi = float(np.percentile(rs, 30)), float(np.percentile(rs, 75))
+        wr = np.clip((R - lo) / max(hi - lo, 0.02), 0, 1) * inside
+        k = max(1, int(round(0.004 * Wf)))
+        wr = cv2.morphologyEx(wr.astype(np.float32), cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1)))
+        out = np.maximum(out, wr * inside)
+    return np.clip(cv2.GaussianBlur(out, (0, 0), max(0.6, 0.0015 * Wf)), 0, 1)
+
+
+def _eye_white_apply_v2(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, mY: np.ndarray, mC: np.ndarray, wf: float, cs: float, k: float):
+    """The veins filled from the white round them: the white's local level (a blur of the sclera weighted to its brighter, less red pixels) is the target; a darker pixel is
+    brought up to it, a redder / yellower one down to its chroma. Nothing brighter than the white round it is made, so no glow and no trace of the mask's edge."""
+    def nblur(x, w, sig):
+        num = cv2.GaussianBlur((x * w).astype(np.float32), (0, 0), sig)
+        den = cv2.GaussianBlur(w.astype(np.float32), (0, 0), sig)
+        return num / np.maximum(den, 1e-4), den
+    if float(mY.max()) < 0.05:
+        return Y, Cb, Cr
+    sY = max(1.0, 0.025 * wf)
+    # the white's level: weighted to the bright pixels (a vein is darker), twice (the second round leaves the veins out of the reference)
+    Yr, _ = nblur(Y, mY, sY)
+    wb = mY * np.clip((Y - (Yr - 0.03)) / 0.03, 0, 1)
+    Yr, dY_ = nblur(Y, np.maximum(wb, 1e-3 * mY), sY)
+    up = np.clip(Yr - Y, 0, None)
+    Y = Y + k * mY * up
+    Y = Y + k * mY * EYE_WHITE_V2_LIFT * (1 - Y)
+    sC = max(1.0, sY * cs)
+    # the chroma of the white: weighted to the least red (a vein is red)
+    Crr, _ = nblur(Cr, mC, sC)
+    wc = mC * np.clip(((Crr + 0.01) - Cr) / 0.02, 0, 1)
+    Crr, _ = nblur(Cr, np.maximum(wc, 1e-3 * mC), sC)
+    Cbr, _ = nblur(Cb, np.maximum(wc, 1e-3 * mC), sC)
+    Cr = Cr + k * mC * np.clip(Crr - Cr, None, 0)               # only down (less red)
+    Cb = Cb + k * mC * (Cbr - Cb) * (Cb < Cbr)                    # a yellow cast (Cb below the white's) up to it
+    # and the white itself a little cleaner (less red / yellow), never past neutral
+    Cr = Cr - k * mC * 0.35 * np.clip(Cr, 0, None)
+    Cb = Cb - k * mC * 0.35 * np.clip(Cb, None, 0)
+    return Y, Cb, Cr
 
 
 def knee_mask(kp: np.ndarray, widths, shape, sx: float, sy: float, prob: np.ndarray, alpha) -> np.ndarray:
@@ -3274,10 +3370,47 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             return under_eye_mask(lm, shape, pa(), fth)
 
         def mk_naso():
-            return _parse_off(_cover_off(wrinkle_masks(lm, shape, pa(), "naso", fth, 1.7 * NASO_WIDE_MUL, paint()), base().get("cover"), lm), base().get("parse"), lm)
+            return _hg(_parse_off(_cover_off(wrinkle_masks(lm, shape, pa(), "naso", fth, 1.7 * NASO_WIDE_MUL, paint()), base().get("cover"), lm), base().get("parse"), lm))
 
         def mk_mouthl():
-            return _parse_off(_cover_off(wrinkle_masks(lm, shape, pa(), "mouth", fth, 1.5, paint()), base().get("cover"), lm), base().get("parse"), lm)
+            return _hg(_parse_off(_cover_off(wrinkle_masks(lm, shape, pa(), "mouth", fth, 1.5, paint()), base().get("cover"), lm), base().get("parse"), lm))
+
+        def hand_guard():
+            """1 - the hands' area (HAND_GUARD), at `shape`, or None (off / no hands)"""
+            if HAND_GUARD <= 1e-4:
+                return None
+            if "hand_guard" not in state:
+                g_ = None
+                try:
+                    hl_ = []
+                    for q_ in np.nonzero(st.present[:, t])[0]:
+                        for side_ in range(2):
+                            h_ = None
+                            if getattr(st, "has_hands", False):
+                                h_ = st.hand[q_, t]
+                            if h_ is None or not np.isfinite(np.asarray(h_)[:, :2]).any():
+                                h_ = st.hand_raw[q_, t].copy()
+                                h_[~(np.nan_to_num(h_[:, 2]) >= 1.5)] = np.nan
+                            h_ = np.asarray(h_)
+                            # the hand arrays hold both hands one after the other (21 points each) or one hand: split them so each hull is one hand
+                            n_ = h_.shape[0]
+                            if n_ >= 42:
+                                hl_.append(h_[side_ * (n_ // 2):(side_ + 1) * (n_ // 2)])
+                            elif side_ == 0:
+                                hl_.append(h_)
+                    wfm_ = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
+                    a_ = _hand_area(hl_, shape, float(px.sx), float(px.sy), wfm_)
+                    if a_ is not None:
+                        g_ = 1.0 - float(HAND_GUARD) * a_
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+                state["hand_guard"] = g_
+            return state["hand_guard"]
+
+        def _hg(m_):
+            g_ = hand_guard()
+            return m_ if (g_ is None or m_ is None or g_.shape != m_.shape) else (m_ * g_).astype(m_.dtype)
 
         def mk_neck():
             b_ = base()
@@ -3291,8 +3424,8 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                     h_[~(np.nan_to_num(h_[:, 2]) >= 1.5)] = np.nan
                 hl.append(h_)
             hnd = np.concatenate(hl, 0) if hl else None
-            return neck_mask(lm, kpn, wdn, shape, px.sx, px.sy, b_["prob"], b_["alpha"], fth,
-                             b_["rgb"], hnd, b_.get("parse"), protect=b_.get("protect"))
+            return _hg(neck_mask(lm, kpn, wdn, shape, px.sx, px.sy, b_["prob"], b_["alpha"], fth,
+                                 b_["rgb"], hnd, b_.get("parse"), protect=b_.get("protect")))
 
         def mk_body_of(bscope_):
             from ..core.project import body_scope_set as _bss
@@ -7410,6 +7543,9 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
             k = float(np.clip(v["eye_white"], 0, 1))
             mY = M(job.masks["eyew"], (hY, wY))
             mC = M(job.masks["eyew"], (hC, wC))
+        if "eyew" in job.masks and v["eye_white"] > 1e-4 and EYE_WHITE_V2 > 1e-4:
+            Y, Cb, Cr = _eye_white_apply_v2(Y, Cb, Cr, mY, mC, wf, cs, k)
+        elif "eyew" in job.masks and v["eye_white"] > 1e-4:
             # thin red veins: even out locally first
             rr = max(1, int(round(0.012 * wf)))
             Y = SK.smooth_channel(Y, mY, 0.8 * k, 0.25, rr, eps=0.002)
