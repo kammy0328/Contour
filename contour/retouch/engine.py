@@ -6542,6 +6542,7 @@ def _feature_holes(lm: np.ndarray, shape, wf: float) -> np.ndarray:
 FOLD_YAW = None        # (lo, hi) or None (off). 2611 IWALY INT_c002 f38..f45 (11/24, user: 코끝 하이라이트 깜빡, 입술 위 보정): a face turned away (towards a profile) has its fold and
                       # mouth landmarks squeezed and wrong from frame to frame; the fold stages and the raised-spot fill flickered on and off there. Their strength falls from 1 at a
                       # turn of `lo` to 0 at `hi` (the turn: |left - right| / (left + right) of the nose tip's distances to the face's outline at the nose's height)
+FINAL_BUMP_NOSE = 0.0   # 0..1: the raised-spot fill kept off the nose (its bridge's highlight is no bump; ENDING: it blinked). 0 = as before
 FINAL_BUMP_LIPS = 0.0   # of the face width (0 = off, as before): how far round the lips the raised-spot fill stays off (the mouth's corner and the lip's highlight are no bumps)
 
 
@@ -7004,6 +7005,15 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
                 if bb is not None:
                     bm, bf = bb
                     bm = bm * float(np.clip(FINAL_BUMP, 0, 1)) * yaw_gate(job.face)
+                    if FINAL_BUMP_NOSE > 1e-4 and lmY is not None:
+                        # (ENDING 03:37:09, user 11/24: the nose bridge's highlight blinked) a highlight on the nose sits right at the bump's brightness threshold and
+                        # is filled on some frames only: no bump fill on the nose
+                        try:
+                            na_ = _nose_area(lmY, (hY, wY), wf)
+                            if na_ is not None:
+                                bm = bm * (1.0 - float(np.clip(FINAL_BUMP_NOSE, 0, 1)) * np.clip(na_, 0, 1))
+                        except Exception:
+                            pass
                     Y = Y + bm * (bf - Y)
             if FINAL_NASO > 1e-4 and lmY is not None and job.wf_src > 0:
                 kn_ = float(np.clip(FINAL_NASO, 0, 1)) * yaw_gate(job.face)
