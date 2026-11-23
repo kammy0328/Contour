@@ -668,6 +668,47 @@ PRORES_PROFILES = {
 VIDEO_PROFILES = dict(PRORES_PROFILES, hevc_mp4=(-1, "yuv420p10le", "H.265 MP4 10bit"))
 _NVENC: dict = {}
 _VTB: dict = {}
+_PRORES_VTB: dict = {}
+
+
+def prores_args(profile: str, alpha: bool = False, prefer: str = "auto") -> List[str]:
+    """Use hardware ProRes on a Mac only after an actual encode succeeds.
+
+    The native planar input stays unchanged; p210/p410 only repack its 10-bit
+    samples for VideoToolbox. Alpha stays on prores_ks to keep 16-bit alpha.
+    DIAP_PRORES_ENCODER=software restores the original encoder on this Mac.
+    """
+    prof, enc_fmt, _ = PRORES_PROFILES[profile]
+    mode = os.environ.get("DIAP_PRORES_ENCODER", "auto").strip().lower()
+    hardware = sys.platform == "darwin" and not alpha and mode != "software" and prefer != "software"
+    if hardware:
+        packed_fmt = "p210le" if prof <= 3 else "p410le"
+        key = (ffmpeg_bin(), prof, packed_fmt)
+        args = ["-c:v", "prores_videotoolbox", "-allow_sw", "0", "-profile:v", str(prof),
+                "-pix_fmt", packed_fmt]
+        if key not in _PRORES_VTB:
+            reason = ""
+            try:
+                probe = subprocess.run(
+                    [ffmpeg_bin(), "-hide_banner", "-v", "error", "-nostdin", "-f", "lavfi", "-i",
+                     "color=black:s=256x256:r=24", "-frames:v", "1"] + args + ["-f", "null", "-"],
+                    capture_output=True, timeout=15)
+                ok = probe.returncode == 0
+                if not ok:
+                    reason = probe.stderr.decode(errors="replace").splitlines()
+                    reason = reason[0][:400] if reason else f"ffmpeg exit {probe.returncode}"
+            except Exception as exc:
+                ok, reason = False, str(exc)
+            _PRORES_VTB[key] = ok
+            if not ok:
+                print("ProRes: hardware check failed; using prores_ks (CPU). " + reason, file=sys.stderr)
+        if _PRORES_VTB[key]:
+            return args
+    args = ["-c:v", "prores_ks", "-profile:v", str(prof), "-vendor", "apl0",
+            "-pix_fmt", "yuva444p10le" if alpha else enc_fmt]
+    if alpha:
+        args += ["-alpha_bits", "16"]
+    return args
 
 
 def videotoolbox_ok() -> bool:
@@ -741,11 +782,8 @@ class FrameWriter:
                  gray: bool = False, encoder: str = "auto", quality: str = "high"):
         if profile not in VIDEO_PROFILES:
             raise MediaError(f"알 수 없는 출력 포맷: {profile}")
-        prof, enc_fmt, _ = VIDEO_PROFILES[profile]
         hevc = profile == "hevc_mp4"
         alpha = in_pix_fmt.startswith("yuva")
-        if alpha:
-            enc_fmt = "yuva444p10le"
         self.layout = plane_layout(in_pix_fmt, width, height)
         self.out_path = out_path
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
@@ -788,9 +826,10 @@ class FrameWriter:
         if hevc:
             cmd += hevc_args(hevc_encoder(encoder), quality)
         else:
-            cmd += ["-c:v", "prores_ks", "-profile:v", str(prof), "-vendor", "apl0", "-pix_fmt", enc_fmt]
-            if alpha:
-                cmd += ["-alpha_bits", "16"]
+            cmd += prores_args(profile, alpha, encoder)
+            selected = cmd[cmd.index("-c:v") + 1]
+            print(f"ProRes output: {selected} ({profile}) -> {out_path}", file=sys.stderr)
+            self.encoder = selected
         if src_info is not None and not gray:
             if src_info.color_primaries in _PRIM_OK:
                 cmd += ["-color_primaries", src_info.color_primaries]

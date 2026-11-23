@@ -907,7 +907,23 @@ def person_geometry_t(final_p: np.ndarray, widths_p: Optional[np.ndarray], t: in
                 vals.append(g[4])
         if len(vals) >= 3:
             halves[tag] = float(np.median(vals))
-    return person_geometry(kp, wd, halves)
+    geometry = person_geometry(kp, wd, halves)
+    # Reject isolated position spikes only when both neighbouring leg segments
+    # also agree on the direction. Constant velocity dance motion passes through.
+    if 0 < t < n - 1:
+        for i, side in enumerate(geometry["sides"]):
+            before, after = (_knee_raw(final_p[u], widths_p[u] if widths_p is not None else None, side)
+                             for u in (t-1, t+1))
+            if before is None or after is None:
+                continue
+            x, y, ax, ay, half = geometry["knees"][i]
+            if np.dot(before[2:4], after[2:4]) < 0.92 or np.hypot(after[0]-before[0], after[1]-before[1]) > half:
+                continue
+            mid = (np.asarray(before[:2]) + np.asarray(after[:2])) * 0.5
+            error = np.hypot(x-mid[0], y-mid[1]) / max(half, 1)
+            blend = float(np.clip((error - 1.25) / 0.75, 0, 1))
+            geometry["knees"][i] = (x + blend*(mid[0]-x), y + blend*(mid[1]-y), ax, ay, half)
+    return geometry
 
 
 def person_geometry(kp: np.ndarray, widths: Optional[np.ndarray], halves: Optional[dict] = None) -> dict:
@@ -1006,3 +1022,85 @@ def belly_fold(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, skin: Optional[np.
     if SOFT_FOLD > 1e-4:
         Yo = E._fold_flat(Yo, m, geom["trunk"] * scale / 3.55, float(k) * SOFT_FOLD)       # (3.55 face widths from the shoulders to the hips)
     return Yo, Cbo, Cro
+
+
+def knee_fold(Y, Cb, Cr, skin, visible, knees, k):
+    """Fill current knee creases, clipping the final change to visible owned skin.
+
+    No reconstructed image is carried across frames. Geometry may be smoothed
+    by person_geometry_t, but occluded pixels always use this frame's ownership.
+    Missing ownership or skin information disables the correction.
+    """
+    if k < 1e-4 or skin is None or visible is None:
+        return Y, Cb, Cr
+    from . import engine as E
+    allowed = np.clip(skin, 0, 1) * np.clip(visible, 0, 1)
+    # Erode before filtering to keep socks and occluding silhouettes out.
+    allowed = cv2.erode(allowed.astype(np.float32), np.ones((3, 3), np.uint8))
+    result = Y
+    chroma = None
+    h, w = Y.shape
+    for centre, axis, half in knees:
+        if not np.isfinite((*centre, *axis, half)).all() or half < 3:
+            continue
+        radius = int(2.5 * half) + 8
+        x0, x1 = max(0, int(centre[0]) - radius), min(w, int(centre[0]) + radius + 1)
+        y0, y1 = max(0, int(centre[1]) - radius), min(h, int(centre[1]) + radius + 1)
+        if x1 - x0 < 8 or y1 - y0 < 8:
+            continue
+        yy, xx = np.mgrid[y0:y1, x0:x1].astype(np.float32)
+        dx, dy = xx - centre[0], yy - centre[1]
+        norm = max(float(np.hypot(*axis)), 1e-6)
+        ax, ay = axis[0] / norm, axis[1] / norm
+        along, across = dx * ax + dy * ay, -dx * ay + dy * ax
+        zone = np.clip(1 - (along / (1.4 * half)) ** 2 - (across / half) ** 2, 0, 1)
+        gate = allowed[y0:y1, x0:x1]
+        mask = (zone * gate).astype(np.float32)
+        if mask.max() < 0.05:
+            continue
+        if chroma is None:
+            chroma = tuple(c if c.shape == Y.shape else cv2.resize(c, (w, h), interpolation=cv2.INTER_LINEAR)
+                           for c in (Cb, Cr))
+        roi = result[y0:y1, x0:x1]
+        cb, cr = (c[y0:y1, x0:x1] for c in chroma)
+        strength = float(np.clip(k, 0, 1))
+        filled, _, _ = E._crease_lift(roi, cb, cr, mask, strength,
+                                      max(1.5, 0.08 * half), axis=(ax, ay), band=0.6 * strength)
+        # Reduce residual mid-scale indentations. Normalized skin-only samples
+        # keep the sock and the background out of the local brightness estimate.
+        weight = gate.astype(np.float32)
+        sigma = max(2.0, 0.28 * half)
+        support = cv2.GaussianBlur(weight, (0, 0), sigma)
+        local = cv2.GaussianBlur(filled * weight, (0, 0), sigma) / np.maximum(support, 1e-4)
+        fine = cv2.GaussianBlur(filled, (0, 0), max(0.65, 0.035 * half))
+        depression = np.clip(local - fine, 0.0, 0.075)
+        filled = filled + strength * depression * mask * _ss(0.55, 0.85, support)
+        # At high strength, reconstruct the wider shadow of a deep indentation.
+        # The normalized surround follows the large-scale shading of the leg.
+        boost = float(np.clip((strength - 0.7) / 0.3, 0, 1))
+        if boost > 0:
+            radius = max(2.0, 0.50 * half)
+            den = cv2.GaussianBlur(weight, (0, 0), radius)
+            surround = cv2.GaussianBlur(filled * weight, (0, 0), radius) / np.maximum(den, 1e-4)
+            residual = surround - cv2.GaussianBlur(filled, (0, 0), max(0.7, 0.035 * half))
+            coverage = _ss(0.0, 0.65, zone) * gate * _ss(0.55, 0.85, den)
+            filled = filled + boost * coverage * np.clip(residual, 0, 0.085)
+        if result is Y:
+            result = Y.copy()
+        result[y0:y1, x0:x1] = roi + (filled - roi) * gate
+    return result, Cb, Cr
+
+def visible_knee_tone(Y, Cb, Cr, skin, ownership, knees, strength, cs, gains):
+    """Keep the visible portion of each knee and feather inwards from an occluder."""
+    if skin is None or ownership is None:
+        return Y, Cb, Cr
+    gate = np.clip(skin * ownership, 0, 1).astype(np.float32)
+    inside = cv2.distanceTransform((gate > 0.25).astype(np.uint8), cv2.DIST_L2, 3)
+    gate *= np.clip(inside / max(2.0, Y.shape[0] / 360.0), 0, 1)
+    corrected = knee_tone(Y, Cb, Cr, gate, knees, strength, cs, gains=gains)
+    output = []
+    for original, filled in zip((Y, Cb, Cr), corrected):
+        weight = gate if original.shape == gate.shape else cv2.resize(
+            gate, (original.shape[1], original.shape[0]), interpolation=cv2.INTER_AREA)
+        output.append(original + weight * (filled - original))
+    return tuple(output)
