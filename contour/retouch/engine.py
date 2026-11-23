@@ -1504,6 +1504,8 @@ def teeth_mask(lm: np.ndarray, rgb_f: np.ndarray) -> np.ndarray:
 EYE_WHITE_V2 = 0.0   # 0/1 (2611 IWALY INT, user 2026-11-24: "핏줄만 제거, 눈썹이나 다른 곳으로 번지면 안 되고, 흔적 없이 깨끗한 흰자"): the sclera found by its red channel (the veins
                      # are red and stay in the mask; the v1 mask weighted by brightness and low saturation left the veins themselves out), inside the eye's own landmarks only, and the
                      # veins filled from the white round them (dark -> up to the local white, red -> down to the white's own chroma) instead of lifting / bleaching the whole white
+EYE_WHITE_MIN_WF = None       # face width in SOURCE px under which the eye-white stage is not run at all (a wide shot: the whites are a few pixels, nothing to see,
+                               # only time spent); None = every face (2611 IWALY, user 11/24: "눈이 디테일하게 보이는 샷에서만")
 EYE_WHITE_V2_SHRINK = 0.88     # the eye's landmark polygon shrunk towards its middle by this (the lid's edge and the lash line stay out)
 EYE_WHITE_V2_LIFT = 0.0        # an overall lift of the white (share of the way to 1); 0: the user wants only the veins gone, no brighter white
 
@@ -3577,7 +3579,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 job.masks["lips"] = get("lips", lambda: lip_mask(lm, shape)) * fw
             if v["teeth"] > 1e-4:
                 job.masks["teeth"] = get("teeth", lambda: teeth_mask(lm, base()["rgbf"])) * fw
-            if v["eye_white"] > 1e-4:
+            if v["eye_white"] > 1e-4 and (EYE_WHITE_MIN_WF is None or float(job.wf_src) >= float(EYE_WHITE_MIN_WF)):
                 job.masks["eyew"] = get("eyew", lambda: eye_white_mask(lm, base()["rgbf"])) * fw
         if body_on:
             # body skin (1.23): its own area, apart from the face's regions (retouch.bodyskin)
