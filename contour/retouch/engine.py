@@ -3922,6 +3922,22 @@ class KneeLook:
                     rf = self.prepare(t)
                     fi = self.build_input(t)
                 sup = knee_probe(rf, self.px) if rf is not None else {}
+                # (11/24) a person's knees crossing (close and their distance changing fast): the knee work ramps down for it (c017 f28/29 flash)
+                try:
+                    prev_ = self.__dict__.setdefault("_knees_prev", {})
+                    for j_ in (rf.jobs if rf is not None else []):
+                        tn_ = getattr(j_, "tone", None)
+                        if not tn_ or not tn_.get("knees"):
+                            continue
+                        f_ = BTN.knee_overlap_support(tn_["knees"], prev_.get(j_.pid))
+                        sides_ = tn_.get("sides") or []
+                        for i_, fv_ in enumerate(f_):
+                            key_ = (j_.pid, sides_[i_] if i_ < len(sides_) else str(i_))
+                            if key_ in sup:
+                                sup[key_] = float(sup[key_]) * float(fv_)
+                        prev_[j_.pid] = tn_["knees"]
+                except Exception:
+                    pass
                 if rf is not None:
                     for j_ in rf.jobs:
                         j_.masks = {k_: _mask_pack(v_) for k_, v_ in j_.masks.items()}

@@ -669,6 +669,41 @@ def knee_owned_share(owner: np.ndarray, scale: float, knee) -> float:
         return 1.0
 
 
+KNEE_OVERLAP = (1.0, 2.4)   # distance of a person's two knees in half widths: from where they overlap (crossing legs) .. apart
+KNEE_OVERLAP_FLOOR = 0.35   # the share of the knee work left while the knees overlap (the front leg's shade on the other one was
+                            # evened for a frame or two as a blotch: a flash, c017 f28/29); the look ahead ramps it in and out
+
+
+KNEE_CROSS_MOVE = (0.25, 0.7)   # how fast the knees' distance changes (half widths per picture): from where it counts as crossing .. fully
+
+
+def _knee_dist(knees):
+    if len(knees) != 2:
+        return None
+    a, b = [np.asarray(k_, np.float64) for k_ in knees]
+    if not (np.isfinite(a).all() and np.isfinite(b).all()):
+        return None
+    h = 0.5 * (a[4] + b[4])
+    return None if h <= 0 else float(np.hypot(a[0] - b[0], a[1] - b[1]) / h)
+
+
+def knee_overlap_support(knees, knees_prev=None) -> list:
+    """Per knee: KNEE_OVERLAP_FLOOR while the person's two knees cross each other (close together and their distance changing fast
+    from the picture before), 1 otherwise: knees held together stay corrected in full, only the crossing is ramped (knee_envelope)."""
+    out = [1.0] * len(knees)
+    try:
+        d = _knee_dist(knees)
+        dp = _knee_dist(knees_prev) if knees_prev is not None else None
+        if d is not None and dp is not None:
+            close = 1.0 - float(_ss(KNEE_OVERLAP[0], KNEE_OVERLAP[1], min(d, dp)))
+            moving = float(_ss(KNEE_CROSS_MOVE[0], KNEE_CROSS_MOVE[1], abs(d - dp)))
+            f = 1.0 - (1.0 - KNEE_OVERLAP_FLOOR) * close * moving
+            out = [f] * len(knees)
+    except Exception:
+        pass
+    return out
+
+
 def knee_envelope(support, t: int, lo: int, hi: int, step: Optional[float] = None) -> float:
     """The most a knee may be corrected on picture t: min over the pictures u in [lo, hi] of support[u] + step * |t - u|, 0 for a picture that has no
     support entry. support: dict picture -> 0..1 (or any object with .get). Never more than the picture's own support; a picture the supported stretch
@@ -1305,6 +1340,7 @@ def knee_fold(Y, Cb, Cr, skin, visible, knees, k, gains=None):
             if sk is None:
                 continue
             sk = np.clip(sk, 0, 1).astype(np.float32)
+        sk = sk * skin_likeness(roi, cb, cr)          # (never cloth: c017 v3 black trousers)
         allowed = cv2.erode((sk * own).astype(np.float32), np.ones((3, 3), np.uint8))
         # (faded in from every edge of the skin it may touch: another person's leg, the sock, a hem: a crease filled up to a sock's
         # edge left a bright line along it)
@@ -1383,13 +1419,32 @@ K5_UP, K5_DOWN, K5_ACROSS = 3.6, 2.6, 1.9   # the leg zone in half widths (up th
 K5_SKIN_LUMA = (0.45, 0.70)  # the leg's own skin when the body area is missing: brightness over the leg's (cloth is far darker)
 
 
-def _leg_skin(Yr, owner_r, zone):
-    """The leg's skin read from the picture (the person's own area, not far darker than its bright part): when the body area is missing."""
-    m = (owner_r > 0.5) & (zone > 0.2) if owner_r is not None else (zone > 0.2)
-    if int(m.sum()) < 60:
+# (11/24 c017 v3: black trousers were taken for the leg's skin and the correction came and went on them from frame to frame)
+# A pixel can be skin only by its own colour: warm and coloured enough and not dark (the trousers: Y 0.16, chroma 0.006, Cr 0.002;
+# the legs' skin: Y 0.27..0.30, chroma 0.026, Cr 0.015, LogC4 code values). Soft, so nothing switches.
+# (11/24 c017 f28/29: two legs of one dancer crossing; the shade the front leg casts along its edge on the other was evened as a
+# blotch for two frames: a bright flash at the edge). A bruise's edge is soft; an edge where one leg passes another is sharp: the
+# blotch and texture work are held back within K5_EDGE_REACH half widths of an edge steeper than K5_EDGE (luma per pixel over the level).
+K5_EDGE = (0.010, 0.022)
+K5_EDGE_REACH = 0.30
+K5_SKIN_CHROMA = (0.009, 0.016)
+K5_SKIN_CR = (0.005, 0.010)
+K5_SKIN_Y = (0.17, 0.22)
+
+
+def skin_likeness(Y, Cb, Cr):
+    """0..1 per pixel: how far this colour can be skin (warm, coloured, not dark). Y, Cb, Cr on one grid."""
+    c = np.hypot(Cb, Cr)
+    w = _ss(K5_SKIN_CHROMA[0], K5_SKIN_CHROMA[1], c) * _ss(K5_SKIN_CR[0], K5_SKIN_CR[1], Cr) * _ss(K5_SKIN_Y[0], K5_SKIN_Y[1], Y)
+    w = w * _ss(-0.3, 0.0, Cr + 0.3 * Cb)          # (red over blue, as _skin_like)
+    return cv2.GaussianBlur(w.astype(np.float32), (0, 0), 1.0)
+
+
+def _leg_skin(Yr, owner_r, zone, cbr=None, crr=None):
+    """The leg's skin read from the picture: the person's own area where the colour is skin's (skin_likeness)."""
+    if cbr is None or crr is None:
         return None
-    yk = float(np.percentile(Yr[m], 70))
-    S = _ss(K5_SKIN_LUMA[0], K5_SKIN_LUMA[1], Yr / max(yk, 1e-4)).astype(np.float32)
+    S = skin_likeness(Yr, cbr, crr)
     return S if owner_r is None else S * owner_r
 
 
@@ -1431,15 +1486,16 @@ def knee_clean(Y, Cb, Cr, skin, owner, knees, k, cs: float = 1.0, gains=None):
         zone = np.maximum(wk, wl)
         Yr = Y[y0:y1, x0:x1].astype(np.float32)
         own = None if owner is None else np.clip(owner[y0:y1, x0:x1], 0, 1).astype(np.float32)
-        Sl = _leg_skin(Yr, own, zone)
+        cbr_ = (Cb if not sub else cv2.resize(Cb, (wY, hY), interpolation=cv2.INTER_LINEAR))[y0:y1, x0:x1].astype(np.float32)
+        crr_ = (Cr if not sub else cv2.resize(Cr, (wY, hY), interpolation=cv2.INTER_LINEAR))[y0:y1, x0:x1].astype(np.float32)
+        Sl = _leg_skin(Yr, own, zone, cbr_, crr_)
         if skin is not None:
             S = np.clip(skin[y0:y1, x0:x1], 0, 1).astype(np.float32)
             if own is not None:
                 S = S * own
-            if Sl is not None:
-                # (the body area can miss the knee for a stretch of frames, a blurred or moving leg: the leg's own skin fills in)
-                S = np.maximum(S, Sl * (1.0 - _ss(0.15, 0.4, float((S * wk).sum()) / max(float(wk.sum()), 1.0))) * 1.0)
-                S = np.maximum(S, 0.0)
+            # the body area and the leg's own skin together (the body area misses a knee for a stretch of frames, a blurred or moving
+            # leg); never where the colour cannot be skin (trousers, socks), the same rule on every frame: nothing switches
+            S = np.maximum(S, Sl) * skin_likeness(Yr, cbr_, crr_)
         else:
             S = Sl
         if S is None or float((S * zone).sum()) < 50.0:
@@ -1453,7 +1509,15 @@ def knee_clean(Y, Cb, Cr, skin, owner, knees, k, cs: float = 1.0, gains=None):
         rad = max(2.0, K4_FEATHER * half)
         inside = cv2.distanceTransform((S > 0.5).astype(np.uint8), cv2.DIST_L2, 5)
         ramp = cv2.GaussianBlur(_ss(0.0, rad, inside).astype(np.float32), (0, 0), max(0.8, 0.3 * rad))
-        base_w = ramp * S * (k * gain)
+        # the sharp edges (a leg in front of another, a hem): the blotch work stays off them
+        ys_ = cv2.GaussianBlur(Yr, (0, 0), max(1.0, 0.03 * half))
+        gx_, gy_ = cv2.Sobel(ys_, cv2.CV_32F, 1, 0, ksize=3) / 8.0, cv2.Sobel(ys_, cv2.CV_32F, 0, 1, ksize=3) / 8.0
+        lvl_ = max(float(np.median(Yr[S > 0.5])) if int((S > 0.5).sum()) > 30 else 0.3, 0.05)
+        ed_ = _ss(K5_EDGE[0], K5_EDGE[1], np.hypot(gx_, gy_) * (0.3 / lvl_) * max(1.0, half / 45.0))
+        rr_ = max(2, int(K5_EDGE_REACH * half))
+        ed_ = cv2.dilate(ed_.astype(np.float32), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rr_ + 1, 2 * rr_ + 1)))
+        guard = 1.0 - np.clip(cv2.GaussianBlur(ed_, (0, 0), max(1.0, 0.5 * rr_)), 0, 1)
+        base_w = ramp * S * (k * gain) * guard
         Wb = (np.maximum(wk, K5_LEG * K5_LEG_BLOTCH * wl) * base_w).astype(np.float32)
         Wt = (np.maximum(wk, K5_LEG * wl) * base_w).astype(np.float32)
         if float(max(Wb.max(), Wt.max())) < 0.01:
