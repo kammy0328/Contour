@@ -191,6 +191,7 @@ HAND_GUARD = 0.0          # 0..1 (2611 IWALY INT_c003 f48, 11/24: a fist at the 
 HAND_GUARD_MARGIN = 0.07
 HAND_GUARD_REACH = 0.45     # of the forearm (elbow -> wrist): how far past the wrist the hand reaches
 HAND_GUARD_RADIUS = 0.32    # of the forearm: the hand's half width
+SKIN_BROW_HOLD = 0.0        # of the face width: the brows grown by this are kept out of the skin stage (0 = off, as before)
 HAND_GUARD_SKIN_IN = 0.04   # of the face width: the skin stage is held off a hand only outside the face's outline moved in by this
 HAND_GUARD_FEATHER = 0.03
 
@@ -3530,6 +3531,20 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 job.masks["tone"] = tm
         if skin_on:
             m = get("skin", mk_skin, job.scope + (":armpit" if arm_on else ""))
+            if SKIN_BROW_HOLD > 1e-4 and lm is not None and np.isfinite(lm[17:27, :2]).all():
+                # (11/24, INT_c001 f119: the left brow made lighter, by the skin stage alone) the brows (their landmarks' hulls, grown) are no skin to smooth
+                try:
+                    wfm_ = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
+                    bh_ = np.zeros(m.shape, np.uint8)
+                    for idx_ in (range(17, 22), range(22, 27)):
+                        cv2.fillConvexPoly(bh_, cv2.convexHull(np.round(lm[list(idx_), :2]).astype(np.int32)), 255)
+                    kb_ = max(3, int(round(SKIN_BROW_HOLD * wfm_)) * 2 + 1)
+                    bh_ = cv2.dilate(bh_, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kb_, kb_)))
+                    bhf_ = cv2.GaussianBlur(bh_.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.5 * SKIN_BROW_HOLD * wfm_))
+                    m = (m * (1.0 - bhf_)).astype(m.dtype)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
             if HAND_GUARD > 1e-4 and lm is not None:
                 # (HAND_GUARD) the skin by a hand at the face's edge (a fist at the jaw: the crease between them was smoothed into a light line); inside the face's
                 # outline, a little in from it, the skin keeps its retouch (an arm across the face does not take the face's retouch away)
