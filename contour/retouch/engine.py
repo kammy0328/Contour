@@ -1688,11 +1688,20 @@ def _raw_cached(cut, tracker, s: int, cache):
             rf = _prepare_raw(cut, tracker, s, cache)
         if rf is not None:
             for j in rf.jobs:
-                j.masks = {k: v.astype(np.float16) for k, v in j.masks.items()}
+                j.masks = {k: _raw_keep(v) for k, v in j.masks.items()}
     lru[s] = rf
     while len(lru) > STEADY_LRU:
         lru.popitem(last=False)
     return rf
+
+
+def _raw_keep(v):
+    """A mask as the table of raw frames keeps it: in float16, and of a float32 mask only the box of its non-zero part (_PackedMask: a person's mask is
+    zero over most of the frame, and turning whole frames into float16 and back was seconds a frame with six people). _mask_unpack gives the same
+    numbers back."""
+    if isinstance(v, np.ndarray) and v.ndim == 2 and v.dtype == np.float32:
+        return _mask_pack(v)
+    return v.astype(np.float16)
 
 
 STEADY_ROBUST = True   # a mask that drops out on one or two frames (the parser or the colour model missing the forehead for a
@@ -1729,6 +1738,8 @@ def _steady(cut, tracker, st, rf: RetouchFrame, cache) -> RetouchFrame:
                 import traceback
                 traceback.print_exc()
         if j.face is None or not j.masks:
+            if j.masks:                         # (not steadied: its masks whole again, in float16 as they always were)
+                j.masks = {n_: _mask_unpack(m_, np.float16) for n_, m_ in j.masks.items()}
             continue
         faces.append(j)
     if not faces:
@@ -1821,13 +1832,13 @@ def _steady_face(k, st, j, t: int, N: int, raws: dict) -> None:
         v_ = np.clip(cv2.GaussianBlur(v_, (0, 0), max(1.0, 0.02 * wf_)) * 2.5, 0, 1)
     out_masks = {}
     for n in names:
-        o_ = j.masks[n].astype(np.float32)
+        o_ = _mask_unpack(j.masks[n])
         fr = [o_]                               # the mask on this frame's geometry: its own, then each neighbour's carried here
         for _, js, A in nbrs:
             ms = js.masks.get(n)
             # that frame had none (below threshold): counts as empty
             fr.append(np.zeros(shp, np.float32) if ms is None else
-                      cv2.warpAffine(ms.astype(np.float32), A, (shp[1], shp[0]), flags=cv2.INTER_LINEAR, borderValue=0))
+                      cv2.warpAffine(_mask_unpack(ms), A, (shp[1], shp[0]), flags=cv2.INTER_LINEAR, borderValue=0))
         if robust:
             # only where any of the frames has something: the median of five full masks is slow
             any_ = np.zeros(shp, bool)
