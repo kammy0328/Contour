@@ -1575,6 +1575,8 @@ FOCUS_GATE = None      # (lo, hi) or None (= off). 2611 IWALY c025 (2026-11-23, 
                        # frames t - 1 .. t + 1 are averaged, so the retouch fades in and out over a few frames
 FOCUS_BIG = (150.0, 1.08, 1.16)   # (face width in proxy px from which, lower, upper end) of the gate on the ratio at the fixed scales 0.8 / 2.4 px: c037 front dancer (blurred) 1.06..1.13, sharp big faces 1.16 and more (c025 front 1.16..1.45, c006 1.12..1.46; c006 f102's arm in front of a face: 1.06). None = the face-width scales for every size
 FOCUS_MIN_WF = 24.0    # face width in proxy px below which the focus cannot be judged: the person is kept (weight 1)
+FOLD_BIG_WF = (200.0, 260.0)    # face width in SOURCE px: from 200 the fold work is turned down by FOLD_BIG_AMOUNT, from 260 fully (close-ups; the wide shots' small faces are not touched)
+FOLD_BIG_AMOUNT = None    # None = off; 0..1: the share of the nasolabial / mouth-line fold work a big face (FOLD_SIZE) keeps
 FOCUS_TAKEBACK = (0.10, 0.06)    # an out-of-focus face gets its retouch taken back by (1 - focus_w): the face outline grown by this x wf, feathered by this x wf
 FOCUS_SIG = (0.005, 0.015)    # the two scales of the edge ratio (fine, coarse) of the face width, never under (0.4, 1.2) px
 
@@ -6645,6 +6647,8 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
                 kh_ = float(np.clip(FOLD_HEAL, 0, 1)) * float(np.clip(job.v.get("nasolabial", 0.0), 0, 1)) * (1.0 - _face_big(job.face, wf, y_per_src))
                 if kh_ > 1e-4 and FOLD_PRESENT is not None:
                     kh_ *= _naso_pres_job(job, Y0, wf, y_per_src)
+                if kh_ > 1e-4 and FOLD_BIG_AMOUNT is not None:
+                    kh_ *= 1.0 - (1.0 - float(FOLD_BIG_AMOUNT)) * float(_ss(FOLD_BIG_WF[0], FOLD_BIG_WF[1], np.array(float(job.wf_src))))
                 if kh_ > 1e-4:
                     kh_ *= 1.0 - (1.0 - MOUTH_OPEN_KEEP) * mouth_open(job.face)
                     Y, Cb, Cr = _fold_heal(Y, Cb, Cr, Y0, M(job.masks["naso"], (hY, wY)), lmY, wf, kh_)
@@ -6791,6 +6795,9 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
             # of before 1.19 still runs, as it did (2611 cut 011, j2721: the hollow at the mouth's corner was left
             # darker than 1.18 left it). Lightening only, inside the fold zone only
             wfold_ = float(np.clip(max(v.get("nasolabial", 0), v.get("mouth_lines", 0)) / 0.3, 0, 1))
+            if FOLD_BIG_AMOUNT is not None and job.face is not None:
+                # a big face: this spot finder's lightening in the fold zone (it takes the dark nostril / wing too) is turned down as the fold work is
+                wfold_ *= 1.0 - (1.0 - float(FOLD_BIG_AMOUNT)) * float(_ss(FOLD_BIG_WF[0], FOLD_BIG_WF[1], np.array(float(job.wf_src))))
             if FOLD_ZONE_OLD and wfold_ > 1e-3 and "skinx" in job.masks and job.face is not None:
                 try:
                     zone_ = DT.fold_zone(np.asarray(job.face, np.float32)[:, :2] * y_per_src, (hY, wY), wf, "folds")
@@ -7041,6 +7048,9 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                 k = float(np.clip(v[key], 0, 1))
                 if job.face is not None:
                     k *= 1.0 - (1.0 - MOUTH_OPEN_KEEP) * mouth_open(job.face)
+                    if FOLD_BIG_AMOUNT is not None:
+                        # a big face (a close-up): the user's references change it only a little (c025 / c027 / c037: at most about 1.2 %), the fold work is turned down by this share
+                        k *= 1.0 - (1.0 - float(FOLD_BIG_AMOUNT)) * float(_ss(FOLD_BIG_WF[0], FOLD_BIG_WF[1], np.array(float(job.wf_src))))
                 if key == "nasolabial" and FOLD_PRESENT is not None:
                     k *= _naso_pres_job(job, Y, wf, y_per_src)       # no crease on this face (c027): none of the nasolabial work
                     if k < 1e-4:
