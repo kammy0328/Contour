@@ -523,6 +523,10 @@ HAND_RAW_MIN = 2.2    # confidence of the whole-body model's hand points to coun
                       # lower face (1.4 and 1.7), and mouth, chin and jaw lost their retouch; real ones are 2.6 and up)
 
 
+HAND_TRUST_CONF = float(__import__('os').environ.get('IWALY_HAND_TRUST', '0'))   # 0 = off. Mean confidence of the whole-body model's 21 hand points from which they are the hand whatever the forearm says
+HAND_TRUST_SPAN = 2.0        # of the face width: a hand points' span beyond this is no hand
+
+
 def limb_cover(st, t: int, lm: np.ndarray, shape, sx: float, sy: float) -> Optional[np.ndarray]:
     """0..1 over the face and neck where an arm, a leg or a hand (this person's or anyone's) passes in front.
 
@@ -602,7 +606,12 @@ def limb_cover(st, t: int, lm: np.ndarray, shape, sx: float, sy: float) -> Optio
                 # half the picture (the model lost the hand) are no hand
                 span = float(np.ptp(pts, 0).max())
                 ref_ = fore if fore and fore > 4 else 0.25 * float(np.nan_to_num(st.scale[q, t])) * sx
-                if ref_ <= 0 or span > 1.1 * ref_:
+                # ... unless the model is sure of all 21 points of this hand (a hand held close to the camera in front of the face is longer than the forearm
+                # that foreshortening makes short, c057: confidences 3.7 and up; the false hands of cut 069 had 1.4 to 1.7): then the points are the hand
+                sure_ = HAND_TRUST_CONF > 0 and int(okh.sum()) >= 20 and float(np.nanmean(hh[okh, 2])) >= HAND_TRUST_CONF and span <= HAND_TRUST_SPAN * Wf
+                if sure_:
+                    pass
+                elif ref_ <= 0 or span > 1.1 * ref_:
                     pts = None
                 elif np.isfinite(kp[wr, :2]).all():
                     w_ = kp[wr, :2] * [sx, sy]
@@ -6158,6 +6167,7 @@ FINAL_NASO = 0.0           # 0..1: the nasolabial folds (팔자주름) and the s
                            # corner and on below it, FINAL_NASO_W of the face width wide), what is darker than its surroundings at the fold's scale (FINAL_NASO_BAND) is lifted;
                            # hair strands (far darker, thin) and the nose / the lips are left. Works where the skin mask or the fold finder missed the fold (a turned, tilted, blurred face)
 FINAL_NASO_W = 0.10
+FINAL_NASO_SKIN = float(__import__('os').environ.get('IWALY_FINAL_NASO_SKIN', '0'))   # 0..1: the last pass's fold work only where the skin mask is skin (0 = the zone from the landmarks alone, as before)
 FINAL_NASO_DEEP = (0.13, 0.20)   # see _final_naso
 FINAL_NASO_NOSE_GAP = 0.04  # of the face width: the zone stays this far from the nose (soft)
 FINAL_NASO_BAND = (0.004, 0.06)
@@ -6681,7 +6691,13 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
                 if FOLD_PRESENT is not None:
                     kn_ *= _naso_pres_job(job, Y0, wf, y_per_src)
                 if kn_ > 1e-4:
+                    Y_p_ = Y.copy() if (FINAL_NASO_SKIN > 1e-4 and skin is not None) else None
                     Y = _final_naso(Y, Y0, lmY, wf, kn_)
+                    if Y_p_ is not None:
+                        # the zone comes from the landmarks alone: where the skin mask says no skin (a hand's fingers in front of the mouth, the gaps between them
+                        # are dark "folds": c057 f152) nothing is lifted
+                        g_ = np.clip(cv2.GaussianBlur(skin.astype(np.float32), (0, 0), max(1.0, 0.02 * wf)) * 1.25, 0.0, 1.0)
+                        Y = Y_p_ + (1.0 - float(FINAL_NASO_SKIN) * (1.0 - g_)) * (Y - Y_p_)
             if FOLD_HEAL > 1e-4 and lmY is not None and job.wf_src > 0 and "naso" in job.masks:
                 # a small face's crease, healed (after the nose's give-back: the top of the crease lies inside the nose's area)
                 kh_ = float(np.clip(FOLD_HEAL, 0, 1)) * float(np.clip(job.v.get("nasolabial", 0.0), 0, 1)) * (1.0 - _face_big(job.face, wf, y_per_src))
