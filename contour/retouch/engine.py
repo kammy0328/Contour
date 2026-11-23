@@ -1579,6 +1579,7 @@ def _eye_white_mask_v2(lm: np.ndarray, rgb_f: np.ndarray) -> np.ndarray:
 EYE_WHITE_V2_VEIN = 0.006      # of the face width: the widest vein (the closing / opening size)
 EYE_WHITE_V2_GUARD = 2.0       # (11/24) how far from the iris nothing is filled, in veins' sizes (2: as on 11/24 g; INT_c001 f119: the white beside the iris is narrow
                                # and its veins stayed); 0 = no guard
+EYE_WHITE_V2_FLAT = 0.0        # (11/24) 0..1: the white's colour evened to its own local level after the vein filling (faint red lines left); 0 = as before
 EYE_WHITE_V2_CAP = (0.10, 0.05)  # most a vein's luma is lifted / its red (Cr) taken down
 
 
@@ -1620,6 +1621,21 @@ def _eye_white_apply_v2(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, mY: np.nd
     Y = Y + k * mY * np.minimum(up, np.clip(Yc - Y, 0, None))
     Cr = Cr - k * mC * np.minimum(dn, np.clip(Cr - Cro, 0, None))
     Cb = Cb + k * mC * np.minimum(upb, np.clip(Cbc - Cb, 0, None))
+    if EYE_WHITE_V2_FLAT > 1e-6:
+        # (11/24, INT_c001 f119: faint red lines stayed) the white's colour taken to its own local level (a soft average over the white only, of the picture with its red
+        # lines opened away): what is redder than that comes down to it, what is less yellow-blue goes up; the white's luma shading is not touched here
+        try:
+            wm_ = np.clip(mC, 0, 1).astype(np.float32)
+            if float(wm_.max()) > 0.05:
+                sg_ = max(1.5, 2.0 * rc)
+                den_ = cv2.GaussianBlur(wm_, (0, 0), sg_) + 1e-4
+                Crl_ = cv2.GaussianBlur((Cro * wm_).astype(np.float32), (0, 0), sg_) / den_
+                Cbl_ = cv2.GaussianBlur((Cbc * wm_).astype(np.float32), (0, 0), sg_) / den_
+                f_ = k * float(np.clip(EYE_WHITE_V2_FLAT, 0, 1)) * wm_
+                Cr = Cr - f_ * np.clip(Cr - Crl_, 0, EYE_WHITE_V2_CAP[1])
+                Cb = Cb + f_ * np.clip(Cbl_ - Cb, 0, EYE_WHITE_V2_CAP[1])
+        except Exception:
+            pass
     if EYE_WHITE_V2_LIFT > 1e-6:
         Y = Y + k * mY * EYE_WHITE_V2_LIFT * (1 - Y)
     return Y, Cb, Cr
