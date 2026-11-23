@@ -165,6 +165,26 @@ FOLD_COVER_SHARE = (0.03, 0.25)   # of the band on the limb: no turning down bel
 FOLD_COVER_MARGIN = 0.035  # of the face width: how far round the limb's cover the bands stay off
 
 
+FOLD_PARSE_GUARD = 0.0     # 0..1: the fold bands stay off what the face parser sees as hair, a hand or clothes in front of the face (2611 IWALY feedback 11/23: c043 f161 hair across the nose and cheek, c045 f0 the fist at the mouth);
+                           # the parser's own skin gate (skin.parse_gate: 1 on skin, down to 0.03 on what lies over it). 0 = as before
+NASO_BULGE = 0.10          # how far out (share of the nose-wing-to-mouth-corner distance) the nasolabial band bulges: a smile pushes the fold out over the raised cheek (c048 f47, c051 f0, c033 f48: the fold was not in the band). 0.10 = as before
+NASO_WIDE_MUL = 1.0        # factor on the width of the nasolabial band of the stages (1 = as before)
+
+
+def _parse_off(m: np.ndarray, parse, lm) -> np.ndarray:
+    """The fold band without the ground the face parser sees as hair / hand / clothes (FOLD_PARSE_GUARD)."""
+    if FOLD_PARSE_GUARD <= 1e-4 or parse is None or lm is None:
+        return m
+    try:
+        Wf = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
+        g = SK.parse_gate(parse, Wf, True)
+        if g is None or g.shape != m.shape:
+            return m
+        return (m * (1.0 - float(min(FOLD_PARSE_GUARD, 1.0)) * (1.0 - np.clip(g, 0, 1)))).astype(m.dtype)
+    except Exception:
+        return m
+
+
 def _cover_off(m: np.ndarray, cover: Optional[np.ndarray], lm: np.ndarray) -> np.ndarray:
     """The fold band without the part on or next to a limb in front of the face (FOLD_COVER_GUARD)."""
     _dc = __import__('os').environ.get('IWALY_DUMP_COVER_MASKS')
@@ -212,7 +232,7 @@ def wrinkle_masks(lm: np.ndarray, shape, prob: np.ndarray, which: str, fth: floa
             a0 = ala + out * 0.06 * Wf - down * 0.03 * Wf
             c0 = corner + (corner - mc) * 0.22
             d = float(np.hypot(*(c0 - a0)))
-            mid = (a0 + c0) / 2 + out * 0.10 * d
+            mid = (a0 + c0) / 2 + out * NASO_BULGE * d
             end = c0 + down * 0.20 * d + out * 0.04 * d
             _curve(m, np.array([a0, mid, c0, end]), 0.085 * Wf * wide)
         else:
@@ -3254,10 +3274,10 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             return under_eye_mask(lm, shape, pa(), fth)
 
         def mk_naso():
-            return _cover_off(wrinkle_masks(lm, shape, pa(), "naso", fth, 1.7, paint()), base().get("cover"), lm)
+            return _parse_off(_cover_off(wrinkle_masks(lm, shape, pa(), "naso", fth, 1.7 * NASO_WIDE_MUL, paint()), base().get("cover"), lm), base().get("parse"), lm)
 
         def mk_mouthl():
-            return _cover_off(wrinkle_masks(lm, shape, pa(), "mouth", fth, 1.5, paint()), base().get("cover"), lm)
+            return _parse_off(_cover_off(wrinkle_masks(lm, shape, pa(), "mouth", fth, 1.5, paint()), base().get("cover"), lm), base().get("parse"), lm)
 
         def mk_neck():
             b_ = base()
