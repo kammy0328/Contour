@@ -160,6 +160,40 @@ def _feather(m: np.ndarray, sig: float) -> np.ndarray:
     return np.clip(f, 0, 1)
 
 
+FOLD_COVER_GUARD = float(__import__('os').environ.get('IWALY_FOLD_COVER_GUARD', '0'))    # 0..1: the fold bands stay off a hand or arm in front of the face and a margin round it (c057 f152: fingers over the mouth, the gaps between them were "folds"); 0 = as before
+FOLD_COVER_SHARE = (0.03, 0.25)   # of the band on the limb: no turning down below the first, none of the band's work left at the second
+FOLD_COVER_MARGIN = 0.035  # of the face width: how far round the limb's cover the bands stay off
+
+
+def _cover_off(m: np.ndarray, cover: Optional[np.ndarray], lm: np.ndarray) -> np.ndarray:
+    """The fold band without the part on or next to a limb in front of the face (FOLD_COVER_GUARD)."""
+    _dc = __import__('os').environ.get('IWALY_DUMP_COVER_MASKS')
+    if _dc:
+        try:
+            _n = "%s_%d" % ("cov" if cover is not None else "nocov", int(round(float(m.sum()))))
+            np.save(__import__('os').path.join(_dc, "fcov_%s_%d.npy" % (_n, id(m) % 100000)), np.stack([m.astype(np.float32), (np.zeros_like(m, np.float32) if cover is None else np.asarray(cover, np.float32))]))
+        except Exception:
+            pass
+    if FOLD_COVER_GUARD <= 1e-4 or cover is None or lm is None:
+        return m
+    try:
+        Wf = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
+        c = (np.asarray(cover, np.float32) > 0.15).astype(np.uint8)
+        if not c.any():
+            return m
+        r = max(1, int(round(FOLD_COVER_MARGIN * Wf)))
+        c = cv2.dilate(c, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1)))
+        g = cv2.GaussianBlur(c.astype(np.float32), (0, 0), max(1.0, 0.4 * r))
+        tot = float(m.sum())
+        # the share of the band that lies on or next to the limb: the cover's outline is coarse (a capsule round the hand's points: the fingertips
+        # and the gaps between fingers stick out of it), so the band as a whole is turned down by that share as well
+        fr = float((m * np.clip(g * 1.25, 0, 1)).sum()) / tot if tot > 1e-3 else 0.0
+        fs = float(np.clip((fr - FOLD_COVER_SHARE[0]) / max(FOLD_COVER_SHARE[1] - FOLD_COVER_SHARE[0], 1e-3), 0.0, 1.0))
+        return (m * (1.0 - np.clip(g * 1.25, 0, 1) * float(FOLD_COVER_GUARD)) * (1.0 - fs * float(FOLD_COVER_GUARD))).astype(m.dtype)
+    except Exception:
+        return m
+
+
 def wrinkle_masks(lm: np.ndarray, shape, prob: np.ndarray, which: str, fth: float = 1.5,
                   wide: float = 1.0, paint: Optional[np.ndarray] = None) -> np.ndarray:
     """Nasolabial folds ('naso') or the lines down from the mouth corners ('mouth'). lm in mask px.
@@ -552,6 +586,12 @@ def limb_cover(st, t: int, lm: np.ndarray, shape, sx: float, sy: float) -> Optio
         for i0, (el, wr) in ((0, (S.L_EL, S.L_WR)), (21, (S.R_EL, S.R_WR))):
             hh = H[i0:i0 + 21]
             okh = np.isfinite(hh[:, :2]).all(1) & (np.nan_to_num(hh[:, 2]) >= thr)
+            _dc = __import__('os').environ.get('IWALY_DUMP_COVER')
+            if _dc:
+                try:
+                    np.save(__import__('os').path.join(_dc, "hand_t%d_q%d_%d_%s_thr%.1f.npy" % (t, q, i0, "trk" if tracked else "raw", thr)), np.concatenate([hh[:, :3] * [sx, sy, 1.0], np.array([[sx, sy, thr]])]))
+                except Exception:
+                    pass
             pts = None
             fore = None
             if np.isfinite(kp[[el, wr], :2]).all():
@@ -3192,10 +3232,10 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             return under_eye_mask(lm, shape, pa(), fth)
 
         def mk_naso():
-            return wrinkle_masks(lm, shape, pa(), "naso", fth, 1.7, paint())
+            return _cover_off(wrinkle_masks(lm, shape, pa(), "naso", fth, 1.7, paint()), base().get("cover"), lm)
 
         def mk_mouthl():
-            return wrinkle_masks(lm, shape, pa(), "mouth", fth, 1.5, paint())
+            return _cover_off(wrinkle_masks(lm, shape, pa(), "mouth", fth, 1.5, paint()), base().get("cover"), lm)
 
         def mk_neck():
             b_ = base()
