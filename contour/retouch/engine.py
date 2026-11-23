@@ -1773,6 +1773,44 @@ def _steady(cut, tracker, st, rf: RetouchFrame, cache) -> RetouchFrame:
     return rf
 
 
+STEADY_BOX = True      # the steadying of a mask worked on the part of the frame its frames can be other than 0 in (False: on the whole frame, as it was)
+
+
+def _pm_box(v):
+    """Where a mask can be other than 0: (y0, y1, x0, x1) of a kept mask (_PackedMask), None when it is empty, False when that is not known (a whole array)."""
+    if isinstance(v, _PackedMask):
+        if not v.a.size:
+            return None
+        return (int(v.y0), int(v.y0) + int(v.a.shape[0]), int(v.x0), int(v.x0) + int(v.a.shape[1]))
+    return False
+
+
+def _box_union(a, b):
+    return (min(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), max(a[3], b[3]))
+
+
+def _box_carried(b, A, shp):
+    """The part of a frame of shape shp that cv2.warpAffine(mask, A, ..., INTER_LINEAR, borderValue=0) can make other than 0 from a mask that is 0 outside
+    b: b a pixel wider (the reach of the interpolation), carried by A, 3 pixels more each way (far beyond the fixed-point steps of the carrying).
+    None: nothing of it falls in the frame; False: A is not usable for this."""
+    y0, y1, x0, x1 = b
+    try:
+        A = np.asarray(A, np.float64)
+        if A.shape != (2, 3) or not np.isfinite(A).all():
+            return False
+        xs = np.array([x0 - 1.0, x1, x0 - 1.0, x1])
+        ys = np.array([y0 - 1.0, y0 - 1.0, y1, y1])
+        X = A[0, 0] * xs + A[0, 1] * ys + A[0, 2]
+        Y = A[1, 0] * xs + A[1, 1] * ys + A[1, 2]
+        rx0, rx1 = max(0, int(np.floor(X.min())) - 3), min(int(shp[1]), int(np.ceil(X.max())) + 4)
+        ry0, ry1 = max(0, int(np.floor(Y.min())) - 3), min(int(shp[0]), int(np.ceil(Y.max())) + 4)
+    except Exception:
+        return False
+    if rx1 <= rx0 or ry1 <= ry0:
+        return None
+    return (ry0, ry1, rx0, rx1)
+
+
 def _steady_usable(st, j, s: int, t: int, N: int) -> bool:
     return 0 <= s < N and bool(st.present[j.p, s]) and st.connected(s, t) \
         and bool(np.isfinite(st.face[j.p, s, :, :2]).all())
@@ -1839,13 +1877,53 @@ def _steady_face(k, st, j, t: int, N: int, raws: dict, name_threads: int = 1) ->
         wf_ = float(np.hypot(*(Lt[16] - Lt[0])))
         v_ = np.clip(cv2.GaussianBlur(v_, (0, 0), max(1.0, 0.02 * wf_)) * 2.5, 0, 1)
     def one_name(n):
-        o_ = _mask_unpack(j.masks[n])
+        m0 = j.masks[n]
+        o_ = _mask_unpack(m0)
         fr = [o_]                               # the mask on this frame's geometry: its own, then each neighbour's carried here
+        box = _pm_box(m0) if STEADY_BOX else False      # where a frame can be other than 0: (y0, y1, x0, x1), None (nowhere), False (not known)
         for _, js, A in nbrs:
             ms = js.masks.get(n)
             # that frame had none (below threshold): counts as empty
-            fr.append(np.zeros(shp, np.float32) if ms is None else
-                      cv2.warpAffine(_mask_unpack(ms), A, (shp[1], shp[0]), flags=cv2.INTER_LINEAR, borderValue=0))
+            if ms is None:
+                fr.append(np.zeros(shp, np.float32))
+                continue
+            fr.append(cv2.warpAffine(_mask_unpack(ms), A, (shp[1], shp[0]), flags=cv2.INTER_LINEAR, borderValue=0))
+            if box is not False:
+                bs_ = _pm_box(ms)
+                if bs_ is False:
+                    box = False
+                elif bs_ is not None:
+                    bw_ = _box_carried(bs_, A, shp)
+                    box = False if bw_ is False else (box if bw_ is None else (bw_ if box is None else _box_union(box, bw_)))
+        if robust and box is not False:
+            # Every frame is 0 outside `box` (a kept mask is the box of its non-zero part: _raw_keep; a carried one lies within that box carried
+            # along), so all of this is worked there and not on the whole frame (it was 14 s of the threads' time a frame with six people); what
+            # comes out is 0 outside the part worked on, as it was (the veto leaves 0 where the mask is not negative: asked below)
+            out = np.zeros(shp, np.float32)
+            if box is None:
+                return out
+            ry0, ry1, rx0, rx1 = box
+            neg = v_ is not None and not bool((o_[ry0:ry1, rx0:rx1] >= 0).all())
+            if not neg:
+                any_ = np.zeros((ry1 - ry0, rx1 - rx0), bool)
+                for ms in fr:
+                    any_ |= ms[ry0:ry1, rx0:rx1] > 0.004
+                ys, xs = np.nonzero(any_.any(1))[0], np.nonzero(any_.any(0))[0]
+                if not (len(ys) and len(xs)):
+                    return out
+                y0, y1, x0, x1 = ry0 + int(ys[0]), ry0 + int(ys[-1]) + 1, rx0 + int(xs[0]), rx0 + int(xs[-1]) + 1
+                stk = np.stack([ms[y0:y1, x0:x1] for ms in fr])
+                med = np.median(stk, axis=0)
+                stk = np.clip(stk, med - STEADY_WIN, med + STEADY_WIN)
+                wv = np.array(wts, np.float32)[:, None, None]
+                a_c = (stk * wv).sum(0)
+                if v_ is not None:
+                    # where this frame sees no skin, a neighbour's mask may not hold more than this frame's own
+                    o_c = o_[y0:y1, x0:x1]
+                    avg = a_c / wsum
+                    a_c = (o_c + (avg - o_c).clip(None, 0) + (avg - o_c).clip(0, None) * v_[y0:y1, x0:x1]) * wsum
+                out[y0:y1, x0:x1] = (a_c / wsum).astype(np.float32)
+                return out
         if robust:
             # only where any of the frames has something: the median of five full masks is slow
             any_ = np.zeros(shp, bool)
@@ -2673,7 +2751,13 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             lm[:, 0] *= px.sx
             lm[:, 1] *= px.sy
         state = {}
-        slock = threading.RLock()       # the person's shared maps are made once, by whoever asks first (MASK_THREADS: the makers ask side by side)
+        # the person's shared maps are made once, by whoever asks first (MASK_THREADS: the makers ask side by side). A lock a map: a maker that needs
+        # the frame's base maps alone does not wait for the body's regions or the painted lines being made (they take the base's lock inside their own,
+        # never the other way round)
+        slock = threading.RLock()       # base(), body_base()
+        block_ = threading.RLock()      # body()
+        plock_ = threading.RLock()      # paint()
+        alock_ = threading.RLock()      # armpit(), armpit_fold()
 
         def body_base():
             with slock:
@@ -2789,7 +2873,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
         arm_on = ARMPIT > 0 and (ARMPIT_PIDS is None or person.id in ARMPIT_PIDS)
 
         def body():
-            with slock:
+            with block_:
                 return _body()
 
         def _body():
@@ -2811,7 +2895,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             return state["body"]
 
         def armpit():
-            with slock:
+            with alock_:
                 return _armpit()
 
         def _armpit():
@@ -2890,7 +2974,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             return state["armpit"]
 
         def armpit_fold():
-            with slock:
+            with alock_:
                 return _armpit_fold()
 
         def _armpit_fold():
@@ -2947,7 +3031,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             return np.clip(reg * np.clip(b["prob"] * 1.4, 0, 1), 0, 1)
 
         def paint():
-            with slock:
+            with plock_:
                 if "paint" not in state:
                     state["paint"] = SK.paint_mask(base()["rgb"], lm)
                 return state["paint"]
@@ -3178,11 +3262,15 @@ def knee_probe(rf: Optional["RetouchFrame"], px) -> Dict[tuple, float]:
     if rf is None:
         return out
     sc = 0.5 * (float(px.sx) + float(px.sy))
+    todo = []
     for job in rf.jobs:
         tone = getattr(job, "tone", None)
         if not tone or not tone.get("knees"):
             continue
-        sides = tone.get("sides") or []
+        todo.append((job, tone))
+
+    def one(e):
+        job, tone = e
         pm = (job.body or {}).get("mask") if getattr(job, "body", None) else None
         m = None
         if pm is not None:
@@ -3190,7 +3278,18 @@ def knee_probe(rf: Optional["RetouchFrame"], px) -> Dict[tuple, float]:
                 m = BS.unpack_mask(pm)
             except Exception:
                 m = None
-        sup = BTN.knee_support(m, sc, tone["knees"]) if m is not None else [1.0] * len(tone["knees"])
+        return BTN.knee_support(m, sc, tone["knees"]) if m is not None else [1.0] * len(tone["knees"])
+
+    # (each person's knees are read from that person's own area: the people side by side where the frame's people are prepared so, in their order)
+    n_thr = max(1, min(int(PREP_THREADS), len(todo)))
+    if n_thr > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=n_thr, thread_name_prefix="kneep") as ex:
+            sups = list(ex.map(one, todo))
+    else:
+        sups = [one(e) for e in todo]
+    for (job, tone), sup in zip(todo, sups):
+        sides = tone.get("sides") or []
         for i, v_ in enumerate(sup):
             out[(job.pid, sides[i] if i < len(sides) else str(i))] = float(v_)
     return out
