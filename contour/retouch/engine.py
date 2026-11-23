@@ -1777,7 +1777,7 @@ def _steady(cut, tracker, st, rf: RetouchFrame, cache) -> RetouchFrame:
 
 
 STEADY_BOX = True      # the steadying of a mask worked on the part of the frame its frames can be other than 0 in (False: on the whole frame, as it was)
-STEADY_BOX_CHECK = 4   # the first frames steadied in a process are worked both ways and compared (the whole frame's result is used for them); a
+STEADY_BOX_CHECK = 6   # the first frames steadied in a process are worked both ways and compared (the whole frame's result is used for them); a
                        # difference is printed and switches the box off for the rest of the process
 _STEADY_CHECKED = [0]
 
