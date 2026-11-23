@@ -189,16 +189,32 @@ HAND_GUARD = 0.0          # 0..1 (2611 IWALY INT_c003 f48, 11/24: a fist at the 
                           # patches that jump from frame to frame): the fold bands (nasolabial, mouth lines) and the neck-line mask stay off every hand's area in the picture, taken
                           # from the hands' own keypoints (tracked, else the whole-body model's sure points), grown by HAND_GUARD_MARGIN of the face width
 HAND_GUARD_MARGIN = 0.07
+HAND_GUARD_REACH = 0.45     # of the forearm (elbow -> wrist): how far past the wrist the hand reaches
+HAND_GUARD_RADIUS = 0.32    # of the forearm: the hand's half width
+HAND_GUARD_SKIN_IN = 0.04   # of the face width: the skin stage is held off a hand only outside the face's outline moved in by this
 HAND_GUARD_FEATHER = 0.03
 
 
-def _hand_area(hands, shape, sx: float, sy: float, wf: float) -> Optional[np.ndarray]:
-    """0..1 at `shape`: the hull of each hand's keypoints (source px; sx, sy to the mask), grown by HAND_GUARD_MARGIN * wf (wf in mask px) and soft."""
-    if not hands:
+def _hand_area(hands, shape, sx: float, sy: float, wf: float, arms=None) -> Optional[np.ndarray]:
+    """0..1 at `shape`: the hull of each hand's keypoints (source px; sx, sy to the mask), and for each forearm (elbow, wrist; source px) a capsule from the wrist on past it by
+    HAND_GUARD_REACH of the forearm (where the hand is, also a fist whose own points were not found), grown by HAND_GUARD_MARGIN * wf (wf in mask px) and soft."""
+    if not hands and not arms:
         return None
     h, w = shape
     out = np.zeros((h, w), np.uint8)
-    for hp in hands:
+    for el, wr in (arms or []):
+        el = np.asarray(el, np.float64)[:2] * [sx, sy]
+        wr = np.asarray(wr, np.float64)[:2] * [sx, sy]
+        d = wr - el
+        L = float(np.hypot(*d))
+        if not np.isfinite(L) or L < 3:
+            continue
+        tip = wr + d * HAND_GUARD_REACH
+        rad = max(2, int(round(HAND_GUARD_RADIUS * L)))
+        cv2.line(out, tuple(int(round(v)) for v in wr), tuple(int(round(v)) for v in tip), 255, 2 * rad)
+        cv2.circle(out, tuple(int(round(v)) for v in tip), rad, 255, -1)
+        cv2.circle(out, tuple(int(round(v)) for v in wr), int(rad * 0.8), 255, -1)
+    for hp in (hands or []):
         if hp is None:
             continue
         q = np.asarray(hp, np.float64)
@@ -3407,8 +3423,17 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                                 hl_.append(h_[side_ * (n_ // 2):(side_ + 1) * (n_ // 2)])
                             elif side_ == 0:
                                 hl_.append(h_)
+                    arms_ = []
+                    for q_ in np.nonzero(st.present[:, t])[0]:
+                        kq_ = st.final[q_, t]
+                        for e_, w_ in ((S.L_EL, S.L_WR), (S.R_EL, S.R_WR)):
+                            if np.isfinite(kq_[e_, :2]).all() and np.isfinite(kq_[w_, :2]).all():
+                                arms_.append((kq_[e_, :2], kq_[w_, :2]))
                     wfm_ = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
-                    a_ = _hand_area(hl_, shape, float(px.sx), float(px.sy), wfm_)
+                    a_ = _hand_area(hl_, shape, float(px.sx), float(px.sy), wfm_, arms_)
+                    if __import__("os").environ.get("IWALY_HAND_GUARD_LOG"):
+                        print("hand_guard t", t, "hands", [int(np.isfinite(np.asarray(x)[:, :2]).all(1).sum()) for x in hl_], "arms", len(arms_),
+                              "area", None if a_ is None else round(float(a_.mean()), 4), flush=True)
                     if a_ is not None:
                         g_ = 1.0 - float(HAND_GUARD) * a_
                 except Exception:
@@ -3490,6 +3515,22 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 job.masks["tone"] = tm
         if skin_on:
             m = get("skin", mk_skin, job.scope + (":armpit" if arm_on else ""))
+            if HAND_GUARD > 1e-4 and lm is not None:
+                # (HAND_GUARD) the skin by a hand at the face's edge (a fist at the jaw: the crease between them was smoothed into a light line); inside the face's
+                # outline, a little in from it, the skin keeps its retouch (an arm across the face does not take the face's retouch away)
+                try:
+                    g_ = hand_guard()
+                    if g_ is not None and g_.shape == m.shape and float(g_.min()) < 0.99:
+                        wfm_ = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
+                        hl_ = np.zeros(m.shape, np.uint8)
+                        cv2.fillConvexPoly(hl_, cv2.convexHull(np.round(lm[0:27, :2]).astype(np.int32)), 255)
+                        ke_ = max(3, int(round(HAND_GUARD_SKIN_IN * wfm_)) * 2 + 1)
+                        hl_ = cv2.erode(hl_, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ke_, ke_)))
+                        inner_ = cv2.GaussianBlur(hl_.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.5 * HAND_GUARD_SKIN_IN * wfm_))
+                        m = (m * (1.0 - (1.0 - g_) * (1.0 - inner_))).astype(m.dtype)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
             if m.max() > 0.01:
                 job.skin = sj
                 job.masks["skin"] = m
