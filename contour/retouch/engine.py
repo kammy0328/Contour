@@ -191,6 +191,7 @@ HAND_GUARD = 0.0          # 0..1 (2611 IWALY INT_c003 f48, 11/24: a fist at the 
 HAND_GUARD_MARGIN = 0.07
 HAND_GUARD_REACH = 0.45     # of the forearm (elbow -> wrist): how far past the wrist the hand reaches
 HAND_GUARD_RADIUS = 0.32    # of the forearm: the hand's half width
+DARK_CHROMA = 0.8           # how far the under-eye's colour is taken to the cheek's (11/24, INT_c006: "눈 아래 색 빠짐" at 0.8); 0.8 = as before
 NASO_NOSTRIL_HOLD = 0.0     # of the face width: the nostrils and the nose's base grown by this are out of the nasolabial band (0 = off)
 SKIN_BROW_HOLD = 0.0        # of the face width: the brows grown by this are kept out of the skin stage (0 = off, as before)
 HAND_GUARD_SKIN_IN = 0.04   # of the face width: the skin stage is held off a hand only outside the face's outline moved in by this
@@ -7516,8 +7517,8 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
             Y = _fold_fill(Y, mY, exY, 0.95 * k, max(0.8, 0.008 * wf), max(3.0, 0.07 * wf), True,
                            valley=max(1.5, DARK_VALLEY * wf) if DARK_VALLEY > 0 else 0.0, cap=DARK_CAP)
             mC = M(job.masks["dark"], (hC, wC))
-            Cb = _fold_fill(Cb, mC, exC, 0.8 * k, max(0.8, 0.008 * wf * cs), max(2.0, 0.07 * wf * cs), False)
-            Cr = _fold_fill(Cr, mC, exC, 0.8 * k, max(0.8, 0.008 * wf * cs), max(2.0, 0.07 * wf * cs), False)
+            Cb = _fold_fill(Cb, mC, exC, DARK_CHROMA * k, max(0.8, 0.008 * wf * cs), max(2.0, 0.07 * wf * cs), False)
+            Cr = _fold_fill(Cr, mC, exC, DARK_CHROMA * k, max(0.8, 0.008 * wf * cs), max(2.0, 0.07 * wf * cs), False)
         # 2c. shine
         if "skinx" in job.masks and v.get("shine", 0) > 1e-4:
             k = float(np.clip(v["shine"], 0, 1))
