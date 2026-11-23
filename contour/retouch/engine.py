@@ -1489,7 +1489,7 @@ EYE_WHITE_V2 = 0.0   # 0/1 (2611 IWALY INT, user 2026-11-24: "핏줄만 제거, 
                      # are red and stay in the mask; the v1 mask weighted by brightness and low saturation left the veins themselves out), inside the eye's own landmarks only, and the
                      # veins filled from the white round them (dark -> up to the local white, red -> down to the white's own chroma) instead of lifting / bleaching the whole white
 EYE_WHITE_V2_SHRINK = 0.88     # the eye's landmark polygon shrunk towards its middle by this (the lid's edge and the lash line stay out)
-EYE_WHITE_V2_LIFT = 0.015      # a gentle overall lift of the white (share of the way to 1)
+EYE_WHITE_V2_LIFT = 0.0        # an overall lift of the white (share of the way to 1); 0: the user wants only the veins gone, no brighter white
 
 
 def eye_white_mask(lm: np.ndarray, rgb_f: np.ndarray) -> np.ndarray:
@@ -1520,14 +1520,19 @@ def eye_white_mask(lm: np.ndarray, rgb_f: np.ndarray) -> np.ndarray:
 
 
 def _eye_white_mask_v2(lm: np.ndarray, rgb_f: np.ndarray) -> np.ndarray:
-    """The sclera of both eyes (EYE_WHITE_V2): inside each eye's landmark polygon (shrunk), the pixels whose red channel is high (the white and its red veins; the iris, the pupil
-    and the lashes are low in red), opened a little so a lash or the iris' rim does not join; 0..1, soft only by a pixel or two (nothing outside the eye)."""
+    """The sclera of both eyes (EYE_WHITE_V2): inside each eye's landmark polygon (shrunk), the pixels that are light once thin dark lines are closed over (the white and its
+    veins; the iris, the pupil and the lashes stay dark after the closing) and high in red; 0..1, soft by a pixel or two (nothing outside the eye)."""
     h, w = rgb_f.shape[:2]
     L = lm[:, :2]
     if not np.isfinite(L[36:48]).all():
         return np.zeros((h, w), np.float32)
     Wf = float(np.hypot(*(L[16] - L[0])))
     R = rgb_f[..., 0].astype(np.float32)
+    Yl = _luma(rgb_f).astype(np.float32)
+    kc = max(1, int(round(0.004 * Wf)))
+    se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * kc + 1, 2 * kc + 1))
+    Yc = cv2.morphologyEx(Yl, cv2.MORPH_CLOSE, se)
+    Rc = cv2.morphologyEx(R, cv2.MORPH_CLOSE, se)
     out = np.zeros((h, w), np.float32)
     for idx in (slice(36, 42), slice(42, 48)):
         e = L[idx]
@@ -1537,43 +1542,47 @@ def _eye_white_mask_v2(lm: np.ndarray, rgb_f: np.ndarray) -> np.ndarray:
         inside = m > 0
         if inside.sum() < 12:
             continue
-        rs = R[inside]
-        lo, hi = float(np.percentile(rs, 30)), float(np.percentile(rs, 75))
-        wr = np.clip((R - lo) / max(hi - lo, 0.02), 0, 1) * inside
-        k = max(1, int(round(0.004 * Wf)))
-        wr = cv2.morphologyEx(wr.astype(np.float32), cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1)))
-        out = np.maximum(out, wr * inside)
+        ys, rs = Yc[inside], Rc[inside]
+        ylo, yhi = float(np.percentile(ys, 40)), float(np.percentile(ys, 75))
+        rlo, rhi = float(np.percentile(rs, 35)), float(np.percentile(rs, 75))
+        wy = np.clip((Yc - ylo) / max(yhi - ylo, 0.02), 0, 1)
+        wr = np.clip((Rc - rlo) / max(rhi - rlo, 0.02), 0, 1)
+        wm = (wy * wr * inside).astype(np.float32)
+        wm = cv2.morphologyEx(wm, cv2.MORPH_OPEN, se)
+        out = np.maximum(out, wm * inside)
     return np.clip(cv2.GaussianBlur(out, (0, 0), max(0.6, 0.0015 * Wf)), 0, 1)
 
 
+EYE_WHITE_V2_VEIN = 0.006      # of the face width: the widest vein (the closing / opening size)
+EYE_WHITE_V2_CAP = (0.10, 0.05)  # most a vein's luma is lifted / its red (Cr) taken down
+
+
 def _eye_white_apply_v2(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, mY: np.ndarray, mC: np.ndarray, wf: float, cs: float, k: float):
-    """The veins filled from the white round them: the white's local level (a blur of the sclera weighted to its brighter, less red pixels) is the target; a darker pixel is
-    brought up to it, a redder / yellower one down to its chroma. Nothing brighter than the white round it is made, so no glow and no trace of the mask's edge."""
-    def nblur(x, w, sig):
-        num = cv2.GaussianBlur((x * w).astype(np.float32), (0, 0), sig)
-        den = cv2.GaussianBlur(w.astype(np.float32), (0, 0), sig)
-        return num / np.maximum(den, 1e-4), den
+    """Only the veins: a thin dark line in the luma is closed over (grey closing) and a thin red line in Cr opened away (grey opening), at the size of a vein; the white's own
+    shading, its highlight and everything round it stay as they are (no lift, no bleach, no edge)."""
     if float(mY.max()) < 0.05:
         return Y, Cb, Cr
-    sY = max(1.0, 0.025 * wf)
-    # the white's level: weighted to the bright pixels (a vein is darker), twice (the second round leaves the veins out of the reference)
-    Yr, _ = nblur(Y, mY, sY)
-    wb = mY * np.clip((Y - (Yr - 0.03)) / 0.03, 0, 1)
-    Yr, dY_ = nblur(Y, np.maximum(wb, 1e-3 * mY), sY)
-    up = np.clip(Yr - Y, 0, None)
-    Y = Y + k * mY * up
-    Y = Y + k * mY * EYE_WHITE_V2_LIFT * (1 - Y)
-    sC = max(1.0, sY * cs)
-    # the chroma of the white: weighted to the least red (a vein is red)
-    Crr, _ = nblur(Cr, mC, sC)
-    wc = mC * np.clip(((Crr + 0.01) - Cr) / 0.02, 0, 1)
-    Crr, _ = nblur(Cr, np.maximum(wc, 1e-3 * mC), sC)
-    Cbr, _ = nblur(Cb, np.maximum(wc, 1e-3 * mC), sC)
-    Cr = Cr + k * mC * np.clip(Crr - Cr, None, 0)               # only down (less red)
-    Cb = Cb + k * mC * (Cbr - Cb) * (Cb < Cbr)                    # a yellow cast (Cb below the white's) up to it
-    # and the white itself a little cleaner (less red / yellow), never past neutral
-    Cr = Cr - k * mC * 0.35 * np.clip(Cr, 0, None)
-    Cb = Cb - k * mC * 0.35 * np.clip(Cb, None, 0)
+    r = max(1, int(round(EYE_WHITE_V2_VEIN * wf)))
+    se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+    Yc = cv2.morphologyEx(Y.astype(np.float32), cv2.MORPH_CLOSE, se)
+    up = np.clip(Yc - Y, 0, EYE_WHITE_V2_CAP[0])
+    rc = max(1, int(round(r * cs)))
+    sec = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rc + 1, 2 * rc + 1))
+    Cro = cv2.morphologyEx(Cr.astype(np.float32), cv2.MORPH_OPEN, sec)
+    dn = np.clip(Cr - Cro, 0, EYE_WHITE_V2_CAP[1])
+    Cbc = cv2.morphologyEx(Cb.astype(np.float32), cv2.MORPH_CLOSE, sec)      # a vein is low in Cb too (red / yellow): closed up to the white's
+    upb = np.clip(Cbc - Cb, 0, EYE_WHITE_V2_CAP[1])
+    # soften the corrections a little so a vein's edge does not leave a ring
+    sm = max(0.5, 0.3 * r)
+    up = cv2.GaussianBlur(up, (0, 0), sm)
+    dn = cv2.GaussianBlur(dn, (0, 0), max(0.5, sm * cs))
+    upb = cv2.GaussianBlur(upb, (0, 0), max(0.5, sm * cs))
+    # never past the closed / opened picture itself (the blur may not carry a vein's fill onto the white beside it)
+    Y = Y + k * mY * np.minimum(up, np.clip(Yc - Y, 0, None))
+    Cr = Cr - k * mC * np.minimum(dn, np.clip(Cr - Cro, 0, None))
+    Cb = Cb + k * mC * np.minimum(upb, np.clip(Cbc - Cb, 0, None))
+    if EYE_WHITE_V2_LIFT > 1e-6:
+        Y = Y + k * mY * EYE_WHITE_V2_LIFT * (1 - Y)
     return Y, Cb, Cr
 
 
