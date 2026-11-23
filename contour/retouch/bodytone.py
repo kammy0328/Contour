@@ -37,7 +37,27 @@ NOT_SKIN = (0.45, 0.65)   # brightness over the leg's: from where a pixel is ski
 FIRM = (0.55, 1.6)        # a blotch's size over the leg's own colour variation: from where it is fully taken .. (a smaller
                           # difference is the skin's own and is taken less: never less than FIRM_MIN of it)
 FIRM_MIN = 0.55
-MAX_CHANGE = {"luma": 0.018, "chroma": 0.02}   # the most one pixel's plane may move (soft limit): the knee is evened, not repainted (the reference's knee moves by about 0.01 in log)
+MAX_CHANGE = {"luma": 0.018, "chroma": 0.02}
+# ---- (11/24, IWALY Mac) a bruise's colour without a grey knee
+# The knee's colour was taken to the ring's one colour (CHROMA_KEEP 0.06) and every darker part of it lifted: a knee that is a little
+# redder and darker than the leg by nature came out grey and flat (11/23 Windows feedback: +1.9 %, colour gone). Now:
+#   - the knee keeps its own even tint (the mean of its skin that is not blotched) by KNEE_TINT_KEEP; only the blotches go,
+#   - no pixel comes out less saturated than the leg's skin round it (KNEE_SAT_FLOOR of the ring's chroma, hue kept),
+#   - the brightness is evened where the knee is blotched in colour or far darker than the leg's own variation, not elsewhere.
+KNEE_V3 = True
+KNEE_TINT_KEEP = 1.0      # of the knee's own even tint (non-blotched skin of its area against the ring): this share stays (the fallback target)
+KNEE_SAT_FLOOR = 0.97     # the corrected chroma is never shorter than this share of the ring's chroma (no grey patch)
+KNEE_BLOTCH = (1.6, 3.2)  # a pixel's hue offset across the skin's tone axis over the leg's spread across it: from where it is a blotch .. fully
+KNEE_RED_FAR = (3.5, 6.0)  # ... and along the axis (more red than the leg, beyond its spread): from where .. fully
+KNEE_DARK_FAR = (3.0, 5.0)  # a darker patch with no colour blotch is evened only from this far under its surround (in the knee's own luma variation)
+KNEE_NAT_C_MIN = 0.0006   # the knee's chroma variation is never read as smaller than this (log material: a bruise is 0.002..0.004 off)
+KNEE_EVEN = 0.0           # of the strength: how far the knee's skin that is not blotched is taken towards its surround (0: only blotches change)
+KNEE_INNER = (0.45, 0.85)  # the knee area's weight from which a pixel can be a blotch .. fully (not at the skin's own edges)
+KNEE_FILL = 0.6           # of a half width: the surround a blotch's colour and brightness are filled from (the knee's own skin round it, not the ring)
+KNEE_DARK_KEEP = 0.15     # of a blotch's darkness under its surround: this share stays
+KNEE_BLOTCH_CAP = {"luma": 0.035, "chroma": 0.012}   # the most a blotch pixel moves (soft limit)
+# ---- (11/24) the edge of what another person's leg (or anything owned by someone else) covers: the correction fades in from it
+OWNER_FEATHER = 0.30      # of the leg's half width (at least 2 px): the ramp inward from an occluder's edge   # the most one pixel's plane may move (soft limit): the knee is evened, not repainted (the reference's knee moves by about 0.01 in log)
 
 # ---- the knee tone's steadiness from one picture to the next (1.26)
 # A knee is read from the picture it is in: how much of the leg's skin is to be seen round it, how much of the knee is seen at all (the
@@ -461,6 +481,46 @@ def tone_plane(P: np.ndarray, area: np.ndarray, ring: np.ndarray, half: float, k
     return out
 
 
+def _knee_luma_v3(Y, w_area, w_ring, half, k, w_far, rel, axis, keep, blotch):
+    """The knee's brightness (v3): evened only where the colour says blotch (blotch, 0..1 on Y's grid) or where it is far darker than
+    the leg's own variation (KNEE_DARK_FAR); a knee darker than the leg by nature keeps its shading."""
+    r = _roi(w_area, int(3.2 * half) + 6)
+    if r is None:
+        return Y.astype(np.float32, copy=True)
+    y0, y1, x0, x1 = r
+    sig_f = max(2.0, FINE * half)
+    base = cv2.GaussianBlur(Y[y0:y1, x0:x1].astype(np.float32), (0, 0), sig_f)
+    W = w_ring[y0:y1, x0:x1].astype(np.float32)
+    sw = float(W.sum())
+    if sw < 40.0:
+        return Y.astype(np.float32, copy=True)
+    A = w_area[y0:y1, x0:x1].astype(np.float32)
+    ws = np.clip(A + W, 0, 1)
+    sg = max(2.0, 0.6 * half)
+    loc = cv2.GaussianBlur(base * ws, (0, 0), sg) / np.maximum(cv2.GaussianBlur(ws, (0, 0), sg), 1e-4)
+    dv = loc - base
+    inA = A > 0.5
+    nat = max(NAT_MIN * 0.25, 1.4826 * float(np.median(np.abs(dv[inA] - np.median(dv[inA]))))) if int(inA.sum()) > 30 else NAT_MIN
+    far = _ss(KNEE_DARK_FAR[0], KNEE_DARK_FAR[1], np.maximum(dv, 0.0) / nat) * _ss(KNEE_INNER[0], KNEE_INNER[1], A)
+    gate = far if blotch is None else np.maximum(far, blotch[y0:y1, x0:x1])
+    gate = cv2.GaussianBlur(gate.astype(np.float32), (0, 0), max(1.5, 0.15 * half))
+    firm = np.zeros(Y.shape, np.float32)
+    firm[y0:y1, x0:x1] = gate
+    return tone_plane(Y, w_area, w_ring, half, k, "luma", firm=firm, ring_res=w_far, rel=rel, axis=axis, keep=keep)
+
+
+def owner_feather(gate: np.ndarray, owner: Optional[np.ndarray], half: float) -> np.ndarray:
+    """gate (0..1) faded in from the edge of `owner` (> 0.5): 0 at that edge, full OWNER_FEATHER half widths inside. owner: what this
+    person owns (another person's leg in front ends it), or the skin gate itself (then the sock's edge, a hem's, an occluder's too)."""
+    if owner is None:
+        return gate
+    rad = max(2.0, OWNER_FEATHER * float(half))
+    inside = cv2.distanceTransform((owner > 0.5).astype(np.uint8), cv2.DIST_L2, 5)
+    ramp = _ss(0.0, rad, inside).astype(np.float32)
+    ramp = cv2.GaussianBlur(ramp, (0, 0), max(0.8, 0.25 * rad))
+    return (gate * ramp).astype(np.float32)
+
+
 def _masked_skin(Yo, skin, e, area, half):
     """(area, ring) weights of one knee from the body skin's area, or None where it has not enough of the leg."""
     ringw = _ss(RING[0], RING[0] + 0.35, e) * (1.0 - _ss(RING[1] - 0.6, RING[1], e))
@@ -581,6 +641,32 @@ def env_reach(step: Optional[float] = None) -> int:
     """How many pictures each side of a picture its envelope looks at (a support of 1 is no more than step per picture away from 0 after this many)."""
     st = ENV_STEP if step is None else float(step)
     return int(np.ceil(1.0 / max(st, 1e-3)))
+
+
+def knee_owned_share(owner: np.ndarray, scale: float, knee) -> float:
+    """0..1: how much of a knee's own area (in source px: (cx, cy, ax, ay, half)) this person owns on a picture `scale` times the source
+    (another person's leg in front takes it). Read into the look ahead's support so that a knee being covered fades (knee_envelope)."""
+    try:
+        cx, cy, ax, ay, half = [float(v) for v in knee]
+        if not np.isfinite([cx, cy, ax, ay, half]).all() or half <= 0:
+            return 1.0
+        h, w = owner.shape
+        c = (cx * scale, cy * scale)
+        hh = half * scale
+        R = int(KNEE_ALONG * KNEE_EDGE[1] * hh) + 2
+        x0, x1 = max(0, int(c[0]) - R), min(w, int(c[0]) + R + 1)
+        y0, y1 = max(0, int(c[1]) - R), min(h, int(c[1]) + R + 1)
+        if x1 - x0 < 3 or y1 - y0 < 3:
+            return 1.0
+        e = knee_geometry((y1 - y0, x1 - x0), (c[0] - x0, c[1] - y0), (ax, ay), max(hh, 1.0))
+        area = 1.0 - _ss(KNEE_EDGE[0], KNEE_EDGE[1], e)
+        sa = float(area.sum())
+        if sa < 4:
+            return 1.0
+        share = float((area * np.clip(owner[y0:y1, x0:x1], 0, 1)).sum()) / sa
+        return float(_ss(0.15, 0.5, share))
+    except Exception:
+        return 1.0
 
 
 def knee_envelope(support, t: int, lo: int, hi: int, step: Optional[float] = None) -> float:
@@ -765,6 +851,124 @@ def _knee_tone_v2(Y, Cb, Cr, skin, knees, k, cs, gains=None):
     return Yo, Cbo, Cro
 
 
+def _knee_chroma_v3(Cb, Cr, wa, wr, half, k, rel):
+    """The knee's colour (both chroma planes at once): blotches (purple, red, grey) to the knee's own even tint, which is the ring's
+    colour plus KNEE_TINT_KEEP of the knee's non-blotched offset from it; never less saturated than the ring (KNEE_SAT_FLOOR).
+    Only the band above the grain is changed (FINE). -> (Cb', Cr', blotch 0..1) on the chroma planes' grid, or None."""
+    r = _roi(wa, int(3.2 * half) + 6)
+    if r is None or k < 1e-4 or rel < 1e-4:
+        return None
+    y0, y1, x0, x1 = r
+    A = wa[y0:y1, x0:x1].astype(np.float32)
+    W = wr[y0:y1, x0:x1].astype(np.float32)
+    sw = float(W.sum())
+    if sw < 40.0:
+        return None
+    sig_f = max(2.0, FINE * half)
+    B = [cv2.GaussianBlur(P[y0:y1, x0:x1].astype(np.float32), (0, 0), sig_f) for P in (Cb, Cr)]
+    ring = [float((b * W).sum() / sw) for b in B]
+    # the knee's even tint and its own chroma variation (robust: the blotches are the outliers of the knee's own colour, not of the
+    # ring's, which holds the leg's shading and the other leg and read every bruise as natural)
+    sa = float(A.sum())
+    if sa < 20.0:
+        return None
+    inA = A > 0.5
+    ringpx = W > 0.5
+    if int(inA.sum()) < 30:
+        return None
+    tint = [float(np.median(b[inA])) for b in B]
+    nat_c = KNEE_NAT_C_MIN
+    for _ in range(3):
+        dist_ = np.hypot(B[0] - tint[0], B[1] - tint[1])
+        nat_c = max(KNEE_NAT_C_MIN, 1.4826 * float(np.median(dist_[inA])))
+        wt = A * (1.0 - _ss(KNEE_BLOTCH[0], KNEE_BLOTCH[1], dist_ / nat_c))
+        s_ = float(wt.sum())
+        if s_ < 0.15 * sa:
+            break
+        tint = [float((b * wt).sum() / s_) for b in B]
+    tint = [ring[i] + KNEE_TINT_KEEP * (tint[i] - ring[i]) for i in range(2)]
+    # A blotch is told by its hue, not by its distance from the knee's mean: the skin's own variation (shade, a little more or less
+    # colour) runs along the skin's tone axis (the ring's chroma direction), a bruise (purple, blue, red-violet) turns away from it.
+    # The spread across the axis is read from the ring and the knee together (a bruise over a quarter of the knee does not hide
+    # itself in the knee's own spread). A red patch along the axis counts only far out (KNEE_RED_FAR).
+    rn = float(np.hypot(*ring))
+    if rn < 1e-5:
+        return None
+    u = (ring[0] / rn, ring[1] / rn)
+    along = B[0] * u[0] + B[1] * u[1]
+    perp = -B[0] * u[1] + B[1] * u[0]
+    both = ringpx | inA
+    pm = float(np.median(perp[both]))
+    am = float(np.median(along[both]))
+    nat_p = max(KNEE_NAT_C_MIN, 1.4826 * float(np.median(np.abs(perp[ringpx] - np.median(perp[ringpx]))))) if int(ringpx.sum()) > 30 else KNEE_NAT_C_MIN
+    nat_a = max(KNEE_NAT_C_MIN, 1.4826 * float(np.median(np.abs(along[ringpx] - np.median(along[ringpx]))))) if int(ringpx.sum()) > 30 else KNEE_NAT_C_MIN
+    hue_off = _ss(KNEE_BLOTCH[0], KNEE_BLOTCH[1], np.abs(perp - pm) / nat_p)
+    red_off = _ss(KNEE_RED_FAR[0], KNEE_RED_FAR[1], (along - am) / nat_a)
+    # (only well inside the knee's skin: the skin next to a sock, a hem or another leg is shaded and coloured by it, and was read as a
+    # blotch and repainted along that edge)
+    blotch = (np.maximum(hue_off, red_off) * _ss(KNEE_INNER[0], KNEE_INNER[1], A)).astype(np.float32)
+    # (a blotch's soft rim is part of it: no ring of the old colour round a corrected spot)
+    blotch = np.maximum(blotch, np.clip(1.6 * cv2.GaussianBlur(blotch, (0, 0), max(1.0, 0.20 * half)), 0, 1) * _ss(KNEE_INNER[0], KNEE_INNER[1], A)).astype(np.float32)
+    # the knee's even tint again, now from its skin that is not blotched by the hue test (the first estimate held the bruise)
+    wt_ = A * (1.0 - blotch)
+    s_ = float(wt_.sum())
+    if s_ >= 0.15 * sa:
+        tint = [float((b * wt_).sum() / s_) for b in B]
+    else:
+        tint = list(ring)
+    g = KNEE_EVEN + (1.0 - KNEE_EVEN) * blotch
+    w = A * float(k) * float(rel) * g
+    # the colour a blotch is filled with: the knee's own skin round it that is not blotched (its hue across the knee kept), the even
+    # tint where there is too little of that
+    non = (A * (1.0 - blotch) + 0.25 * W).astype(np.float32)
+    sg = max(3.0, KNEE_FILL * half)
+    den = cv2.GaussianBlur(non, (0, 0), sg)
+    have = _ss(0.05, 0.25, den)
+    ref = [have * (cv2.GaussianBlur(B[i] * non, (0, 0), sg) / np.maximum(den, 1e-4)) + (1.0 - have) * tint[i] for i in range(2)]
+    nb = [B[i] + w * ((ref[i] + CHROMA_KEEP * (B[i] - ref[i])) - B[i]) for i in range(2)]
+    # no grey: a changed pixel never comes out less saturated than the skin it is filled from (hue kept)
+    ln = np.hypot(nb[0], nb[1])
+    floor = KNEE_SAT_FLOOR * np.hypot(ref[0], ref[1]) * (w > 0.01)
+    sc = np.where((ln < floor) & (ln > 1e-6), floor / np.maximum(ln, 1e-6), 1.0).astype(np.float32)
+    nb = [B[i] + (nb[i] * sc - B[i]) for i in range(2)]
+    out = []
+    cap = KNEE_BLOTCH_CAP.get("chroma")
+    for i, P in enumerate((Cb, Cr)):
+        d = nb[i] - B[i]
+        if cap:
+            c0 = 0.6 * cap
+            a = np.abs(d)
+            d = np.where(a <= c0, d, np.sign(d) * (c0 + (cap - c0) * np.tanh((a - c0) / (cap - c0)))).astype(np.float32)
+        o = P.astype(np.float32, copy=True)
+        o[y0:y1, x0:x1] += d
+        out.append(o)
+    bl = np.zeros(Cb.shape, np.float32)
+    bl[y0:y1, x0:x1] = blotch * (A > 0.02)
+    return out[0], out[1], bl
+
+
+def _knee_blotch_luma(Y, w_area, w_ring, blotch, half, k, rel):
+    """A blotch's darkness filled from the knee's own skin round it (KNEE_FILL), above the grain only; lighter parts are left."""
+    r = _roi(w_area, int(3.2 * half) + 6)
+    if r is None or blotch is None:
+        return Y.astype(np.float32, copy=True)
+    y0, y1, x0, x1 = r
+    A = w_area[y0:y1, x0:x1].astype(np.float32)
+    W = w_ring[y0:y1, x0:x1].astype(np.float32)
+    bl = blotch[y0:y1, x0:x1].astype(np.float32)
+    sig_f = max(2.0, FINE * half)
+    base = cv2.GaussianBlur(Y[y0:y1, x0:x1].astype(np.float32), (0, 0), sig_f)
+    non = (A * (1.0 - bl) + 0.25 * W).astype(np.float32)
+    sg = max(3.0, KNEE_FILL * half)
+    den = cv2.GaussianBlur(non, (0, 0), sg)
+    ref = cv2.GaussianBlur(base * non, (0, 0), sg) / np.maximum(den, 1e-4)
+    d = np.maximum(ref - base, 0.0) * (1.0 - KNEE_DARK_KEEP) * _ss(0.05, 0.25, den)
+    d = _soft_cap(A * bl * float(k) * float(rel) * d, KNEE_BLOTCH_CAP["luma"])
+    out = Y.astype(np.float32, copy=True)
+    out[y0:y1, x0:x1] += d
+    return out
+
+
 def _knee_tone_v2_full(Y, Cb, Cr, skin, knees, k, cs, gains=None):
     """The knee tone with its read of the leg weighed (knee_reliability): every knee reads the picture as it came (not what
     another knee changed), changes it by as much as the read can be trusted, and where two knees change the same pixel the
@@ -804,6 +1008,24 @@ def _knee_tone_v2_full(Y, Cb, Cr, skin, knees, k, cs, gains=None):
         if rel < 1e-3:
             continue
         w_far = (w_ring * _ss(RES_FROM, RES_FROM + 0.4, e)).astype(np.float32)
+        if KNEE_V3:
+            if Cb.shape == (hY, wY):
+                wa, wr, hf = w_area, w_ring, half
+            else:
+                wa = cv2.resize(w_area, (wC, hC), interpolation=cv2.INTER_AREA)
+                wr = cv2.resize(w_ring, (wC, hC), interpolation=cv2.INTER_AREA)
+                hf = max(1.5, half * cs)
+            cr3 = _knee_chroma_v3(Cb, Cr, wa, wr, hf, k, rel)
+            if cr3 is not None:
+                dCb = _merge(dCb, cr3[0] - Cb)
+                dCr = _merge(dCr, cr3[1] - Cr)
+                bl = cr3[2] if cr3[2].shape == (hY, wY) else cv2.resize(cr3[2], (wY, hY), interpolation=cv2.INTER_LINEAR)
+                Yb = _knee_blotch_luma(Y, w_area, w_ring, bl, half, k, rel)
+                dY = _merge(dY, Yb - Y)
+            # (a patch far darker than the knee's own variation with no colour to it: evened by the tone as before, gated)
+            Yn = _knee_luma_v3(Y, w_area, w_ring, half, k, w_far, rel, axis, keep, None)
+            dY = _merge(dY, Yn - Y)
+            continue
         Yn = tone_plane(Y, w_area, w_ring, half, k, "luma", ring_res=w_far, rel=rel, axis=axis, keep=keep)
         dY = _merge(dY, Yn - Y)
         for nm in ("cb", "cr"):
@@ -1024,24 +1246,40 @@ def belly_fold(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, skin: Optional[np.
     return Yo, Cbo, Cro
 
 
-def knee_fold(Y, Cb, Cr, skin, visible, knees, k):
+KNEE_FOLD_CAP = 0.028      # the most knee_fold moves one pixel's luma (soft limit, as MAX_CHANGE): creases are filled, the knee is not repainted
+KNEE_FOLD_BOOST_FROM = 0.85   # the strength from which the wider shadow of a deep crease is rebuilt too (was 0.7)
+KNEE_FOLD_BOOST_CAP = 0.04    # ... by at most this much luma
+
+
+def _soft_cap(d, cap):
+    c0 = 0.6 * cap
+    a = np.abs(d)
+    return np.where(a <= c0, d, np.sign(d) * (c0 + (cap - c0) * np.tanh((a - c0) / (cap - c0)))).astype(np.float32)
+
+
+def knee_fold(Y, Cb, Cr, skin, visible, knees, k, gains=None):
     """Fill current knee creases, clipping the final change to visible owned skin.
 
-    No reconstructed image is carried across frames. Geometry may be smoothed
-    by person_geometry_t, but occluded pixels always use this frame's ownership.
-    Missing ownership or skin information disables the correction.
+    No reconstructed image is carried across frames. Geometry may be smoothed by person_geometry_t; the strength of each knee
+    follows the render's look ahead (gains, knee_envelope) so that a knee lost for a picture fades instead of switching off.
+    The change fades in from the edge of anything another person owns (owner_feather) and is soft limited (KNEE_FOLD_CAP).
+    skin None: the leg's skin is read from the picture round each knee (local_zone_skin) instead of switching the knee off.
     """
-    if k < 1e-4 or skin is None or visible is None:
+    if k < 1e-4 or visible is None:
         return Y, Cb, Cr
     from . import engine as E
-    allowed = np.clip(skin, 0, 1) * np.clip(visible, 0, 1)
-    # Erode before filtering to keep socks and occluding silhouettes out.
-    allowed = cv2.erode(allowed.astype(np.float32), np.ones((3, 3), np.uint8))
+    owner = np.clip(visible, 0, 1).astype(np.float32)
     result = Y
+    dall = None          # (every knee reads the picture as it came; where two knees overlap the larger change stays, not both)
     chroma = None
     h, w = Y.shape
-    for centre, axis, half in knees:
+    for ki, (centre, axis, half) in enumerate(knees):
         if not np.isfinite((*centre, *axis, half)).all() or half < 3:
+            continue
+        gain = 1.0
+        if gains is not None and ki < len(gains) and gains[ki] is not None:
+            gain = float(np.clip(gains[ki], 0.0, 1.0))
+        if gain < 1e-3:
             continue
         radius = int(2.5 * half) + 8
         x0, x1 = max(0, int(centre[0]) - radius), min(w, int(centre[0]) + radius + 1)
@@ -1054,49 +1292,63 @@ def knee_fold(Y, Cb, Cr, skin, visible, knees, k):
         ax, ay = axis[0] / norm, axis[1] / norm
         along, across = dx * ax + dy * ay, -dx * ay + dy * ax
         zone = np.clip(1 - (along / (1.4 * half)) ** 2 - (across / half) ** 2, 0, 1)
-        gate = allowed[y0:y1, x0:x1]
-        mask = (zone * gate).astype(np.float32)
-        if mask.max() < 0.05:
-            continue
         if chroma is None:
             chroma = tuple(c if c.shape == Y.shape else cv2.resize(c, (w, h), interpolation=cv2.INTER_LINEAR)
                            for c in (Cb, Cr))
-        roi = result[y0:y1, x0:x1]
+        roi = Y[y0:y1, x0:x1].astype(np.float32)
         cb, cr = (c[y0:y1, x0:x1] for c in chroma)
+        own = owner[y0:y1, x0:x1]
+        if skin is not None:
+            sk = np.clip(skin[y0:y1, x0:x1], 0, 1).astype(np.float32)
+        else:
+            sk = local_zone_skin(roi, cb, cr, zone.astype(np.float32))
+            if sk is None:
+                continue
+            sk = np.clip(sk, 0, 1).astype(np.float32)
+        allowed = cv2.erode((sk * own).astype(np.float32), np.ones((3, 3), np.uint8))
+        # (faded in from every edge of the skin it may touch: another person's leg, the sock, a hem: a crease filled up to a sock's
+        # edge left a bright line along it)
+        gate = owner_feather(allowed, allowed, half)
+        mask = (zone * gate).astype(np.float32)
+        if mask.max() < 0.05:
+            continue
         strength = float(np.clip(k, 0, 1))
         filled, _, _ = E._crease_lift(roi, cb, cr, mask, strength,
                                       max(1.5, 0.08 * half), axis=(ax, ay), band=0.6 * strength)
         # Reduce residual mid-scale indentations. Normalized skin-only samples
         # keep the sock and the background out of the local brightness estimate.
-        weight = gate.astype(np.float32)
+        weight = (sk * own).astype(np.float32)
         sigma = max(2.0, 0.28 * half)
         support = cv2.GaussianBlur(weight, (0, 0), sigma)
         local = cv2.GaussianBlur(filled * weight, (0, 0), sigma) / np.maximum(support, 1e-4)
         fine = cv2.GaussianBlur(filled, (0, 0), max(0.65, 0.035 * half))
         depression = np.clip(local - fine, 0.0, 0.075)
         filled = filled + strength * depression * mask * _ss(0.55, 0.85, support)
-        # At high strength, reconstruct the wider shadow of a deep indentation.
-        # The normalized surround follows the large-scale shading of the leg.
-        boost = float(np.clip((strength - 0.7) / 0.3, 0, 1))
+        # At high strength, reconstruct the wider shadow of a deep indentation (limited: the knee's relief stays).
+        boost = float(np.clip((strength - KNEE_FOLD_BOOST_FROM) / max(1e-3, 1.0 - KNEE_FOLD_BOOST_FROM), 0, 1))
         if boost > 0:
-            radius = max(2.0, 0.50 * half)
-            den = cv2.GaussianBlur(weight, (0, 0), radius)
-            surround = cv2.GaussianBlur(filled * weight, (0, 0), radius) / np.maximum(den, 1e-4)
+            rad = max(2.0, 0.50 * half)
+            den = cv2.GaussianBlur(weight, (0, 0), rad)
+            surround = cv2.GaussianBlur(filled * weight, (0, 0), rad) / np.maximum(den, 1e-4)
             residual = surround - cv2.GaussianBlur(filled, (0, 0), max(0.7, 0.035 * half))
             coverage = _ss(0.0, 0.65, zone) * gate * _ss(0.55, 0.85, den)
-            filled = filled + boost * coverage * np.clip(residual, 0, 0.085)
-        if result is Y:
-            result = Y.copy()
-        result[y0:y1, x0:x1] = roi + (filled - roi) * gate
+            filled = filled + boost * coverage * np.clip(residual, 0, KNEE_FOLD_BOOST_CAP)
+        d = _soft_cap((filled - roi) * gate, KNEE_FOLD_CAP) * gain
+        full = np.zeros(Y.shape, np.float32)
+        full[y0:y1, x0:x1] = d
+        dall = _merge(dall, full)
+    if dall is not None:
+        result = (Y + dall).astype(np.float32)
     return result, Cb, Cr
 
 def visible_knee_tone(Y, Cb, Cr, skin, ownership, knees, strength, cs, gains):
     """Keep the visible portion of each knee and feather inwards from an occluder."""
     if skin is None or ownership is None:
         return Y, Cb, Cr
-    gate = np.clip(skin * ownership, 0, 1).astype(np.float32)
-    inside = cv2.distanceTransform((gate > 0.25).astype(np.uint8), cv2.DIST_L2, 3)
-    gate *= np.clip(inside / max(2.0, Y.shape[0] / 360.0), 0, 1)
+    owner = np.clip(ownership, 0, 1).astype(np.float32)
+    gate = np.clip(skin * owner, 0, 1).astype(np.float32)
+    halves = [float(h) for (_c, _a, h) in knees if np.isfinite(h) and h > 1.5]
+    gate = owner_feather(gate, gate, min(halves) if halves else Y.shape[0] / 360.0 / OWNER_FEATHER)
     corrected = knee_tone(Y, Cb, Cr, gate, knees, strength, cs, gains=gains)
     output = []
     for original, filled in zip((Y, Cb, Cr), corrected):

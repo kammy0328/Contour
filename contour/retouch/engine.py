@@ -2184,13 +2184,38 @@ def _steady_asks(st, j, t: int, N: int) -> List[int]:
     return out
 
 
+_GRID_WARNED: set = set()
+
+
+def _grid_warn(name, got, want) -> None:
+    if name not in _GRID_WARNED:
+        _GRID_WARNED.add(name)
+        print("MASK GRID: mask %s was %s, resized to %s" % (name, got, want), flush=True)
+
+
+def _on_grid(m, shp):
+    """A neighbour's or own mask as an array on grid shp (resized when it was made on another one)."""
+    a = _mask_unpack(m)
+    if a.shape != tuple(shp):
+        a = cv2.resize(a, (shp[1], shp[0]), interpolation=cv2.INTER_LINEAR)
+    return a
+
+
 def _steady_face(k, st, j, t: int, N: int, raws: dict, name_threads: int = 1, check: bool = False) -> None:
     """One person's face masks (and score maps) of frame t held steady with that person's masks of the frames round it (raws: those frames). The
     masks are worked through one name at a time (a neighbour's mask is carried here, used and let go), not all the names of all the frames at once:
     the same numbers with a few dozen MB in hand instead of more than a GB a person. k: the analysis picture's scale (sx, sy)."""
     Lt = j.face[:, :2] * k
     names = list(j.masks)
-    shp = j.masks[names[0]].shape
+    # (11/24) every mask on the grid most of this person's masks are on: one made on another grid (the leg ownership read on the
+    # analysis' 1280x720 while the masks are on the 2560x1440 picture: IWALY c016..c018 on the Mac) raised here, and the whole frame
+    # fell back to its raw masks (masks that jump). It is resized to the common grid instead, and said once.
+    shapes = [tuple(getattr(j.masks[n_], "shape", ())) for n_ in names]
+    shp = max(set(shapes), key=shapes.count) if shapes else ()
+    for n_, sh_ in zip(names, shapes):
+        if sh_ != shp and len(shp) == 2:
+            _grid_warn(n_, sh_, shp)
+            j.masks[n_] = cv2.resize(_mask_unpack(j.masks[n_]), (shp[1], shp[0]), interpolation=cv2.INTER_LINEAR)
     veto = getattr(j, "veto", None)
     vetos = [veto.astype(np.float32)] if veto is not None else []
     dets = []                                   # (weight, a neighbour's score maps, its motion onto this frame)
@@ -2245,7 +2270,13 @@ def _steady_face(k, st, j, t: int, N: int, raws: dict, name_threads: int = 1, ch
             if ms is None:
                 fr.append(np.zeros(shp, np.float32))
                 continue
-            fr.append(cv2.warpAffine(_mask_unpack(ms), A, (shp[1], shp[0]), flags=cv2.INTER_LINEAR, borderValue=0))
+            ms_a = _mask_unpack(ms)
+            if ms_a.shape != tuple(shp):
+                # (a neighbour's mask on another grid: its box is not on this grid either)
+                _grid_warn(n, ms_a.shape, shp)
+                ms_a = cv2.resize(ms_a, (shp[1], shp[0]), interpolation=cv2.INTER_LINEAR)
+                box = False
+            fr.append(cv2.warpAffine(ms_a, A, (shp[1], shp[0]), flags=cv2.INTER_LINEAR, borderValue=0))
             if box is not False:
                 bs_ = _pm_box(ms)
                 if bs_ is False:
@@ -2310,8 +2341,12 @@ def _steady_face(k, st, j, t: int, N: int, raws: dict, name_threads: int = 1, ch
             return (a_ / wsum).astype(np.float32)
 
         if n == "face_hold":
-            # An occluder entering this frame must win over motion-aligned history.
-            return np.maximum(o_, whole())
+            # (11/24) the median of this frame's hold and its neighbours' carried here: a cover seen on one frame only (a parser or
+            # hair-label slip) no longer takes the whole face's retouch away for that frame (retouch that switches off); hair
+            # that stays over the face is held from its second frame on
+            if len(fr) >= 3:
+                return np.median(np.stack(fr), axis=0).astype(np.float32)
+            return o_
         got = in_box() if (robust and box is not False) else None
         if got is not None and not check:
             return got
@@ -3603,14 +3638,24 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                     # Use measured segmentation only. Pose-based label fallback can assign an occluder to this knee.
                     seg = tracker.seglab.get(t) if tracker.seglab.exists() else None
                     alpha = tracker.matte.get(t)
+                    owned = None
                     if seg is not None and alpha is not None:
                         owner_ids = [int(st.pids[p]) + 1]
                         owner_ids.extend(int(src) + 1 for src, dst in tracker._seg_alias().items()
                                          if dst == st.pids[p])
                         measured = np.isin(seg, owner_ids) & (seg != 255) & (seg != 0)
                         owned = measured.astype(np.float32) * (alpha.astype(np.float32) / 255.0)
+                    if owned is None:
+                        # (11/24) no measured labels for this frame: the person's own matte (as the body skin uses), not no knee at all
+                        try:
+                            pa_ = SK.person_alpha(tracker, t, p, (px.w, px.h))
+                            owned = None if pa_ is None else np.clip(pa_.astype(np.float32), 0, 1)
+                        except Exception:
+                            owned = None
+                    if owned is not None:
+                        # (bilinear, on the masks' own grid: the labels' 1280x720 steps are not carried to the picture)
                         job.masks["knee_visible"] = cv2.resize(owned, (shape[1], shape[0]),
-                                                              interpolation=cv2.INTER_NEAREST)
+                                                              interpolation=cv2.INTER_LINEAR)
 
                 if job.tone and "knee_visible" in job.masks and "leg" in body_scope_set(bscope):
                     reviewed = cut.status.get("reviewed_knee_masks", {})
@@ -3727,7 +3772,14 @@ def knee_probe(rf: Optional["RetouchFrame"], px) -> Dict[tuple, float]:
                 m = BS.unpack_mask(pm)
             except Exception:
                 m = None
-        return BTN.knee_support(m, sc, tone["knees"]) if m is not None else [1.0] * len(tone["knees"])
+        sup = BTN.knee_support(m, sc, tone["knees"]) if m is not None else [1.0] * len(tone["knees"])
+        vis = job.masks.get("knee_visible") if getattr(job, "masks", None) else None
+        if vis is not None:
+            try:
+                sup = [float(a_) * BTN.knee_owned_share(_mask_unpack(vis), sc, kn_) for a_, kn_ in zip(sup, tone["knees"])]
+            except Exception:
+                pass
+        return sup
 
     # (each person's knees are read from that person's own area: the people side by side where the frame's people are prepared so, in their order)
     n_thr = max(1, min(int(PREP_THREADS), len(todo)))
@@ -7084,12 +7136,16 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                 traceback.print_exc()
         if job.tone and job.tone.get("knees") and v.get("knee_fold", 0) > 1e-4:
             visible = job.masks.get("knee_visible")
-            if visible is not None and knee_skin is not None:
-                knees = [((cx * y_per_src, cy * y_per_src), (ax, ay), half * y_per_src)
-                         for cx, cy, ax, ay, half in job.tone["knees"]]
-                with _tm("apply.knee_fold"):
-                    Y, Cb, Cr = BTN.knee_fold(Y, Cb, Cr, knee_skin, M(visible, (hY, wY)),
-                                             knees, v["knee_fold"])
+            if visible is not None:
+                try:
+                    knees = [((cx * y_per_src, cy * y_per_src), (ax, ay), half * y_per_src)
+                             for cx, cy, ax, ay, half in job.tone["knees"]]
+                    with _tm("apply.knee_fold"):
+                        Y, Cb, Cr = BTN.knee_fold(Y, Cb, Cr, knee_skin, M(visible, (hY, wY)),
+                                                 knees, v["knee_fold"], gains=job.tone.get("gain"))
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
         if knee_input is not None:
             wy = BS.unpack_mask(attenuation, (hY, wY))
             wc = wy if (hY, wY) == (hC, wC) else BS.unpack_mask(attenuation, (hC, wC))
