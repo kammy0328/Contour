@@ -193,6 +193,8 @@ HAND_GUARD_REACH = 0.45     # of the forearm (elbow -> wrist): how far past the 
 HAND_GUARD_RADIUS = 0.32    # of the forearm: the hand's half width
 DARK_CHROMA = 0.8           # how far the under-eye's colour is taken to the cheek's (11/24, INT_c006: "눈 아래 색 빠짐" at 0.8); 0.8 = as before
 NASO_NOSTRIL_HOLD = 0.0     # of the face width: the nostrils and the nose's base grown by this are out of the nasolabial band (0 = off)
+SKIN_FS_G = None            # (2611 IWALY INT, 11/24: the pebbled skin of INT_c001 / c006 / c007 / c010 stayed) the gains of the skin stage's texture bands (skin.FS_G, finest
+                            # to widest), set from here so a batch's settings can carry them; None = skin.FS_G as it is. INT_c006 f90 / INT_c001 f119: (1.35, 0.70, 0.30, 0.20, 0.20, 0.45)
 SKIN_BROW_HOLD = 0.0        # of the face width: the brows grown by this are kept out of the skin stage (0 = off, as before)
 HAND_GUARD_SKIN_IN = 0.04   # of the face width: the skin stage is held off a hand only outside the face's outline moved in by this
 HAND_GUARD_FEATHER = 0.03
@@ -1575,6 +1577,8 @@ def _eye_white_mask_v2(lm: np.ndarray, rgb_f: np.ndarray) -> np.ndarray:
 
 
 EYE_WHITE_V2_VEIN = 0.006      # of the face width: the widest vein (the closing / opening size)
+EYE_WHITE_V2_GUARD = 2.0       # (11/24) how far from the iris nothing is filled, in veins' sizes (2: as on 11/24 g; INT_c001 f119: the white beside the iris is narrow
+                               # and its veins stayed); 0 = no guard
 EYE_WHITE_V2_CAP = (0.10, 0.05)  # most a vein's luma is lifted / its red (Cr) taken down
 
 
@@ -1595,8 +1599,9 @@ def _eye_white_apply_v2(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, mY: np.nd
             ref_ = float(np.percentile(Yc[sel_], 70))
             dark_ = ((Y < 0.80 * ref_) & (cv2.dilate((mY > 0.05).astype(np.uint8), se) > 0)).astype(np.uint8)
             dark_ = cv2.morphologyEx(dark_, cv2.MORPH_OPEN, se)          # thin veins are no iris: only what survives an opening at the vein's size
-            if dark_.any():
-                near_ = cv2.dilate(dark_, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (4 * r + 1, 4 * r + 1)))
+            gr_ = int(round(EYE_WHITE_V2_GUARD * r))
+            if dark_.any() and gr_ > 0:
+                near_ = cv2.dilate(dark_, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * gr_ + 1, 2 * gr_ + 1)))
                 up = up * (1.0 - near_.astype(np.float32))
     except Exception:
         pass
@@ -7248,6 +7253,8 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
             if dkz_ is not None:
                 mY = mY * (1.0 - dkz_)
                 mC = mC * M(1.0 - dkz_, (hC, wC))
+            if SKIN_FS_G is not None and len(SKIN_FS_G) == len(SK.FS_S):
+                SK.FS_G = tuple(float(g_) for g_ in SKIN_FS_G)      # (11/24) the texture bands' gains set from the engine's settings (control.json engine_cfg)
             r = SK.radius_px(job.skin, y_per_src)
             try:
                 if getattr(SK, "PIT", 0) > 0 and hasattr(SK, "_TLS"):
