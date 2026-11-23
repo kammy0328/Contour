@@ -1699,16 +1699,19 @@ STEADY_ROBUST = True   # a mask that drops out on one or two frames (the parser 
 STEADY_WIN = 0.15      # frame: cut 086 frames 23/27/33, cut 100 frame 4) is pulled to the median of the frames round it
 
 
+STEADY_THREADS = 0     # people of a frame whose face masks are held steady side by side (0: as PREP_THREADS). Every person's masks are steadied from
+                       # that person's own masks alone, so what comes out is what one after the other gives
+
+
 def _steady(cut, tracker, st, rf: RetouchFrame, cache) -> RetouchFrame:
     t = rf.t
-    px = tracker.proxy
     N = st.final.shape[1]
-    k = np.array([px.sx, px.sy])
     try:
         _body_motions_ahead(cut, tracker, st, rf, cache)
     except Exception:
         import traceback
         traceback.print_exc()
+    faces = []
     for j in rf.jobs:
         # the body's mask has no face to follow: it is held steady along the picture's own motion (_steady_bskin)
         if j.body and j.body.get("mask") is not None:
@@ -1727,95 +1730,134 @@ def _steady(cut, tracker, st, rf: RetouchFrame, cache) -> RetouchFrame:
                 traceback.print_exc()
         if j.face is None or not j.masks:
             continue
-        Lt = j.face[:, :2] * k
-        own = {n: m.astype(np.float32) for n, m in j.masks.items()}
-        shp = next(iter(own.values())).shape
-        frames = [(1.0, own)]                       # (weight, masks on this frame's geometry)
-        veto = getattr(j, "veto", None)
-        vetos = [veto.astype(np.float32)] if veto is not None else []
-        dets = []                                   # (weight, a neighbour's score maps, its motion onto this frame)
-        def usable(s):
-            return 0 <= s < N and bool(st.present[j.p, s]) and st.connected(s, t) \
-                and bool(np.isfinite(st.face[j.p, s, :, :2]).all())
-
-        for d in range(1, STEADY_R + 1):
-            w = float(np.exp(-0.5 * (d / STEADY_SIGMA) ** 2))
-            # both sides or neither: on the first and last frames of a shot (or next to a frame the face is missing on)
-            # the frames of one side alone pulled the mask towards where the face was, and its cover dropped by a
-            # quarter on that frame only (lngshot cut 011, last frame: 0.97 raw, 0.72 steadied)
-            if not (usable(t - d) and usable(t + d)):
-                break
-            for s in (t - d, t + d):
-                rs = _raw_cached(cut, tracker, s, cache)
-                js = next((x for x in rs.jobs if x.pid == j.pid), None) if rs is not None else None
-                if js is None or js.face is None:
-                    continue
-                Ls = js.face[:, :2] * k
-                A, _ = cv2.estimateAffinePartial2D(Ls.astype(np.float32), Lt.astype(np.float32), method=cv2.LMEDS)
-                if A is None:
-                    continue
-                ws = {}
-                for n in own:
-                    ms = js.masks.get(n)
-                    # that frame had none (below threshold): counts as empty
-                    ws[n] = np.zeros(shp, np.float32) if ms is None else \
-                        cv2.warpAffine(ms.astype(np.float32), A, (shp[1], shp[0]), flags=cv2.INTER_LINEAR, borderValue=0)
-                frames.append((w, ws))
-                if j.det is not None:
-                    dets.append((w, js.det, A))
-                vs = getattr(js, "veto", None)
-                if veto is not None and vs is not None and vs.shape == veto.shape:
-                    q_ = veto.shape[1] / float(shp[1])
-                    Aq = A.copy(); Aq[:, 2] *= q_
-                    vetos.append(cv2.warpAffine(vs.astype(np.float32), Aq, (veto.shape[1], veto.shape[0]),
-                                                flags=cv2.INTER_LINEAR, borderValue=0))
-        wsum = float(sum(w for w, _ in frames))
-        acc = {}
-        robust = STEADY_ROBUST and len(frames) >= 3
-        for n in own:
-            if robust:
-                # only where any of the frames has something: the median of five full masks is slow
-                any_ = np.zeros(shp, bool)
-                for _, ms in frames:
-                    any_ |= ms[n] > 0.004
-                ys, xs = np.nonzero(any_.any(1))[0], np.nonzero(any_.any(0))[0]
-                out = np.zeros(shp, np.float32)
-                if len(ys) and len(xs):
-                    y0, y1, x0, x1 = int(ys[0]), int(ys[-1]) + 1, int(xs[0]), int(xs[-1]) + 1
-                    stk = np.stack([ms[n][y0:y1, x0:x1] for _, ms in frames])
-                    med = np.median(stk, axis=0)
-                    stk = np.clip(stk, med - STEADY_WIN, med + STEADY_WIN)
-                    wv = np.array([w for w, _ in frames], np.float32)[:, None, None]
-                    out[y0:y1, x0:x1] = (stk * wv).sum(0)
-                acc[n] = out
-            else:
-                a_ = np.zeros(shp, np.float32)
-                for w, ms in frames:
-                    a_ += w * ms[n]
-                acc[n] = a_
-        if veto is not None and wsum > 1.0:
-            h_, w_ = shp
-            vv = vetos[0]
-            if robust and len(vetos) >= 3:
-                # what covers the face stays for more than a frame or two; a frame on which the skin is lost for
-                # one or two frames is this frame's failure, not a cover
-                vv = np.maximum(vv, np.median(np.stack(vetos), axis=0))
-            v_ = cv2.resize(vv, (w_, h_), interpolation=cv2.INTER_LINEAR)
-            wf_ = float(np.hypot(*(Lt[16] - Lt[0])))
-            v_ = np.clip(cv2.GaussianBlur(v_, (0, 0), max(1.0, 0.02 * wf_)) * 2.5, 0, 1)
-            # where this frame sees no skin, a neighbour's mask may not hold more than this frame's own
-            for n in acc:
-                o_ = own[n]
-                avg = acc[n] / wsum
-                acc[n] = (o_ + (avg - o_).clip(None, 0) + (avg - o_).clip(0, None) * v_) * wsum
-        j.masks = {n: (m / wsum).astype(np.float32) for n, m in acc.items()}
-        if j.det is not None and dets:
-            try:
-                j.det = _det_fuse(j.det, dets)
-            except Exception:
-                import traceback
-                traceback.print_exc()
+        faces.append(j)
+    if not faces:
+        return rf
+    # the neighbouring frames the faces ask for, fetched here (one after the other: a frame not made yet is made once), then every person's masks
+    # are steadied on their own
+    raws: Dict[int, object] = {}
+    for j in faces:
+        for s in _steady_asks(st, j, t, N):
+            if s not in raws:
+                raws[s] = _raw_cached(cut, tracker, s, cache)
+    n_thr = max(1, min(int(STEADY_THREADS or PREP_THREADS), len(faces)))
+    px = tracker.proxy
+    k = np.array([px.sx, px.sy])
+    with _tm("steady.faces"):
+        if n_thr > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=n_thr, thread_name_prefix="steady") as ex:
+                list(ex.map(lambda j_: _steady_face(k, st, j_, t, N, raws), faces))
+        else:
+            for j in faces:
+                _steady_face(k, st, j, t, N, raws)
     return rf
+
+
+def _steady_usable(st, j, s: int, t: int, N: int) -> bool:
+    return 0 <= s < N and bool(st.present[j.p, s]) and st.connected(s, t) \
+        and bool(np.isfinite(st.face[j.p, s, :, :2]).all())
+
+
+def _steady_asks(st, j, t: int, N: int) -> List[int]:
+    """The neighbouring frames a person's masks are steadied with, in the order they are asked for."""
+    out = []
+    for d in range(1, STEADY_R + 1):
+        # both sides or neither: on the first and last frames of a shot (or next to a frame the face is missing on)
+        # the frames of one side alone pulled the mask towards where the face was, and its cover dropped by a
+        # quarter on that frame only (lngshot cut 011, last frame: 0.97 raw, 0.72 steadied)
+        if not (_steady_usable(st, j, t - d, t, N) and _steady_usable(st, j, t + d, t, N)):
+            break
+        out += [t - d, t + d]
+    return out
+
+
+def _steady_face(k, st, j, t: int, N: int, raws: dict) -> None:
+    """One person's face masks (and score maps) of frame t held steady with that person's masks of the frames round it (raws: those frames). The
+    masks are worked through one name at a time (a neighbour's mask is carried here, used and let go), not all the names of all the frames at once:
+    the same numbers with a few dozen MB in hand instead of more than a GB a person. k: the analysis picture's scale (sx, sy)."""
+    Lt = j.face[:, :2] * k
+    names = list(j.masks)
+    shp = j.masks[names[0]].shape
+    veto = getattr(j, "veto", None)
+    vetos = [veto.astype(np.float32)] if veto is not None else []
+    dets = []                                   # (weight, a neighbour's score maps, its motion onto this frame)
+    nbrs = []                                   # (weight, the person's job on a neighbouring frame, its motion onto this frame)
+    for d in range(1, STEADY_R + 1):
+        w = float(np.exp(-0.5 * (d / STEADY_SIGMA) ** 2))
+        if not (_steady_usable(st, j, t - d, t, N) and _steady_usable(st, j, t + d, t, N)):
+            break
+        for s in (t - d, t + d):
+            rs = raws[s]
+            js = next((x for x in rs.jobs if x.pid == j.pid), None) if rs is not None else None
+            if js is None or js.face is None:
+                continue
+            Ls = js.face[:, :2] * k
+            A, _ = cv2.estimateAffinePartial2D(Ls.astype(np.float32), Lt.astype(np.float32), method=cv2.LMEDS)
+            if A is None:
+                continue
+            nbrs.append((w, js, A))
+            if j.det is not None:
+                dets.append((w, js.det, A))
+            vs = getattr(js, "veto", None)
+            if veto is not None and vs is not None and vs.shape == veto.shape:
+                q_ = veto.shape[1] / float(shp[1])
+                Aq = A.copy(); Aq[:, 2] *= q_
+                vetos.append(cv2.warpAffine(vs.astype(np.float32), Aq, (veto.shape[1], veto.shape[0]),
+                                            flags=cv2.INTER_LINEAR, borderValue=0))
+    wts = [1.0] + [w for w, _, _ in nbrs]       # (this frame's own masks first)
+    wsum = float(sum(wts))
+    robust = STEADY_ROBUST and len(wts) >= 3
+    v_ = None
+    if veto is not None and wsum > 1.0:
+        h_, w_ = shp
+        vv = vetos[0]
+        if robust and len(vetos) >= 3:
+            # what covers the face stays for more than a frame or two; a frame on which the skin is lost for
+            # one or two frames is this frame's failure, not a cover
+            vv = np.maximum(vv, np.median(np.stack(vetos), axis=0))
+        v_ = cv2.resize(vv, (w_, h_), interpolation=cv2.INTER_LINEAR)
+        wf_ = float(np.hypot(*(Lt[16] - Lt[0])))
+        v_ = np.clip(cv2.GaussianBlur(v_, (0, 0), max(1.0, 0.02 * wf_)) * 2.5, 0, 1)
+    out_masks = {}
+    for n in names:
+        o_ = j.masks[n].astype(np.float32)
+        fr = [o_]                               # the mask on this frame's geometry: its own, then each neighbour's carried here
+        for _, js, A in nbrs:
+            ms = js.masks.get(n)
+            # that frame had none (below threshold): counts as empty
+            fr.append(np.zeros(shp, np.float32) if ms is None else
+                      cv2.warpAffine(ms.astype(np.float32), A, (shp[1], shp[0]), flags=cv2.INTER_LINEAR, borderValue=0))
+        if robust:
+            # only where any of the frames has something: the median of five full masks is slow
+            any_ = np.zeros(shp, bool)
+            for ms in fr:
+                any_ |= ms > 0.004
+            ys, xs = np.nonzero(any_.any(1))[0], np.nonzero(any_.any(0))[0]
+            a_ = np.zeros(shp, np.float32)
+            if len(ys) and len(xs):
+                y0, y1, x0, x1 = int(ys[0]), int(ys[-1]) + 1, int(xs[0]), int(xs[-1]) + 1
+                stk = np.stack([ms[y0:y1, x0:x1] for ms in fr])
+                med = np.median(stk, axis=0)
+                stk = np.clip(stk, med - STEADY_WIN, med + STEADY_WIN)
+                wv = np.array(wts, np.float32)[:, None, None]
+                a_[y0:y1, x0:x1] = (stk * wv).sum(0)
+        else:
+            a_ = np.zeros(shp, np.float32)
+            for w, ms in zip(wts, fr):
+                a_ += w * ms
+        if v_ is not None:
+            # where this frame sees no skin, a neighbour's mask may not hold more than this frame's own
+            avg = a_ / wsum
+            a_ = (o_ + (avg - o_).clip(None, 0) + (avg - o_).clip(0, None) * v_) * wsum
+        out_masks[n] = (a_ / wsum).astype(np.float32)
+    j.masks = out_masks
+    if j.det is not None and dets:
+        try:
+            j.det = _det_fuse(j.det, dets)
+        except Exception:
+            import traceback
+            traceback.print_exc()
 
 
 BODY_STEADY_HOLD = 2.5      # a neighbour's skin counts where this frame's own mask (softened) times this reaches 1
