@@ -97,6 +97,7 @@ class Job:
     bdet: Optional[dict] = None            # the body's spot candidates of this frame (retouch.bodyspots)
     bmarks: Optional[list] = None          # the operator's body spot marks as they lie on this frame
     tone: Optional[dict] = None            # where the knees and the belly are (retouch.bodytone.person_geometry), source px
+    naso_pres: Optional[float] = None      # how far a nasolabial crease is there on this frame (FOLD_PRESENT), measured once
     arm_axes: Optional[list] = None        # the armpit stage's hanging arms (ARMPIT_LINE_HOLD): [(the upper arm's angle from the vertical in degrees, weight 0..1, zone centre x, y, zone radius)] in proxy px
 
 
@@ -1567,6 +1568,89 @@ def _sharp_q(tracker, st, p: int, t: int, px) -> float:
         return 1.0
 
 
+FOCUS_GATE = None      # (lo, hi) or None (= off). 2611 IWALY c025 (2026-11-23, user: the dancers behind who are out of focus are not to be tracked or retouched, and the retouch comes in
+                       # slowly again where the focus comes back): the face's edge ratio R (see _focus_r: about 1.0 for a face blurred past help, 1.3 and more for a sharp one) goes
+                       # through smoothstep(lo, hi, R): 0 = the person is not worked on in that picture at all (no masks, no retouch), 1 = as without the gate. The values of the
+                       # frames t - 1 .. t + 1 are averaged, so the retouch fades in and out over a few frames
+FOCUS_MIN_WF = 24.0    # face width in proxy px below which the focus cannot be judged: the person is kept (weight 1)
+FOCUS_SIG = (0.005, 0.015)    # the two scales of the edge ratio (fine, coarse) of the face width, never under (0.4, 1.2) px
+
+
+def _edge_ratio(Y: np.ndarray, mask: np.ndarray, s1: float, s3: float, top: float = 0.05) -> Optional[float]:
+    """Median of (gradient at scale s1) / (gradient at scale s3) over the pixels of mask where the coarse gradient is among the strongest `top` share: a sharp step gives s3/s1 (3 for a
+    ratio of 3), the same step blurred by more than s3 gives about 1. Grain does not move it: it is read on the strongest edges only."""
+    def grad(s):
+        b = cv2.GaussianBlur(Y, (0, 0), s)
+        gx = cv2.Sobel(b, cv2.CV_32F, 1, 0, ksize=3) * 0.125
+        gy = cv2.Sobel(b, cv2.CV_32F, 0, 1, ksize=3) * 0.125
+        return np.hypot(gx, gy)
+    g1, g3 = grad(s1), grad(s3)
+    v3 = g3[mask > 0]
+    if v3.size < 200:
+        return None
+    thr = np.percentile(v3, 100.0 * (1.0 - top))
+    sel = (mask > 0) & (g3 >= thr) & (g3 > 1e-4)
+    if int(sel.sum()) < 30:
+        return None
+    return float(np.median(g1[sel] / g3[sel]))
+
+
+def _focus_r(px, lm: np.ndarray, t: int) -> Optional[float]:
+    """How sharp this face is on frame t: the edge ratio on the face's own outline area (its strongest edges: eyes, brows, lips, hair line). None where it cannot be told."""
+    try:
+        pts = np.asarray(lm[:, :2], np.float32)
+        if not np.isfinite(pts).all():
+            return None
+        wf = float(np.hypot(*(pts[16] - pts[0])))
+        if wf < FOCUS_MIN_WF:
+            return None
+        rgb = np.asarray(px.frame(t))
+        h, w = rgb.shape[:2]
+        x0 = int(max(0, pts[:, 0].min() - 4)); x1 = int(min(w, pts[:, 0].max() + 5))
+        y0 = int(max(0, pts[:, 1].min() - 0.25 * wf)); y1 = int(min(h, pts[:, 1].max() + 5))
+        if x1 - x0 < 16 or y1 - y0 < 16:
+            return None
+        Y = (0.299 * rgb[y0:y1, x0:x1, 0] + 0.587 * rgb[y0:y1, x0:x1, 1] + 0.114 * rgb[y0:y1, x0:x1, 2]).astype(np.float32) / 255.0
+        m = np.zeros(Y.shape, np.uint8)
+        outline = np.concatenate([pts[0:17], pts[26:16:-1]]) - np.array([x0, y0], np.float32)
+        cv2.fillPoly(m, [np.round(outline).astype(np.int32)], 1)
+        return _edge_ratio(Y, m, max(0.4, FOCUS_SIG[0] * wf), max(1.2, FOCUS_SIG[1] * wf))
+    except Exception:
+        return None
+
+
+def _focus_w(tracker, st, p: int, t: int, px) -> float:
+    """0..1: the share of the retouch this person gets on frame t by how sharp its face is (FOCUS_GATE). 1 where the gate is off or the focus cannot be judged."""
+    if FOCUS_GATE is None:
+        return 1.0
+    try:
+        cache = tracker.__dict__.setdefault("_focus_cache", {})
+        key0 = id(st)
+
+        def r(s):
+            k_ = (key0, p, s)
+            if k_ not in cache:
+                v = None
+                if 0 <= s < st.final.shape[1] and st.present[p, s] and np.isfinite(st.face[p, s, :, :2]).all():
+                    lm_ = st.face[p, s].copy()
+                    lm_[:, 0] *= px.sx
+                    lm_[:, 1] *= px.sy
+                    v = _focus_r(px, lm_, s)
+                cache[k_] = v
+            return cache[k_]
+        if len(cache) > 6000:
+            cache.clear()
+        vals = [r(s) for s in (t - 1, t, t + 1) if (hasattr(st, "connected") and st.connected(s, t)) or s == t]
+        vals = [x for x in vals if x is not None]
+        if not vals:
+            return 1.0
+        x = (float(np.mean(vals)) - float(FOCUS_GATE[0])) / max(1e-6, float(FOCUS_GATE[1]) - float(FOCUS_GATE[0]))
+        x = float(np.clip(x, 0.0, 1.0))
+        return x * x * (3.0 - 2.0 * x)
+    except Exception:
+        return 1.0
+
+
 def _parse_visible(tracker, pid: int, t: int, face: np.ndarray, px) -> float:
     """0..1: how plainly this face shows on frame t going by the face parser (its skin inside the face outline)."""
     try:
@@ -2742,6 +2826,13 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
         v = {k: pp.amount(k, t) / 100.0 for k in RETOUCH_KEYS}
         if only is not None:
             v["skin"] = max(v["skin"], 0.5)
+        elif FOCUS_GATE is not None and st.has_face:
+            # a person out of focus is not worked on (FOCUS_GATE); the retouch comes in again with the focus
+            fg_ = _focus_w(tracker, st, p, t, px)
+            if fg_ < 0.999:
+                if fg_ <= 0.01:
+                    return None, bdet_here
+                v = {k: x * fg_ for k, x in v.items()}
         if not any(abs(x) > 1e-4 for x in v.values()):
             return None, bdet_here
         face = None
@@ -4812,6 +4903,101 @@ PAINT_HUE = (40.0, 65.0)    # degrees of hue away from the skin at which colour 
 FS_FOREHEAD = True
 
 
+
+FOLD_TRUST = 0.0       # the stages made for close-ups that lift a wide area (broad lift, levelling) need the nose's landmarks to lie as a nose's do (_nose_plausible); where they do not (a head
+                       # rolled on its side, a turned or covered face, 2611 IWALY c025 f89 / 01:36:10, user: "마스크 경계가 너무 잘 보여, 주변에 어두워진 라인") the band they work in is not where the
+                       # crease is, and they lifted a crescent of the cheek by 10 %. This share of them is kept there (0 = off for such a face; the thin valley fill stays)
+FOLD_TOTAL_CAP = (0.04, 0.03)   # most the nasolabial / mouth-line stages together may lift / darken the luma of one picture (display luma): the user's references change a crease by +2.4..5 % and its
+                                # rim by -1.7..2.8 %, never by 10 %. Soft (c tanh(d / c)), so a plateau has no edge. None = off
+
+
+def _naso_trust(face, wf: float, scale: float) -> float:
+    """1 where the nose's landmarks lie as a nose's do (the nasolabial band is where the crease is), FOLD_TRUST where they do not."""
+    try:
+        if face is None:
+            return 1.0
+        L = np.asarray(face, np.float64)[:, :2] * float(scale)
+        return 1.0 if _nose_plausible(L, wf) else float(np.clip(FOLD_TRUST, 0.0, 1.0))
+    except Exception:
+        return 1.0
+
+
+FOLD_PRESENT = None    # (lo, hi) or None (= off): 2611 IWALY c027 (2026-11-23, user: "c027과 같은 컷들은 팔자주름이 없다고 인지하는게 맞아", the reference changes the nose and mouth area by 0.2 % only, ours lifted
+                       # 1 % beside the nose): a face with no crease from the nose's wing to the mouth's corner gets no 팔자주름 work. The crease's depth (relative, across the line, read from the picture:
+                       # the luma on the line against the mean of the two flanks) below lo: none of it; from hi: all of it
+
+
+def _naso_presence(Y: np.ndarray, lm, wf: float) -> float:
+    """0..1: how far a nasolabial crease is there (FOLD_PRESENT). Y: luma at the picture's resolution, lm: the landmarks at the same resolution, wf: the face's width. 1 where it cannot be judged."""
+    if FOLD_PRESENT is None or lm is None:
+        return 1.0
+    try:
+        L = np.asarray(lm, np.float64)[:, :2]
+        if L.shape[0] < 68 or not np.isfinite(L[[31, 33, 35, 48, 54]]).all() or not _nose_plausible(L, wf):
+            return 1.0
+        pad = int(0.35 * wf) + 4
+        x0, x1 = max(0, int(L[27:55, 0].min()) - pad), min(Y.shape[1], int(L[27:55, 0].max()) + pad)
+        y0, y1 = max(0, int(L[27:55, 1].min()) - pad), min(Y.shape[0], int(L[27:55, 1].max()) + pad)
+        if x1 - x0 < 8 or y1 - y0 < 8:
+            return 1.0
+        S = cv2.GaussianBlur(Y[y0:y1, x0:x1].astype(np.float32), (0, 0), max(1.0, 0.008 * wf))
+        Lc = L - [x0, y0]
+
+        def smp(px, py):
+            return cv2.remap(S, px.astype(np.float32), py.astype(np.float32), cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        ts = np.linspace(0.25, 0.92, 14)
+        vals = []
+        for wing, corner in ((31, 48), (35, 54)):
+            a, d = Lc[wing], Lc[corner] - Lc[wing]
+            ln = float(np.linalg.norm(d))
+            if ln < 0.08 * wf or ln > 0.6 * wf:
+                continue
+            d = d / ln
+            n = np.array([-d[1], d[0]])
+            if float(np.dot(Lc[33] - a, n)) > 0:
+                n = -n
+            px, py = a[0] + ts * ln * d[0], a[1] + ts * ln * d[1]
+            g = 0.045 * wf
+            best = None
+            for o in (-0.01, 0.01, 0.03, 0.05, 0.07):
+                c = smp(px + o * wf * n[0], py + o * wf * n[1])
+                f1 = smp(px + (o * wf + g) * n[0], py + (o * wf + g) * n[1])
+                f2 = smp(px + (o * wf - g) * n[0], py + (o * wf - g) * n[1])
+                fm = 0.5 * (f1 + f2)
+                rel = ((fm - c) / (fm + 0.02)).reshape(-1)
+                best = rel if best is None else np.maximum(best, rel)
+            vals.append(float(np.quantile(best, 0.6)))
+        if not vals:
+            return 1.0
+        val = max(vals)
+        pres = float(_ss(FOLD_PRESENT[0], FOLD_PRESENT[1], np.array(val)))
+        import os as _os_p
+        if _os_p.environ.get("IWALY_PRES_DEBUG"):
+            print("PRES wf=%.0f sides=%s val=%.4f pres=%.3f" % (wf, [round(x, 4) for x in vals], val, pres), flush=True)
+        return pres
+    except Exception:
+        return 1.0
+
+
+def _naso_pres_job(job, Y: np.ndarray, wf: float, scale: float) -> float:
+    """The job's crease presence, measured once per frame and kept on the job."""
+    pj = getattr(job, "naso_pres", None)
+    if pj is None:
+        pj = 1.0
+        if FOLD_PRESENT is not None and job.face is not None:
+            pj = _naso_presence(Y, np.asarray(job.face, np.float64) * float(scale), wf)
+        try:
+            job.naso_pres = pj
+        except Exception:
+            pass
+    return float(pj)
+
+
+def _soft_cap(d: np.ndarray, up: float, dn: float) -> np.ndarray:
+    """c tanh(d / c) on each side: slope 1 for small changes, never more than up above / dn below."""
+    up, dn = max(1e-4, float(up)), max(1e-4, float(dn))
+    return np.where(d >= 0, up * np.tanh(d / up), -dn * np.tanh(-d / dn)).astype(d.dtype)
+
 def _fs_forehead(lm: np.ndarray, shape, scale: float, wf: float) -> Optional[np.ndarray]:
     """The band of forehead just above the brows (from a fifth of the face width above them down to the brows),
     inside the face outline and away from its edge, brows out. 0..1 at `shape`."""
@@ -6425,6 +6611,8 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
             if FOLD_HEAL > 1e-4 and lmY is not None and job.wf_src > 0 and "naso" in job.masks:
                 # a small face's crease, healed (after the nose's give-back: the top of the crease lies inside the nose's area)
                 kh_ = float(np.clip(FOLD_HEAL, 0, 1)) * float(np.clip(job.v.get("nasolabial", 0.0), 0, 1)) * (1.0 - _face_big(job.face, wf, y_per_src))
+                if kh_ > 1e-4 and FOLD_PRESENT is not None:
+                    kh_ *= _naso_pres_job(job, Y0, wf, y_per_src)
                 if kh_ > 1e-4:
                     kh_ *= 1.0 - (1.0 - MOUTH_OPEN_KEEP) * mouth_open(job.face)
                     Y, Cb, Cr = _fold_heal(Y, Cb, Cr, Y0, M(job.masks["naso"], (hY, wY)), lmY, wf, kh_)
@@ -6816,6 +7004,10 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                 k = float(np.clip(v[key], 0, 1))
                 if job.face is not None:
                     k *= 1.0 - (1.0 - MOUTH_OPEN_KEEP) * mouth_open(job.face)
+                if key == "nasolabial" and FOLD_PRESENT is not None:
+                    k *= _naso_pres_job(job, Y, wf, y_per_src)       # no crease on this face (c027): none of the nasolabial work
+                    if k < 1e-4:
+                        continue
                 band = M(job.masks[name], (hY, wY))
                 # the fold where it really is in the (wide) search band, plus a little of the band itself
                 found = _fold_find(Y, band, wf, max(1.5, fw_ * wf))
@@ -6848,10 +7040,11 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                         mY = mY * nh_
                 if he_ is not None:
                     mY = mY * (1.0 - he_)
+                Y_fb_ = Y if FOLD_TOTAL_CAP else None            # (the luma before this key's fold stages: their total change is capped below, FOLD_TOTAL_CAP)
                 Y = _fold_fill(Y, mY, exY, 0.95 * k, max(0.8, sf * wf), max(2.0, ss * wf), True,
                                valley=max(1.5, 1.6 * fw_ * wf))
                 fcf_ = NASO_FOLD if (key == "nasolabial" and NASO_FOLD) else {}
-                big_ = _face_big(job.face, wf, y_per_src)          # (a small face: the valley fill alone, FOLD_SIZE)
+                big_ = _face_big(job.face, wf, y_per_src) * _naso_trust(job.face, wf, y_per_src)   # (a small face: the valley fill alone, FOLD_SIZE; nose landmarks out of order: the same, FOLD_TRUST)
                 fb_ = fcf_.get("broad", FOLD_BROAD) * big_
                 fl_ = fcf_.get("level", FOLD_LEVEL) * big_
                 if fb_ > 1e-4:
@@ -6867,6 +7060,8 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                         mb_ = mb_ * nh_
                     Y = _fold_level(Y, mb_, M(job.masks["skin"], (hY, wY)), exY, wf, fl_ * k, he_,
                                     fcf_.get("excl"), fcf_.get("edge"), fcf_.get("cap"))
+                if Y_fb_ is not None:
+                    Y = Y_fb_ + _soft_cap(Y - Y_fb_, FOLD_TOTAL_CAP[0], FOLD_TOTAL_CAP[1])
                 mC = M(mY, (hC, wC))
                 Cb = _fold_fill(Cb, mC, exC, 0.7 * k, max(0.8, sf * wf * cs), max(1.5, ss * wf * cs), False)
                 Cr = _fold_fill(Cr, mC, exC, 0.7 * k, max(0.8, sf * wf * cs), max(1.5, ss * wf * cs), False)
