@@ -1762,18 +1762,32 @@ def _steady(cut, tracker, st, rf: RetouchFrame, cache) -> RetouchFrame:
         k_names = 1                             # (PREP_THREADS 1: everything one after the other, as it was)
     px = tracker.proxy
     k = np.array([px.sx, px.sy])
+    chk = bool(STEADY_BOX) and _STEADY_CHECKED[0] < int(STEADY_BOX_CHECK)
+    if chk:
+        _STEADY_CHECKED[0] += 1
     with _tm("steady.faces"):
         if n_thr > 1:
             from concurrent.futures import ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=n_thr, thread_name_prefix="steady") as ex:
-                list(ex.map(lambda j_: _steady_face(k, st, j_, t, N, raws, k_names), faces))
+                list(ex.map(lambda j_: _steady_face(k, st, j_, t, N, raws, k_names, chk), faces))
         else:
             for j in faces:
-                _steady_face(k, st, j, t, N, raws, k_names)
+                _steady_face(k, st, j, t, N, raws, k_names, chk)
     return rf
 
 
 STEADY_BOX = True      # the steadying of a mask worked on the part of the frame its frames can be other than 0 in (False: on the whole frame, as it was)
+STEADY_BOX_CHECK = 4   # the first frames steadied in a process are worked both ways and compared (the whole frame's result is used for them); a
+                       # difference is printed and switches the box off for the rest of the process
+_STEADY_CHECKED = [0]
+
+
+def _steady_box_off(what: str) -> None:
+    global STEADY_BOX
+    if STEADY_BOX:
+        STEADY_BOX = False
+        print("STEADY BOX MISMATCH: the steadying on the masks' own part of the frame gave another result than on the whole frame (%s); "
+              "the whole frame is used from here on" % what, flush=True)
 
 
 def _pm_box(v):
@@ -1829,7 +1843,7 @@ def _steady_asks(st, j, t: int, N: int) -> List[int]:
     return out
 
 
-def _steady_face(k, st, j, t: int, N: int, raws: dict, name_threads: int = 1) -> None:
+def _steady_face(k, st, j, t: int, N: int, raws: dict, name_threads: int = 1, check: bool = False) -> None:
     """One person's face masks (and score maps) of frame t held steady with that person's masks of the frames round it (raws: those frames). The
     masks are worked through one name at a time (a neighbour's mask is carried here, used and let go), not all the names of all the frames at once:
     the same numbers with a few dozen MB in hand instead of more than a GB a person. k: the analysis picture's scale (sx, sy)."""
@@ -1895,58 +1909,71 @@ def _steady_face(k, st, j, t: int, N: int, raws: dict, name_threads: int = 1) ->
                 elif bs_ is not None:
                     bw_ = _box_carried(bs_, A, shp)
                     box = False if bw_ is False else (box if bw_ is None else (bw_ if box is None else _box_union(box, bw_)))
-        if robust and box is not False:
-            # Every frame is 0 outside `box` (a kept mask is the box of its non-zero part: _raw_keep; a carried one lies within that box carried
-            # along), so all of this is worked there and not on the whole frame (it was 14 s of the threads' time a frame with six people); what
-            # comes out is 0 outside the part worked on, as it was (the veto leaves 0 where the mask is not negative: asked below)
+
+        def in_box():
+            """Every frame is 0 outside `box` (a kept mask is the box of its non-zero part: _raw_keep; a carried one lies within that box carried
+            along), so all of this is worked there and not on the whole frame (it was 14 s of the threads' time a frame with six people); what
+            comes out is 0 outside the part worked on, as it was (the veto leaves 0 where the mask is not negative: asked here). None: not this way."""
             out = np.zeros(shp, np.float32)
             if box is None:
                 return out
             ry0, ry1, rx0, rx1 = box
-            neg = v_ is not None and not bool((o_[ry0:ry1, rx0:rx1] >= 0).all())
-            if not neg:
-                any_ = np.zeros((ry1 - ry0, rx1 - rx0), bool)
-                for ms in fr:
-                    any_ |= ms[ry0:ry1, rx0:rx1] > 0.004
-                ys, xs = np.nonzero(any_.any(1))[0], np.nonzero(any_.any(0))[0]
-                if not (len(ys) and len(xs)):
-                    return out
-                y0, y1, x0, x1 = ry0 + int(ys[0]), ry0 + int(ys[-1]) + 1, rx0 + int(xs[0]), rx0 + int(xs[-1]) + 1
-                stk = np.stack([ms[y0:y1, x0:x1] for ms in fr])
-                med = np.median(stk, axis=0)
-                stk = np.clip(stk, med - STEADY_WIN, med + STEADY_WIN)
-                wv = np.array(wts, np.float32)[:, None, None]
-                a_c = (stk * wv).sum(0)
-                if v_ is not None:
-                    # where this frame sees no skin, a neighbour's mask may not hold more than this frame's own
-                    o_c = o_[y0:y1, x0:x1]
-                    avg = a_c / wsum
-                    a_c = (o_c + (avg - o_c).clip(None, 0) + (avg - o_c).clip(0, None) * v_[y0:y1, x0:x1]) * wsum
-                out[y0:y1, x0:x1] = (a_c / wsum).astype(np.float32)
-                return out
-        if robust:
-            # only where any of the frames has something: the median of five full masks is slow
-            any_ = np.zeros(shp, bool)
+            if v_ is not None and not bool((o_[ry0:ry1, rx0:rx1] >= 0).all()):
+                return None
+            any_ = np.zeros((ry1 - ry0, rx1 - rx0), bool)
             for ms in fr:
-                any_ |= ms > 0.004
+                any_ |= ms[ry0:ry1, rx0:rx1] > 0.004
             ys, xs = np.nonzero(any_.any(1))[0], np.nonzero(any_.any(0))[0]
-            a_ = np.zeros(shp, np.float32)
-            if len(ys) and len(xs):
-                y0, y1, x0, x1 = int(ys[0]), int(ys[-1]) + 1, int(xs[0]), int(xs[-1]) + 1
-                stk = np.stack([ms[y0:y1, x0:x1] for ms in fr])
-                med = np.median(stk, axis=0)
-                stk = np.clip(stk, med - STEADY_WIN, med + STEADY_WIN)
-                wv = np.array(wts, np.float32)[:, None, None]
-                a_[y0:y1, x0:x1] = (stk * wv).sum(0)
-        else:
-            a_ = np.zeros(shp, np.float32)
-            for w, ms in zip(wts, fr):
-                a_ += w * ms
-        if v_ is not None:
-            # where this frame sees no skin, a neighbour's mask may not hold more than this frame's own
-            avg = a_ / wsum
-            a_ = (o_ + (avg - o_).clip(None, 0) + (avg - o_).clip(0, None) * v_) * wsum
-        return (a_ / wsum).astype(np.float32)
+            if not (len(ys) and len(xs)):
+                return out
+            y0, y1, x0, x1 = ry0 + int(ys[0]), ry0 + int(ys[-1]) + 1, rx0 + int(xs[0]), rx0 + int(xs[-1]) + 1
+            stk = np.stack([ms[y0:y1, x0:x1] for ms in fr])
+            med = np.median(stk, axis=0)
+            stk = np.clip(stk, med - STEADY_WIN, med + STEADY_WIN)
+            wv = np.array(wts, np.float32)[:, None, None]
+            a_c = (stk * wv).sum(0)
+            if v_ is not None:
+                # where this frame sees no skin, a neighbour's mask may not hold more than this frame's own
+                o_c = o_[y0:y1, x0:x1]
+                avg = a_c / wsum
+                a_c = (o_c + (avg - o_c).clip(None, 0) + (avg - o_c).clip(0, None) * v_[y0:y1, x0:x1]) * wsum
+            out[y0:y1, x0:x1] = (a_c / wsum).astype(np.float32)
+            return out
+
+        def whole():
+            if robust:
+                # only where any of the frames has something: the median of five full masks is slow
+                any_ = np.zeros(shp, bool)
+                for ms in fr:
+                    any_ |= ms > 0.004
+                ys, xs = np.nonzero(any_.any(1))[0], np.nonzero(any_.any(0))[0]
+                a_ = np.zeros(shp, np.float32)
+                if len(ys) and len(xs):
+                    y0, y1, x0, x1 = int(ys[0]), int(ys[-1]) + 1, int(xs[0]), int(xs[-1]) + 1
+                    stk = np.stack([ms[y0:y1, x0:x1] for ms in fr])
+                    med = np.median(stk, axis=0)
+                    stk = np.clip(stk, med - STEADY_WIN, med + STEADY_WIN)
+                    wv = np.array(wts, np.float32)[:, None, None]
+                    a_[y0:y1, x0:x1] = (stk * wv).sum(0)
+            else:
+                a_ = np.zeros(shp, np.float32)
+                for w, ms in zip(wts, fr):
+                    a_ += w * ms
+            if v_ is not None:
+                # where this frame sees no skin, a neighbour's mask may not hold more than this frame's own
+                avg = a_ / wsum
+                a_ = (o_ + (avg - o_).clip(None, 0) + (avg - o_).clip(0, None) * v_) * wsum
+            return (a_ / wsum).astype(np.float32)
+
+        got = in_box() if (robust and box is not False) else None
+        if got is not None and not check:
+            return got
+        full = whole()
+        if got is not None and not (got.dtype == full.dtype and got.shape == full.shape and np.array_equal(got, full)):
+            # (the first frames of a run are worked both ways: STEADY_BOX_CHECK. They never differed; if they do, the whole frame is what counts and
+            # the box is not used again in this process)
+            _steady_box_off("mask %s of person %s on frame %d" % (n, getattr(j, "pid", "?"), t))
+        return full
 
     # (a mask is steadied from the masks of its own name alone: the names of a person side by side as well, when there are threads to spare)
     k_thr = max(1, min(len(names), int(name_threads)))
