@@ -1575,6 +1575,7 @@ FOCUS_GATE = None      # (lo, hi) or None (= off). 2611 IWALY c025 (2026-11-23, 
                        # frames t - 1 .. t + 1 are averaged, so the retouch fades in and out over a few frames
 FOCUS_BIG = (150.0, 1.08, 1.16)   # (face width in proxy px from which, lower, upper end) of the gate on the ratio at the fixed scales 0.8 / 2.4 px: c037 front dancer (blurred) 1.06..1.13, sharp big faces 1.16 and more (c025 front 1.16..1.45, c006 1.12..1.46; c006 f102's arm in front of a face: 1.06). None = the face-width scales for every size
 FOCUS_MIN_WF = 24.0    # face width in proxy px below which the focus cannot be judged: the person is kept (weight 1)
+FOCUS_TAKEBACK = (0.10, 0.06)    # an out-of-focus face gets its retouch taken back by (1 - focus_w): the face outline grown by this x wf, feathered by this x wf
 FOCUS_SIG = (0.005, 0.015)    # the two scales of the edge ratio (fine, coarse) of the face width, never under (0.4, 1.2) px
 
 
@@ -6683,6 +6684,11 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
             m = m.astype(np.float32)        # OpenCV 5 cannot resize float16 / float64 / bool masks (cut 055 armpit, 2026-11-14)
         return cv2.resize(m, (shape[1], shape[0]), interpolation=cv2.INTER_LINEAR)
 
+    # out-of-focus faces: whatever the stages did inside the face is taken back by (1 - focus_w) at the very end (the sliders are scaled too, but
+    # the stages that do not depend on them, and the final pass, still left a blob on the cheek and a band at the jaw: c037 f6)
+    fj_ = [j for j in rf.jobs if float(getattr(j, "focus_w", 1.0)) < 0.999 and j.face is not None and j.wf_src > 0]
+    dY0_ = src["dY"].copy() if (fj_ and src is not None and "dY" in src) else None
+
     for job in rf.jobs:
         v = job.v
         wf = job.wf_src * y_per_src if job.wf_src > 0 else 0.11 * max(job.scale, 200.0) * y_per_src
@@ -7357,6 +7363,27 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                             nc = _grain((c1 - c0, d1 - d0), sizec * 1.3, seed + 7 + ci)
                             Cx[c0:c1, d0:d1] += mC[c0:c1, d0:d1] * nc * (0.016 * cg)
     Y, Cb, Cr = _final_pass(Y, Cb, Cr, Y_in, Cb_in, Cr_in, rf, y_per_src, M)
+    for j_ in fj_:
+        try:
+            wf_ = j_.wf_src * y_per_src
+            lm_ = np.asarray(j_.face, np.float32)[:, :2] * y_per_src
+            if not np.isfinite(lm_[0:27]).all():
+                continue
+            hl_ = np.zeros((hY, wY), np.uint8)
+            cv2.fillConvexPoly(hl_, cv2.convexHull(np.round(lm_[0:27]).astype(np.int32)), 255)
+            rd_ = max(1, int(round(FOCUS_TAKEBACK[0] * wf_)))
+            hl_ = cv2.dilate(hl_, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rd_ + 1, 2 * rd_ + 1)))
+            R_ = cv2.GaussianBlur(hl_.astype(np.float32) / 255.0, (0, 0), max(1.0, FOCUS_TAKEBACK[1] * wf_))
+            k_ = R_ * float(1.0 - np.clip(j_.focus_w, 0.0, 1.0))
+            Y = Y + k_ * (Y_in - Y)
+            kC_ = M(k_, (hC, wC))
+            Cb = Cb + kC_ * (Cb_in - Cb)
+            Cr = Cr + kC_ * (Cr_in - Cr)
+            if dY0_ is not None and src["dY"].shape == k_.shape:
+                src["dY"] = src["dY"] + k_ * (dY0_ - src["dY"])
+        except Exception:
+            import traceback
+            traceback.print_exc()
     return Y, Cb, Cr
 
 
