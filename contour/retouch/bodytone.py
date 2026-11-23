@@ -1341,8 +1341,146 @@ def knee_fold(Y, Cb, Cr, skin, visible, knees, k, gains=None):
         result = (Y + dall).astype(np.float32)
     return result, Cb, Cr
 
+# ---- knee clean (v4, 11/24 IWALY c016 feedback): the knee evened for sure, not by what a ring of leg round it says
+# The tone (v2/v3) read the leg's colour from a ring round the knee and changed the knee only as far as that ring could be trusted:
+# a raised leg (the knee near the shorts, the ring on cloth) switched it off for twelve frames (c016 P2 f77..f88), and a bruise
+# that was not an outlier of the knee's own colour was left (purple patches all over the knee). v4 works like a frequency
+# separation on the knee's own skin: what is finer than the grain (K4_FINE) and broader than the leg's shading (K4_MID) stays, the
+# band between (blotches, bruises, mottling) is evened; the broad purple of a bruise is turned back to the leg's skin hue (across
+# the skin-tone axis only: the warmth is kept, nothing turns grey). Every weight is smooth (no threshold, no edge), the strength
+# follows only how much of the knee this person owns (another leg in front), and slider 70 is the full correction (KNEE_GAIN).
+KNEE_V4 = True
+KNEE_GAIN = 1.0 / 0.7       # the slider (0..1) times this, at most 1: 70 = full, a user's lower keyframes keep their share
+K4_ALONG, K4_ACROSS = 1.6, 1.3   # the knee's zone: semi axes in half widths of the leg (along it, across it)
+K4_EDGE = (0.55, 1.0)       # elliptical radius over which the zone falls from full to nothing
+K4_FINE = 0.06              # of a half width (at least 1.2 px): finer is grain, pores, fine hair: never changed
+K4_MID = 0.55               # of a half width: broader is the leg's shading and the knee's form: kept
+K4_DARK_KEEP = 0.06         # of the band's darker part (a bruise, a blotch): this share stays
+K4_LIGHT_KEEP = 0.55        # of the band's lighter part (the cap's highlight): this share stays
+K4_CHROMA_KEEP = 0.05       # of the band's colour (red, purple patches): this share stays
+K4_HUE_PULL = 0.85          # of the broad hue offset across the skin axis (the purple of a large bruise): taken back
+K4_CAP = {"luma": 0.06, "chroma": 0.016}
+K4_FEATHER = 0.55           # of a half width: the ramp inward from every edge of the skin it may touch (sock, shorts, another leg)
+K4_SAT_FLOOR = 0.97
+
+
+def _nblur(X, S, sig):
+    den = cv2.GaussianBlur(S, (0, 0), sig)
+    return cv2.GaussianBlur(X * S, (0, 0), sig) / np.maximum(den, 1e-4), den
+
+
+def knee_clean(Y, Cb, Cr, skin, owner, knees, k, cs: float = 1.0, gains=None):
+    """The knee's blotches and bruises evened on this person's own skin (KNEE_V4). skin, owner: 0..1 on Y's grid (owner None: all).
+    knees: [((cx, cy), axis, half)] in Y's pixels. gains: [0..1] per knee (look ahead on ownership) or None. -> (Y, Cb, Cr)."""
+    k = float(np.clip(float(k) * KNEE_GAIN, 0.0, 1.0))
+    if k < 1e-4:
+        return Y, Cb, Cr
+    hY, wY = Y.shape
+    hC, wC = Cb.shape
+    sub = (hC, wC) != (hY, wY)
+    dY = dCb = dCr = None
+    for ki, (centre, axis, half) in enumerate(knees):
+        half = float(half)
+        if not (half > 2.0) or not np.isfinite([centre[0], centre[1], axis[0], axis[1], half]).all():
+            continue
+        gain = 1.0
+        if gains is not None and ki < len(gains) and gains[ki] is not None:
+            gain = float(np.clip(gains[ki], 0.0, 1.0))
+        if gain < 1e-3:
+            continue
+        R = int(3.0 * half) + 10
+        x0, x1 = max(0, int(centre[0]) - R), min(wY, int(centre[0]) + R + 1)
+        y0, y1 = max(0, int(centre[1]) - R), min(hY, int(centre[1]) + R + 1)
+        if x1 - x0 < 12 or y1 - y0 < 12:
+            continue
+        yy, xx = np.mgrid[y0:y1, x0:x1].astype(np.float32)
+        nrm = max(float(np.hypot(axis[0], axis[1])), 1e-6)
+        ax, ay = axis[0] / nrm, axis[1] / nrm
+        dx, dy_ = xx - float(centre[0]), yy - float(centre[1])
+        e = np.sqrt(((dx * ax + dy_ * ay) / (K4_ALONG * half)) ** 2 + ((-dx * ay + dy_ * ax) / (K4_ACROSS * half)) ** 2)
+        zone = (1.0 - _ss(K4_EDGE[0], K4_EDGE[1], e)).astype(np.float32)
+        Yr = Y[y0:y1, x0:x1].astype(np.float32)
+        if skin is not None:
+            S = np.clip(skin[y0:y1, x0:x1], 0, 1).astype(np.float32)
+        else:
+            cbr = (Cb if not sub else cv2.resize(Cb, (wY, hY), interpolation=cv2.INTER_LINEAR))[y0:y1, x0:x1]
+            crr = (Cr if not sub else cv2.resize(Cr, (wY, hY), interpolation=cv2.INTER_LINEAR))[y0:y1, x0:x1]
+            S = local_zone_skin(Yr, cbr, crr, zone)
+            if S is None:
+                continue
+            S = np.clip(S, 0, 1).astype(np.float32)
+        if owner is not None:
+            S = S * np.clip(owner[y0:y1, x0:x1], 0, 1).astype(np.float32)
+        if float((S * zone).sum()) < 50.0:
+            continue
+        # (never cloth: a black sock, shorts or trousers that a skin area takes in are far darker than the knee's skin)
+        core = (S * zone) > 0.5
+        if int(core.sum()) >= 30:
+            yk = float(np.median(Yr[core]))
+            S = S * _ss(0.35, 0.6, Yr / max(yk, 1e-4)).astype(np.float32)
+            if float((S * zone).sum()) < 50.0:
+                continue
+        # the weight: the zone, faded in from every edge of the skin (nothing that ends in a line)
+        rad = max(2.0, K4_FEATHER * half)
+        inside = cv2.distanceTransform((S > 0.5).astype(np.uint8), cv2.DIST_L2, 5)
+        ramp = cv2.GaussianBlur(_ss(0.0, rad, inside).astype(np.float32), (0, 0), max(0.8, 0.3 * rad))
+        Wt = (zone * ramp * S * (k * gain)).astype(np.float32)
+        if float(Wt.max()) < 0.01:
+            continue
+        s1, s2 = max(1.2, K4_FINE * half), max(4.0, K4_MID * half)
+        y1_, _ = _nblur(Yr, S, s1)
+        y2_, _ = _nblur(Yr, S, s2)
+        mid = y1_ - y2_
+        d = -np.where(mid < 0, (1.0 - K4_DARK_KEEP) * mid, (1.0 - K4_LIGHT_KEEP) * mid).astype(np.float32)
+        d = _soft_cap(d, K4_CAP["luma"]) * Wt
+        full = np.zeros((hY, wY), np.float32)
+        full[y0:y1, x0:x1] = d
+        dY = _merge(dY, full)
+        # colour, on the chroma planes' grid
+        if sub:
+            sx, sy = wC / float(wY), hC / float(hY)
+            c0, c1, r0, r1 = int(x0 * sx), max(int(x0 * sx) + 2, int(np.ceil(x1 * sx))), int(y0 * sy), max(int(y0 * sy) + 2, int(np.ceil(y1 * sy)))
+            c1, r1 = min(c1, wC), min(r1, hC)
+            Sc = cv2.resize(S, (c1 - c0, r1 - r0), interpolation=cv2.INTER_AREA)
+            Wc = cv2.resize(Wt, (c1 - c0, r1 - r0), interpolation=cv2.INTER_AREA)
+            hc = half * 0.5 * (sx + sy)
+        else:
+            c0, c1, r0, r1, Sc, Wc, hc = x0, x1, y0, y1, S, Wt, half
+        B = [P[r0:r1, c0:c1].astype(np.float32) for P in (Cb, Cr)]
+        t1, t2 = max(1.2, K4_FINE * hc), max(4.0, K4_MID * hc)
+        lo1 = [_nblur(b, Sc, t1)[0] for b in B]
+        lo2 = [_nblur(b, Sc, t2)[0] for b in B]
+        # the leg's skin hue round the knee (a wide, skin weighted mean): the broad purple is what lies across it
+        wide = [_nblur(b, Sc, max(6.0, 1.6 * hc))[0] for b in B]
+        ln = np.maximum(np.hypot(wide[0], wide[1]), 1e-6)
+        u0, u1 = wide[0] / ln, wide[1] / ln
+        perp = -lo2[0] * u1 + lo2[1] * u0
+        tgt = [lo1[i] - (1.0 - K4_CHROMA_KEEP) * (lo1[i] - lo2[i]) for i in range(2)]
+        tgt = [tgt[0] + K4_HUE_PULL * perp * u1, tgt[1] - K4_HUE_PULL * perp * u0]
+        # no grey: never less saturated than the knee's own smooth colour there
+        lt = np.hypot(tgt[0], tgt[1])
+        fl = K4_SAT_FLOOR * np.hypot(lo2[0], lo2[1])
+        sc = np.where((lt < fl) & (lt > 1e-6), fl / np.maximum(lt, 1e-6), 1.0).astype(np.float32)
+        tgt = [tgt[i] * sc for i in range(2)]
+        for i in range(2):
+            dc = _soft_cap(tgt[i] - lo1[i], K4_CAP["chroma"]) * Wc
+            full = np.zeros((hC, wC), np.float32)
+            full[r0:r1, c0:c1] = dc
+            if i == 0:
+                dCb = _merge(dCb, full)
+            else:
+                dCr = _merge(dCr, full)
+    Yo = Y if dY is None else (Y + dY).astype(np.float32)
+    Cbo = Cb if dCb is None else (Cb + dCb).astype(np.float32)
+    Cro = Cr if dCr is None else (Cr + dCr).astype(np.float32)
+    return Yo, Cbo, Cro
+
+
 def visible_knee_tone(Y, Cb, Cr, skin, ownership, knees, strength, cs, gains):
     """Keep the visible portion of each knee and feather inwards from an occluder."""
+    if KNEE_V4:
+        return knee_clean(Y, Cb, Cr, skin, None if ownership is None else np.clip(ownership, 0, 1).astype(np.float32),
+                          knees, strength, cs, gains)
     if skin is None or ownership is None:
         return Y, Cb, Cr
     owner = np.clip(ownership, 0, 1).astype(np.float32)

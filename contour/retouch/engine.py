@@ -3772,7 +3772,11 @@ def knee_probe(rf: Optional["RetouchFrame"], px) -> Dict[tuple, float]:
                 m = BS.unpack_mask(pm)
             except Exception:
                 m = None
-        sup = BTN.knee_support(m, sc, tone["knees"]) if m is not None else [1.0] * len(tone["knees"])
+        if getattr(BTN, "KNEE_V4", False):
+            # (v4: the knee is evened on its own skin; only another person in front of it ramps its strength, not the leg's ring)
+            sup = [1.0] * len(tone["knees"])
+        else:
+            sup = BTN.knee_support(m, sc, tone["knees"]) if m is not None else [1.0] * len(tone["knees"])
         vis = job.masks.get("knee_visible") if getattr(job, "masks", None) else None
         if vis is not None:
             try:
@@ -7125,7 +7129,10 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                        for (cx, cy, ax_, ay_, hf_) in job.tone["knees"]]
                 with _tm("apply.knee_tone"):
                     ownership = job.masks.get("knee_visible")
-                    if ownership is not None:
+                    if getattr(BTN, "KNEE_V4", False):
+                        Y, Cb, Cr = BTN.knee_clean(Y, Cb, Cr, regK, None if ownership is None else M(ownership, (hY, wY)),
+                                                   kn_, v["knee_tone"], cs, job.tone.get("gain"))
+                    elif ownership is not None:
                         Y, Cb, Cr = BTN.visible_knee_tone(Y, Cb, Cr, regK, M(ownership, (hY, wY)),
                                                          kn_, v["knee_tone"], cs, job.tone.get("gain"))
                     elif v.get("knee_fold", 0) <= 1e-4:
