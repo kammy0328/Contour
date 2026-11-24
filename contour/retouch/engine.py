@@ -4285,7 +4285,7 @@ class KneeLook:
                 # (11/24) a person's knees crossing (close and their distance changing fast): the knee work ramps down for it (c017 f28/29 flash)
                 try:
                     prev_ = self.__dict__.setdefault("_knees_prev", {})
-                    for j_ in (rf.jobs if rf is not None else []):
+                    for j_ in (rf.jobs if (rf is not None and getattr(BTN, "KNEE_V4", False)) else []):
                         tn_ = getattr(j_, "tone", None)
                         if not tn_ or not tn_.get("knees"):
                             continue
@@ -7683,7 +7683,8 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
         # 0c. knee tone (1.25): the knee's blotches, redness and bruise-like patches to the leg's own colour; the grain stays
         if job.tone and job.tone.get("knees") and v.get("knee_tone", 0) > 1e-4:
             try:
-                regK = knee_skin
+                mac_knee_ = bool(getattr(BTN, "KNEE_V4", False) or getattr(BTN, "KNEE_V3", False))   # (Mac IWALY knee; off: 1.25.0's knee tone)
+                regK = knee_skin if mac_knee_ else bmY
                 for nm_ in ("skinx", "neck"):
                     if regK is not None and nm_ in job.masks:      # (what the face's area holds is the face's)
                         regK = regK * (1.0 - np.clip(M(job.masks[nm_], (hY, wY)), 0, 1))
@@ -7691,7 +7692,9 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                        for (cx, cy, ax_, ay_, hf_) in job.tone["knees"]]
                 with _tm("apply.knee_tone"):
                     ownership = job.masks.get("knee_visible")
-                    if getattr(BTN, "KNEE_V4", False):
+                    if not mac_knee_:
+                        Y, Cb, Cr = BTN.knee_tone(Y, Cb, Cr, regK, kn_, float(np.clip(v["knee_tone"], 0, 1)), cs, gains=job.tone.get("gain"))
+                    elif getattr(BTN, "KNEE_V4", False):
                         Y, Cb, Cr = BTN.knee_clean(Y, Cb, Cr, regK, None if ownership is None else M(ownership, (hY, wY)),
                                                    kn_, v["knee_tone"], cs, job.tone.get("gain"))
                     elif ownership is not None:

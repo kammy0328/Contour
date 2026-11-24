@@ -44,7 +44,7 @@ MAX_CHANGE = {"luma": 0.018, "chroma": 0.02}
 #   - the knee keeps its own even tint (the mean of its skin that is not blotched) by KNEE_TINT_KEEP; only the blotches go,
 #   - no pixel comes out less saturated than the leg's skin round it (KNEE_SAT_FLOOR of the ring's chroma, hue kept),
 #   - the brightness is evened where the knee is blotched in colour or far darker than the leg's own variation, not elsewhere.
-KNEE_V3 = True
+KNEE_V3 = False
 KNEE_TINT_KEEP = 1.0      # of the knee's own even tint (non-blotched skin of its area against the ring): this share stays (the fallback target)
 KNEE_SAT_FLOOR = 0.97     # the corrected chroma is never shorter than this share of the ring's chroma (no grey patch)
 KNEE_BLOTCH = (1.6, 3.2)  # a pixel's hue offset across the skin's tone axis over the leg's spread across it: from where it is a blotch .. fully
@@ -1385,7 +1385,7 @@ def knee_fold(Y, Cb, Cr, skin, visible, knees, k, gains=None):
 # band between (blotches, bruises, mottling) is evened; the broad purple of a bruise is turned back to the leg's skin hue (across
 # the skin-tone axis only: the warmth is kept, nothing turns grey). Every weight is smooth (no threshold, no edge), the strength
 # follows only how much of the knee this person owns (another leg in front), and slider 70 is the full correction (KNEE_GAIN).
-KNEE_V4 = True
+KNEE_V4 = False
 KNEE_GAIN = 1.0 / 0.7       # the slider (0..1) times this, at most 1: 70 = full, a user's lower keyframes keep their share
 K4_ALONG, K4_ACROSS = 1.6, 1.3   # the knee's zone: semi axes in half widths of the leg (along it, across it)
 K4_EDGE = (0.55, 1.0)       # elliptical radius over which the zone falls from full to nothing
