@@ -98,6 +98,8 @@ class Job:
     body_size: float = 0.4                 # 0..1 largest spot taken by the body blemish removal
     bdet: Optional[dict] = None            # the body's spot candidates of this frame (retouch.bodyspots)
     bmarks: Optional[list] = None          # the operator's body spot marks as they lie on this frame
+    forehead_hold: Optional[float] = None  # the forehead's hold from the skin stage of this frame (SKIN_FOREHEAD_HOLD / SKIN_FOREHEAD_AUTO); None = SKIN_FOREHEAD_HOLD
+    forehead_cover: Optional[float] = None # how much of the lower forehead hair covers on this frame (SKIN_FOREHEAD_AUTO), for the record
     tone: Optional[dict] = None            # where the knees and the belly are (retouch.bodytone.person_geometry), source px
     focus_w: float = 1.0                   # the share of the retouch this person gets by the focus of its face (FOCUS_GATE), kept so prepare() can apply it again after it reads the slider values
     naso_pres: Optional[float] = None      # how far a nasolabial crease is there on this frame (FOLD_PRESENT), measured once
@@ -208,6 +210,41 @@ def _face_hair_hold(parse, cloth, lm, shape):
     return np.maximum(core, cv2.GaussianBlur(core, (0, 0), sigma))
 
 
+def _forehead_cover(parse, alpha, lm):
+    """How much of the lower forehead (FOREHEAD_BAND above the brows) is not face skin to the face parser: bangs over it. 0..1, or None
+    (no parser, no brows, or too little of the band inside the person's matte and the picture)."""
+    if parse is None or parse.get("skin") is None or lm is None:
+        return None
+    L = np.asarray(lm[:, :2], np.float64)
+    if not np.isfinite(L[[0, 8, 16, 17, 21, 22, 26, 27]]).all():
+        return None
+    sk = parse["skin"]
+    h, w = sk.shape[:2]
+    wf = float(np.hypot(*(L[16] - L[0])))
+    if wf < 8:
+        return None
+    up = L[27] - L[8]
+    up = up / max(1e-6, float(np.hypot(*up)))
+    a_, b_ = FOREHEAD_BAND
+    br = L[17:27]
+    poly = np.vstack([br + up * (a_ * wf), (br + up * (b_ * wf))[::-1]])
+    x0, y0 = np.floor(poly.min(0)).astype(int)
+    x1, y1 = np.ceil(poly.max(0)).astype(int) + 1
+    x0, y0, x1, y1 = max(0, x0), max(0, y0), min(w, x1), min(h, y1)
+    if x1 - x0 < 3 or y1 - y0 < 3:
+        return None
+    band = np.zeros((y1 - y0, x1 - x0), np.uint8)
+    cv2.fillPoly(band, [np.round(poly - [x0, y0]).astype(np.int32)], 1)
+    wgt = band.astype(np.float32)
+    if alpha is not None and alpha.shape[:2] == (h, w):
+        wgt = wgt * np.clip(alpha[y0:y1, x0:x1], 0, 1)
+    full = float(band.sum())
+    if full < 9 or float(wgt.sum()) < 0.4 * full:
+        return None
+    skin = _ss(0.3, 0.7, sk[y0:y1, x0:x1].astype(np.float32))
+    return float(1.0 - (skin * wgt).sum() / max(1e-6, float(wgt.sum())))
+
+
 def _fold_fade(mask, lm):
     """FOLD_EDGE_FADE (Mac IWALY): the fold band's mask fades in from its own edge (_feather_fold); off: the mask as it is (1.25.0)."""
     return _feather_fold(mask, lm) if FOLD_EDGE_FADE > 1e-4 else mask
@@ -247,6 +284,10 @@ GPU_MASKS = None            # (11/24) 1: the Gaussian blurs of the mask making a
 SKIN_FS_G = None            # (2611 IWALY INT, 11/24: the pebbled skin of INT_c001 / c006 / c007 / c010 stayed) the gains of the skin stage's texture bands (skin.FS_G, finest
                             # to widest), set from here so a batch's settings can carry them; None = skin.FS_G as it is. INT_c006 f90 / INT_c001 f119: (1.35, 0.70, 0.30, 0.20, 0.20, 0.45)
 SKIN_FOREHEAD_HOLD = 0.0    # 0..1: the forehead above the brows kept out of the skin stage (bangs over it: the strands flickered, INT_c005 11/24). 0 = as before
+SKIN_FOREHEAD_AUTO = None   # (lo, hi): the forehead hold follows how much of the forehead hair covers on each frame (the face parser's skin over the lower
+                            # forehead, inside the person's matte): none held under lo, all over hi (11/24 user: "앞머리가 이마 면적을 많이 차지하면 보정 의미가
+                            # 없다", INT_c005). The hold is then the larger of this and SKIN_FOREHEAD_HOLD. None = off, as before
+FOREHEAD_BAND = (0.03, 0.25)  # of the face width above the brows: the part of the forehead whose cover is measured
 SKIN_BROW_HOLD = 0.0        # of the face width: the brows grown by this are kept out of the skin stage (0 = off, as before)
 HAND_GUARD_SKIN_IN = 0.04   # of the face width: the skin stage is held off a hand only outside the face's outline moved in by this
 HAND_GUARD_FEATHER = 0.03
@@ -3896,7 +3937,19 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 except Exception:
                     import traceback
                     traceback.print_exc()
-            if SKIN_FOREHEAD_HOLD > 1e-4 and lm is not None and np.isfinite(lm[[8, 17, 21, 22, 26, 27], :2]).all():
+            fh_ = float(SKIN_FOREHEAD_HOLD)
+            if SKIN_FOREHEAD_AUTO is not None and lm is not None:
+                try:
+                    cov_ = _forehead_cover(base().get("parse"), base().get("alpha"), lm)
+                    if cov_ is not None:
+                        lo_, hi_ = SKIN_FOREHEAD_AUTO
+                        fh_ = max(fh_, float(_ss(float(lo_), float(hi_), np.float32(cov_))))
+                        job.forehead_cover = float(cov_)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+            job.forehead_hold = fh_
+            if fh_ > 1e-4 and lm is not None and np.isfinite(lm[[8, 17, 21, 22, 26, 27], :2]).all():
                 # (11/24, INT_c005: bangs cover the forehead, the skin stage on the strands flickered) the forehead above the brows is no skin to smooth
                 try:
                     L_ = np.asarray(lm[:, :2], np.float64)
@@ -3907,7 +3960,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                     poly_ = np.round(np.vstack([br_, (br_ + up_ * (0.9 * wfm_))[::-1]])).astype(np.int32)
                     loc_ = _soft_local(m.shape, lambda c_, o_: cv2.fillPoly(c_, [poly_ - np.int32(o_)], 255), poly_, 0, max(1.0, 0.02 * wfm_))
                     if loc_ is not None:
-                        m = _times_local(m, loc_[0], 1.0 - float(np.clip(SKIN_FOREHEAD_HOLD, 0, 1)) * loc_[1])
+                        m = _times_local(m, loc_[0], 1.0 - float(np.clip(fh_, 0, 1)) * loc_[1])
                 except Exception:
                     import traceback
                     traceback.print_exc()
@@ -7978,7 +8031,8 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                 except Exception:
                     import traceback
                     traceback.print_exc()
-            if SKIN_FOREHEAD_HOLD > 1e-4 and job.face is not None:
+            fh_ = float(SKIN_FOREHEAD_HOLD if getattr(job, "forehead_hold", None) is None else job.forehead_hold)
+            if fh_ > 1e-4 and job.face is not None:
                 # (11/24, INT_c005 f0: the hold in the mask stage did not reach the smoothing) the forehead above the brows taken out here, on the picture's own grid
                 try:
                     L_ = np.asarray(job.face, np.float64)[:, :2] * y_per_src
@@ -7989,7 +8043,7 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                         poly_ = np.round(np.vstack([br_, (br_ + up_ * (0.9 * wf))[::-1]])).astype(np.int32)
                         loc_ = _soft_local((hY, wY), lambda c_, o_: cv2.fillPoly(c_, [poly_ - np.int32(o_)], 255), poly_, 0, max(1.0, 0.02 * wf))
                         if loc_ is not None:
-                            mY, mC = _hold_yc(mY, mC, (loc_[0], float(np.clip(SKIN_FOREHEAD_HOLD, 0, 1)) * loc_[1]), (hY, wY), (hC, wC))
+                            mY, mC = _hold_yc(mY, mC, (loc_[0], float(np.clip(fh_, 0, 1)) * loc_[1]), (hY, wY), (hC, wC))
                 except Exception:
                     import traceback
                     traceback.print_exc()
