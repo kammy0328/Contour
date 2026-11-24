@@ -22,9 +22,9 @@ NORM_W = 96.0         # faces wider than this (analysis px) are made this wide b
 MIN_W = 48.0          # faces narrower than this (analysis px) are not judged (small faces measure low in focus too: c034, c040)
 MIN_SEEN = 4          # samples a person needs before they can be called out of focus
 REL = 0.62            # out of focus: under this share of the sharpest face's measure on the same frames ...
-ABS = 0.80            # ... and under this on their own
+ABS = 0.60            # ... and under this on their own (IWALY 21 cuts: c057 sides 0.53 / 0.49, c041 0.55; in focus, turned or soft 0.72 and up)
 SHARP_REF = 0.95      # the sharpest face must be at least this sharp (a soft or blurred shot calls nobody out)
-KEEP_Q = 85           # a person's measure: this percentile of their samples (one sharp stretch keeps them)
+KEEP_Q = 90           # a person's measure: this percentile of their samples (one sharp stretch keeps them)
 INNER = slice(17, 68) # 68-point face: brows, nose, eyes, mouth
 
 
