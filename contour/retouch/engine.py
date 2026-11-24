@@ -4377,7 +4377,7 @@ def _cloth_zone(Y: np.ndarray, m: np.ndarray, wf: float) -> Optional[np.ndarray]
     ref = float(np.percentile(cv2.GaussianBlur(Y[y0:y1, x0:x1].astype(np.float32), (0, 0), 1.2)[sel], NECK_CLOTH_Q))
     if ref < 0.02:
         return None
-    hh = Y.shape[0]
+    hh = _ph(Y.shape[0])
     reach = max(6, int(round(SKIN_CLOTH_REACH * hh)))
     sg = max(2.0, SKIN_CLOTH_SOFT * hh)
     pad = reach + int(3 * sg) + 4
@@ -4407,7 +4407,7 @@ def _cloth_input(I: np.ndarray, dk: np.ndarray) -> np.ndarray:
     if not len(ys):
         return I
     xs = np.flatnonzero(bad.any(0))
-    s = max(6.0, SKIN_CLOTH_FILL * I.shape[0])
+    s = max(6.0, SKIN_CLOTH_FILL * _ph(I.shape[0]))
     pad = int(3 * s) + 3
     y0, y1 = max(0, int(ys[0]) - pad), min(I.shape[0], int(ys[-1]) + pad + 1)
     x0, x1 = max(0, int(xs[0]) - pad), min(I.shape[1], int(xs[-1]) + pad + 1)
@@ -5057,7 +5057,7 @@ def _spot_fill(Y, Cb, Cr, mY, S, Sred, k: float, size: float, cs: float, plane_h
     # back, _keep_fine) where the flaw is only likely; where it is sure, only what is finer than DET_FINE, because
     # a small spot's sharp core is in that band and stayed as a dot. Nothing is put in its place
     # (plane_h: the plane's height when Y is only a piece of it: the grain band follows the plane, not the piece)
-    sig_g = float(np.clip(GRAIN_SIGMA * (plane_h or Y.shape[0]) / 1080.0, 0.8, 2.4))
+    sig_g = float(np.clip(GRAIN_SIGMA * (plane_h or _ph(Y.shape[0])) / 1080.0, 0.8, 2.4))
     Ys = cv2.GaussianBlur(roi, (0, 0), sig_f)
     if sig_g > sig_f * 1.2:
         sure = _ss(DET_SURE[0], DET_SURE[1], sp)
@@ -6407,7 +6407,7 @@ def _keep_fine(before: np.ndarray, after: np.ndarray, m: np.ndarray, rows: Optio
     rows: the plane's height when before and after are a piece of it."""
     if before.shape != after.shape or m is None or m.shape != after.shape:
         return after
-    sg = float(np.clip(GRAIN_SIGMA * (rows or after.shape[0]) / 1080.0, 0.8, 2.4))
+    sg = float(np.clip(GRAIN_SIGMA * (rows or _ph(after.shape[0])) / 1080.0, 0.8, 2.4))
     fb = before - cv2.GaussianBlur(before, (0, 0), sg)
     fa = after - cv2.GaussianBlur(after, (0, 0), sg)
     # all of it wherever the smoothing reached (scaled by the mask, the partly smoothed edges kept less grain)
@@ -7350,7 +7350,28 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
     return Y, Cb, Cr
 
 
+_PLANE = threading.local()      # APPLY_ROI: the whole picture's height while a piece of it is worked on (sizes that follow the picture's height)
+
+
+def _ph(h: int) -> int:
+    """The picture's height for the sizes that follow it (grain, the cloth's reach): the whole picture's while a piece of it is worked on."""
+    v = getattr(_PLANE, "h", None)
+    return int(v) if v else int(h)
+
+
 def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame, y_per_src: float,
+                linear_light: bool = False, src: Optional[dict] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """_process_ycc (below); on a piece of a picture (APPLY_ROI, rf.full_h) the sizes that follow the picture's height use the whole one."""
+    fh = getattr(rf, "full_h", None)
+    old = getattr(_PLANE, "h", None)
+    _PLANE.h = (int(round(fh * Y.shape[0] / max(1.0, float(getattr(rf, "piece_h", Y.shape[0]) or Y.shape[0])))) if fh else None)
+    try:
+        return _process_ycc(Y, Cb, Cr, rf, y_per_src, linear_light, src)
+    finally:
+        _PLANE.h = old
+
+
+def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame, y_per_src: float,
                 linear_light: bool = False, src: Optional[dict] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Y 0..1, Cb/Cr centred on 0 (any resolution each). y_per_src: Y-plane px per source px.
 
@@ -7423,7 +7444,7 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                     with _tm("apply.body_spots"):
                         Y, Cb, Cr = BP.fill(Y, Cb, Cr, regB, bd_, float(np.clip(v["body_blemish"], 0, 1)), job.body_size,
                                             float(job.body["ref"]) * y_per_src, y_per_src, cs,
-                                            lambda *a_: _spot_fill(*a_, plane_h=hY))
+                                            lambda *a_: _spot_fill(*a_, plane_h=_ph(hY)))
             except Exception:
                 import traceback
                 traceback.print_exc()
@@ -7518,8 +7539,8 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                             nxg_ = None
                             if SKIN_CLOTH_INFACE:
                                 # inside the face's outline the zone stays where the exterior (hair, background, cloth) is near: the outline of a turned face lies over the hair
-                                rch_ = max(6, int(round(SKIN_CLOTH_REACH * hY)))
-                                sgm_ = max(2.0, SKIN_CLOTH_SOFT * hY)
+                                rch_ = max(6, int(round(SKIN_CLOTH_REACH * _ph(hY))))
+                                sgm_ = max(2.0, SKIN_CLOTH_SOFT * _ph(hY))
                                 nxg_ = _exterior_near(M(job.masks["excl"], (hY, wY)) if job.masks.get("excl") is not None else None, job.face, (hY, wY), y_per_src, wf,
                                                       mY, rch_ + 2.0 * sgm_ + 4.0, sgm_)
                             dkz_ = dkz_ * (1.0 - fzc_ if nxg_ is None else 1.0 - fzc_ * (1.0 - nxg_))
@@ -8086,7 +8107,7 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
             r = _roi(mY, 2)
             if r is not None:
                 y0, y1, x0, x1 = r
-                size = job.grain_size * hY / 1080.0
+                size = job.grain_size * _ph(hY) / 1080.0
                 seed = zlib.crc32(f"{rf.t}:{job.pid}:{getattr(rf, 'full_h', hY)}".encode())     # (the whole picture's height also on a piece of it, APPLY_ROI)
                 n = _grain((y1 - y0, x1 - x0), size, seed)
                 yy = Y[y0:y1, x0:x1]
@@ -8313,6 +8334,7 @@ def roi_frame(rf: "RetouchFrame", j, box, plane_wh: Tuple[int, int], y_per_src: 
         jc.det = d_
     out = RetouchFrame(rf.t, [jc], (wc * pw / float(W), hc * ph / float(H)), (wc / y_per_src, hc / y_per_src))
     out.full_h = getattr(rf, "full_h", H)
+    out.piece_h = hc
     return out
 
 
