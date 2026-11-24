@@ -86,7 +86,7 @@ def _gm(x: np.ndarray, w: np.ndarray, sig: float) -> np.ndarray:
     return np.where(den > 1e-3, num / np.maximum(den, 1e-3), cv2.GaussianBlur(x, (0, 0), sig)).astype(np.float32)
 
 
-def _hessian(I: np.ndarray, sig: float):
+def _hessian(I: np.ndarray, sig: float, *, direction: bool = True):
     """Eigenvalues (l1 >= l2) of the Hessian at scale sig, scale normalised, and the direction across (angle of the
     strongest curvature)."""
     Ih = cv2.GaussianBlur(I, (0, 0), max(0.5, sig))
@@ -97,18 +97,27 @@ def _hessian(I: np.ndarray, sig: float):
     disc = np.sqrt((Ixx - Iyy) ** 2 + 4 * Ixy * Ixy)
     l1 = 0.5 * (tr + disc)
     l2 = 0.5 * (tr - disc)
-    phi = 0.5 * np.arctan2(2 * Ixy, Ixx - Iyy)
+    phi = 0.5 * np.arctan2(2 * Ixy, Ixx - Iyy) if direction else None
     return l1, l2, phi
 
 
-def _levels(Ys: np.ndarray, wsk: np.ndarray, sig: float, sign: float, floor: float) -> Tuple[np.ndarray, np.ndarray]:
-    """The skin's level around each point without the outliers on the side looked for (sign -1: dark ones, +1:
-    bright ones), and the local texture (standard deviation of what is left)."""
-    b0 = _gm(Ys, wsk, sig)
-    dev = Ys - b0
+def _local_deviation(Ys, wsk, sig, floor):
+    dev = Ys - _gm(Ys, wsk, sig)
     tex = np.sqrt(np.maximum(_gm(dev * dev, wsk, sig), 0)) + floor
+    return dev, tex
+
+
+def _level_base(Ys, wsk, sig, sign, deviation):
+    dev, tex = deviation
     w = wsk * np.exp(-(np.clip(sign * dev, 0, None) / tex) ** 2)
-    base = _gm(Ys, w, sig)
+    return _gm(Ys, w, sig), w
+
+
+def _levels(Ys: np.ndarray, wsk: np.ndarray, sig: float, sign: float, floor: float,
+            deviation=None) -> Tuple[np.ndarray, np.ndarray]:
+    if deviation is None:
+        deviation = _local_deviation(Ys, wsk, sig, floor)
+    base, w = _level_base(Ys, wsk, sig, sign, deviation)
     dev = Ys - base
     tex = np.sqrt(np.maximum(_gm(dev * dev, w, sig), 0)) + floor
     return base, tex
@@ -173,7 +182,7 @@ def spots(Y: np.ndarray, Cr: np.ndarray, skin: np.ndarray, size: float,
         sig_l = max(2.0, 0.85 * s)
         g = 1.0 + (SMALL_GAIN - 1.0) * float(np.clip((9.0 - s * red_) / 6.0, 0.0, 1.0))
         Ys = cv2.GaussianBlur(roi, (0, 0), sig_s)
-        l1, l2, _ = _hessian(roi, max(0.7, 0.28 * s))
+        l1, l2, _ = _hessian(roi, max(0.7, 0.28 * s), direction=False)
         # with skin all around: at the skin's edge the dark (or light) side beyond it looks like a spot
         rin = max(1, int(round(1.0 * s)))
         inner = cv2.erode((mm > 0.6).astype(np.uint8),
@@ -186,8 +195,10 @@ def spots(Y: np.ndarray, Cr: np.ndarray, skin: np.ndarray, size: float,
             sc = cv2.dilate(sc, spread)
             return np.clip(cv2.GaussianBlur(sc, (0, 0), max(0.6, 0.25 * s)) * 1.3, 0, 1)
 
+        # Both luminance passes start with the same local deviation.
+        deviation = _local_deviation(Ys, wsk, sig_l, 0.004)
         # ---- dark
-        base, tex = _levels(Ys, wsk, sig_l, -1.0, 0.004)
+        base, tex = _levels(Ys, wsk, sig_l, -1.0, 0.004, deviation)
         texr = np.minimum(tex, GLOBAL_TEX_MAX * _calm(tex, sel))
         D = np.clip(base - Ys, 0, 0.3)
         rel = D / np.maximum(base, 0.05)
@@ -206,7 +217,7 @@ def spots(Y: np.ndarray, Cr: np.ndarray, skin: np.ndarray, size: float,
         sc = sc * (1.0 - _ss(DARK_MAX[0], DARK_MAX[1], rel)) * inner
         # not a piece of a fold: along a crease (beside the mouth, under the eye, on the neck) the valley has dips
         # that are round at the spot's own size; at twice that size the crease is a valley running on
-        b1, b2, _ = _hessian(roi, max(1.0, 0.7 * s))
+        b1, b2, _ = _hessian(roi, max(1.0, 0.7 * s), direction=False)
         run = np.where(b1 > 1e-7, 1 - _ss(0.25, 0.6, np.abs(b2) / np.maximum(b1, 1e-7)), 0.0).astype(np.float32)
         strong = _ss(1.5, 3.0, b1 / (float(np.median(np.abs(b1[sel]))) + 1e-7))
         sc = sc * (1.0 - cv2.GaussianBlur(run * strong, (0, 0), max(0.8, 0.3 * s)))
@@ -216,7 +227,7 @@ def spots(Y: np.ndarray, Cr: np.ndarray, skin: np.ndarray, size: float,
             sc = sc * (1.0 - (shd if red_ == 1.0 else cv2.resize(shd, (roi.shape[1], roi.shape[0]), interpolation=cv2.INTER_AREA)))
         acc_s["dark"] = whole(sc)
         # ---- bump: a bright top, both curvatures negative (a dome), of the skin's own colour
-        base, tex = _levels(Ys, wsk, sig_l, +1.0, 0.004)
+        base, tex = _levels(Ys, wsk, sig_l, +1.0, 0.004, deviation)
         texr = np.minimum(tex, GLOBAL_TEX_MAX * _calm(tex, sel))
         E = np.clip(Ys - base, 0, 0.3)
         relb = E / np.maximum(base, 0.05)
@@ -244,8 +255,8 @@ def spots(Y: np.ndarray, Cr: np.ndarray, skin: np.ndarray, size: float,
         # edge of a shadow or beside a highlight the lit skin is "redder" in Cr (it grows with the light) and the
         # skin in shade is redder in colour; a red spot is redder both ways
         Cra = cv2.GaussianBlur(crr, (0, 0), sig_s)
-        abase, _t = _levels(Cra, wsk, sig_l, +1.0, 0.002)
-        awide, _t = _levels(Cra, wsk, 3.0 * sig_l, +1.0, 0.002)
+        abase, _ = _level_base(Cra, wsk, sig_l, +1.0, _local_deviation(Cra, wsk, sig_l, 0.002))
+        awide, _ = _level_base(Cra, wsk, 3.0 * sig_l, +1.0, _local_deviation(Cra, wsk, 3.0 * sig_l, 0.002))
         Ra = np.minimum(Cra - abase, Cra - awide + 0.003)
         lum = np.maximum(cv2.GaussianBlur(roi, (0, 0), max(1.0, 2.0 * sig_s)), 0.06)
         ref_l = float(np.median(lum[sel]))
@@ -254,9 +265,9 @@ def spots(Y: np.ndarray, Cr: np.ndarray, skin: np.ndarray, size: float,
         ctexr = np.minimum(ctex, GLOBAL_TEX_MAX * _calm(ctex, sel))
         # redder than the skin right around it and than the skin further out: beside a highlight (which has
         # little colour) plain skin is "redder than what is around it" too
-        cwide, _t = _levels(Crs, wsk, 3.0 * sig_l, +1.0, 0.002)
+        cwide, _ = _level_base(Crs, wsk, 3.0 * sig_l, +1.0, _local_deviation(Crs, wsk, 3.0 * sig_l, 0.002))
         R = np.clip(np.minimum(np.minimum(Crs - cbase, Crs - cwide + 0.003), Ra), 0, 0.1)
-        m1, m2, _ = _hessian(crr, max(0.7, 0.28 * s))
+        m1, m2, _ = _hessian(crr, max(0.7, 0.28 * s), direction=False)
         cdome = np.where(m2 < -1e-7, _ss(0.08, 0.40, m1 / np.minimum(m2, -1e-7)), 0.0).astype(np.float32)
         cdome = cv2.GaussianBlur(cdome, (0, 0), max(0.8, 0.35 * s))
         sr = _ss(1.5 * g, 3.0 * g, R / ctexr) * _ss(0.004, 0.015, R) * np.clip(np.maximum(cdome, blob) * 1.6 + 0.3, 0, 1) * inner

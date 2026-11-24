@@ -118,10 +118,14 @@ class RetouchFrame:
         out = None
         for j in self.jobs:
             for k, m in j.masks.items():
-                if k == "excl" or (names is not None and k not in names):
+                if k in ("excl", "face_hold", "knee_visible") or (names is not None and k not in names):
                     continue
                 out = m.copy() if out is None else np.maximum(out, m)
             if names is None or "body" in names:
+                reviewed = (j.tone or {}).get("reviewed_skin")
+                if reviewed is not None:
+                    m = BS.unpack_mask(reviewed, self.proxy_wh[::-1])
+                    out = m if out is None else np.maximum(out, m)
                 b = self.body_area(j)
                 if b is not None:
                     out = b if out is None else np.maximum(out, b)
@@ -172,6 +176,49 @@ FOLD_PARSE_GUARD = 0.0     # 0..1: the fold bands stay off what the face parser 
                            # the parser's own skin gate (skin.parse_gate: 1 on skin, down to 0.03 on what lies over it). 0 = as before
 NASO_BULGE = 0.10          # how far out (share of the nose-wing-to-mouth-corner distance) the nasolabial band bulges: a smile pushes the fold out over the raised cheek (c048 f47, c051 f0, c033 f48: the fold was not in the band). 0.10 = as before
 NASO_WIDE_MUL = 1.0        # factor on the width of the nasolabial band of the stages (1 = as before)
+
+
+def _face_hair_hold(parse, cloth, lm, shape):
+    """Current occluder evidence over the face, feathered outside its measured core."""
+    h, w = shape
+    hull = np.zeros(shape, np.uint8)
+    points = np.rint(lm[:27, :2]).astype(np.int32)
+    cv2.fillConvexPoly(hull, cv2.convexHull(points), 1)
+    width = float(np.linalg.norm(lm[16, :2] - lm[0, :2]))
+    sigma = max(1.0, 0.014 * width)
+    region = cv2.GaussianBlur(hull.astype(np.float32), (0, 0), sigma)
+    blocked = np.zeros(shape, np.float32)
+    if parse is not None:
+        # Eyes and lips are intentionally outside parsed skin. Preserve their own effects.
+        features = np.zeros(shape, np.uint8)
+        for start, end in ((17, 22), (22, 27), (36, 42), (42, 48), (48, 60)):
+            pts = np.rint(lm[start:end, :2]).astype(np.int32)
+            cv2.fillConvexPoly(features, cv2.convexHull(pts), 1)
+        radius = max(1, int(round(sigma * 2)))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*radius+1, 2*radius+1))
+        features = cv2.dilate(features, kernel)
+        blocked = ((1 - _ss(0.12, 0.75, parse["skin"])) * parse["cover"]
+                   * float(parse.get("trust", 1)) * (1 - features))
+    if cloth is not None:
+        from ..track.skincloth import HAIR
+        hair = cv2.resize((cloth == HAIR + 1).astype(np.float32), (w, h),
+                          interpolation=cv2.INTER_NEAREST)
+        blocked = np.maximum(blocked, hair)
+    core = np.clip(blocked * region, 0, 1).astype(np.float32)
+    return np.maximum(core, cv2.GaussianBlur(core, (0, 0), sigma))
+
+
+def _fold_fade(mask, lm):
+    """FOLD_EDGE_FADE (Mac IWALY): the fold band's mask fades in from its own edge (_feather_fold); off: the mask as it is (1.25.0)."""
+    return _feather_fold(mask, lm) if FOLD_EDGE_FADE > 1e-4 else mask
+
+
+def _feather_fold(mask, lm):
+    # Feather towards the interior so a fold cannot expand into hair or the mouth.
+    width = float(np.linalg.norm(lm[16, :2] - lm[0, :2]))
+    support = (mask > 0.01).astype(np.uint8)
+    distance = cv2.distanceTransform(support, cv2.DIST_L2, 5)
+    return mask * _ss(0, max(2.0, 0.028 * width), distance)
 
 
 def _parse_off(m: np.ndarray, parse, lm) -> np.ndarray:
@@ -2186,6 +2233,7 @@ def prepare(cut, tracker, t: int, cache: Optional[dict] = None, steady: bool = T
             # the slider values are read now, not when the masks were cached
             pp = cut.params_for(j.pid)
             jj.v = {k_: pp.amount(k_, t) / 100.0 for k_ in RETOUCH_KEYS}
+            _knee_off(jj.v)
             if float(getattr(j, "focus_w", 1.0)) < 0.999:
                 jj.v = _focus_scale(jj.v, float(j.focus_w))        # (a face out of focus gets less of it, FOCUS_GATE: the values read here would drop that)
             jj.keep = float(np.clip(pp.skin_detail / 100.0, 0, 1))
@@ -2406,13 +2454,38 @@ def _steady_asks(st, j, t: int, N: int) -> List[int]:
     return out
 
 
+_GRID_WARNED: set = set()
+
+
+def _grid_warn(name, got, want) -> None:
+    if name not in _GRID_WARNED:
+        _GRID_WARNED.add(name)
+        print("MASK GRID: mask %s was %s, resized to %s" % (name, got, want), flush=True)
+
+
+def _on_grid(m, shp):
+    """A neighbour's or own mask as an array on grid shp (resized when it was made on another one)."""
+    a = _mask_unpack(m)
+    if a.shape != tuple(shp):
+        a = cv2.resize(a, (shp[1], shp[0]), interpolation=cv2.INTER_LINEAR)
+    return a
+
+
 def _steady_face(k, st, j, t: int, N: int, raws: dict, name_threads: int = 1, check: bool = False) -> None:
     """One person's face masks (and score maps) of frame t held steady with that person's masks of the frames round it (raws: those frames). The
     masks are worked through one name at a time (a neighbour's mask is carried here, used and let go), not all the names of all the frames at once:
     the same numbers with a few dozen MB in hand instead of more than a GB a person. k: the analysis picture's scale (sx, sy)."""
     Lt = j.face[:, :2] * k
     names = list(j.masks)
-    shp = j.masks[names[0]].shape
+    # (11/24) every mask on the grid most of this person's masks are on: one made on another grid (the leg ownership read on the
+    # analysis' 1280x720 while the masks are on the 2560x1440 picture: IWALY c016..c018 on the Mac) raised here, and the whole frame
+    # fell back to its raw masks (masks that jump). It is resized to the common grid instead, and said once.
+    shapes = [tuple(getattr(j.masks[n_], "shape", ())) for n_ in names]
+    shp = max(set(shapes), key=shapes.count) if shapes else ()
+    for n_, sh_ in zip(names, shapes):
+        if sh_ != shp and len(shp) == 2:
+            _grid_warn(n_, sh_, shp)
+            j.masks[n_] = cv2.resize(_mask_unpack(j.masks[n_]), (shp[1], shp[0]), interpolation=cv2.INTER_LINEAR)
     veto = getattr(j, "veto", None)
     vetos = [veto.astype(np.float32)] if veto is not None else []
     dets = []                                   # (weight, a neighbour's score maps, its motion onto this frame)
@@ -2456,6 +2529,9 @@ def _steady_face(k, st, j, t: int, N: int, raws: dict, name_threads: int = 1, ch
     def one_name(n):
         m0 = j.masks[n]
         o_ = _mask_unpack(m0)
+        if n == "knee_visible":
+            # Current leg ownership must never follow a neighbouring face transform.
+            return o_
         fr = [o_]                               # the mask on this frame's geometry: its own, then each neighbour's carried here
         box = _pm_box(m0) if STEADY_BOX else False      # where a frame can be other than 0: (y0, y1, x0, x1), None (nowhere), False (not known)
         for _, js, A in nbrs:
@@ -2464,7 +2540,13 @@ def _steady_face(k, st, j, t: int, N: int, raws: dict, name_threads: int = 1, ch
             if ms is None:
                 fr.append(np.zeros(shp, np.float32))
                 continue
-            fr.append(cv2.warpAffine(_mask_unpack(ms), A, (shp[1], shp[0]), flags=cv2.INTER_LINEAR, borderValue=0))
+            ms_a = _mask_unpack(ms)
+            if ms_a.shape != tuple(shp):
+                # (a neighbour's mask on another grid: its box is not on this grid either)
+                _grid_warn(n, ms_a.shape, shp)
+                ms_a = cv2.resize(ms_a, (shp[1], shp[0]), interpolation=cv2.INTER_LINEAR)
+                box = False
+            fr.append(cv2.warpAffine(ms_a, A, (shp[1], shp[0]), flags=cv2.INTER_LINEAR, borderValue=0))
             if box is not False:
                 bs_ = _pm_box(ms)
                 if bs_ is False:
@@ -2528,6 +2610,13 @@ def _steady_face(k, st, j, t: int, N: int, raws: dict, name_threads: int = 1, ch
                 a_ = (o_ + (avg - o_).clip(None, 0) + (avg - o_).clip(0, None) * v_) * wsum
             return (a_ / wsum).astype(np.float32)
 
+        if n == "face_hold":
+            # (11/24) the median of this frame's hold and its neighbours' carried here: a cover seen on one frame only (a parser or
+            # hair-label slip) no longer takes the whole face's retouch away for that frame (retouch that switches off); hair
+            # that stays over the face is held from its second frame on
+            if len(fr) >= 3:
+                return np.median(np.stack(fr), axis=0).astype(np.float32)
+            return o_
         got = in_box() if (robust and box is not False) else None
         if got is not None and not check:
             return got
@@ -2573,7 +2662,19 @@ def _body_marks(st, p: int, t: int, pp, v) -> Optional[list]:
         return None
 
 
-BODY_EFFECTS = ("body_skin", "body_blemish", "knee_tone", "belly_fold")   # the values that bring the body skin's area with them
+# (11/24, the user: render c016..c023 without the knee retouch for now) KNEE_OFF > 0 sets the knee tone and the knee fold to 0 for every person
+# at render time; the saved slider values in the cut's project are not changed, so turning it back to 0 restores them
+KNEE_OFF = 0.0
+
+
+def _knee_off(v):
+    if KNEE_OFF:
+        v["knee_tone"] = 0.0
+        v["knee_fold"] = 0.0
+    return v
+
+
+BODY_EFFECTS = ("body_skin", "body_blemish", "knee_tone", "knee_fold", "belly_fold")   # the values that bring the body skin's area with them
 BDET_NOW = True            # a job that came without its spots (a single frame, a test) has them found on the plane
 
 
@@ -3303,6 +3404,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             return None, bdet_here
         pp = cut.params_for(person.id)
         v = {k: pp.amount(k, t) / 100.0 for k in RETOUCH_KEYS}
+        _knee_off(v)
         fg_ = 1.0
         if only is not None:
             v["skin"] = max(v["skin"], 0.5)
@@ -3830,6 +3932,18 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 except Exception:
                     import traceback
                     traceback.print_exc()
+            if FACE_NOSE_ADD > 1e-4 and lm is not None and m is not None:
+                # (11/24) the nose in the skin area where the skin model left it out (its shiny tip), weighted, inside the person's own matte
+                try:
+                    wfn_ = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
+                    na_ = _nose_area(lm, shape, wfn_)
+                    if na_ is not None:
+                        al_ = base().get("alpha")
+                        if al_ is not None and al_.shape == na_.shape:
+                            na_ = na_ * np.clip(al_, 0, 1)
+                        m = np.maximum(m, (float(FACE_NOSE_ADD) * na_).astype(np.float32))
+                except Exception:
+                    pass
             if m.max() > 0.01:
                 job.skin = sj
                 job.masks["skin"] = m
@@ -3845,14 +3959,17 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             if sx_.max() > 0.01:
                 job.masks["skinx"] = sx_
         if face_on:
+            from ..track import skincloth
+            if FACE_HAIR_HOLD > 1e-4:
+                job.masks["face_hold"] = _face_hair_hold(base().get("parse"), skincloth.get(tracker, t), lm, shape)
             if v.get("dark_circle", 0) > 1e-4:
                 job.masks["dark"] = get("dark", mk_dark, f"{fth:.2f}") * fw
             if v.get("shine", 0) > 1e-4:
                 job.masks["hot"] = get("hot", lambda: hot_zone_mask(lm, shape, pa(), fth), f"{fth:.2f}") * fw
             if v["nasolabial"] > 1e-4:
-                job.masks["naso"] = get("naso", mk_naso, f"{fth:.2f}:w") * fw
+                job.masks["naso"] = _fold_fade(get("naso", mk_naso, f"{fth:.2f}:w"), lm) * fw
             if v["mouth_lines"] > 1e-4:
-                job.masks["mouthl"] = get("mouthl", mk_mouthl, f"{fth:.2f}:w") * fw
+                job.masks["mouthl"] = _fold_fade(get("mouthl", mk_mouthl, f"{fth:.2f}:w"), lm) * fw
             if v["nasolabial"] > 1e-4 or v["mouth_lines"] > 1e-4 or v.get("dark_circle", 0) > 1e-4:
                 def mk_ex():
                     b = base()
@@ -3883,11 +4000,48 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             try:
                 from ..core.project import body_scope_set, norm_body_scope
                 bscope = norm_body_scope(getattr(pp, "body_scope", "all"))
-                if v.get("knee_tone", 0) > 1e-4 or v.get("belly_fold", 0) > 1e-4:
+                if v.get("knee_tone", 0) > 1e-4 or v.get("knee_fold", 0) > 1e-4 or v.get("belly_fold", 0) > 1e-4:
                     # (from the tracks alone: the knee tone reads the leg's skin from the picture itself where the body
                     # skin's area is not there)
                     # (the legs' widths are the median of the neighbouring pictures': the measure of one picture jumps, the leg does not)
                     job.tone = BTN.person_geometry_t(st.final[p], st.widths[p] if getattr(st, "widths", None) is not None else None, int(t))
+
+                if v.get("knee_fold", 0) > 1e-4 or v.get("knee_tone", 0) > 1e-4:
+                    # Use measured segmentation only. Pose-based label fallback can assign an occluder to this knee.
+                    seg = tracker.seglab.get(t) if tracker.seglab.exists() else None
+                    alpha = tracker.matte.get(t)
+                    owned = None
+                    if seg is not None and alpha is not None:
+                        owner_ids = [int(st.pids[p]) + 1]
+                        owner_ids.extend(int(src) + 1 for src, dst in tracker._seg_alias().items()
+                                         if dst == st.pids[p])
+                        measured = np.isin(seg, owner_ids) & (seg != 255) & (seg != 0)
+                        owned = measured.astype(np.float32) * (alpha.astype(np.float32) / 255.0)
+                    if owned is None:
+                        # (11/24) no measured labels for this frame: the person's own matte (as the body skin uses), not no knee at all
+                        try:
+                            pa_ = SK.person_alpha(tracker, t, p, (px.w, px.h))
+                            owned = None if pa_ is None else np.clip(pa_.astype(np.float32), 0, 1)
+                        except Exception:
+                            owned = None
+                    if owned is not None:
+                        # (bilinear, on the masks' own grid: the labels' 1280x720 steps are not carried to the picture)
+                        job.masks["knee_visible"] = cv2.resize(owned, (shape[1], shape[0]),
+                                                              interpolation=cv2.INTER_LINEAR)
+
+                if job.tone and "knee_visible" in job.masks and "leg" in body_scope_set(bscope):
+                    reviewed = cut.status.get("reviewed_knee_masks", {})
+                    if (reviewed.get("analysis") == cut.analysis_version and
+                            t in reviewed.get("frames", {}).get(str(person.id), [])):
+                        path = tracker.path.parent / "knee_review" / f"p{person.id}_f{t}.npz"
+                        if path.is_file():
+                            with np.load(path, allow_pickle=False) as data:
+                                if "m" in data:
+                                    job.tone["reviewed_skin"] = dict(shape=tuple(data["shape"]),
+                                        box=tuple(data["box"]), m=data["m"].astype(np.float32) / 255.0)
+                                if "atten" in data:
+                                    job.tone["knee_attenuation"] = dict(shape=tuple(data["atten_shape"]),
+                                        box=tuple(data["atten_box"]), m=data["atten"].astype(np.float32) / 255.0)
 
                 def mk_body():
                     return mk_body_of(bscope)
@@ -3990,7 +4144,18 @@ def knee_probe(rf: Optional["RetouchFrame"], px) -> Dict[tuple, float]:
                 m = BS.unpack_mask(pm)
             except Exception:
                 m = None
-        return BTN.knee_support(m, sc, tone["knees"]) if m is not None else [1.0] * len(tone["knees"])
+        if getattr(BTN, "KNEE_V4", False):
+            # (v4: the knee is evened on its own skin; only another person in front of it ramps its strength, not the leg's ring)
+            sup = [1.0] * len(tone["knees"])
+        else:
+            sup = BTN.knee_support(m, sc, tone["knees"]) if m is not None else [1.0] * len(tone["knees"])
+        vis = job.masks.get("knee_visible") if getattr(job, "masks", None) else None
+        if vis is not None:
+            try:
+                sup = [float(a_) * BTN.knee_owned_share(_mask_unpack(vis), sc, kn_) for a_, kn_ in zip(sup, tone["knees"])]
+            except Exception:
+                pass
+        return sup
 
     # (each person's knees are read from that person's own area: the people side by side where the frame's people are prepared so, in their order)
     n_thr = max(1, min(int(PREP_THREADS), len(todo)))
@@ -4117,6 +4282,22 @@ class KneeLook:
                     rf = self.prepare(t)
                     fi = self.build_input(t)
                 sup = knee_probe(rf, self.px) if rf is not None else {}
+                # (11/24) a person's knees crossing (close and their distance changing fast): the knee work ramps down for it (c017 f28/29 flash)
+                try:
+                    prev_ = self.__dict__.setdefault("_knees_prev", {})
+                    for j_ in (rf.jobs if (rf is not None and getattr(BTN, "KNEE_V4", False)) else []):
+                        tn_ = getattr(j_, "tone", None)
+                        if not tn_ or not tn_.get("knees"):
+                            continue
+                        f_ = BTN.knee_overlap_support(tn_["knees"], prev_.get(j_.pid))
+                        sides_ = tn_.get("sides") or []
+                        for i_, fv_ in enumerate(f_):
+                            key_ = (j_.pid, sides_[i_] if i_ < len(sides_) else str(i_))
+                            if key_ in sup:
+                                sup[key_] = float(sup[key_]) * float(fv_)
+                        prev_[j_.pid] = tn_["knees"]
+                except Exception:
+                    pass
                 if rf is not None:
                     for j_ in rf.jobs:
                         if getattr(j_, "masks", None):
@@ -4593,8 +4774,46 @@ def _fold_level(Y: np.ndarray, band: np.ndarray, skin: np.ndarray, excl: Optiona
         h = cv2.dilate(h, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d3, d3)))
         b = b * (1.0 - np.clip(cv2.GaussianBlur(h, (0, 0), max(1.0, fe_[1] * wf)), 0, 1))
     out = Y.astype(np.float32, copy=True)
-    out[y0:y1, x0:x1] = roi + k * b * _even_mid(roi, w, wf, FOLD_LEVEL_SIG, cap)
+    d_ = _even_mid(roi, w, wf, FOLD_LEVEL_SIG, cap)
+    if FOLD_LEVEL_LIFT_ONLY:
+        # (11/24 IWALY c016 f38: the levelling darkened the lit cheek beside a turned face's fold: a dark patch with the band's outline)
+        d_ = np.maximum(d_, 0.0)
+    out[y0:y1, x0:x1] = roi + k * b * d_
     return out
+
+
+# (Mac IWALY, 11/24; default off = 1.25.0's face) the Mac batch's own face changes, on in its control.json engine_cfg
+FACE_HAIR_HOLD = 0.0       # > 0: hair / cover over the face (face parsing + the hair class) takes the face's retouch back there (job mask face_hold)
+FOLD_EDGE_FADE = 0.0       # > 0: the nasolabial / mouth line bands fade in from their own edge (no rim)
+FINAL_NASO_IN_BAND = 0.0   # > 0: the last pass's nasolabial lift only inside the nasolabial band's mask
+FOLD_LEVEL_LIFT_ONLY = False   # True: the fold levelling only lifts (a fold is darker than the skin round it; nothing in its band is darkened)
+SKIN_EDGE_KEEP = 0.0      # > 0: the skin smoothing fades in from the skin area's own edge over this many face widths (the jaw's contour
+                          # against the neck's shade was smoothed away: a bright band inside the jaw line and a dark one under it, c016 f38)
+FACE_NOSE_ADD = 0.0       # > 0: the nose (bridge, tip, wings from the landmarks) is added to the skin area at this weight where the skin
+                          # model left it out (a shiny nose tip is not 'skin coloured': the nose was not retouched at all, c016)
+
+
+def _skin_edge_ramp(m: np.ndarray, wf: float) -> np.ndarray:
+    rad = max(2.0, SKIN_EDGE_KEEP * wf)
+    inside = cv2.distanceTransform((m > 0.5).astype(np.uint8), cv2.DIST_L2, 5)
+    t = np.clip(inside / rad, 0.0, 1.0)
+    return cv2.GaussianBlur((t * t * (3.0 - 2.0 * t)).astype(np.float32), (0, 0), max(1.0, 0.25 * rad))
+
+
+def _nose_area(lm: np.ndarray, shape, wf: float) -> Optional[np.ndarray]:
+    try:
+        pts = np.rint(lm[27:36, :2]).astype(np.int32)
+        m = np.zeros(shape, np.uint8)
+        cv2.fillConvexPoly(m, cv2.convexHull(pts), 1)
+        d = max(3, int(0.035 * wf) | 1)
+        m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d)))
+        # the nostrils' shadows are the nose's shape: kept out
+        nost = np.zeros(shape, np.uint8)
+        cv2.fillConvexPoly(nost, cv2.convexHull(np.rint(lm[31:36, :2]).astype(np.int32)), 1)
+        m = m.astype(np.float32) * (1.0 - 0.7 * nost.astype(np.float32))
+        return cv2.GaussianBlur(m, (0, 0), max(1.0, 0.02 * wf))
+    except Exception:
+        return None
 
 
 def _neck_level(Y: np.ndarray, m: np.ndarray, hold: Optional[np.ndarray], wf: float, k: float, axis=None) -> np.ndarray:
@@ -7316,14 +7535,19 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
                 except Exception:
                     import traceback
                     traceback.print_exc()
-            if FINAL_NASO > 1e-4 and lmY is not None and job.wf_src > 0:
+            in_band_ = FINAL_NASO_IN_BAND > 1e-4
+            if FINAL_NASO > 1e-4 and lmY is not None and job.wf_src > 0 and (not in_band_ or "naso" in job.masks):
                 kn_ = float(np.clip(FINAL_NASO, 0, 1)) * yaw_gate(job.face)
                 if FOLD_PRESENT is not None:
                     kn_ *= _naso_pres_job(job, Y0, wf, y_per_src)
                 if kn_ > 1e-4:
-                    Y_p_ = Y.copy() if (FINAL_NASO_SKIN > 1e-4 and skin is not None) else None
+                    Y_p_ = Y.copy() if (in_band_ or (FINAL_NASO_SKIN > 1e-4 and skin is not None)) else None
                     Y = _final_naso(Y, Y0, lmY, wf, kn_)
-                    if Y_p_ is not None:
+                    if in_band_:
+                        # (Mac IWALY, FINAL_NASO_IN_BAND) the last pass only inside the nasolabial band's own mask
+                        fold_gate = M(job.masks["naso"], (hY, wY))
+                        Y = Y_p_ + fold_gate * (Y - Y_p_)
+                    if FINAL_NASO_SKIN > 1e-4 and skin is not None:
                         # the zone comes from the landmarks alone: where the skin mask says no skin (a hand's fingers in front of the mouth, the gaps between them
                         # are dark "folds": c057 f152) nothing is lifted
                         g_ = np.clip(cv2.GaussianBlur(skin.astype(np.float32), (0, 0), max(1.0, 0.02 * wf)) * 1.25, 0.0, 1.0)
@@ -7398,7 +7622,8 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
     # out-of-focus faces: whatever the stages did inside the face is taken back by (1 - focus_w) at the very end (the sliders are scaled too, but
     # the stages that do not depend on them, and the final pass, still left a blob on the cheek and a band at the jaw: c037 f6)
     fj_ = [j for j in rf.jobs if float(getattr(j, "focus_w", 1.0)) < 0.999 and j.face is not None and j.wf_src > 0]
-    dY0_ = src["dY"].copy() if (fj_ and src is not None and "dY" in src) else None
+    holds = [j.masks["face_hold"] for j in rf.jobs if "face_hold" in j.masks]
+    dY0_ = src["dY"].copy() if ((fj_ or holds) and src is not None and "dY" in src) else None
 
     for job in rf.jobs:
         v = job.v
@@ -7449,20 +7674,56 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
             except Exception:
                 import traceback
                 traceback.print_exc()
+        attenuation = (job.tone or {}).get("knee_attenuation")
+        knee_input = (Y, Cb, Cr) if attenuation is not None else None
+        knee_skin = bmY
+        if job.tone and "reviewed_skin" in job.tone:
+            reviewed_skin = BS.unpack_mask(job.tone["reviewed_skin"], (hY, wY))
+            knee_skin = reviewed_skin if bmY is None else np.maximum(bmY, reviewed_skin)
         # 0c. knee tone (1.25): the knee's blotches, redness and bruise-like patches to the leg's own colour; the grain stays
         if job.tone and job.tone.get("knees") and v.get("knee_tone", 0) > 1e-4:
             try:
-                regK = bmY
+                mac_knee_ = bool(getattr(BTN, "KNEE_V4", False) or getattr(BTN, "KNEE_V3", False))   # (Mac IWALY knee; off: 1.25.0's knee tone)
+                regK = knee_skin if mac_knee_ else bmY
                 for nm_ in ("skinx", "neck"):
                     if regK is not None and nm_ in job.masks:      # (what the face's area holds is the face's)
                         regK = regK * (1.0 - np.clip(M(job.masks[nm_], (hY, wY)), 0, 1))
                 kn_ = [((cx * y_per_src, cy * y_per_src), (ax_, ay_), hf_ * y_per_src)
                        for (cx, cy, ax_, ay_, hf_) in job.tone["knees"]]
                 with _tm("apply.knee_tone"):
-                    Y, Cb, Cr = BTN.knee_tone(Y, Cb, Cr, regK, kn_, float(np.clip(v["knee_tone"], 0, 1)), cs, gains=job.tone.get("gain"))
+                    ownership = job.masks.get("knee_visible")
+                    if not mac_knee_:
+                        Y, Cb, Cr = BTN.knee_tone(Y, Cb, Cr, regK, kn_, float(np.clip(v["knee_tone"], 0, 1)), cs, gains=job.tone.get("gain"))
+                    elif getattr(BTN, "KNEE_V4", False):
+                        Y, Cb, Cr = BTN.knee_clean(Y, Cb, Cr, regK, None if ownership is None else M(ownership, (hY, wY)),
+                                                   kn_, v["knee_tone"], cs, job.tone.get("gain"))
+                    elif ownership is not None:
+                        Y, Cb, Cr = BTN.visible_knee_tone(Y, Cb, Cr, regK, M(ownership, (hY, wY)),
+                                                         kn_, v["knee_tone"], cs, job.tone.get("gain"))
+                    elif v.get("knee_fold", 0) <= 1e-4:
+                        # Older tone-only projects can use the original local skin reader.
+                        Y, Cb, Cr = BTN.knee_tone(Y, Cb, Cr, regK, kn_, v["knee_tone"], cs, gains=job.tone.get("gain"))
             except Exception:
                 import traceback
                 traceback.print_exc()
+        if job.tone and job.tone.get("knees") and v.get("knee_fold", 0) > 1e-4:
+            visible = job.masks.get("knee_visible")
+            if visible is not None:
+                try:
+                    knees = [((cx * y_per_src, cy * y_per_src), (ax, ay), half * y_per_src)
+                             for cx, cy, ax, ay, half in job.tone["knees"]]
+                    with _tm("apply.knee_fold"):
+                        Y, Cb, Cr = BTN.knee_fold(Y, Cb, Cr, knee_skin, M(visible, (hY, wY)),
+                                                 knees, v["knee_fold"], gains=job.tone.get("gain"))
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+        if knee_input is not None:
+            wy = BS.unpack_mask(attenuation, (hY, wY))
+            wc = wy if (hY, wY) == (hC, wC) else BS.unpack_mask(attenuation, (hC, wC))
+            Y = Y + wy * (knee_input[0] - Y)
+            Cb = Cb + wc * (knee_input[1] - Cb)
+            Cr = Cr + wc * (knee_input[2] - Cr)
         # 0d. belly creases (1.25): the folds a bent trunk makes, filled from the skin round them; none found, nothing changed
         if job.tone and job.tone.get("belly") and v.get("belly_fold", 0) > 1e-4:
             try:
@@ -7635,6 +7896,13 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                     traceback.print_exc()
             if SKIN_FS_G is not None and len(SKIN_FS_G) == len(SK.FS_S):
                 SK.FS_G = tuple(float(g_) for g_ in SKIN_FS_G)      # (11/24) the texture bands' gains set from the engine's settings (control.json engine_cfg)
+            if SKIN_EDGE_KEEP > 1e-4:
+                try:
+                    er_ = _skin_edge_ramp(M(job.masks["skin"], (hY, wY)), wf)
+                    mY = mY * er_
+                    mC = mC * M(er_, (hC, wC))
+                except Exception:
+                    pass
             r = SK.radius_px(job.skin, y_per_src)
             try:
                 if getattr(SK, "PIT", 0) > 0 and hasattr(SK, "_TLS"):
@@ -8125,6 +8393,18 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                             nc = _grain((c1 - c0, d1 - d0), sizec * 1.3, seed + 7 + ci)
                             Cx[c0:c1, d0:d1] += mC[c0:c1, d0:d1] * nc * (0.016 * cg)
     Y, Cb, Cr = _final_pass(Y, Cb, Cr, Y_in, Cb_in, Cr_in, rf, y_per_src, M)
+    if holds:
+        # Clip all accumulated retouch, including the last landmark-only passes and source-space lift.
+        hold = holds[0].astype(np.float32)
+        for other in holds[1:]:
+            hold = np.maximum(hold, other)
+        hy = M(hold, Y.shape)
+        hc = M(hold, Cb.shape)
+        Y += hy * (Y_in - Y)
+        Cb += hc * (Cb_in - Cb)
+        Cr += hc * (Cr_in - Cr)
+        if dY0_ is not None and dY0_.shape == hy.shape:
+            src["dY"] += hy * (dY0_ - src["dY"])
     for j_ in fj_:
         try:
             wf_ = j_.wf_src * y_per_src

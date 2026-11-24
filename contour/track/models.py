@@ -593,12 +593,30 @@ class Session:
                     k.pop("run_options", None)
                     return self.run(*a, **k)
                 if not is_oom(e):
+                    twin = self._cpu_twin(e)
+                    if twin is not None:
+                        k.pop("run_options", None)
+                        return twin.run(*a, **k)
                     raise
                 sys.stderr.write(f"GPU OOM {Path(self._path).name} (try {attempt + 1}): {str(e)[:300]}\n")
                 if attempt >= self.RETRIES:
                     return self._without_memory(e, a, k)
                 free_gpu_memory()
                 time.sleep(1.5 * (attempt + 1))
+
+    def _cpu_twin(self, err):
+        """(Mac, Core ML) a run Core ML cannot make (a picture with no detection gives a tensor with no elements, which the
+        Core ML provider refuses) is made by a CPU session of the same file; None when the error is not Core ML's."""
+        try:
+            if "CoreML" not in str(err) or "CoreMLExecutionProvider" not in list(self._s.get_providers()):
+                return None
+            if getattr(self, "_twin", None) is None:
+                import onnxruntime as ort
+                self._twin = ort.InferenceSession(self._path, sess_options=_options(False), providers=["CPUExecutionProvider"])
+                sys.stderr.write(f"COREML FALLBACK {Path(self._path).name}: {str(err)[:200]}\n")
+            return self._twin
+        except Exception:
+            return None
 
     def _first_run(self, seconds: float) -> None:
         """After the first run: which provider ran the operators (the session's profile), kept with the reasons."""
