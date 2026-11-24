@@ -590,7 +590,23 @@ def _feature_exclusion_full(lm: np.ndarray, shape) -> np.ndarray:
 def tone_mask(lm: Optional[np.ndarray], shape, prob: np.ndarray, alpha: Optional[np.ndarray], scope: str,
               face_w: float, fth: float = 1.5, body: Optional[np.ndarray] = None) -> np.ndarray:
     """Where skin brightness, tone, saturation and grain apply: the whole face (around the eyes too),
-    softly; only the eyeballs and lips are left out. body: the chosen body regions (body_regions)."""
+    softly; only the eyeballs and lips are left out. body: the chosen body regions (body_regions).
+    MASK_ROI (no body regions): made on the face's region, the same result."""
+    if body is None and lm is not None:
+        try:
+            from ..core.project import scope_set as _ss
+            if "face" in _ss(scope):
+                o_ = _roi_call(_tone_mask_full, lm, shape, 1.0 + 0.04 * 4.2 * max(fth, 0.5), 0.06, [prob, alpha], scope, face_w, fth, None)
+                if o_ is not None:
+                    return o_
+        except Exception:
+            import traceback
+            traceback.print_exc()
+    return _tone_mask_full(lm, shape, prob, alpha, scope, face_w, fth, body)
+
+
+def _tone_mask_full(lm: Optional[np.ndarray], shape, prob: np.ndarray, alpha: Optional[np.ndarray], scope: str,
+                    face_w: float, fth: float = 1.5, body: Optional[np.ndarray] = None) -> np.ndarray:
     from ..core.project import scope_set
     if "face" not in scope_set(scope):
         lm = None
