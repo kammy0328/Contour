@@ -56,6 +56,7 @@ def warp(img: np.ndarray, flow: np.ndarray) -> np.ndarray:
 
 
 MAX_LEN = 3      # events of up to this many frames (a mask that is there for two frames and gone)
+EDGE = 0.02      # of the width: a place this near the frame's edge is not judged
 REL = 0.25       # the threshold: this share of the cut's strongest retouch (99th percentile of |render - original|) ...
 
 
@@ -115,6 +116,10 @@ def check(src: str, out: str, out_dir: str, width: int = 960, thr: float = 2.5, 
             for i in range(1, n):
                 if st[i, 4] < min_px:
                     continue
+                bx0, by0, bw_, bh_ = int(st[i, 0]), int(st[i, 1]), int(st[i, 2]), int(st[i, 3])
+                e_ = max(2, int(EDGE * w))
+                if bx0 < e_ or by0 < e_ or bx0 + bw_ > w - e_ or by0 + bh_ > h - e_:
+                    continue                     # at the frame's edge the motion is not known (someone coming in): not judged
                 sel = lab == i
                 blobs.append(dict(x=int(cen[i][0] * W / w), y=int(cen[i][1] * H / h), w=int(st[i, 2] * W / w), h=int(st[i, 3] * H / h),
                                   px=int(st[i, 4]), strength=round(float(spike[sel].mean()), 2), frames=L))
