@@ -1964,6 +1964,7 @@ def prepare(cut, tracker, t: int, cache: Optional[dict] = None, steady: bool = T
             # the slider values are read now, not when the masks were cached
             pp = cut.params_for(j.pid)
             jj.v = {k_: pp.amount(k_, t) / 100.0 for k_ in RETOUCH_KEYS}
+            _knee_off(jj.v)
             if float(getattr(j, "focus_w", 1.0)) < 0.999:
                 jj.v = _focus_scale(jj.v, float(j.focus_w))        # (a face out of focus gets less of it, FOCUS_GATE: the values read here would drop that)
             jj.keep = float(np.clip(pp.skin_detail / 100.0, 0, 1))
@@ -2390,6 +2391,18 @@ def _body_marks(st, p: int, t: int, pp, v) -> Optional[list]:
         return BS.marks_at(st, p, t, marks) or None
     except Exception:
         return None
+
+
+# (11/24, the user: render c016..c023 without the knee retouch for now) KNEE_OFF > 0 sets the knee tone and the knee fold to 0 for every person
+# at render time; the saved slider values in the cut's project are not changed, so turning it back to 0 restores them
+KNEE_OFF = 0.0
+
+
+def _knee_off(v):
+    if KNEE_OFF:
+        v["knee_tone"] = 0.0
+        v["knee_fold"] = 0.0
+    return v
 
 
 BODY_EFFECTS = ("body_skin", "body_blemish", "knee_tone", "knee_fold", "belly_fold")   # the values that bring the body skin's area with them
@@ -3122,6 +3135,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             return None, bdet_here
         pp = cut.params_for(person.id)
         v = {k: pp.amount(k, t) / 100.0 for k in RETOUCH_KEYS}
+        _knee_off(v)
         fg_ = 1.0
         if only is not None:
             v["skin"] = max(v["skin"], 0.5)
