@@ -99,11 +99,9 @@ def leg_area(shape: Tuple[int, int], legs: Sequence[tuple]) -> np.ndarray:
     return m.astype(np.float32)
 
 
-def clean(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, S: np.ndarray, limb: float, k: float = 1.0, dbg: Optional[dict] = None):
-    """The bruises on the skin S (0..1, the leg's skin) of planes of one size; limb: the leg's width in their pixels. -> Y, Cb, Cr."""
+def _maps(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, S: np.ndarray, limb: float) -> dict:
+    """What the finding and the filling read of the leg's skin S (0..1) on planes of one size; limb: the leg's width in their pixels."""
     Sb = S > 0.5
-    if k <= 1e-4 or limb < 16 or Sb.sum() < 64:
-        return Y, Cb, Cr
     Sf = S.astype(np.float32)
     grain = Y - cv2.GaussianBlur(Y, (0, 0), 0.8)
     gsd = 1.4826 * float(np.median(np.abs(grain[Sb]))) + 1e-4
@@ -125,6 +123,13 @@ def clean(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, S: np.ndarray, limb: fl
     Tl = _nblur(ys, w, sig)
     dk = np.clip(Tl - ys, 0, None)
     dE = cv2.distanceTransform(Sb.astype(np.uint8), cv2.DIST_L2, 5)
+    return dict(Sb=Sb, Sf=Sf, gsd=gsd, ys=ys, dip=dip, cbs=cbs, crs=crs, u=u, v=v, sig=sig, w=w, zb=zb, Tl=Tl, dk=dk, dE=dE, limb=float(limb))
+
+
+def detect(M: dict, dbg: Optional[dict] = None):
+    """The bruises on the maps M (_maps): (the bruises with their soft rims (0/1 float32), those of them off the skin's hue or wide (0/1), the
+    candidates looked at)."""
+    Sb, gsd, dip, zb, Tl, dk, dE, limb = M["Sb"], M["gsd"], M["dip"], M["zb"], M["Tl"], M["dk"], M["dE"], M["limb"]
     # candidates: a closed basin of the light; a patch off the skin's hue; a clearly dark compact patch inside the leg (open to a hem, so no basin)
     # (each kind its own patches: a dark patch running into a hem's shadow is not let to swallow a small bruise next to it)
     cand = ((dip > BASIN * gsd) | ((zb > HUE_Z) & (dk > gsd) & (dE > 0.02 * limb))).astype(np.uint8)
@@ -162,9 +167,9 @@ def clean(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, S: np.ndarray, limb: fl
         info.append(dict(x=x0 + ww / 2, y=y0 + hh / 2, area=a, depth=round(depth, 1), hue=round(hue, 1), edge=round(de, 3), ok=bool(ok)))
     if dbg is not None:
         dbg.update(info=info, gsd=gsd, zb=zb, dk=dk, dip=dip, dE=dE)
-    if not keep.any():
-        return Y, Cb, Cr
     m0 = keep[lab].astype(np.uint8)
+    if not keep.any():
+        return m0.astype(np.float32), m0.astype(np.float32), info
     # the whole basin a bruise lies in (its soft rim too), as far as it is closed: down to a share of the bruise's own depth
     m1 = np.zeros_like(m0)
     for i in np.nonzero(keep)[0]:
@@ -176,9 +181,17 @@ def clean(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, S: np.ndarray, limb: fl
         near = cv2.dilate((lab == i).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rh + 1, 2 * rh + 1)))
         nb, lb_ = cv2.connectedComponents(((dip > thr) | ((((zb > 0.5 * HUE_Z) & (dk > 0.5 * gsd)) | (dk > 0.4 * DARK * gsd)) & (near > 0) & (dE > 0.015 * limb)) | (lab == i)).astype(np.uint8))
         ids = np.unique(lb_[y0:y0 + hh, x0:x0 + ww][r])
-        add_ = np.isin(lb_, ids[ids > 0]).astype(np.uint8)
-        m1 |= add_
-    m0 = (m1 | m0).astype(np.float32)
+        m1 |= np.isin(lb_, ids[ids > 0]).astype(np.uint8)
+    return (m1 | m0).astype(np.float32), offhue[lab].astype(np.float32), info
+
+
+def fill(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, M: dict, m0: np.ndarray, off: np.ndarray, k: float = 1.0, dbg: Optional[dict] = None):
+    """The bruises m0 (0..1, with their rims; off: those to be lifted to the skin's level round them over a wider reach) filled with the leg's
+    own light and colour round them on planes of one size (maps M of them, _maps). -> Y, Cb, Cr."""
+    if k <= 1e-4 or float(m0.max()) < 0.5:
+        return Y, Cb, Cr
+    Sf, ys, dip, cbs, crs, u, v, w, Tl, dE, sig, limb = (M[q] for q in ("Sf", "ys", "dip", "cbs", "crs", "u", "v", "w", "Tl", "dE", "sig", "limb"))
+    m0 = (m0 > 0.5).astype(np.float32)
     rr = max(3, int(GROW * limb))
     ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rr + 1, 2 * rr + 1))
     grow = cv2.dilate(m0, ker)
@@ -186,9 +199,9 @@ def clean(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, S: np.ndarray, limb: fl
     # the skin round, carried in from the nearest side first (the leg's own shading through the patch, not a flat level)
     Tl2, ul, vl = _membrane((cv2.GaussianBlur(ys, (0, 0), 0.5 * rr), u, v), w2 * Sf, Sf, rr / 3.0)
     T = np.maximum(ys + dip * grow, Tl2)
-    if offhue.any():
+    if float(off.max()) > 0.5:
         # a bruise off the skin's hue lying in a shade (along a hem, in a fold's valley): its light up to the skin's round it over a wider reach
-        gh = cv2.GaussianBlur(cv2.dilate(offhue[lab].astype(np.float32), ker), (0, 0), rr * 0.5)
+        gh = cv2.GaussianBlur(cv2.dilate((off > 0.5).astype(np.float32), ker), (0, 0), rr * 0.5)
         T = T + gh * np.clip(Tl - T, 0, None)
     d_ = np.clip(T - ys, 0, MAX_LIFT * np.abs(T))
     inner = np.clip((dE - 0.01 * limb) / max(0.02 * limb, 1.0), 0, 1)      # nothing at the skin's edge (a hem, the leg's outline)
@@ -200,6 +213,18 @@ def clean(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, S: np.ndarray, limb: fl
     if dbg is not None:
         dbg.update(m=m, T=T, w2=w2, w=w)
     return Yo.astype(Y.dtype), Cbo.astype(Cb.dtype), Cro.astype(Cr.dtype)
+
+
+def clean(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, S: np.ndarray, limb: float, k: float = 1.0, dbg: Optional[dict] = None):
+    """The bruises on the skin S (0..1, the leg's skin) of planes of one size, found and filled on this picture alone; limb: the leg's width in
+    their pixels. -> Y, Cb, Cr."""
+    if k <= 1e-4 or limb < 16 or (S > 0.5).sum() < 64:
+        return Y, Cb, Cr
+    M = _maps(Y, Cb, Cr, S, limb)
+    m0, off, info = detect(M, dbg)
+    if float(m0.max()) < 0.5:
+        return Y, Cb, Cr
+    return fill(Y, Cb, Cr, M, m0, off, k, dbg)
 
 
 def clean_planes(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, skin: np.ndarray, legs: Sequence[tuple], k: float,
