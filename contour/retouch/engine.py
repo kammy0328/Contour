@@ -8170,21 +8170,27 @@ APPLY_ROI = 1.0     # (11/24) the apply works person by person on each one's own
                     # whole frame for everybody at once, as before
 
 
-def roi_job_ok(j) -> bool:
+def roi_job_ok(j, why: bool = False):
     """A job the apply can work on its own piece of the picture: a face, no body effects (their areas and the armpit's scale
-    are of the whole picture)."""
+    are of the whole picture). why: the reason it cannot (a string) instead of False."""
+    def no(r):
+        return r if why else False
     try:
         if j.face is None or not (j.wf_src > 0) or not np.isfinite(np.asarray(j.face, np.float32)[:, :2]).all():
-            return False
+            return no("no face")
         v = j.v
-        if any(v.get(k, 0) > 1e-4 for k in BODY_EFFECTS) or v.get("knee_tone", 0) > 1e-4 or v.get("belly_fold", 0) > 1e-4 \
-                or v.get("knee_dark", 0) > 1e-4:
-            return False
-        if "armpit" in j.masks or "knee" in j.masks or j.bmarks or getattr(j, "arm_axes", None):
-            return False
+        on = [k for k in BODY_EFFECTS + ("knee_dark",) if v.get(k, 0) > 1e-4]
+        if on:
+            return no("body values " + ",".join(on))
+        if "armpit" in j.masks:
+            return no("armpit mask")
+        if v.get("knee_dark", 0) > 1e-4 and "knee" in j.masks:
+            return no("knee")
+        if j.bmarks or getattr(j, "arm_axes", None):
+            return no("body marks / arm axes")
         return True
-    except Exception:
-        return False
+    except Exception as e:
+        return no("error " + repr(e))
 
 
 def roi_job_box(j, plane_wh: Tuple[int, int], proxy_wh: Tuple[int, int], y_per_src: float, margin: float = 0.8,

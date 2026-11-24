@@ -151,13 +151,23 @@ def _yuv_to_rgb(planes, max_value: float, rng: str) -> np.ndarray:
     return _from_ycc(yn, un, vn).astype(np.float32)
 
 
+def _dbg(*a):
+    import os as _o
+    if _o.environ.get("IWALY_ROI_DEBUG"):
+        print("APPLY_ROI:", *a, flush=True)
+
+
 def _apply_roi(planes, subsample, max_value, pix_fmt, rf, y_per_src, cm, vs, rng):
     """engine.APPLY_ROI: each person on their own piece of the picture, one after the other (a later person's piece is read from
     the planes the earlier ones left). None when it does not apply (a body effect, no face): the whole frame then."""
     if not pix_fmt.startswith("yuv") or len(planes) < 3:
+        _dbg("not yuv planes", pix_fmt)
         return None
     H, W = planes[0].shape[:2]
-    if not all(RE.roi_job_ok(j) for j in rf.jobs):
+    bad = [(j.pid, RE.roi_job_ok(j, why=True)) for j in rf.jobs]
+    bad = [b for b in bad if b[1] is not True]
+    if bad:
+        _dbg("jobs not on their piece", bad)
         return None
     al = 2
     for pl in planes[1:3]:
@@ -168,10 +178,13 @@ def _apply_roi(planes, subsample, max_value, pix_fmt, rf, y_per_src, cm, vs, rng
     for j in rf.jobs:
         b = RE.roi_job_box(j, (W, H), rf.proxy_wh, y_per_src, CROP_MARGIN, al)
         if b is None:
+            _dbg("no box", j.pid)
             return None
         boxes.append(b)
     if sum((b[2] - b[0]) * (b[3] - b[1]) for b in boxes) > 0.8 * W * H:
+        _dbg("pieces cover most of the picture", boxes)
         return None                      # the pieces are most of the picture: once for all is cheaper
+    _dbg("on pieces", boxes)
     out = [np.array(p, copy=True) for p in planes[:3]]
     for j, (x0, y0, x1, y1) in zip(rf.jobs, boxes):
         rfj = RE.roi_frame(rf, j, (x0, y0, x1, y1), (W, H), y_per_src)
