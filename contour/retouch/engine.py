@@ -8087,7 +8087,7 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
             if r is not None:
                 y0, y1, x0, x1 = r
                 size = job.grain_size * hY / 1080.0
-                seed = zlib.crc32(f"{rf.t}:{job.pid}:{hY}".encode())
+                seed = zlib.crc32(f"{rf.t}:{job.pid}:{getattr(rf, 'full_h', hY)}".encode())     # (the whole picture's height also on a piece of it, APPLY_ROI)
                 n = _grain((y1 - y0, x1 - x0), size, seed)
                 yy = Y[y0:y1, x0:x1]
                 lw = 0.35 + 2.6 * np.clip(yy, 0, 1) * (1 - np.clip(yy, 0, 1))
@@ -8163,6 +8163,110 @@ def yuv_scale(max_value: float, rng: Optional[str]) -> Tuple[float, float, float
     if (rng or "tv") == "tv":
         return 16.0 * s, 219.0 * s, 128.0 * s, 224.0 * s
     return 0.0, float(max_value), 128.0 * s, float(max_value)
+
+
+APPLY_ROI = 1.0     # (11/24) the apply works person by person on each one's own piece of the picture (retouch.logwrap): the same result
+                    # where the people's pieces do not overlap, a fraction of the time and memory of the whole 4K frame a person. 0 = the
+                    # whole frame for everybody at once, as before
+
+
+def roi_job_ok(j) -> bool:
+    """A job the apply can work on its own piece of the picture: a face, no body effects (their areas and the armpit's scale
+    are of the whole picture)."""
+    try:
+        if j.face is None or not (j.wf_src > 0) or not np.isfinite(np.asarray(j.face, np.float32)[:, :2]).all():
+            return False
+        v = j.v
+        if any(v.get(k, 0) > 1e-4 for k in BODY_EFFECTS) or v.get("knee_tone", 0) > 1e-4 or v.get("belly_fold", 0) > 1e-4 \
+                or v.get("knee_dark", 0) > 1e-4:
+            return False
+        if "armpit" in j.masks or "knee" in j.masks or j.bmarks or getattr(j, "arm_axes", None):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def roi_job_box(j, plane_wh: Tuple[int, int], proxy_wh: Tuple[int, int], y_per_src: float, margin: float = 0.8,
+                align: int = 2) -> Optional[Tuple[int, int, int, int]]:
+    """The piece of the plane (x0, y0, x1, y1, plane px) a job's retouch can reach: its masks, its landmarks and its flaws' box,
+    grown by `margin` face widths (at least 48 px), on a grid of `align` px (the chroma of 4:2:x files)."""
+    W, H = plane_wh
+    pw, ph = proxy_wh
+    fx, fy = W / float(pw), H / float(ph)
+    xs, ys = [], []
+    for k, m in j.masks.items():
+        if m is None:
+            continue
+        a = np.asarray(m)
+        rr = np.nonzero(a.max(1) > 1e-4)[0]
+        cc = np.nonzero(a.max(0) > 1e-4)[0]
+        if len(rr) and len(cc):
+            sx_, sy_ = W / float(a.shape[1]), H / float(a.shape[0])
+            xs += [cc[0] * sx_, (cc[-1] + 1) * sx_]
+            ys += [rr[0] * sy_, (rr[-1] + 1) * sy_]
+    lm = np.asarray(j.face, np.float32)[:, :2] * y_per_src
+    xs += [float(lm[:, 0].min()), float(lm[:, 0].max())]
+    ys += [float(lm[:, 1].min()), float(lm[:, 1].max())]
+    if j.det and j.det.get("box") is not None:
+        bx = j.det["box"]
+        xs += [bx[0] * fx, bx[2] * fx]
+        ys += [bx[1] * fy, bx[3] * fy]
+    m_ = max(48.0, margin * j.wf_src * y_per_src)
+    x0 = int(max(0, np.floor((min(xs) - m_) / align) * align))
+    y0 = int(max(0, np.floor((min(ys) - m_) / align) * align))
+    x1 = int(min(W, np.ceil((max(xs) + m_) / align) * align))
+    y1 = int(min(H, np.ceil((max(ys) + m_) / align) * align))
+    if x1 - x0 < 16 or y1 - y0 < 16:
+        return None
+    return x0, y0, x1, y1
+
+
+def roi_frame(rf: "RetouchFrame", j, box, plane_wh: Tuple[int, int], y_per_src: float) -> "RetouchFrame":
+    """A RetouchFrame of one job laid on the piece `box` (plane px) of the picture: its masks made at the piece's own pixels
+    (what M() would make of the whole mask, cut there), its landmarks and boxes moved by the piece's corner."""
+    import copy as _copy
+    x0, y0, x1, y1 = box
+    W, H = plane_wh
+    pw, ph = rf.proxy_wh
+    wc, hc = x1 - x0, y1 - y0
+    jc = _copy.copy(j)
+    ms = {}
+    for k, m in j.masks.items():
+        if m is None:
+            ms[k] = m
+            continue
+        a = np.asarray(m)
+        if a.dtype != np.float32:
+            a = a.astype(np.float32)
+        fx_, fy_ = a.shape[1] / float(W), a.shape[0] / float(H)
+        # cv2.resize's pixel centres (INTER_LINEAR): src = (dst + 0.5) * f - 0.5, the piece's dst moved by its corner
+        A = np.array([[fx_, 0.0, (x0 + 0.5) * fx_ - 0.5], [0.0, fy_, (y0 + 0.5) * fy_ - 0.5]], np.float64)
+        ms[k] = cv2.warpAffine(a, A, (wc, hc), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_REPLICATE)
+    jc.masks = ms
+    off = np.array([x0 / y_per_src, y0 / y_per_src], np.float32)
+    f_ = np.array(j.face, np.float32, copy=True)
+    f_[:, :2] -= off
+    jc.face = f_
+    if j.skin is not None:
+        sk_ = _copy.copy(j.skin)
+        if sk_.face is not None:
+            sf_ = np.array(sk_.face, np.float32, copy=True)
+            sf_[:, :2] -= off
+            sk_.face = sf_
+        if getattr(sk_, "head", None) is not None:
+            sk_.head = np.asarray(sk_.head, np.float32) - off
+        jc.skin = sk_
+    if j.det:
+        d_ = dict(j.det)
+        if d_.get("box") is not None:
+            ox, oy = x0 * pw / float(W), y0 * ph / float(H)
+            b_ = d_["box"]
+            d_["box"] = (b_[0] - ox, b_[1] - oy, b_[2] - ox, b_[3] - oy)
+        jc.det = d_
+    out = RetouchFrame(rf.t, [jc], (wc * pw / float(W), hc * ph / float(H)), (wc / y_per_src, hc / y_per_src))
+    out.full_h = getattr(rf, "full_h", H)
+    return out
 
 
 def apply_planes(planes: List[np.ndarray], subsample, max_value: float, pix_fmt: str,

@@ -230,8 +230,9 @@ def _pass(fl, D: np.ndarray, valid: np.ndarray, order, to_flow, breaks: set):
     return out, age, agree
 
 
-def refine(store, fs, frame_range: Tuple[int, int], progress: Optional[Callable] = None) -> dict:
-    """Runs on store.face / store.face_vis after solve_face. Returns counts for the report."""
+def refine(store, fs, frame_range: Tuple[int, int], progress: Optional[Callable] = None, skip=()) -> dict:
+    """Runs on store.face / store.face_vis after solve_face. Returns counts for the report. skip: store indices left as
+    they are (people out of focus, track/focus.py: never retouched, their faces need no flow)."""
     if fs is None or not getattr(store, "has_face", False):
         return {}
     a, b = frame_range
@@ -245,6 +246,8 @@ def refine(store, fs, frame_range: Tuple[int, int], progress: Optional[Callable]
     P = store.face.shape[0]
     T = b - a
     for p in range(P):
+        if p in skip:
+            continue
         pres = store.present[p, a:b]
         if pres.sum() < 2:
             continue
