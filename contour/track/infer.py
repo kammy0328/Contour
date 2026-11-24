@@ -510,7 +510,8 @@ class Finder31:
     def __init__(self, key: str = "seg_sam31_find"):
         from pathlib import Path
         d = M.ensure_model(key)
-        self.sess = M.session(d / "finder-gpu.onnx")
+        alt = os.environ.get("DIAP_SAM_FINDER", "")              # another build of the finder (Mac Core ML: the fixed inputs folded in)
+        self.sess = M.session(Path(alt) if alt and Path(alt).is_file() else d / "finder-gpu.onnx")
         txt = np.load(str(Path(__file__).parent / "data" / "sam31_text_person.npz"))
         self.const = {"text": txt["text"].astype(np.float32), "text_pad": txt["text_pad"],
                       "box_tokens": np.zeros((0, 1, 256), np.float32)}
