@@ -5048,7 +5048,106 @@ def _det_wanted(v) -> bool:
     return any(v.get(k, 0) > 1e-4 for k in ("blemish", "neck_lines", "neck_bumps"))
 
 
+DET_CACHE: Optional[str] = None   # (11/24) a folder: the score maps of each frame and person kept there and used again while everything they are
+                                  # made from is the same (the original's piece, the masks there, the landmarks, the face's size, the detector's settings
+                                  # and code). A render again after a fix of the apply (most feedback) skips the detection, the most of the masks'
+                                  # time (78 %, 2611 IWALY c057). None: off (the app). The batch sets it per cut
+_DETC = {"hit": 0, "miss": 0, "fail": 0}
+_DETC_CODE: list = []
+
+
+def _det_key(cut, px, t: int, job, lm, rgb_u8) -> Optional[str]:
+    """What the score maps of _det_raw_make depend on, as one hash (None: not to be kept)."""
+    import hashlib
+    import inspect
+    from . import spotnet_run as SR
+    v = job.v
+    use_sk = v.get("blemish", 0) > 1e-4
+    use_nk = _det_wanted(v)
+    sk = job.masks.get("skinx") if use_sk else None
+    nk = job.masks.get("neck") if use_nk else None
+    if sk is None and nk is None:
+        return None
+    h = hashlib.blake2b(digest_size=20)
+    if not _DETC_CODE:
+        src_ = []
+        for mod in (DT, SR):
+            try:
+                src_.append(open(mod.__file__, "rb").read())
+            except Exception:
+                src_.append(repr(mod).encode())
+        src_.append(inspect.getsource(_det_raw_make).encode() + inspect.getsource(_det_fuse).encode())
+        _DETC_CODE.append(hashlib.blake2b(b"\0".join(src_), digest_size=16).hexdigest())
+    _det_cfg()
+    cfg = {k: v_ for k, v_ in vars(DT).items() if k.isupper() and isinstance(v_, (int, float, str, tuple, bool, type(None)))}
+    scfg = {k: (str(v_) if k == "MODEL" else v_) for k, v_ in vars(SR).items() if k.isupper() and isinstance(v_, (int, float, str, tuple, bool, type(None), type(SR.MODEL)))}
+    try:
+        from ..warp.render import _vs_for
+        vs_ = repr(_vs_for(cut))
+    except Exception:
+        vs_ = "?"
+    try:
+        st_ = os.stat(str(cut.source))
+        srcid = f"{cut.source}|{st_.st_size}|{int(st_.st_mtime)}"
+    except Exception:
+        srcid = str(getattr(cut, "source", ""))
+    h.update(repr((_DETC_CODE[0], sorted(cfg.items()), sorted(scfg.items()), SR.available(), vs_, srcid, int(t), DET_WF_MAX, DET_SRC, DET_SRC_GAIN,
+                   float(px.sx), float(px.sy), tuple(rgb_u8.shape), float(job.wf_src), float(job.blemish_size), use_sk, use_nk)).encode())
+    h.update(np.ascontiguousarray(np.asarray(lm, np.float32)).tobytes())
+    for m in (sk, nk):
+        if m is None:
+            h.update(b"none")
+        else:
+            a = np.ascontiguousarray(m)
+            h.update(repr((a.shape, str(a.dtype))).encode())
+            h.update(a.tobytes())
+    if not DET_SRC:
+        h.update(np.ascontiguousarray(rgb_u8).tobytes())
+    return h.hexdigest()
+
+
 def _det_raw(cut, px, t: int, job, lm: np.ndarray, rgb_u8: np.ndarray) -> Optional[dict]:
+    """_det_raw_make, kept in DET_CACHE when it is set."""
+    if not DET_CACHE:
+        return _det_raw_make(cut, px, t, job, lm, rgb_u8)
+    try:
+        key = _det_key(cut, px, t, job, lm, rgb_u8)
+    except Exception:
+        _DETC["fail"] += 1
+        key = None
+    if key is None:
+        return _det_raw_make(cut, px, t, job, lm, rgb_u8)
+    path = os.path.join(DET_CACHE, key[:2], key + ".npz")
+    if os.path.exists(path):
+        try:
+            with np.load(path, allow_pickle=False) as z:
+                if int(z["none"]):
+                    _DETC["hit"] += 1
+                    return None
+                maps = {k[2:]: z[k] for k in z.files if k.startswith("m_")}
+                d = dict(box=tuple(float(x) for x in z["box"]), maps=maps, thumb=z["thumb"], src=bool(z["src"]), wf=float(z["wf"]))
+            _DETC["hit"] += 1
+            return d
+        except Exception:
+            _DETC["fail"] += 1
+    d = _det_raw_make(cut, px, t, job, lm, rgb_u8)
+    _DETC["miss"] += 1
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + f".{os.getpid()}.{threading.get_ident()}.tmp"
+        with open(tmp, "wb") as f:
+            if d is None:
+                np.savez(f, none=np.array(1))
+            else:
+                np.savez_compressed(f, none=np.array(0), box=np.array(d["box"], np.float64), thumb=d["thumb"], src=np.array(bool(d.get("src"))),
+                                    wf=np.array(float(d["wf"])), **{"m_" + k: m for k, m in d["maps"].items()})
+        os.replace(tmp, path)
+    except Exception:
+        _DETC["fail"] += 1
+    return d
+
+
+def _det_raw_make(cut, px, t: int, job, lm: np.ndarray, rgb_u8: np.ndarray) -> Optional[dict]:
     """One frame's score maps for a job, on the best picture there is of its face and neck: a piece of the original
     at (up to) its own resolution where the analysis picture is a reduced copy (a 4K original seen at 1920: fine
     lines and small spots are gone from the copy), else the analysis picture itself. Never a reduced picture made
