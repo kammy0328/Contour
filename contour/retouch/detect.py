@@ -29,6 +29,8 @@ from typing import Dict, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
+from . import gpuops as _GPU   # (11/24) cv2 with its GaussianBlur on the GPU when engine.GPU_MASKS is on (see gpuops)
+cv2 = _GPU.proxy()
 
 KINDS = ("dark", "red", "bump", "line", "fold", "protect")
 

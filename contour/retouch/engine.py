@@ -14,6 +14,8 @@ from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+from . import gpuops as _GPU   # (11/24) cv2 with its GaussianBlur on the GPU when engine.GPU_MASKS is on (see gpuops)
+cv2 = _GPU.proxy()
 
 from . import bodyskin as BS
 from . import bodyspots as BP
@@ -194,6 +196,7 @@ HAND_GUARD_REACH = 0.45     # of the forearm (elbow -> wrist): how far past the 
 HAND_GUARD_RADIUS = 0.32    # of the forearm: the hand's half width
 DARK_CHROMA = 0.8           # how far the under-eye's colour is taken to the cheek's (11/24, INT_c006: "눈 아래 색 빠짐" at 0.8); 0.8 = as before
 NASO_NOSTRIL_HOLD = 0.0     # of the face width: the nostrils and the nose's base grown by this are out of the nasolabial band (0 = off)
+GPU_MASKS = None            # (11/24) 1: the Gaussian blurs of the mask making and the apply on the GPU (gpuops; same result as OpenCV); 0: OpenCV; None: env IWALY_GPU_MASKS
 SKIN_FS_G = None            # (2611 IWALY INT, 11/24: the pebbled skin of INT_c001 / c006 / c007 / c010 stayed) the gains of the skin stage's texture bands (skin.FS_G, finest
                             # to widest), set from here so a batch's settings can carry them; None = skin.FS_G as it is. INT_c006 f90 / INT_c001 f119: (1.35, 0.70, 0.30, 0.20, 0.20, 0.45)
 SKIN_FOREHEAD_HOLD = 0.0    # 0..1: the forehead above the brows kept out of the skin stage (bangs over it: the strands flickered, INT_c005 11/24). 0 = as before
