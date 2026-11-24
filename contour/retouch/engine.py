@@ -8222,13 +8222,57 @@ def roi_job_box(j, plane_wh: Tuple[int, int], proxy_wh: Tuple[int, int], y_per_s
         xs += [bx[0] * fx, bx[2] * fx]
         ys += [bx[1] * fy, bx[3] * fy]
     m_ = max(48.0, margin * j.wf_src * y_per_src)
-    x0 = int(max(0, np.floor((min(xs) - m_) / align) * align))
-    y0 = int(max(0, np.floor((min(ys) - m_) / align) * align))
-    x1 = int(min(W, np.ceil((max(xs) + m_) / align) * align))
-    y1 = int(min(H, np.ceil((max(ys) + m_) / align) * align))
+    # on the masks' grid too (a piece whose corner is a whole proxy pixel: its masks are then made exactly as M() makes the whole
+    # mask, roi_frame); 2560 -> 3840: every 3 px
+    ax, ay = align, align
+    shp = next((np.asarray(m).shape for k, m in j.masks.items() if m is not None), None)
+    if shp is not None:
+        from fractions import Fraction
+        from math import lcm
+        ax = lcm(ax, Fraction(W, shp[1]).numerator)
+        ay = lcm(ay, Fraction(H, shp[0]).numerator)
+    x0 = int(max(0, np.floor((min(xs) - m_) / ax) * ax))
+    y0 = int(max(0, np.floor((min(ys) - m_) / ay) * ay))
+    x1 = int(min(W, np.ceil((max(xs) + m_) / ax) * ax))
+    y1 = int(min(H, np.ceil((max(ys) + m_) / ay) * ay))
     if x1 - x0 < 16 or y1 - y0 < 16:
         return None
     return x0, y0, x1, y1
+
+
+def _piece_of_resized(a: np.ndarray, box, plane_wh) -> np.ndarray:
+    """cv2.resize(a, plane_wh, INTER_LINEAR)[y0:y1, x0:x1] (what process_ycc's M() makes of the whole mask, cut to the piece) without
+    making the whole: the mask's piece with a margin of whole pixels is resized at the same scale and the margin cut off. Exact when
+    the piece's corners lie on the mask's grid (roi_job_box); else a warp at the same pixel centres."""
+    from fractions import Fraction
+    x0, y0, x1, y1 = box
+    W, H = plane_wh
+    if a.dtype not in (np.float32, np.uint8):
+        a = a.astype(np.float32)
+    h, w = a.shape[:2]
+    fx, fy = Fraction(W, w), Fraction(H, h)
+    nx, dx, ny, dy = fx.numerator, fx.denominator, fy.numerator, fy.denominator
+    if x0 % nx == 0 and y0 % ny == 0 and (x1 % nx == 0 or x1 == W) and (y1 % ny == 0 or y1 == H) and nx <= 64 and ny <= 64:
+        p0, q0 = x0 * dx // nx, y0 * dy // ny
+        p1 = w if x1 == W else x1 * dx // nx
+        q1 = h if y1 == H else y1 * dy // ny
+        pl, pt = min(p0, 2 * dx), min(q0, 2 * dy)           # whole groups of the grid: the margin is a whole number of plane px
+        pr, pb = min(w - p1, 2 * dx), min(h - q1, 2 * dy)
+        pr -= pr % dx if p1 + pr < w else 0
+        pb -= pb % dy if q1 + pb < h else 0
+        sub = a[q0 - pt:q1 + pb, p0 - pl:p1 + pr]
+        ow = (p1 + pr - (p0 - pl)) * nx // dx
+        oh = (q1 + pb - (q0 - pt)) * ny // dy
+        if (p1 + pr - (p0 - pl)) * nx % dx == 0 and (q1 + pb - (q0 - pt)) * ny % dy == 0:
+            r = cv2.resize(sub, (ow, oh), interpolation=cv2.INTER_LINEAR)
+            ox, oy = pl * nx // dx, pt * ny // dy
+            out = r[oy:oy + (y1 - y0), ox:ox + (x1 - x0)]
+            if out.shape[:2] == (y1 - y0, x1 - x0):
+                return np.ascontiguousarray(out, dtype=np.float32) if a.dtype != np.uint8 else np.ascontiguousarray(out)
+    fx_, fy_ = w / float(W), h / float(H)
+    A = np.array([[fx_, 0.0, (x0 + 0.5) * fx_ - 0.5], [0.0, fy_, (y0 + 0.5) * fy_ - 0.5]], np.float64)
+    return cv2.warpAffine(a.astype(np.float32), A, (x1 - x0, y1 - y0), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                          borderMode=cv2.BORDER_REPLICATE)
 
 
 def roi_frame(rf: "RetouchFrame", j, box, plane_wh: Tuple[int, int], y_per_src: float) -> "RetouchFrame":
@@ -8245,13 +8289,7 @@ def roi_frame(rf: "RetouchFrame", j, box, plane_wh: Tuple[int, int], y_per_src: 
         if m is None:
             ms[k] = m
             continue
-        a = np.asarray(m)
-        if a.dtype != np.float32:
-            a = a.astype(np.float32)
-        fx_, fy_ = a.shape[1] / float(W), a.shape[0] / float(H)
-        # cv2.resize's pixel centres (INTER_LINEAR): src = (dst + 0.5) * f - 0.5, the piece's dst moved by its corner
-        A = np.array([[fx_, 0.0, (x0 + 0.5) * fx_ - 0.5], [0.0, fy_, (y0 + 0.5) * fy_ - 0.5]], np.float64)
-        ms[k] = cv2.warpAffine(a, A, (wc, hc), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_REPLICATE)
+        ms[k] = _piece_of_resized(np.asarray(m), (x0, y0, x1, y1), (W, H))
     jc.masks = ms
     off = np.array([x0 / y_per_src, y0 / y_per_src], np.float32)
     f_ = np.array(j.face, np.float32, copy=True)
