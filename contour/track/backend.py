@@ -66,6 +66,8 @@ def coreml_files() -> Dict[str, dict]:
     o: dict = {}
     if os.environ.get("DIAP_COREML_UNITS"):
         o["MLComputeUnits"] = os.environ["DIAP_COREML_UNITS"]
+    if os.environ.get("DIAP_COREML_FORMAT"):
+        o["ModelFormat"] = os.environ["DIAP_COREML_FORMAT"]
     if os.environ.get("DIAP_COREML_CACHE"):
         o["ModelCacheDirectory"] = os.environ["DIAP_COREML_CACHE"]
     return {n: dict(o) for n in names}
