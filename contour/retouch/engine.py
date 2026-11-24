@@ -7365,6 +7365,22 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
             if dkz_ is not None:
                 mY = mY * (1.0 - dkz_)
                 mC = mC * M(1.0 - dkz_, (hC, wC))
+            if SKIN_BROW_HOLD > 1e-4 and job.face is not None:
+                # (11/24) the brows' hold of the mask stage, on the smoothing's own mask too (the forehead's did not reach it there, INT_c005 f0)
+                try:
+                    L_ = np.asarray(job.face, np.float64)[:, :2] * y_per_src
+                    if np.isfinite(L_[17:27]).all():
+                        bh_ = np.zeros((hY, wY), np.uint8)
+                        for idx_ in (range(17, 22), range(22, 27)):
+                            cv2.fillConvexPoly(bh_, cv2.convexHull(np.round(L_[list(idx_)]).astype(np.int32)), 255)
+                        kb_ = max(3, int(round(SKIN_BROW_HOLD * wf)) * 2 + 1)
+                        bh_ = cv2.dilate(bh_, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kb_, kb_)))
+                        bhf_ = cv2.GaussianBlur(bh_.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.5 * SKIN_BROW_HOLD * wf))
+                        mY = mY * (1.0 - bhf_)
+                        mC = mC * M(1.0 - bhf_, (hC, wC))
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
             if SKIN_FOREHEAD_HOLD > 1e-4 and job.face is not None:
                 # (11/24, INT_c005 f0: the hold in the mask stage did not reach the smoothing) the forehead above the brows taken out here, on the picture's own grid
                 try:
