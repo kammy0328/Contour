@@ -25,6 +25,7 @@ class ParamDef:
     unit: str = "%"          # % (signed) | pct (unsigned %) | deg
     kind: str = "body"
     tip: str = ""
+    hidden: bool = False     # (1.26) not shown in the panel unless a project has a value for it (the engine still does what it says)
 
 
 GROUPS: List[Tuple[str, str, str]] = [
@@ -99,7 +100,7 @@ PARAMS: List[ParamDef] = [
     ParamDef("dark_circle", "다크서클", "skin", 0, 100, unit="pct", kind="skin",
              tip="눈 밑 어둡고 푸른 그늘을 볼 피부 밝기·색으로 끌어올립니다"),
     ParamDef("shine", "번들거림", "skin", 0, 100, unit="pct", kind="skin",
-             tip="이마·코·볼의 하얗게 번들거리는 유분 광만 눌러 줍니다"),
+             tip="이마·코·볼의 하얗게 번들거리는 유분 광만 눌러 줍니다", hidden=True),
     ParamDef("redness", "홍조", "skin", 0, 100, unit="pct", kind="skin",
              tip="볼·코 주변의 붉은 기를 얼굴 피부톤으로 가라앉힙니다 (입술은 그대로)"),
     ParamDef("neck_lines", "목주름", "skin", 0, 100, unit="pct", kind="skin",
@@ -136,7 +137,8 @@ PARAMS: List[ParamDef] = [
     ParamDef("shading", "쉐딩", "color", 0, 100, unit="pct", kind="color", tip="콧대 옆, 광대 아래, 턱선 안쪽을 어둡게 (윤곽)"),
     ParamDef("highlight", "하이라이트", "color", 0, 100, unit="pct", kind="color", tip="콧대, 광대 위, 이마 가운데, 턱 끝을 밝게"),
     ParamDef("teeth", "치아 미백", "color", 0, 100, unit="pct", kind="color"),
-    ParamDef("knee_dark", "무릎 어두움", "color", 0, 100, unit="pct", kind="color", tip="무릎의 어둡고 붉은 부분을 주변 피부톤에 맞춥니다"),
+    ParamDef("knee_dark", "무릎 어두움", "color", 0, 100, unit="pct", kind="color", tip="무릎의 어둡고 붉은 부분을 주변 피부톤에 맞춥니다",
+             hidden=True),
 ]
 
 PARAM: Dict[str, ParamDef] = {p.key: p for p in PARAMS}

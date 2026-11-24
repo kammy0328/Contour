@@ -166,6 +166,8 @@ class ReshapeTab(_Tab):
                 r.keyToggled.connect(self.ctl.toggle_param_key)
                 self.rows[d.key] = r
                 bl.addWidget(r)
+                if d.hidden:
+                    r.setVisible(False)
                 if d.key == "sculpt":
                     bl.addWidget(self._sculpt_row())
                 if d.key == "body_sculpt":
@@ -839,6 +841,10 @@ class ReshapeTab(_Tab):
             else:
                 r.set_value(0)
                 r.set_key_state("none")
+            from ..core.params import PARAM as _PRM
+            if _PRM[k].hidden:
+                # (1.26: 번들거림, 무릎 어두움) shown only while this person has a value for it (a project of before)
+                r.setVisible(bool(pp is not None and pp._active(k)))
         if self.part == "skin":
             self._fill_basic(pp, enabled)
             self._fill_body(pp, enabled, t)
