@@ -8194,7 +8194,7 @@ def roi_job_ok(j, why: bool = False):
 
 
 def roi_job_box(j, plane_wh: Tuple[int, int], proxy_wh: Tuple[int, int], y_per_src: float, margin: float = 0.8,
-                align: int = 2) -> Optional[Tuple[int, int, int, int]]:
+                align: int = 2, why_: Optional[list] = None) -> Optional[Tuple[int, int, int, int]]:
     """The piece of the plane (x0, y0, x1, y1, plane px) a job's retouch can reach: its masks, its landmarks and its flaws' box,
     grown by `margin` face widths (at least 48 px), on a grid of `align` px (the chroma of 4:2:x files)."""
     W, H = plane_wh
@@ -8202,12 +8202,14 @@ def roi_job_box(j, plane_wh: Tuple[int, int], proxy_wh: Tuple[int, int], y_per_s
     fx, fy = W / float(pw), H / float(ph)
     xs, ys = [], []
     for k, m in j.masks.items():
-        if m is None:
+        if m is None or k == "excl":           # (excl: where the features are held, 1 outside the face too; RetouchFrame.union leaves it out as well)
             continue
         a = np.asarray(m)
-        rr = np.nonzero(a.max(1) > 1e-4)[0]
-        cc = np.nonzero(a.max(0) > 1e-4)[0]
+        rr = np.nonzero(a.max(1) > 0.004)[0]
+        cc = np.nonzero(a.max(0) > 0.004)[0]
         if len(rr) and len(cc):
+            if why_ is not None:
+                why_.append((k, int(cc[0]), int(rr[0]), int(cc[-1]) + 1, int(rr[-1]) + 1, a.shape[1], a.shape[0]))
             sx_, sy_ = W / float(a.shape[1]), H / float(a.shape[0])
             xs += [cc[0] * sx_, (cc[-1] + 1) * sx_]
             ys += [rr[0] * sy_, (rr[-1] + 1) * sy_]
