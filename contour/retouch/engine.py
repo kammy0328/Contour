@@ -7365,6 +7365,23 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
             if dkz_ is not None:
                 mY = mY * (1.0 - dkz_)
                 mC = mC * M(1.0 - dkz_, (hC, wC))
+            if SKIN_FOREHEAD_HOLD > 1e-4 and job.face is not None:
+                # (11/24, INT_c005 f0: the hold in the mask stage did not reach the smoothing) the forehead above the brows taken out here, on the picture's own grid
+                try:
+                    L_ = np.asarray(job.face, np.float64)[:, :2] * y_per_src
+                    if np.isfinite(L_[[8, 17, 21, 22, 26, 27]]).all():
+                        up_ = L_[27] - L_[8]
+                        up_ = up_ / max(1e-6, float(np.hypot(*up_)))
+                        br_ = L_[17:27] + up_ * (0.012 * wf)
+                        poly_ = np.vstack([br_, (br_ + up_ * (0.9 * wf))[::-1]])
+                        fh_ = np.zeros((hY, wY), np.uint8)
+                        cv2.fillPoly(fh_, [np.round(poly_).astype(np.int32)], 255)
+                        fhf_ = float(np.clip(SKIN_FOREHEAD_HOLD, 0, 1)) * cv2.GaussianBlur(fh_.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.02 * wf))
+                        mY = mY * (1.0 - fhf_)
+                        mC = mC * M(1.0 - fhf_, (hC, wC))
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
             if SKIN_FS_G is not None and len(SKIN_FS_G) == len(SK.FS_S):
                 SK.FS_G = tuple(float(g_) for g_ in SKIN_FS_G)      # (11/24) the texture bands' gains set from the engine's settings (control.json engine_cfg)
             r = SK.radius_px(job.skin, y_per_src)
