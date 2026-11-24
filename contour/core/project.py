@@ -496,7 +496,7 @@ class TrackingSettings:
 class OutputSettings:
     format: str = "prores_4444_xq"
     out_dir: str = ""
-    name_pattern: str = "{cut}_reshape"
+    name_pattern: str = "{cut}_DIAP"            # (1.26; "{cut}_reshape" before, from when the app reshaped bodies only)
     include_audio: bool = True
     matte_person: bool = False
     matte_warp: bool = False

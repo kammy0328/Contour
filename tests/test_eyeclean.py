@@ -85,7 +85,7 @@ def test_basic_parts():
     v = skin_basic_values("std", ["naso"], {"eye": "strong"})
     assert v["eye_white"] == 100.0 and v["knee_tone"] == 0.0
     v2 = skin_basic_values("strong", [], {"eye": "light", "knee": "std", "elbow": "strong"})
-    assert v2["eye_white"] == 60.0 and v2["knee_tone"] == 70.0             # each part its own step, apart from the skin's level
+    assert v2["eye_white"] == 60.0 and v2["knee_tone"] == 70.0 and v2["knee_fold"] == 70.0   # each part its own step, apart from the skin's level
     assert ("elbow_tone" in v2) == ("elbow_tone" in PARAM)                # a part the app has no slider for is left out
 
 
