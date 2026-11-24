@@ -279,6 +279,10 @@ def test_a_ring_of_a_few_pixels_leaves_the_knee_alone(monkeypatch):
     area_only = (e < 1.1).astype(np.float32) * skin
     ring_bit = ((np.abs(gx - CX) < 7) & (gy > 62) & (gy < 70)).astype(np.float32) * skin          # ~ 100 px of ring: enough to be read, hardly any of the leg
     only = np.maximum(area_only, ring_bit).astype(np.float32)
+    # the knee where it was read (1.25: a knee with too little skin round it is moved along the leg or read again,
+    # KNEE_SLIDE / KNEE_RESCUE; here the knee itself is the case)
+    monkeypatch.setattr(BT, "KNEE_SLIDE", 0.0)
+    monkeypatch.setattr(BT, "KNEE_RESCUE", False)
     monkeypatch.setattr(BT, "KNEE_V2", False)
     old = BT.knee_tone(Y, Cb, Cr, only, KNEE, 1.0)
     monkeypatch.setattr(BT, "KNEE_V2", True)

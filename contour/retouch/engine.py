@@ -4119,7 +4119,8 @@ class KneeLook:
                 sup = knee_probe(rf, self.px) if rf is not None else {}
                 if rf is not None:
                     for j_ in rf.jobs:
-                        j_.masks = {k_: _mask_pack(v_) for k_, v_ in j_.masks.items()}
+                        if getattr(j_, "masks", None):
+                            j_.masks = {k_: _mask_pack(v_) for k_, v_ in j_.masks.items()}
                 with self.cv:
                     self.items[t] = (rf, fi)
                     self.sup[t] = sup
