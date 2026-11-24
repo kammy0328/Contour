@@ -264,7 +264,9 @@ class PartParams:
                 "sculpt": {str(k): list(v) for k, v in self.sculpt.items()},
                 "body_sculpt": dict(self.body_sculpt), "body_sides": self.body_sides,
                 **({"skin_basic": {"level": self.skin_basic.get("level", "std"),
-                                   "remove": list(self.skin_basic.get("remove", []))}} if self.skin_basic else {})}
+                                   "remove": list(self.skin_basic.get("remove", [])),
+                                   **({"on": list(self.skin_basic["on"])} if self.skin_basic.get("on") is not None else {})}}
+                   if self.skin_basic else {})}
 
     def _body_dict(self) -> dict:
         """The body skin settings, only what is not as a new person has it (a project that never used them is
@@ -322,6 +324,8 @@ class PartParams:
         sb = d.get("skin_basic") or {}
         if isinstance(sb, dict) and sb.get("level") in ("light", "std", "strong"):
             p.skin_basic = {"level": sb["level"], "remove": [str(x) for x in (sb.get("remove") or [])]}
+            if isinstance(sb.get("on"), list):
+                p.skin_basic["on"] = [str(x) for x in sb["on"]]          # (1.26) the parts switched on: eye whites, knees, elbows
             p._basic_upgrade()
         return p
 
@@ -364,6 +368,8 @@ class PartParams:
         p.body_sides = self.body_sides
         p.skin_basic = {"level": self.skin_basic["level"], "remove": list(self.skin_basic.get("remove", []))} \
             if self.skin_basic else {}
+        if self.skin_basic and self.skin_basic.get("on") is not None:
+            p.skin_basic["on"] = list(self.skin_basic["on"])
         return p
 
 

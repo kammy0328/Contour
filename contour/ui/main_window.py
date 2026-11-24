@@ -3884,9 +3884,9 @@ class MainWindow(QMainWindow):
             if getattr(q, "skin_basic", None):
                 q.skin_basic = {}
 
-    def apply_skin_basic(self, level: str = "", switch=None):
-        """Sets the detail sliders from the basic adjustment (level light | std | strong, switch (name, remove)).
-        With no basic adjustment chosen yet, a switch starts from 표준 with every switch on 보호."""
+    def apply_skin_basic(self, level: str = "", switch=None, toggle=None):
+        """Sets the detail sliders from the basic adjustment (level light | std | strong, switch (name, remove), toggle (part, on): the eye
+        whites, the knees, the elbows). With no basic adjustment chosen yet, a switch starts from 표준 with every switch on 보호."""
         pp = self._params()
         if pp is None:
             self.inspector.refresh("reshape")
@@ -3901,7 +3901,11 @@ class MainWindow(QMainWindow):
         if switch is not None:
             (rm.add if switch[1] else rm.discard)(switch[0])
         cur["remove"] = sorted(rm)
-        vals = skin_basic_values(cur["level"], cur["remove"])
+        if toggle is not None:
+            ons = set(cur.get("on") or [])
+            (ons.add if toggle[1] else ons.discard)(toggle[0])
+            cur["on"] = sorted(ons)
+        vals = skin_basic_values(cur["level"], cur["remove"], cur.get("on"))
         targets = [pp] + self._others()
         if any(q.amounts[k].keys for q in targets for k in vals):
             m = QMessageBox(self)
@@ -3921,11 +3925,13 @@ class MainWindow(QMainWindow):
             for k, v in vals.items():
                 q.amounts[k] = Curve(base=float(v))
             q.skin_basic = {"level": cur["level"], "remove": list(cur["remove"])}
+            if cur.get("on") is not None:
+                q.skin_basic["on"] = list(cur["on"])
         self.session.touch("ret")
         self.viewer.update()
         self.timeline.update()
         self.inspector.refresh("reshape")
-        if started and switch is not None and not level:
+        if started and (switch is not None or toggle is not None) and not level:
             self.toast("강도는 표준으로 적용했습니다", "ok")
 
     def copy_settings_dialog(self):

@@ -1807,6 +1807,9 @@ def teeth_mask(lm: np.ndarray, rgb_f: np.ndarray) -> np.ndarray:
 EYE_WHITE_V2 = 0.0   # 0/1 (2611 IWALY INT, user 2026-11-24: "핏줄만 제거, 눈썹이나 다른 곳으로 번지면 안 되고, 흔적 없이 깨끗한 흰자"): the sclera found by its red channel (the veins
                      # are red and stay in the mask; the v1 mask weighted by brightness and low saturation left the veins themselves out), inside the eye's own landmarks only, and the
                      # veins filled from the white round them (dark -> up to the local white, red -> down to the white's own chroma) instead of lifting / bleaching the whole white
+EYE_WHITE_CLEAN = 1.0         # 0..1 (2026-11-25, IU NES BASE_CL_29; the user: "점, 얼룩, 실핏줄, 멍이 있으면 지워져야 해"): the eye-white slider runs the white's
+                              # cleanup of retouch.eyeclean (spots, stains, veins and the shade beside the iris off, the white's tone, shading and grain kept)
+                              # instead of the vein filling (EYE_WHITE_V2) or the v1 lift; 0 = those as before
 EYE_WHITE_MIN_WF = None       # face width in SOURCE px under which the eye-white stage is not run at all (a wide shot: the whites are a few pixels, nothing to see,
                                # only time spent); None = every face (2611 IWALY, user 11/24: "눈이 디테일하게 보이는 샷에서만")
 EYE_WHITE_V2_SHRINK = 0.88     # the eye's landmark polygon shrunk towards its middle by this (the lid's edge and the lash line stay out)
@@ -8491,7 +8494,17 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
             k = float(np.clip(v["eye_white"], 0, 1))
             mY = M(job.masks["eyew"], (hY, wY))
             mC = M(job.masks["eyew"], (hC, wC))
-        if "eyew" in job.masks and v["eye_white"] > 1e-4 and EYE_WHITE_V2 > 1e-4:
+        if "eyew" in job.masks and v["eye_white"] > 1e-4 and EYE_WHITE_CLEAN > 1e-4 and job.face is not None:
+            # 흰자 정리 (retouch.eyeclean): spots, stains, veins and the shade beside the iris taken off the white, its tone, shading and grain kept
+            try:
+                from . import eyeclean as EC
+                lmY_ = np.asarray(job.face, np.float32)[:, :2] * y_per_src
+                kk_ = k * float(np.clip(EYE_WHITE_CLEAN, 0, 1)) * float(np.clip(getattr(job, "face_w", 1.0), 0, 1))
+                Y, Cb, Cr = EC.clean_planes(Y, Cb, Cr, lmY_, kk_, EC.MIN_EYE_PX)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+        elif "eyew" in job.masks and v["eye_white"] > 1e-4 and EYE_WHITE_V2 > 1e-4:
             Y, Cb, Cr = _eye_white_apply_v2(Y, Cb, Cr, mY, mC, wf, cs, k)
         elif "eyew" in job.masks and v["eye_white"] > 1e-4:
             # thin red veins: even out locally first

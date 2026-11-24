@@ -191,13 +191,25 @@ SKIN_REMOVE: List[Tuple[str, str, str]] = [("mouth", "mouth_lines", "입가주�
 SKIN_REMOVE_VALUES: Dict[str, float] = {"light": 25, "std": 40, "strong": 80}
 SKIN_REMOVE_VALUES_V1: Dict[str, float] = {"light": 25, "std": 40, "strong": 60}     # before 1.18 (cut 024: folds stayed)
 SKIN_BASIC_KEYS: List[str] = list(SKIN_LEVEL_VALUES["std"]) + [k for _, k, _ in SKIN_REMOVE]
+# (2026-11-25, the user: "기본 조정에서 눈, 무릎, 팔꿈치에 대한 보정 기능을 토글 식으로") parts switched on or off in the basic adjustment: switch ->
+# (detail slider, label); the slider's value at light / std / strong when on. A switch whose slider the app does not have yet is shown but not used
+SKIN_TOGGLES: List[Tuple[str, str, str]] = [("eye", "eye_white", "눈 흰자 정리"), ("knee", "knee_tone", "무릎 멍·얼룩"), ("elbow", "elbow_tone", "팔꿈치 주름·멍")]
+SKIN_TOGGLE_VALUES: Dict[str, Dict[str, float]] = {"eye": {"light": 60, "std": 100, "strong": 100},
+                                                   "knee": {"light": 50, "std": 70, "strong": 100},
+                                                   "elbow": {"light": 50, "std": 70, "strong": 100}}
 
 
-def skin_basic_values(level: str, remove) -> Dict[str, float]:
-    """The detail slider values of a basic adjustment: level (light | std | strong) and the switches set to 제거."""
+def skin_basic_values(level: str, remove, on=None) -> Dict[str, float]:
+    """The detail slider values of a basic adjustment: level (light | std | strong), the switches set to 제거, and the parts switched on
+    (SKIN_TOGGLES; None: the parts' sliders are not part of it, as before 1.26)."""
     level = level if level in SKIN_LEVEL_VALUES else "std"
     out = {k: float(v) for k, v in SKIN_LEVEL_VALUES[level].items()}
     rm = set(remove or ())
     for sw, key, _ in SKIN_REMOVE:
         out[key] = float(SKIN_REMOVE_VALUES[level]) if sw in rm else 0.0
+    if on is not None:
+        ons = set(on)
+        for sw, key, _ in SKIN_TOGGLES:
+            if key in PARAM:
+                out[key] = float(SKIN_TOGGLE_VALUES[sw][level]) if sw in ons else 0.0
     return out
