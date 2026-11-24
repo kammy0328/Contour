@@ -177,7 +177,7 @@ def _apply_roi(planes, subsample, max_value, pix_fmt, rf, y_per_src, cm, vs, rng
     boxes = []
     for j in rf.jobs:
         w_ = []
-        b = RE.roi_job_box(j, (W, H), rf.proxy_wh, y_per_src, CROP_MARGIN, al, w_)
+        b = RE.roi_job_box(j, (W, H), rf.proxy_wh, y_per_src, float(getattr(RE, "APPLY_ROI_MARGIN", 1.5)), al, w_)
         _dbg("job", j.pid, "masks' boxes (proxy px)", w_)
         if b is None:
             _dbg("no box", j.pid)

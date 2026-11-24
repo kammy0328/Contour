@@ -8168,6 +8168,7 @@ def yuv_scale(max_value: float, rng: Optional[str]) -> Tuple[float, float, float
 APPLY_ROI = 1.0     # (11/24) the apply works person by person on each one's own piece of the picture (retouch.logwrap): the same result
                     # where the people's pieces do not overlap, a fraction of the time and memory of the whole 4K frame a person. 0 = the
                     # whole frame for everybody at once, as before
+APPLY_ROI_MARGIN = 1.5   # face widths round a person's masks and landmarks that their piece takes in (the blurs and the local levels of the stages reach that far)
 
 
 def roi_job_ok(j, why: bool = False):
