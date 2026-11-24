@@ -2217,7 +2217,7 @@ def _focus_w(tracker, st, p: int, t: int, px) -> float:
 
 def _focus_scale(v: dict, w: float) -> dict:
     """The person's values times the focus weight w: the face's keys only (the body's stay: a face out of focus says nothing of the body)."""
-    return {k: (x if (k.startswith("body_") or k.startswith("knee")) else x * w) for k, x in v.items()}
+    return {k: (x if (k.startswith("body_") or k.startswith("knee") or k.startswith("leg_")) else x * w) for k, x in v.items()}
 
 
 def _parse_visible(tracker, pid: int, t: int, face: np.ndarray, px) -> float:
@@ -2719,7 +2719,7 @@ def _knee_off(v):
     return v
 
 
-BODY_EFFECTS = ("body_skin", "body_blemish", "knee_tone", "knee_fold", "belly_fold")   # the values that bring the body skin's area with them
+BODY_EFFECTS = ("body_skin", "body_blemish", "knee_tone", "knee_fold", "leg_bruise", "belly_fold")   # the values that bring the body skin's area with them
 BDET_NOW = True            # a job that came without its spots (a single frame, a test) has them found on the plane
 
 
@@ -4063,6 +4063,12 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                     # (the legs' widths are the median of the neighbouring pictures': the measure of one picture jumps, the leg does not)
                     job.tone = BTN.person_geometry_t(st.final[p], st.widths[p] if getattr(st, "widths", None) is not None else None, int(t))
 
+                if v.get("leg_bruise", 0) > 1e-4 and "leg" in body_scope_set(bscope):
+                    # 다리 멍 정리 (retouch.legbruise): the thighs and the calves, their widths the median of the pictures round
+                    from . import legbruise as LBR
+                    legs_ = LBR.legs_of_t(st.final[p], st.widths[p] if getattr(st, "widths", None) is not None else None, int(t), BTN.GEO_WIN)
+                    if legs_:
+                        job.tone = dict(job.tone or {}, legs=legs_)
                 if v.get("knee_fold", 0) > 1e-4 or v.get("knee_tone", 0) > 1e-4:
                     # Use measured segmentation only. Pose-based label fallback can assign an occluder to this knee.
                     seg = tracker.seglab.get(t) if tracker.seglab.exists() else None
@@ -7880,6 +7886,21 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
             Y = Y + wy * (knee_input[0] - Y)
             Cb = Cb + wc * (knee_input[1] - Cb)
             Cr = Cr + wc * (knee_input[2] - Cr)
+        # 0c3. leg bruises (1.26): a bruise on a thigh or a calf filled with the leg's own light and colour round it; the grain stays
+        if job.tone and job.tone.get("legs") and bmY is not None and v.get("leg_bruise", 0) > 1e-4:
+            try:
+                from . import legbruise as LBR
+                regL = bmY
+                for nm_ in ("skinx", "neck"):
+                    if nm_ in job.masks:
+                        regL = regL * (1.0 - np.clip(M(job.masks[nm_], (hY, wY)), 0, 1))
+                legsY = [(ax_ * y_per_src, ay_ * y_per_src, bx_ * y_per_src, by_ * y_per_src, hf_ * y_per_src)
+                         for (ax_, ay_, bx_, by_, hf_) in job.tone["legs"]]
+                with _tm("apply.leg_bruise"):
+                    Y, Cb, Cr = LBR.clean_planes(Y, Cb, Cr, regL, legsY, float(np.clip(v["leg_bruise"], 0, 1)))
+            except Exception:
+                import traceback
+                traceback.print_exc()
         # 0d. belly creases (1.25): the folds a bent trunk makes, filled from the skin round them; none found, nothing changed
         if job.tone and job.tone.get("belly") and v.get("belly_fold", 0) > 1e-4:
             try:

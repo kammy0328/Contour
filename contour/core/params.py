@@ -120,6 +120,9 @@ PARAMS: List[ParamDef] = [
     ParamDef("knee_tone", "무릎 얼룩 정리", "bodyskin", 0, 100, unit="pct", kind="skin",
              tip="무릎의 멍 같은 얼룩, 붉은 기, 주변 다리색과 안 맞는 자국을 다리의 피부색·밝기에 맞춥니다. 그레인·모공·잔털은 원본 그대로 두고, "
                  "무릎뼈의 입체감(밝은 쪽)도 남깁니다. 양말·옷·다른 인물은 건드리지 않습니다"),
+    ParamDef("leg_bruise", "다리 멍 정리", "bodyskin", 0, 100, unit="pct", kind="skin",
+             tip="허벅지·종아리의 멍(푸르거나 거무스름한 자국)을 둘레 피부의 밝기·색으로 채웁니다. 다리 사이 틈, 옷 밑단 그늘, 다리 음영, "
+                 "모공·잔털·그레인과 작은 점은 그대로 둡니다. 작은 잡티는 '몸 잡티 제거'가 맡습니다"),
     ParamDef("knee_fold", "무릎 접힘선 제거", "bodyskin", 0, 100, unit="pct", kind="skin",
              tip="무릎 접힘선을 주변 피부로 메웁니다. 현재 보이는 본인 피부에만 적용하며 강도에 키프레임을 줄 수 있습니다"),
     ParamDef("belly_fold", "뱃살 주름 제거", "bodyskin", 0, 100, unit="pct", kind="skin",
@@ -152,8 +155,8 @@ RETOUCH_KEYS = [p.key for p in PARAMS if p.kind in ("skin", "color")]
 # body skin (1.23). Each effect is on when its value is above 0; a new person has both at 0 (off). The regions are
 # apart from the face's 보정 부위: an older project's body regions there (목, 어깨·쇄골, 팔, 손, 다리 under the face's
 # 피부결) keep working as they did
-BODY_SKIN_KEYS = ["body_skin", "body_blemish", "knee_tone", "knee_fold", "belly_fold"]
-BODY_START = {"body_skin": 50.0, "body_blemish": 50.0, "knee_tone": 70.0, "knee_fold": 70.0, "belly_fold": 70.0}        # the value an effect starts from when it is switched on
+BODY_SKIN_KEYS = ["body_skin", "body_blemish", "knee_tone", "knee_fold", "leg_bruise", "belly_fold"]
+BODY_START = {"body_skin": 50.0, "body_blemish": 50.0, "knee_tone": 70.0, "knee_fold": 70.0, "leg_bruise": 80.0, "belly_fold": 70.0}        # the value an effect starts from when it is switched on
 BODY_REGIONS: List[Tuple[str, str]] = [("neck", "목·어깨"), ("arm", "팔·손"), ("torso", "몸통 앞면·등"), ("leg", "다리")]
 BODY_ALL = "all"                                               # 전신: every part of the body there is, the face left out
 # body parts that have a measured width (range multiplier)
@@ -198,10 +201,12 @@ SKIN_BASIC_KEYS: List[str] = list(SKIN_LEVEL_VALUES["std"]) + [k for _, k, _ in 
 # 끄기 / 약하게 / 표준 / 강하게: part -> (detail slider, label), the slider's value at each step. A part whose slider the app does not have yet is
 # shown but not used
 SKIN_PARTS: List[Tuple[str, Tuple[str, ...], str]] = [("eye", ("eye_white",), "눈 흰자 정리"), ("knee", ("knee_tone", "knee_fold"), "무릎 멍·주름"),
+                                                    ("leg", ("leg_bruise",), "다리 멍"),
                                                     ("elbow", ("elbow_tone",), "팔꿈치 주름·멍")]
 SKIN_PART_LEVELS: List[Tuple[str, str]] = [("off", "끄기"), ("light", "약하게"), ("std", "표준"), ("strong", "강하게")]
 SKIN_PART_VALUES: Dict[str, Dict[str, float]] = {"eye": {"off": 0, "light": 60, "std": 100, "strong": 100},
                                                  "knee": {"off": 0, "light": 50, "std": 70, "strong": 100},
+                                                 "leg": {"off": 0, "light": 50, "std": 80, "strong": 100},
                                                  "elbow": {"off": 0, "light": 50, "std": 70, "strong": 100}}
 
 

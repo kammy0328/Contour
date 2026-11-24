@@ -272,6 +272,8 @@ class ReshapeTab(_Tab):
         v.addSpacing(4)
         switch("knee_fold", "무릎 접힘선 제거")
         v.addSpacing(4)
+        switch("leg_bruise", "다리 멍 정리")
+        v.addSpacing(4)
         switch("belly_fold", "뱃살 주름 제거")
         v.addSpacing(4)
         v.addWidget(Wd.label("적용 부위", "", 12))
