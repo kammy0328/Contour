@@ -194,7 +194,8 @@ def _apply_roi(planes, subsample, max_value, pix_fmt, rf, y_per_src, cm, vs, rng
         for pl in out:
             kx, ky = W // pl.shape[1], H // pl.shape[0]
             sub.append(pl[y0 // ky:y1 // ky, x0 // kx:x1 // kx])
-        res = apply_planes_display(sub, subsample, max_value, pix_fmt, rfj, y_per_src, cm, vs, rng, _roi=False)
+        # the whole piece as it is (no mean fill round the masks, CROP): a stage that looks further than CROP_MARGIN sees the real picture
+        res = apply_planes_display(sub, subsample, max_value, pix_fmt, rfj, y_per_src, cm, vs, rng, _roi=False, _crop=False)
         for pl, r in zip(out, res[:3]):
             kx, ky = W // pl.shape[1], H // pl.shape[0]
             pl[y0 // ky:y1 // ky, x0 // kx:x1 // kx] = r
@@ -203,7 +204,7 @@ def _apply_roi(planes, subsample, max_value, pix_fmt, rf, y_per_src, cm, vs, rng
 
 
 def apply_planes_display(planes: List[np.ndarray], subsample, max_value: float, pix_fmt: str, rf,
-                         y_per_src: float, cm, vs, rng: str = "tv", _roi: bool = True) -> List[np.ndarray]:
+                         y_per_src: float, cm, vs, rng: str = "tv", _roi: bool = True, _crop: bool = True) -> List[np.ndarray]:
     """Same contract as engine.apply_planes, retouching in the display picture of `vs`."""
     if rf is None or rf.empty():
         return planes
@@ -222,7 +223,7 @@ def apply_planes_display(planes: List[np.ndarray], subsample, max_value: float, 
         g, b, r = planes[0], planes[1], planes[2]
         src = np.stack([r, g, b], -1).astype(np.float32)
     Hs, Ws = src.shape[:2]
-    box = _box(rf, Ws, Hs) if CROP else None
+    box = _box(rf, Ws, Hs) if (CROP and _crop) else None
     if box is None:
         disp0 = cm.to_display(src, vs)
     else:
