@@ -266,6 +266,8 @@ class ReshapeTab(_Tab):
         v.addSpacing(4)
         switch("knee_tone", "무릎 얼룩 정리")
         v.addSpacing(4)
+        switch("knee_fold", "무릎 접힘선 제거")
+        v.addSpacing(4)
         switch("belly_fold", "뱃살 주름 제거")
         v.addSpacing(4)
         v.addWidget(Wd.label("적용 부위", "", 12))
@@ -369,7 +371,7 @@ class ReshapeTab(_Tab):
                 r.set_key_state("none")
         skin_on = bool(pp is not None and pp.body_on("body_skin"))
         spot_on = bool(pp is not None and pp.body_on("body_blemish"))
-        tone_on = bool(pp is not None and (pp.body_on("knee_tone") or pp.body_on("belly_fold")))
+        tone_on = bool(pp is not None and (pp.body_on("knee_fold") or pp.body_on("knee_tone") or pp.body_on("belly_fold")))
         self.body_detail.setEnabled(enabled and skin_on)
         self.body_size.setEnabled(enabled and spot_on)
         if pp is not None:
