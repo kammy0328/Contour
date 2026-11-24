@@ -6560,6 +6560,10 @@ def _feature_holes(lm: np.ndarray, shape, wf: float) -> np.ndarray:
 FOLD_YAW = None        # (lo, hi) or None (off). 2611 IWALY INT_c002 f38..f45 (11/24, user: 코끝 하이라이트 깜빡, 입술 위 보정): a face turned away (towards a profile) has its fold and
                       # mouth landmarks squeezed and wrong from frame to frame; the fold stages and the raised-spot fill flickered on and off there. Their strength falls from 1 at a
                       # turn of `lo` to 0 at `hi` (the turn: |left - right| / (left + right) of the nose tip's distances to the face's outline at the nose's height)
+FINAL_WHITE = 0.0       # 0..1: tiny light dots (whiteheads, milia) on the face's skin filled from the skin round them (INT_c005 f82, 11/24). 0 = off
+FINAL_WHITE_K = 0.009   # of the face width: the dot's size scale (top-hat)
+FINAL_WHITE_THR = 0.025 # brighter than the local level by this share
+FINAL_WHITE_BUSY = 0.06 # share of the window round a dot that may light up too (more: hair, texture, a glint row: left)
 FINAL_BUMP_NOSE = 0.0   # 0..1: the raised-spot fill kept off the nose (its bridge's highlight is no bump; ENDING: it blinked). 0 = as before
 FINAL_BUMP_LIPS = 0.0   # of the face width (0 = off, as before): how far round the lips the raised-spot fill stays off (the mouth's corner and the lip's highlight are no bumps)
 
@@ -6703,6 +6707,61 @@ def _final_bumps(Y0: np.ndarray, region: np.ndarray, wf: float, lm: Optional[np.
     M_[y0:y1, x0:x1] = ms
     F_[y0:y1, x0:x1] = fill
     return M_, F_
+
+
+def _final_whiteheads(Y0: np.ndarray, region: np.ndarray, wf: float, lm: np.ndarray, shape):
+    """(mask 0..1, None) of tiny light dots (whiteheads, milia; INT_c005 f82) on Y0 inside region: a small top-hat (FINAL_WHITE_K of the face width) above FINAL_WHITE_THR of
+    the local level, a few pixels across, off the nose, the eyes, the brows and the lips."""
+    r = _roi(region, int(0.05 * wf) + 6)
+    if r is None:
+        return None
+    y0, y1, x0, x1 = r
+    roi = Y0[y0:y1, x0:x1].astype(np.float32)
+    kb = max(5, int(round(FINAL_WHITE_K * wf)) | 1)
+    rb = cv2.GaussianBlur(roi, (0, 0), 0.7)
+    base = cv2.GaussianBlur(roi, (0, 0), max(4.0, 0.015 * wf)) + 0.02
+    th = cv2.morphologyEx(rb, cv2.MORPH_TOPHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kb, kb))) / base
+    reg = region[y0:y1, x0:x1] > 0.5
+    reg = cv2.erode(reg.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kb, kb))) > 0
+    lmr = np.asarray(lm, np.float32)[:, :2] - [x0, y0]
+    reg &= ~_feature_holes(lmr, roi.shape, wf)
+    if np.isfinite(lmr[48:60]).all():
+        lp_ = np.zeros(roi.shape, np.uint8)
+        cv2.fillConvexPoly(lp_, cv2.convexHull(np.round(lmr[48:60]).astype(np.int32)), 255)
+        k_ = max(3, int(0.05 * wf) | 1)
+        reg &= ~(cv2.dilate(lp_, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_, k_))) > 0)
+    na_ = _nose_area(np.asarray(lm, np.float32)[:, :2], shape, wf)
+    if na_ is not None:
+        reg &= ~(na_[y0:y1, x0:x1] > 0.2)
+    cand = (th > FINAL_WHITE_THR) & reg
+    n, lab, st, cen = cv2.connectedComponentsWithStats(cand.astype(np.uint8), connectivity=8)
+    if n <= 1:
+        return None
+    # alone on calm skin: few other light marks in a window of 6 dot sizes (hair strands over the cheek light up in rows)
+    busy = cv2.blur((th > 0.6 * FINAL_WHITE_THR).astype(np.float32), (6 * kb + 1, 6 * kb + 1))
+    keep = [i for i in range(1, n) if st[i, 4] <= kb * kb // 2 and max(st[i, 2], st[i, 3]) <= kb
+            and busy[int(cen[i][1]), int(cen[i][0])] < FINAL_WHITE_BUSY]
+    if not keep:
+        return None
+    m = np.isin(lab, keep).astype(np.uint8)
+    m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    ms = np.clip(cv2.GaussianBlur(m.astype(np.float32), (0, 0), 0.8) * 1.5, 0, 1)
+    M_ = np.zeros(Y0.shape, np.float32)
+    M_[y0:y1, x0:x1] = ms
+    return M_, None
+
+
+def _fill_from(Y: np.ndarray, m: np.ndarray, wf: float) -> np.ndarray:
+    """Y with the marked dots filled from the skin round them (inpainted)"""
+    r = _roi(m, 8)
+    out = Y.astype(np.float32, copy=True)
+    if r is None:
+        return out
+    y0, y1, x0, x1 = r
+    md = (m[y0:y1, x0:x1] > 0.05).astype(np.uint8)
+    fill = cv2.inpaint(np.clip(Y[y0:y1, x0:x1] * 65535.0, 0, 65535).astype(np.uint16), md, 3, cv2.INPAINT_TELEA).astype(np.float32) / 65535.0
+    out[y0:y1, x0:x1] = fill
+    return out
 
 
 def _final_long_lines(Y0: np.ndarray, region: np.ndarray, wf: float) -> Optional[np.ndarray]:
@@ -7033,6 +7092,15 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
                         except Exception:
                             pass
                     Y = Y + bm * (bf - Y)
+            if FINAL_WHITE > 1e-4 and spot_reg is not None and lmY is not None and job.wf_src > 0:
+                try:
+                    wm_ = _final_whiteheads(Y0, spot_reg, wf, lmY, (hY, wY))
+                    if wm_ is not None:
+                        wmk_, wfill_ = wm_
+                        Y = Y + float(np.clip(FINAL_WHITE, 0, 1)) * wmk_ * (_fill_from(Y, wmk_, wf) - Y)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
             if FINAL_NASO > 1e-4 and lmY is not None and job.wf_src > 0:
                 kn_ = float(np.clip(FINAL_NASO, 0, 1)) * yaw_gate(job.face)
                 if FOLD_PRESENT is not None:
