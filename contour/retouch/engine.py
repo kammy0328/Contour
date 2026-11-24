@@ -283,6 +283,7 @@ NASO_NOSTRIL_HOLD = 0.0     # of the face width: the nostrils and the nose's bas
 GPU_MASKS = None            # (11/24) 1: the Gaussian blurs of the mask making and the apply on the GPU (gpuops; same result as OpenCV); 0: OpenCV; None: env IWALY_GPU_MASKS
 SKIN_FS_G = None            # (2611 IWALY INT, 11/24: the pebbled skin of INT_c001 / c006 / c007 / c010 stayed) the gains of the skin stage's texture bands (skin.FS_G, finest
                             # to widest), set from here so a batch's settings can carry them; None = skin.FS_G as it is. INT_c006 f90 / INT_c001 f119: (1.35, 0.70, 0.30, 0.20, 0.20, 0.45)
+SKIN_FS_NORM = None          # the skin stage's bands from blurs of the skin alone (skin.FS_NORM, set from here like SKIN_FS_G; None = skin.FS_NORM as it is)
 SKIN_FOREHEAD_HOLD = 0.0    # 0..1: the forehead above the brows kept out of the skin stage (bangs over it: the strands flickered, INT_c005 11/24). 0 = as before
 SKIN_FOREHEAD_AUTO = None   # (lo, hi): the forehead hold follows how much of the forehead hair covers on each frame (the face parser's skin over the lower
                             # forehead, inside the person's matte): none held under lo, all over hi (11/24 user: "앞머리가 이마 면적을 많이 차지하면 보정 의미가
@@ -8049,6 +8050,8 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                     traceback.print_exc()
             if SKIN_FS_G is not None and len(SKIN_FS_G) == len(SK.FS_S):
                 SK.FS_G = tuple(float(g_) for g_ in SKIN_FS_G)      # (11/24) the texture bands' gains set from the engine's settings (control.json engine_cfg)
+            if SKIN_FS_NORM is not None:
+                SK.FS_NORM = float(SKIN_FS_NORM)
             if SKIN_EDGE_KEEP > 1e-4:
                 try:
                     er_ = _skin_edge_ramp(M(job.masks["skin"], (hY, wY)), wf)
