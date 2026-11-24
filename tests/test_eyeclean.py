@@ -1,5 +1,5 @@
 """흰자 정리 (contour.retouch.eyeclean) on a drawn eye: the dot, the vein and the red go, the lashes, the grain and everything outside the white
-stay; the basic adjustment's part switches (eye, knee, elbow) set their sliders and are saved with the project."""
+stay; the basic adjustment's parts (eye, knee, elbow: 끄기 / 약하게 / 표준 / 강하게 each) set their sliders and are saved with the project."""
 import numpy as np
 import cv2
 
@@ -78,23 +78,23 @@ def test_eye_planes_subsampled_chroma():
     assert float(np.abs(Yk - Y).max()) == 0.0
 
 
-def test_basic_toggles():
+def test_basic_parts():
     from contour.core.params import skin_basic_values, PARAM
     v_old = skin_basic_values("std", ["naso"])
     assert "eye_white" not in v_old and "knee_tone" not in v_old          # an adjustment of before 1.26 does not touch the parts
-    v = skin_basic_values("std", ["naso"], ["eye"])
+    v = skin_basic_values("std", ["naso"], {"eye": "strong"})
     assert v["eye_white"] == 100.0 and v["knee_tone"] == 0.0
-    v2 = skin_basic_values("light", [], ["eye", "knee", "elbow"])
-    assert v2["eye_white"] == 60.0 and v2["knee_tone"] == 50.0
+    v2 = skin_basic_values("strong", [], {"eye": "light", "knee": "std", "elbow": "strong"})
+    assert v2["eye_white"] == 60.0 and v2["knee_tone"] == 70.0             # each part its own step, apart from the skin's level
     assert ("elbow_tone" in v2) == ("elbow_tone" in PARAM)                # a part the app has no slider for is left out
 
 
-def test_basic_toggles_saved():
+def test_basic_parts_saved():
     from contour.core.project import PartParams
     p = PartParams()
-    p.skin_basic = {"level": "std", "remove": ["naso"], "on": ["eye", "knee"]}
+    p.skin_basic = {"level": "std", "remove": ["naso"], "parts": {"eye": "strong", "knee": "light"}}
     q = PartParams.from_dict(p.to_dict())
-    assert q.skin_basic.get("on") == ["eye", "knee"]
+    assert q.skin_basic.get("parts") == {"eye": "strong", "knee": "light"}
     p2 = PartParams()
     p2.skin_basic = {"level": "std", "remove": []}
-    assert "on" not in PartParams.from_dict(p2.to_dict()).skin_basic
+    assert "parts" not in PartParams.from_dict(p2.to_dict()).skin_basic

@@ -111,7 +111,7 @@ class ReshapeTab(_Tab):
         self.face_mask_info = self.cloth_mask_info = None
         self.level = None
         self.switches: Dict[str, Wd.Segmented] = {}
-        self.toggles: Dict[str, Wd.Segmented] = {}
+        self.parts: Dict[str, Wd.Segmented] = {}
         self.wrows: Dict[str, Wd.ParamRow] = {}
         add = self.add
         if part == "body":
@@ -433,21 +433,21 @@ class ReshapeTab(_Tab):
             seg.changed.connect(lambda k, sw=sw: self.ctl.apply_skin_basic(switch=(sw, k == "remove")))
             v.addWidget(Wd.FieldRow(lab, seg, tips.get(sw, "")))
             self.switches[sw] = seg
-        # (1.26) parts switched on or off: the eye whites, the knees, the elbows
-        from ..core.params import SKIN_TOGGLES, PARAM as _P
+        # (1.26) the parts, each with its own step: the eye whites, the knees, the elbows
+        from ..core.params import SKIN_PARTS, SKIN_PART_LEVELS, PARAM as _P
         v.addSpacing(4)
         v.addWidget(Wd.label("부위 보정", "", 12))
         ttips = {"eye": "흰자의 점, 얼룩, 실핏줄, 홍채 옆 그늘을 지웁니다 (흰자 톤, 음영, 그레인과 속눈썹은 그대로). 눈이 보이는 샷에만 적용됩니다",
                  "knee": "무릎의 멍, 얼룩, 주름을 정리합니다", "elbow": "팔꿈치의 주름과 멍을 정리합니다"}
-        for sw, key, lab in SKIN_TOGGLES:
-            seg = Wd.Segmented([("off", "끄기"), ("on", "켜기")], compact=True)
-            seg.set_current("")
-            seg.setFixedWidth(132)
+        for sw, key, lab in SKIN_PARTS:
             ready = key in _P
-            seg.changed.connect(lambda k, sw=sw: self.ctl.apply_skin_basic(toggle=(sw, k == "on")))
-            v.addWidget(Wd.FieldRow(lab if ready else lab + " (준비 중)", seg, ttips.get(sw, "")))
+            seg = Wd.Segmented(SKIN_PART_LEVELS, compact=True)
+            seg.set_current("")
+            seg.changed.connect(lambda k, sw=sw: self.ctl.apply_skin_basic(part=(sw, k)))
+            row = Wd.FieldRow(lab if ready else lab + " (준비 중)", seg, ttips.get(sw, ""))
+            v.addWidget(row)
             seg.setProperty("ready", ready)
-            self.toggles[sw] = seg
+            self.parts[sw] = seg
         self.basic_note = Wd.label("고른 값은 세부 조정 슬라이더에 그대로 들어갑니다. 세부 조정에서 값을 바꾸면 "
                                    "여기 선택이 해제됩니다.", "Faint", 11)
         self.basic_note.setWordWrap(True)
@@ -468,15 +468,15 @@ class ReshapeTab(_Tab):
         rm = set(sb.get("remove", [])) if sb else set()
         for sw, seg in self.switches.items():
             seg.set_current(("remove" if sw in rm else "keep") if sb else "")
-        ons = sb.get("on") if sb else None
-        for sw, seg in self.toggles.items():
-            seg.set_current(("on" if sw in (ons or []) else "off") if (sb and ons is not None) else "")
+        parts = sb.get("parts") if sb else None
+        for sw, seg in self.parts.items():
+            seg.set_current(str((parts or {}).get(sw, "off")) if (sb and parts is not None) else "")
         for w_ in [self.level] + list(self.switches.values()):
             w_.setEnabled(enabled)
-        for seg in self.toggles.values():
+        for seg in self.parts.values():
             seg.setEnabled(enabled and bool(seg.property("ready")))
         if sb:
-            vals = skin_basic_values(sb["level"], sb.get("remove", []), ons)
+            vals = skin_basic_values(sb["level"], sb.get("remove", []), parts)
             self.level_info.setText(" · ".join(f"{PARAM[k].label} {v:.0f}" for k, v in vals.items() if v > 0))
         elif pp is not None and pp.retouch_active():
             self.level_info.setText("세부 조정에서 직접 맞춘 값입니다")
