@@ -117,6 +117,12 @@ PARAMS: List[ParamDef] = [
     ParamDef("body_blemish", "몸 잡티 제거", "bodyskin", 0, 100, unit="pct", kind="skin",
              tip="몸 피부의 작은 트러블·붉은 점을 주변 피부로 메웁니다. 문신·점·주근깨·흉터, 옷 경계, 손(마디 주름)은 그대로 둡니다. "
                  "남겨 둔 자국은 아래 '제거' 표시로 지울 수 있습니다"),
+    ParamDef("knee_tone", "무릎 얼룩 정리", "bodyskin", 0, 100, unit="pct", kind="skin",
+             tip="무릎의 멍 같은 얼룩, 붉은 기, 주변 다리색과 안 맞는 자국을 다리의 피부색·밝기에 맞춥니다. 그레인·모공·잔털은 원본 그대로 두고, "
+                 "무릎뼈의 입체감(밝은 쪽)도 남깁니다. 양말·옷·다른 인물은 건드리지 않습니다"),
+    ParamDef("belly_fold", "뱃살 주름 제거", "bodyskin", 0, 100, unit="pct", kind="skin",
+             tip="배에 접혀 생긴 주름(가로 골)만 찾아 주변 피부로 메웁니다. 주름이 없는 프레임은 그대로입니다. "
+                 "튀어나온 윤곽을 살짝 넣는 것은 '몸 > 뱃살'로"),
     # ---- colour
     ParamDef("lip_hue", "입술 색조", "color", -40, 40, unit="deg", kind="color", tip="− 쪽이 핑크/보라, + 쪽이 코랄/오렌지"),
     ParamDef("lip_sat", "입술 채도", "color", -60, 60, kind="color"),
@@ -141,8 +147,8 @@ RETOUCH_KEYS = [p.key for p in PARAMS if p.kind in ("skin", "color")]
 # body skin (1.23). Each effect is on when its value is above 0; a new person has both at 0 (off). The regions are
 # apart from the face's 보정 부위: an older project's body regions there (목, 어깨·쇄골, 팔, 손, 다리 under the face's
 # 피부결) keep working as they did
-BODY_SKIN_KEYS = ["body_skin", "body_blemish"]
-BODY_START = {"body_skin": 50.0, "body_blemish": 50.0}        # the value an effect starts from when it is switched on
+BODY_SKIN_KEYS = ["body_skin", "body_blemish", "knee_tone", "belly_fold"]
+BODY_START = {"body_skin": 50.0, "body_blemish": 50.0, "knee_tone": 70.0, "belly_fold": 70.0}        # the value an effect starts from when it is switched on
 BODY_REGIONS: List[Tuple[str, str]] = [("neck", "목·어깨"), ("arm", "팔·손"), ("torso", "몸통 앞면·등"), ("leg", "다리")]
 BODY_ALL = "all"                                               # 전신: every part of the body there is, the face left out
 # body parts that have a measured width (range multiplier)

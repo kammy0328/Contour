@@ -9,11 +9,14 @@ Filter = edge-preserving guided filter: the large-scale tone is evened out, a ch
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+from . import gpuops as _GPU   # (11/24) cv2 with its GaussianBlur on the GPU when engine.GPU_MASKS is on (see gpuops)
+cv2 = _GPU.proxy()
 
 from ..track.store import VIS_VISIBLE
 
@@ -467,6 +470,13 @@ def _parse_fill(rgb_u8: np.ndarray, lm: np.ndarray, parse: dict) -> Optional[np.
 
 
 def face_skin_probability(rgb_u8: np.ndarray, model, lm: Optional[np.ndarray], parse: Optional[dict] = None) -> np.ndarray:
+    return face_skin_and_protect(rgb_u8, model, lm, parse)[0]
+
+
+def face_skin_and_protect(rgb_u8: np.ndarray, model, lm: Optional[np.ndarray], parse: Optional[dict] = None):
+    """(the face's skin probability, the soft map of what the retouch leaves alone on it: hair strands over the skin and face
+    paint, 0..1, or None). The map is what has been cut out of the probability; the neck mask blurs the probability (a strand is
+    a few pixels wide) and needs the map itself to keep a strand out."""
     gate = None
     if parse is not None and lm is not None and np.isfinite(lm[[0, 16], :2]).all():
         gate = parse_gate(parse, float(np.hypot(*(lm[16, :2] - lm[0, :2]))))
@@ -486,7 +496,7 @@ def face_skin_probability(rgb_u8: np.ndarray, model, lm: Optional[np.ndarray], p
     pm = soft_paint(rgb_u8, lm) if lm is not None else None
     if pm is not None:
         out = out * (1.0 - pm)
-    return out.astype(np.float32)
+    return out.astype(np.float32), pm
 
 
 def _face_skin_probability(rgb_u8: np.ndarray, model, lm: Optional[np.ndarray], gate=None, tex=None) -> np.ndarray:
@@ -537,6 +547,13 @@ _LK: dict = {}
 STRAND_LO, STRAND_HI = 0.012, 0.026
 STRAND_SEEN = 2.5      # code values (of 255) a strand must differ from the skin beside it to be kept
 NECK_LINE_MAX = 0.15   # dark lines on the neck fainter than this (of the skin's brightness) are neck lines
+# 2611 IWALY c050 (2026-11-22): a faint hair or a thin necklace chain lying diagonally on the neck was handed back
+# to the neck line removal as a neck line and lifted (the chain went pale, a hair strand broke). A neck line is a short,
+# soft, curved valley; a hair or a chain is a long straight thin line (its pieces are 8-12 times as long as wide, the
+# neck lines and tendons it was confused with 2-5). A piece that long and that straight stays a strand.
+NECK_STRAND_GUARD = True
+NECK_STRAND_ELONG = 6.5    # at least this many times longer than wide (the ratio of the piece's two principal axes)
+NECK_STRAND_SPAN = 0.30    # and at least this long (of the face width)
 PAINT_SEEN = 5.0       # the same for a drawn line
 
 
@@ -691,6 +708,15 @@ def soft_paint(rgb_u8: np.ndarray, lm: Optional[np.ndarray]) -> Optional[np.ndar
     return _neck_lines_back(out, rgb_u8, lm, Wf)
 
 
+def _elongation(sub: np.ndarray) -> float:
+    """How many times longer than wide a piece is (the ratio of the two principal axes of its pixels; 1 = round)."""
+    ys, xs = np.nonzero(sub)
+    if len(xs) < 4:
+        return 1.0
+    ev = np.linalg.eigvalsh(np.cov(np.vstack([xs, ys]).astype(np.float64)))
+    return float(np.sqrt(max(ev[1], 1e-9) / max(ev[0], 1e-9)))
+
+
 def _neck_lines_back(out: np.ndarray, rgb_u8: np.ndarray, lm: np.ndarray, Wf: float) -> np.ndarray:
     """Below the jaw a faint thin dark line is a neck line, not a hair. Taken for a strand it was cut out of the
     skin, and the neck line removal never saw it."""
@@ -732,6 +758,8 @@ def _neck_lines_back(out: np.ndarray, rgb_u8: np.ndarray, lm: np.ndarray, Wf: fl
         span = float(np.hypot(bw, bh_))
         gl = float(np.percentile(th[y0:y0 + bh_, x0:x0 + bw][cv2.dilate(sub.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0], 97))
         if dk > lt and dk < NECK_LINE_MAX and span < 0.6 * Wf and gl < 0.25:
+            if NECK_STRAND_GUARD and span >= NECK_STRAND_SPAN * Wf and _elongation(sub) >= NECK_STRAND_ELONG:
+                continue                                       # a long straight thin line: a hair, a chain; it stays a strand
             drop[i] = True
     if drop.any():
         gone = cv2.dilate(drop[lab].astype(np.uint8), np.ones((5, 5), np.uint8))
@@ -740,6 +768,32 @@ def _neck_lines_back(out: np.ndarray, rgb_u8: np.ndarray, lm: np.ndarray, Wf: fl
 
 
 # --------------------------------------------------------------------------- mask
+
+DARK_GUARD = (0.30, 0.46)   # of the face's own skin brightness: round the face the mask fades out between these
+DARK_ZONE = 1.7             # face widths round the face where the guard works (not on a leg or an arm in shadow)
+
+
+def _dark_guard(m: np.ndarray, rgb_u8: np.ndarray, lm: np.ndarray) -> np.ndarray:
+    """Hair lying over the cheek or beside the neck, a black top under it: far darker than the face's skin, and the
+    colour model lets it through when its hue is the skin's (a log clip seen in Rec.709, dark brown hair). Round
+    the face the mask is taken out where the picture is much darker than the skin the mask sits on."""
+    h, w = m.shape
+    Wf = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
+    c = lm[:17, :2][np.isfinite(lm[:17, :2]).all(1)].mean(0) if np.isfinite(lm[:17, :2]).all(1).any() else None
+    if c is None or Wf < 8:
+        return m
+    Y = rgb_u8.astype(np.float32) @ np.array([0.299, 0.587, 0.114], np.float32)
+    zone = np.zeros((h, w), np.uint8)
+    cv2.circle(zone, (int(round(c[0])), int(round(c[1]))), int(DARK_ZONE * Wf), 255, -1)
+    zf = cv2.GaussianBlur(zone.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.15 * Wf))
+    sel = (zone > 0) & (m > 0.6)
+    if sel.sum() < 40:
+        return m
+    yref = float(np.median(Y[sel]))
+    Ys = cv2.GaussianBlur(Y, (0, 0), max(1.0, 0.012 * Wf))
+    g = _sstep(DARK_GUARD[0] * yref, DARK_GUARD[1] * yref, Ys)
+    return (m * (1.0 - zf * (1.0 - g))).astype(np.float32)
+
 
 def skin_mask(job: SkinJob, rgb_proxy: np.ndarray, sx: float, sy: float, person_alpha: Optional[np.ndarray],
               model, parse: Optional[dict] = None, body_region: Optional[np.ndarray] = None,
@@ -839,6 +893,8 @@ def skin_mask(job: SkinJob, rgb_proxy: np.ndarray, sx: float, sy: float, person_
             cv2.circle(hm, (int(round(c[0])), int(round(c[1]))), int(rad), 255, -1)
             k = max(3, int(rad * 0.3) | 1)
             m *= 1.0 - cv2.GaussianBlur(hm.astype(np.float32) / 255.0, (k, k), 0)
+    if DARK_GUARD is not None and lm is not None and np.isfinite(lm[[0, 16], :2]).all():
+        m = _dark_guard(m, rgb_proxy, lm)
     # edge softening follows the face size (a fixed pixel blur washed a small face's mask out: during a zoom
     # the retouch faded in instead of holding its strength)
     sig = max(0.8, 0.0025 * h)
@@ -1129,7 +1185,16 @@ def person_alpha(tracker, t: int, p: int, size: Tuple[int, int]) -> Optional[np.
     return cv2.resize(m, size, interpolation=cv2.INTER_LINEAR)
 
 
+_MODEL_LOCK = threading.RLock()     # the people of a frame are prepared side by side (engine.PREP_THREADS): the models kept on the tracker are made
+                                    # and let go of by one at a time
+
+
 def model_for(tracker, p: int):
+    with _MODEL_LOCK:
+        return _model_for(tracker, p)
+
+
+def _model_for(tracker, p: int):
     cache = getattr(tracker, "_skin_models", None)
     if cache is None:
         cache = tracker._skin_models = {}
@@ -1168,12 +1233,13 @@ def frame_model_for(tracker, p: int, t: int, rgb_u8: np.ndarray, lm_px: Optional
         return (np.asarray(centre[:2], np.float64), icov, float(centre[2]))
     if lm_px is None or not np.isfinite(lm_px[:, :2]).all():
         return base
-    cache = getattr(tracker, "_skin_fmodels", None)
-    if cache is None:
-        cache = tracker._skin_fmodels = {}
-    key = (p, t)
-    if key in cache:
-        return cache[key]
+    with _MODEL_LOCK:
+        cache = getattr(tracker, "_skin_fmodels", None)
+        if cache is None:
+            cache = tracker._skin_fmodels = {}
+        key = (p, t)
+        if key in cache:
+            return cache[key]
     fm = build_skin_model([rgb_u8], [lm_px])
     if fm is None:
         res = base
@@ -1186,9 +1252,13 @@ def frame_model_for(tracker, p: int, t: int, rgb_u8: np.ndarray, lm_px: Optional
             grow = max(1.0, float(np.trace(c_fr) / max(np.trace(c_base), 1e-6)))
             icov = np.linalg.inv(c_base * grow)
         res = (fm[0], icov, fm[2])
-    cache[key] = res
-    while len(cache) > 600:
-        cache.pop(next(iter(cache)))
+    with _MODEL_LOCK:
+        cache[key] = res
+        while len(cache) > 600:
+            try:
+                cache.pop(next(iter(cache)))
+            except (StopIteration, KeyError, RuntimeError):
+                break
     return res
 
 

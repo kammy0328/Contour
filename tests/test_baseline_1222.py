@@ -274,7 +274,8 @@ def test_body_fixture_has_the_regions_and_they_did_something_in_1222(golden_body
     assert str(golden_body["version"]) == "1.22.2"
     cut = json.loads(str(golden_body["cut_json"]))
     assert cut["params"]["0"]["skin_scope"] == BU.BODY_REGIONS
-    d = np.abs(golden_body["preview"].astype(np.int32) - golden_body["preview_face"].astype(np.int32)).max(-1)
+    # (1.22.2's own preview: the renders were taken again by 1.25.0, tools/rebase_baseline_render.py)
+    d = np.abs(golden_body.get("preview_1222", golden_body["preview"]).astype(np.int32) - golden_body["preview_face"].astype(np.int32)).max(-1)
     assert int((d > 0).sum()) > 200 and int(d.max()) >= 10, "the fixture's body regions change nothing: it would hold nothing"
     # and where: on the bare skin below the face (it begins at row 87 of the frames), not on the face
     ys = np.nonzero(d[0] > 0)[0]

@@ -7,7 +7,9 @@ display-referred image.
 """
 from __future__ import annotations
 
+import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -42,6 +44,142 @@ class ViewSettings:
     def from_dict(cls, d: Optional[dict]) -> "ViewSettings":
         d = d or {}
         return cls(**{k: d[k] for k in ("input_cs", "display", "view", "lut_path", "exposure") if k in d})
+
+
+# ----------------------------------------------------------------------------- one picture in strips (1.27)
+# OCIO's CPU processor converts every pixel on its own and gives up Python's lock while it works, so the rows of a picture can be
+# converted by several threads at once and the result is the same, bit for bit, as one call over the whole picture. With the ACES 2.0
+# view a 4K frame takes about 4 s in one call; it was most of the time a render and an analysis spent on a frame.
+STRIP_MIN_PIXELS = 1 << 20          # a picture smaller than this (1 MP) is converted in one call
+_strip_pool: Optional[ThreadPoolExecutor] = None
+_strip_pool_n = 0
+_strip_lock = threading.Lock()
+
+
+def strip_threads() -> int:
+    """How many threads convert one picture: CONTOUR_COLOUR_THREADS (1: no strips), else half of the logical CPUs, 2 to 8."""
+    try:
+        n = int(os.environ.get("CONTOUR_COLOUR_THREADS", "") or 0)
+    except ValueError:
+        n = 0
+    if n <= 0:
+        n = max(2, min(8, (os.cpu_count() or 2) // 2))
+    return n
+
+
+def _strips(n: int) -> ThreadPoolExecutor:
+    global _strip_pool, _strip_pool_n
+    with _strip_lock:
+        if _strip_pool is None or n > _strip_pool_n:
+            old = _strip_pool
+            _strip_pool = ThreadPoolExecutor(max_workers=n, thread_name_prefix="colour")
+            _strip_pool_n = n
+            if old is not None:
+                old.shutdown(wait=False)
+        return _strip_pool
+
+
+def _can_strip(a: np.ndarray, n: int) -> bool:
+    return (n > 1 and a.ndim == 3 and a.shape[2] == 3 and a.shape[0] >= n * 8 and a.shape[0] * a.shape[1] >= STRIP_MIN_PIXELS)
+
+
+def _run_strips(n: int, h: int, job) -> None:
+    """job(y0, y1) for n blocks of rows, side by side; what one of them raises is raised here."""
+    pool = _strips(n)
+    futs = [pool.submit(job, h * i // n, h * (i + 1) // n) for i in range(n)]
+    err = None
+    for f in futs:
+        try:
+            f.result()
+        except BaseException as e:      # (every strip is waited for before this goes on: none is left writing into the picture)
+            err = err or e
+    if err is not None:
+        raise err
+
+
+def apply_rgb(proc, img: np.ndarray) -> None:
+    """proc.applyRGB(img) in place (float32, C-contiguous), in strips of rows when the picture is big."""
+    n = strip_threads()
+    if _can_strip(img, n) and img.flags.c_contiguous:
+        _run_strips(n, img.shape[0], lambda y0, y1: proc.applyRGB(img[y0:y1]))
+    else:
+        proc.applyRGB(img)
+
+
+# ---------------------------------------------------------------------------------------------- the display transform on the GPU
+# CONTOUR_COLOUR_GPU=1: a view's transform (code values -> display) is read once from OpenColorIO into a 3D table of GPU_LUT_N points a side and applied
+# on the GPU (torch, trilinear). The render converts every 4K frame several times (the analysis view, the log wrap, its Jacobian); on the CPU that was a
+# third of the render's work while the GPU idled. The table's error on LogC4 footage is under 0.001 of the display range (measured: mean 0.00005).
+# Anything that goes wrong (no torch, no CUDA, out of GPU memory) falls back to OpenColorIO on the CPU, for that call.
+GPU_LUT_N = 193
+_gpu_luts: Dict[int, object] = {}
+_gpu_lock = threading.Lock()
+_gpu_off = [False]
+
+
+def gpu_wanted() -> bool:
+    return (not _gpu_off[0]) and os.environ.get("CONTOUR_COLOUR_GPU", "0") not in ("", "0")
+
+
+class _GpuLut:
+    def __init__(self, proc, n: int):
+        import torch
+        self.torch = torch
+        self.dev = torch.device("cuda")
+        g = np.linspace(0.0, 1.0, n, dtype=np.float32)
+        grid = np.stack(np.meshgrid(g, g, g, indexing="ij"), -1).reshape(-1, 1, 3).copy()      # (r, g, b) in C order
+        for a in range(0, grid.shape[0], 1 << 20):
+            proc.applyRGB(grid[a:a + (1 << 20)])
+        lut = grid.reshape(n, n, n, 3)
+        # grid_sample: input [1, C, D, H, W]; a point's (x, y, z) picks (W, H, D) = (b, g, r)
+        self.lut = torch.from_numpy(np.ascontiguousarray(lut.transpose(3, 0, 1, 2))[None]).to(self.dev)
+        self.n = n
+
+    def apply(self, img: np.ndarray, u8: bool = False) -> np.ndarray:
+        torch = self.torch
+        F = torch.nn.functional
+        shp = img.shape
+        flat = np.ascontiguousarray(img, dtype=np.float32).reshape(-1, 3)
+        out = np.empty(flat.shape, np.uint8 if u8 else np.float32)
+        step = 1 << 22
+        with torch.no_grad():
+            for a in range(0, flat.shape[0], step):
+                x = torch.from_numpy(flat[a:a + step]).to(self.dev)
+                gr = (x[:, [2, 1, 0]] * 2.0 - 1.0).view(1, 1, 1, -1, 3)
+                y = F.grid_sample(self.lut, gr, mode="bilinear", padding_mode="border", align_corners=True)      # [1, 3, 1, 1, P]
+                y = y.view(3, -1).t()
+                if u8:
+                    y = (y.clamp_(0.0, 1.0) * 255.0 + 0.5).to(torch.uint8)
+                out[a:a + step] = y.cpu().numpy()
+                del x, gr, y
+        return out.reshape(shp)
+
+
+def _gpu_lut(proc):
+    """The GPU table of an OpenColorIO processor, or None (not wanted / not possible)."""
+    if proc is None or not gpu_wanted():
+        return None
+    k = id(proc)
+    lut = _gpu_luts.get(k)
+    if lut is None:
+        with _gpu_lock:
+            lut = _gpu_luts.get(k)
+            if lut is None:
+                try:
+                    import torch
+                    if not torch.cuda.is_available():
+                        raise RuntimeError("no CUDA")
+                    try:
+                        n = int(os.environ.get("CONTOUR_COLOUR_GPU_N", "") or GPU_LUT_N)
+                    except ValueError:
+                        n = GPU_LUT_N
+                    lut = _GpuLut(proc, n)
+                    _gpu_luts[k] = lut
+                except Exception as e:
+                    _gpu_off[0] = True
+                    print("colour: the GPU table is not used:", repr(e)[:200], flush=True)
+                    return None
+    return lut
 
 
 class ColourManager:
@@ -204,15 +342,48 @@ class ColourManager:
 
     def to_display(self, rgb: np.ndarray, vs: ViewSettings) -> np.ndarray:
         """float32 HxWx3 (code values) -> float32 display-referred 0..1 (copy)."""
-        img = np.ascontiguousarray(rgb, dtype=np.float32).copy()
         proc = self._processor(vs)
+        lut = _gpu_lut(proc)
+        if lut is not None and getattr(rgb, "ndim", 0) >= 2 and rgb.shape[-1] == 3:
+            try:
+                return lut.apply(rgb)
+            except Exception as e:
+                print("colour: GPU table failed for a call, CPU used:", repr(e)[:160], flush=True)
+        img = np.ascontiguousarray(rgb, dtype=np.float32).copy()
         if proc is not None:
-            proc.applyRGB(img)
+            apply_rgb(proc, img)
         elif vs.exposure:
             img *= 2.0 ** vs.exposure
         return img
 
     def to_display_u8(self, rgb: np.ndarray, vs: ViewSettings) -> np.ndarray:
+        proc = self._processor(vs)
+        lut = _gpu_lut(proc)
+        if lut is not None and getattr(rgb, "ndim", 0) >= 2 and rgb.shape[-1] == 3:
+            try:
+                return lut.apply(rgb, u8=True)
+            except Exception as e:
+                print("colour: GPU table failed for a call, CPU used:", repr(e)[:160], flush=True)
+        n = strip_threads()
+        src = None
+        if proc is not None:
+            src = np.ascontiguousarray(rgb, dtype=np.float32)
+            if not _can_strip(src, n):
+                src = None
+        if src is not None:
+            # a strip at a time: convert, clip, scale and cut to 8 bits (the same operations in the same order as below, on a piece of the rows),
+            # so the whole picture is not copied as float again
+            out = np.empty(src.shape, np.uint8)
+
+            def one(y0: int, y1: int) -> None:
+                t = src[y0:y1].copy()
+                proc.applyRGB(t)
+                np.clip(t, 0.0, 1.0, out=t)
+                t *= 255.0
+                t += 0.5
+                out[y0:y1] = t.astype(np.uint8)
+            _run_strips(n, src.shape[0], one)
+            return out
         out = self.to_display(rgb, vs)
         np.clip(out, 0.0, 1.0, out=out)
         return (out * 255.0 + 0.5).astype(np.uint8)
@@ -228,7 +399,7 @@ class ColourManager:
                 proc = self.config.getProcessor(src, dst).getDefaultCPUProcessor()
                 self._cache[key] = proc
         img = np.ascontiguousarray(rgb, dtype=np.float32).copy()
-        proc.applyRGB(img)
+        apply_rgb(proc, img)
         return img
 
 

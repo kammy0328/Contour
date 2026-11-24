@@ -130,7 +130,20 @@ STAB_SIGMA = 1.4      # frames
 STAB_REJECT = 0.035   # a neighbour's point further than this (face widths) from the median is an expression change
 
 
-def stabilize(fl: _Flow, X: np.ndarray, keep: np.ndarray, to_flow: np.ndarray, breaks: set) -> np.ndarray:
+def _pairs_all(fl: _Flow, Xs, keeps, to_flow: np.ndarray, breaks: set):
+    """stabilize()'s frame-to-frame motions (t -> t+1) of several people, frame by frame (the flow made once for all of them)."""
+    T = len(Xs[0]) if Xs else 0
+    Ms = [[None] * T for _ in Xs]
+    for t in range(T - 1):
+        if t in breaks:
+            continue
+        for i, (X, keep) in enumerate(zip(Xs, keeps)):
+            if keep[t] and keep[t + 1]:
+                Ms[i][t] = _pair(fl, X[t], t, t + 1, to_flow)
+    return Ms
+
+
+def stabilize(fl: _Flow, X: np.ndarray, keep: np.ndarray, to_flow: np.ndarray, breaks: set, Mf=None) -> np.ndarray:
     """Takes the frame-to-frame shake out of the landmarks without slowing down any real movement.
 
     Each frame's neighbours (up to STAB_R each side) are brought onto this frame along the picture's own motion
@@ -139,10 +152,8 @@ def stabilize(fl: _Flow, X: np.ndarray, keep: np.ndarray, to_flow: np.ndarray, b
     their timing. What remains to be averaged is the landmark model's own frame-to-frame noise."""
     T = len(X)
     out = X.copy()
-    Mf: list = [None] * T                       # t -> t+1
-    for t in range(T - 1):
-        if keep[t] and keep[t + 1] and t not in breaks:
-            Mf[t] = _pair(fl, X[t], t, t + 1, to_flow)
+    if Mf is None:
+        Mf = _pairs_all(fl, [X], [keep], to_flow, breaks)[0]          # t -> t+1
     for t in range(T):
         if not keep[t]:
             continue
@@ -182,29 +193,36 @@ def _dist(A: np.ndarray, B: np.ndarray) -> float:
     return float(np.median(np.linalg.norm(A - B, axis=1))) / wf
 
 
-def _pass(fl, D: np.ndarray, valid: np.ndarray, order, to_flow, breaks: set):
-    """One direction. Returns carried landmarks (T,68,2), age (frames since an agreeing detection), and
-    whether the frame's own landmarks agreed."""
-    T = len(D)
-    out = np.full((T, 68, 2), np.nan)
-    age = np.full(T, 999, np.int32)
-    agree = np.zeros(T, bool)
-    X = None
-    a = 999
-    prev = None
-    run = []                 # consecutive disagreeing detections that agree among themselves
-    for t in order:
+class _PassState:
+    """One person's state in one direction of _pass (so the people of a cut go through the frames together: the flow between two
+    frames is then made once for all of them, not once a person; 2611 IWALY c057, 4 people: 854 s of a 2183 s analysis)."""
+    __slots__ = ("D", "valid", "out", "age", "agree", "X", "a", "prev", "run")
+
+    def __init__(self, D: np.ndarray, valid: np.ndarray):
+        T = len(D)
+        self.D, self.valid = D, valid
+        self.out = np.full((T, 68, 2), np.nan)
+        self.age = np.full(T, 999, np.int32)
+        self.agree = np.zeros(T, bool)
+        self.X = None
+        self.a = 999
+        self.prev = None
+        self.run = []                 # consecutive disagreeing detections that agree among themselves
+
+    def step(self, fl, t: int, to_flow, breaks: set) -> None:
+        D, valid = self.D, self.valid
+        X, a, prev, run = self.X, self.a, self.prev, self.run
         Pd = None
         if X is not None and prev is not None and min(prev, t) not in breaks:
             Pd, q = _carry(fl, X, prev, t, to_flow)
         if valid[t]:
             if Pd is None:
                 X, a = D[t].copy(), 0
-                agree[t] = True
+                self.agree[t] = True
                 run = []
             elif _dist(D[t], Pd) < AGREE:
                 X, a = 0.65 * D[t] + 0.35 * Pd, 0
-                agree[t] = True
+                self.agree[t] = True
                 run = []
             else:
                 # the frame says somewhere else; follow the picture, unless the frames keep saying so
@@ -215,7 +233,7 @@ def _pass(fl, D: np.ndarray, valid: np.ndarray, order, to_flow, breaks: set):
                     run = [t]
                 if len(run) >= REANCHOR or (Pd is not None and a >= MAX_DRIFT // 2 and len(run) >= 2):
                     X, a = D[t].copy(), 0
-                    agree[t] = True
+                    self.agree[t] = True
                     run = []
                 else:
                     X, a = Pd, a + 1
@@ -224,14 +242,29 @@ def _pass(fl, D: np.ndarray, valid: np.ndarray, order, to_flow, breaks: set):
         if X is not None and a > MAX_DRIFT:
             X, a = None, 999
         if X is not None:
-            out[t] = X
-            age[t] = a
-        prev = t
-    return out, age, agree
+            self.out[t] = X
+            self.age[t] = a
+        self.X, self.a, self.prev, self.run = X, a, t, run
 
 
-def refine(store, fs, frame_range: Tuple[int, int], progress: Optional[Callable] = None) -> dict:
-    """Runs on store.face / store.face_vis after solve_face. Returns counts for the report."""
+def _passes(fl, Ds, valids, order, to_flow, breaks: set):
+    """_pass for several people at once, frame by frame: [(carried (T,68,2), age, agreed)] in the order of Ds."""
+    sts = [_PassState(D, v) for D, v in zip(Ds, valids)]
+    for t in order:
+        for st_ in sts:
+            st_.step(fl, t, to_flow, breaks)
+    return [(st_.out, st_.age, st_.agree) for st_ in sts]
+
+
+def _pass(fl, D: np.ndarray, valid: np.ndarray, order, to_flow, breaks: set):
+    """One direction. Returns carried landmarks (T,68,2), age (frames since an agreeing detection), and
+    whether the frame's own landmarks agreed."""
+    return _passes(fl, [D], [valid], order, to_flow, breaks)[0]
+
+
+def refine(store, fs, frame_range: Tuple[int, int], progress: Optional[Callable] = None, skip=()) -> dict:
+    """Runs on store.face / store.face_vis after solve_face. Returns counts for the report. skip: store indices left as
+    they are (people out of focus, track/focus.py: never retouched, their faces need no flow)."""
     if fs is None or not getattr(store, "has_face", False):
         return {}
     a, b = frame_range
@@ -244,7 +277,11 @@ def refine(store, fs, frame_range: Tuple[int, int], progress: Optional[Callable]
     rep = dict(replaced=0, filled=0, faded=0)
     P = store.face.shape[0]
     T = b - a
+    loc_brk = {t - a for t in brk if a < t < b}
+    people = []
     for p in range(P):
+        if p in skip:
+            continue
         pres = store.present[p, a:b]
         if pres.sum() < 2:
             continue
@@ -253,9 +290,15 @@ def refine(store, fs, frame_range: Tuple[int, int], progress: Optional[Callable]
         valid = pres & np.isfinite(D).all((1, 2)) & (vis >= 0.3)
         if valid.sum() < 1:
             continue
-        loc_brk = {t - a for t in brk if a < t < b}
-        fwd, af, okf = _pass(fl, D, valid, range(T), to_flow, loc_brk)
-        bwd, ab, okb = _pass(fl, D, valid, range(T - 1, -1, -1), to_flow, loc_brk)
+        people.append((p, pres, D, vis, valid))
+    if not people:
+        return rep
+    # the people go through the frames together: each flow between two frames is made once for all of them (FlowCache
+    # keeps the last few), the same flows and the same steps as one person after the other
+    F_ = _passes(fl, [x[2] for x in people], [x[4] for x in people], range(T), to_flow, loc_brk)
+    B_ = _passes(fl, [x[2] for x in people], [x[4] for x in people], range(T - 1, -1, -1), to_flow, loc_brk)
+    news, nvs, keeps = [], [], []
+    for (p, pres, D, vis, valid), (fwd, af, okf), (bwd, ab, okb) in zip(people, F_, B_):
         new = D.copy()
         nv = vis.copy()
         for t in range(T):
@@ -290,8 +333,16 @@ def refine(store, fs, frame_range: Tuple[int, int], progress: Optional[Callable]
                 nv[t] = float(np.clip(0.85 - 0.04 * age, 0.4, 0.85)) * (1.0 if both_ok else 0.8)
                 rep["filled"] += 1
         keep = pres & np.isfinite(new).all((1, 2)) & (nv >= 0.08)
-        if keep.sum() >= 3:
-            new = stabilize(fl, new, keep, to_flow, loc_brk)
+        news.append(new)
+        nvs.append(nv)
+        keeps.append(keep)
+    stab = [i for i, k_ in enumerate(keeps) if k_.sum() >= 3]
+    Ms = _pairs_all(fl, [news[i] for i in stab], [keeps[i] for i in stab], to_flow, loc_brk)
+    Mof = dict(zip(stab, Ms))
+    for i, (p, pres, D, vis, valid) in enumerate(people):
+        new, nv, keep = news[i], nvs[i], keeps[i]
+        if i in Mof:
+            new = stabilize(fl, new, keep, to_flow, loc_brk, Mf=Mof[i])
         sc = store.face[p, a:b, :, 2:3]
         sc = np.where(np.isfinite(sc), sc, 0.5)
         out = np.concatenate([new, sc], -1).astype(np.float32)
@@ -299,5 +350,5 @@ def refine(store, fs, frame_range: Tuple[int, int], progress: Optional[Callable]
         store.face[p, a:b] = out
         store.face_vis[p, a:b] = np.where(keep, nv, 0.0)
         if progress:
-            progress((p + 1) / P, "얼굴 화면 추적")
+            progress((i + 1) / len(people), "얼굴 화면 추적")
     return rep

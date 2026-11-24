@@ -1,6 +1,7 @@
 """Analysis orchestration for one cut and the edit-time re-solve logic."""
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -21,6 +22,8 @@ from ..core.proxy import MatteStore, Proxy
 from ..warp import body as B
 from .modelpkg import cut_models as _cut_models
 
+_LABEL_LOCK = threading.RLock()        # CutTracker.labels: what it lets go of from its small cache, one at a time
+
 Progress = Optional[Callable[[float, str], None]]
 
 
@@ -30,6 +33,9 @@ class Cancelled(Exception):
 
 RECOVER = True        # carry a person through missed detections while tracking (people standing clear only)
 FILL_GAPS = True      # after linking, fill the remaining gaps by following the pose
+# people whose face is out of focus through the whole shot (track/focus.py; 2611 IWALY c057): no close-up matte, no face flow
+# and face layer, protected. Environment IWALY_DEFOCUS_SKIP=0 switches it off
+DEFOCUS_SKIP = __import__("os").environ.get("IWALY_DEFOCUS_SKIP", "1") not in ("0", "", "off")
 
 
 class _Recover:
@@ -282,9 +288,13 @@ class CutTracker:
         if lab is None:
             seg = self.seglab.get(t) if self.seglab.exists() else None
             lab = self.labels_from(t, seg, lambda: self.matte.get(t))
-            if len(self._label_cache) > 48:
-                self._label_cache.pop(next(iter(self._label_cache)))
-            self._label_cache[t] = lab
+            with _LABEL_LOCK:                       # (the people of a frame ask side by side: retouch.engine.PREP_THREADS)
+                while len(self._label_cache) > 48:
+                    try:
+                        self._label_cache.pop(next(iter(self._label_cache)))
+                    except (StopIteration, KeyError, RuntimeError):
+                        break
+                self._label_cache[t] = lab
         return lab
 
     def labels_from(self, t: int, seg, alpha) -> np.ndarray:
@@ -496,6 +506,24 @@ class CutTracker:
                         self._hand42(st, p, f, kp / [sx, sy], sc)
         del raw1
 
+        # ---------------- faces out of focus (track/focus.py): people the shot is not about. They get no close-up matte, no
+        # face flow and no face layer, and are protected (not retouched) when this analysis is the first to see them
+        st.defocus = set()
+        self._focus_info = {}
+        if DEFOCUS_SKIP:
+            try:
+                from . import focus as FC
+                sc_ = FC.scores(st, proxy.gray, sx, sy, (a, b))
+                out_, info_ = FC.defocused(sc_)
+                st.defocus = {int(st.pids[p]) for p in out_}
+                self._focus_info = {int(st.pids[p]): i_ for p, i_ in info_.items()}
+                if st.defocus:
+                    print(f"초점 밖 인물 {sorted(st.defocus)}: 보정 안 함, 분석 일부 생략", flush=True)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                st.defocus = set()
+
         # ---------------- matte (needed to tell visible joints from guessed ones)
         p_m = step(0.42, 0.48)
         self._label_cache.clear()
@@ -661,7 +689,7 @@ class CutTracker:
         if fs is not None:
             try:
                 from .faceflow import refine as _ff
-                _ff(st, fs, (a, b))
+                _ff(st, fs, (a, b), skip={i for i, q in enumerate(st.pids) if int(q) in getattr(st, "defocus", ())})
             except Exception:
                 import traceback
                 traceback.print_exc()
@@ -716,10 +744,22 @@ class CutTracker:
         except Exception:
             import traceback
             traceback.print_exc()
-        # face layer (parsing + steady skin colour) for the retouch masks
+        # people out of focus (track/focus.py): protected, only for people new in this analysis (a role the user chose stays)
+        try:
+            new = getattr(self, "_new_pids", set())
+            for q in self.cut.persons:
+                if q.id in getattr(st, "defocus", ()) and q.id in new and not getattr(q, "still", False) and not getattr(q, "hold", ""):
+                    q.role, q.hold = "protect", "defocus"
+                    q.name = f"{q.name} (초점밖)"
+        except Exception:
+            import traceback
+            traceback.print_exc()
+        # face layer (parsing + steady skin colour) for the retouch masks (not for the people out of focus)
         try:
             from . import facelayer as FL
-            FL.build(self, lambda f, m: p_w(0.3 + 0.65 * f, m), cancel)
+            soft_ = getattr(st, "defocus", set())
+            only_ = {i for i, q in enumerate(st.pids) if int(q) not in soft_} if soft_ else None
+            FL.build(self, lambda f, m: p_w(0.3 + 0.65 * f, m), cancel, persons=only_)
         except Exception:
             import traceback
             traceback.print_exc()

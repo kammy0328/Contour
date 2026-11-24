@@ -151,18 +151,79 @@ def _yuv_to_rgb(planes, max_value: float, rng: str) -> np.ndarray:
     return _from_ycc(yn, un, vn).astype(np.float32)
 
 
+def _dbg(*a):
+    import os as _o
+    if _o.environ.get("IWALY_ROI_DEBUG"):
+        print("APPLY_ROI:", *a, flush=True)
+
+
+def _apply_roi(planes, subsample, max_value, pix_fmt, rf, y_per_src, cm, vs, rng):
+    """engine.APPLY_ROI: each person on their own piece of the picture, one after the other (a later person's piece is read from
+    the planes the earlier ones left). None when it does not apply (a body effect, no face): the whole frame then."""
+    if not pix_fmt.startswith("yuv") or len(planes) < 3:
+        _dbg("not yuv planes", pix_fmt)
+        return None
+    H, W = planes[0].shape[:2]
+    bad = [(j.pid, RE.roi_job_ok(j, why=True)) for j in rf.jobs]
+    bad = [b for b in bad if b[1] is not True]
+    if bad:
+        _dbg("jobs not on their piece", bad)
+        return None
+    al = 2
+    for pl in planes[1:3]:
+        if W % pl.shape[1] or H % pl.shape[0]:
+            return None
+        al = max(al, W // pl.shape[1], H // pl.shape[0])
+    boxes = []
+    for j in rf.jobs:
+        w_ = []
+        b = RE.roi_job_box(j, (W, H), rf.proxy_wh, y_per_src, float(getattr(RE, "APPLY_ROI_MARGIN", 1.5)), al, w_)
+        _dbg("job", j.pid, "masks' boxes (proxy px)", w_)
+        if b is None:
+            _dbg("no box", j.pid)
+            return None
+        boxes.append(b)
+    if sum((b[2] - b[0]) * (b[3] - b[1]) for b in boxes) > 0.8 * W * H:
+        _dbg("pieces cover most of the picture", boxes)
+        return None                      # the pieces are most of the picture: once for all is cheaper
+    _dbg("on pieces", boxes)
+    out = [np.array(p, copy=True) for p in planes[:3]]
+    for j, (x0, y0, x1, y1) in zip(rf.jobs, boxes):
+        rfj = RE.roi_frame(rf, j, (x0, y0, x1, y1), (W, H), y_per_src)
+        sub = []
+        for pl in out:
+            kx, ky = W // pl.shape[1], H // pl.shape[0]
+            sub.append(pl[y0 // ky:y1 // ky, x0 // kx:x1 // kx])
+        # the whole piece as it is (no mean fill round the masks, CROP): a stage that looks further than CROP_MARGIN sees the real picture
+        res = apply_planes_display(sub, subsample, max_value, pix_fmt, rfj, y_per_src, cm, vs, rng, _roi=False, _crop=False)
+        for pl, r in zip(out, res[:3]):
+            kx, ky = W // pl.shape[1], H // pl.shape[0]
+            pl[y0 // ky:y1 // ky, x0 // kx:x1 // kx] = r
+        j.naso_pres = rfj.jobs[0].naso_pres
+    return out + list(planes[3:])
+
+
 def apply_planes_display(planes: List[np.ndarray], subsample, max_value: float, pix_fmt: str, rf,
-                         y_per_src: float, cm, vs, rng: str = "tv") -> List[np.ndarray]:
+                         y_per_src: float, cm, vs, rng: str = "tv", _roi: bool = True, _crop: bool = True) -> List[np.ndarray]:
     """Same contract as engine.apply_planes, retouching in the display picture of `vs`."""
     if rf is None or rf.empty():
         return planes
+    if _roi and float(getattr(RE, "APPLY_ROI", 0) or 0) > 0:
+        try:
+            r_ = _apply_roi(planes, subsample, max_value, pix_fmt, rf, y_per_src, cm, vs, rng)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            r_ = None
+        if r_ is not None:
+            return r_
     if pix_fmt.startswith("yuv"):
         src = _yuv_to_rgb(planes, max_value, rng)
     else:
         g, b, r = planes[0], planes[1], planes[2]
         src = np.stack([r, g, b], -1).astype(np.float32)
     Hs, Ws = src.shape[:2]
-    box = _box(rf, Ws, Hs) if CROP else None
+    box = _box(rf, Ws, Hs) if (CROP and _crop) else None
     if box is None:
         disp0 = cm.to_display(src, vs)
     else:

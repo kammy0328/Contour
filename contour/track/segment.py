@@ -578,7 +578,11 @@ def decode_frame(seg, rgb, st, t: int, sx: float, sy: float, W: int, H: int, mw:
                     assigned.pop(i)
                 else:
                     seen[k] = i
-    small = sorted([i for i, x in enumerate(pr) if (x[1][3] - x[1][1]) < SMALL_PERSON * H and i not in reposed],
+    # people out of focus (track/focus.py, st.defocus: person ids) get no close-up encoding: never retouched, their
+    # outline from the whole frame is all they need, and a close-up is another encoder and finder run a person a frame
+    soft_ = getattr(st, "defocus", None) or ()
+    small = sorted([i for i, x in enumerate(pr) if (x[1][3] - x[1][1]) < SMALL_PERSON * H and i not in reposed
+                    and int(st.pids[x[0]]) not in soft_],
                    key=lambda i: pr[i][1][3] - pr[i][1][1])[:MAX_CLOSEUPS]
     taken = set(assigned.values()) | set(merged)
     inst_cv = [None] * len(insts)

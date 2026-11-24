@@ -283,12 +283,50 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
                 rep.warnings.append(f"GPU 워프 오류로 CPU로 전환: {e.__class__.__name__}")
         return F.warp_planes(planes_, subs, fr_, maxv)
 
+    # the knee tone through time (1.26): the pictures are prepared a few ahead, in a thread of their own, and a picture is worked on when the pictures round it
+    # have been looked at (retouch.engine.KneeLook); off, every picture is prepared by the one that works on it
+    knee_look = None
+    if parallel and n_workers > 1 and getattr(RE.BTN, "KNEE_ENV", False):
+        knee_look = RE.KneeLook(lambda t_: RE.prepare(cut, tracker, t_), lambda t_: F.build_input(cut, tracker, t_), prep_lock, a, b, tracker.proxy)
+
+    # the raw frames (each frame's masks on their own, most of the serial stage) made ahead in helper processes when the environment asks for them
+    # (CONTOUR_RAW_PROCS): retouch.rawpool. What a frame gets is the same; a frame no helper made is made here as before.
+    from ..retouch import rawpool as RP
+    raw_pool = RP.start_for_render(project, cut, tracker, a, b)
+
+    # the retouch of each frame done in helper processes when the environment asks for them (CONTOUR_APPLY_PROCS): retouch.applypool
+    from ..retouch import applypool as AP
+    apply_pool = AP.start_for_render(subs, maxv, pf, disp_, info.color_range) if parallel and n_workers > 1 else None
+
+    def stop_raw():
+        if apply_pool is not None:
+            try:
+                sa_ = apply_pool.close()
+                rep.apply_pool = sa_
+                rep.accel = (rep.accel + " · " if rep.accel else "") + f"보정 도우미 {sa_.get('helpers')}개 ({sa_.get('done')}/{sa_.get('done', 0) + sa_.get('local', 0)})"
+            except Exception:
+                pass
+        st_ = RP.stop_for_render(tracker) if raw_pool is not None else None
+        if st_ is not None:
+            try:
+                rep.raw_pool = st_
+            except Exception:
+                pass
+            rep.accel = (rep.accel + " · " if rep.accel else "") + f"준비 도우미 {st_.get('helpers')}개 ({st_.get('taken')}/{st_.get('taken', 0) + st_.get('local', 0)})"
+
     def process(t_, planes_):
-        with prep_lock:                    # tracker caches are not shared between threads
-            rf_ = RE.prepare(cut, tracker, t_)
-            fi_ = F.build_input(cut, tracker, t_)
-        if rf_ is not None:
-            planes_ = RE.apply_planes(planes_, subs, maxv, pf, rf_, 1.0, disp_, info.color_range)
+        if knee_look is not None:
+            rf_, fi_ = knee_look.get(t_)
+        else:
+            with prep_lock:                    # tracker caches are not shared between threads
+                rf_ = RE.prepare(cut, tracker, t_)
+                fi_ = F.build_input(cut, tracker, t_)
+        if rf_ is not None and not rf_.empty():
+            res_ = apply_pool.apply(t_, planes_, rf_) if apply_pool is not None else None
+            if res_ is None:
+                RE.masks_f32(rf_)
+                res_ = RE.apply_planes(planes_, subs, maxv, pf, rf_, 1.0, disp_, info.color_range)
+            planes_ = res_
         fr_ = F.compute_field(fi_, W, H, grid_step)
         if not warper[1] and not fr_.empty():
             with prep_lock:
@@ -333,6 +371,8 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
     if parallel and n_workers > 1:
         pool = ThreadPoolExecutor(max_workers=n_workers)
         pending: "deque" = deque()
+        if knee_look is not None:
+            knee_look.start()
         try:
             for t in range(a, b):
                 if cancel and cancel():
@@ -353,6 +393,9 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
                 _, fr0, outp0 = fut.result()
                 write_frame(t0_, outp0, fr0)
         except Exception:
+            if knee_look is not None:
+                knee_look.stop()
+            stop_raw()
             pool.shutdown(wait=False, cancel_futures=True)
             reader.close()
             if writer and ext_writer is None:
@@ -360,6 +403,8 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
             for w in matte_writers.values():
                 w.abort()
             raise
+        if knee_look is not None:
+            knee_look.stop()
         pool.shutdown(wait=True, cancel_futures=True)
         a_range = range(0)
     else:
@@ -392,12 +437,14 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
                 alpha_out = np.clip(F.warp_planes([ta], [(1, 1)], fr, 1.0)[0], 0, 1) if not fr.empty() else ta
             write_frame(t, outp, fr, alpha_out)
     except Exception:
+        stop_raw()
         reader.close()
         if writer and ext_writer is None:
             writer.abort()
         for w in matte_writers.values():
             w.abort()
         raise
+    stop_raw()
     reader.close()
     if not rep.cancelled and rep.frames < n:
         # the source ended early: a shorter file is not this cut (in an edited timeline every later shot would move)
