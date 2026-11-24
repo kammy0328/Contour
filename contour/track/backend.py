@@ -54,6 +54,22 @@ COREML_NO = ("seg_sam31", "seg_sam31_find", "seg_sam2_s", "seg_sam2_b", "track_s
 COREML_OPTIONS = {"ModelFormat": "MLProgram", "MLComputeUnits": "ALL", "RequireStaticInputShapes": "0",
                   "EnableOnSubgraphs": "0"}
 
+
+def coreml_files() -> Dict[str, dict]:
+    """Model FILES given to Core ML even when their model is in COREML_NO or not in COREML_OK (environment
+    DIAP_COREML_FILES: file names separated by commas, e.g. "image-encoder-gpu.onnx"; DIAP_COREML_UNITS: ALL,
+    CPUAndGPU, CPUAndNeuralEngine; DIAP_COREML_CACHE: a folder for the compiled model). Set by the Mac batch after
+    the file was checked on that Mac against the CPU (iwaly_batch/coreml.json). Empty by default: nothing changes."""
+    names = [n.strip() for n in os.environ.get("DIAP_COREML_FILES", "").split(",") if n.strip()]
+    if not names or sys.platform != "darwin":
+        return {}
+    o: dict = {}
+    if os.environ.get("DIAP_COREML_UNITS"):
+        o["MLComputeUnits"] = os.environ["DIAP_COREML_UNITS"]
+    if os.environ.get("DIAP_COREML_CACHE"):
+        o["ModelCacheDirectory"] = os.environ["DIAP_COREML_CACHE"]
+    return {n: dict(o) for n in names}
+
 # models that are not moved to the CPU when the GPU has no memory left for them: one run there takes minutes (the
 # SAM 3.1 encoder: 206 s a picture on 16 threads), so the analysis says what to do instead of seeming to hang
 CPU_TOO_SLOW = ("image-encoder", "finder", "vision_encoder", "memory_attention")
@@ -193,6 +209,10 @@ def for_model(path, base: List, want: str = "auto") -> Tuple[List, List[str]]:
             why.append(f"{LABEL[b]}: 이 모델 패키지의 대상이 아님 ({', '.join(LABEL.get(x, x) for x in allowed)})")
             continue
         if b == "coreml":
+            forced = coreml_files().get(Path(str(path)).name)
+            if forced is not None:
+                out.append((pname, {**COREML_OPTIONS, **(opts or {}), **forced}))
+                continue
             if name in COREML_NO:
                 why.append("Core ML: 이 모델은 지원하지 않는 연산·입력이 있어 CPU로 실행")
                 continue
