@@ -19,7 +19,7 @@ import numpy as np
 
 SAMPLES = 16          # frames looked at in the work range
 NORM_W = 96.0         # faces wider than this (analysis px) are made this wide before the measure
-MIN_W = 22.0          # faces narrower than this are not judged
+MIN_W = 48.0          # faces narrower than this (analysis px) are not judged (small faces measure low in focus too: c034, c040)
 MIN_SEEN = 4          # samples a person needs before they can be called out of focus
 REL = 0.62            # out of focus: under this share of the sharpest face's measure on the same frames ...
 ABS = 0.80            # ... and under this on their own
@@ -30,13 +30,19 @@ INNER = slice(17, 68) # 68-point face: brows, nose, eyes, mouth
 
 def _box(lm68: np.ndarray, sx: float, sy: float, W: int, H: int):
     pts = lm68[INNER, :2]
-    if not np.isfinite(pts).all():
+    if not np.isfinite(pts).all() or not np.isfinite(lm68[:17, :2]).all():
         return None
     pts = pts * [sx, sy]
     x0, y0 = pts.min(0)
     x1, y1 = pts.max(0)
     w = float(x1 - x0)
-    if w < 4:
+    h = float(y1 - y0)
+    if w < 4 or h < 4:
+        return None
+    # landmarks that sit on the face: the inner points about as wide as tall, and as wide as the jaw (c040: a track whose points
+    # spread over hair and a neighbour gave a "face" of the frame's width, sharp, the reference of everybody else)
+    jw = float(np.ptp(lm68[:17, 0] * sx))
+    if not (0.45 <= w / h <= 2.2) or not (0.5 <= w / max(jw, 1e-3) <= 1.15):
         return None
     m = 0.06 * w
     x0, y0 = max(0, int(x0 - m)), max(0, int(y0 - m))
