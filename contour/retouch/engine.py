@@ -240,6 +240,44 @@ def _hand_area(hands, shape, sx: float, sy: float, wf: float, arms=None) -> Opti
     return np.clip(cv2.GaussianBlur(out.astype(np.float32) / 255.0, (0, 0), max(1.0, HAND_GUARD_FEATHER * wf)) * 1.2, 0, 1)
 
 
+def _hand_area_local(hands, shape, sx: float, sy: float, wf: float, arms=None):
+    """_hand_area as ((y0, y1, x0, x1), 0..1 there): the same values, worked only round what is drawn (0 outside the box). None: nothing."""
+    if not hands and not arms:
+        return None
+    h, w = shape
+    out = np.zeros((h, w), np.uint8)
+    for el, wr in (arms or []):
+        el = np.asarray(el, np.float64)[:2] * [sx, sy]
+        wr = np.asarray(wr, np.float64)[:2] * [sx, sy]
+        d = wr - el
+        L = float(np.hypot(*d))
+        if not np.isfinite(L) or L < 3:
+            continue
+        tip = wr + d * HAND_GUARD_REACH
+        rad = max(2, int(round(HAND_GUARD_RADIUS * L)))
+        cv2.line(out, tuple(int(round(v)) for v in wr), tuple(int(round(v)) for v in tip), 255, 2 * rad)
+        cv2.circle(out, tuple(int(round(v)) for v in tip), rad, 255, -1)
+        cv2.circle(out, tuple(int(round(v)) for v in wr), int(rad * 0.8), 255, -1)
+    for hp in (hands or []):
+        if hp is None:
+            continue
+        q = np.asarray(hp, np.float64)
+        q = q[np.isfinite(q[:, :2]).all(1)][:, :2] if q.ndim == 2 else None
+        if q is None or len(q) < 3:
+            continue
+        q = q * [sx, sy]
+        cv2.fillConvexPoly(out, cv2.convexHull(np.round(q).astype(np.int32)), 255)
+    bx, by, bw, bh = cv2.boundingRect(out)
+    if bw <= 0 or bh <= 0:
+        return None
+    r = max(1, int(round(HAND_GUARD_MARGIN * wf)))
+    sg = max(1.0, HAND_GUARD_FEATHER * wf)
+    R = r + ((int(round(sg * 8.0 + 1.0)) | 1) // 2) + 3
+    x0, x1, y0, y1 = max(0, bx - R), min(w, bx + bw + R), max(0, by - R), min(h, by + bh + R)
+    c = cv2.dilate(out[y0:y1, x0:x1], cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1)))
+    return (y0, y1, x0, x1), np.clip(cv2.GaussianBlur(c.astype(np.float32) / 255.0, (0, 0), sg) * 1.2, 0, 1)
+
+
 def _cover_off(m: np.ndarray, cover: Optional[np.ndarray], lm: np.ndarray) -> np.ndarray:
     """The fold band without the part on or next to a limb in front of the face (FOLD_COVER_GUARD)."""
     _dc = __import__('os').environ.get('IWALY_DUMP_COVER_MASKS')
@@ -269,10 +307,138 @@ def _cover_off(m: np.ndarray, cover: Optional[np.ndarray], lm: np.ndarray) -> np
         return m
 
 
+MASK_ROI = 1.0    # (11/24) 1: the fold bands, the under-eye crescents and the features' exclusion are made on the face's own region of the picture (the same result;
+                 # a full-frame picture per person was most of their time: c034, 7 people, 20 s a frame)
+
+
+def _roi_face(lm, shape, reach: float, margin: float):
+    """(inner (y0, y1, x0, x1), outer (Y0, Y1, X0, X1)) round the face's landmarks: inner holds every non-zero value of the mask (the landmarks' box grown by
+    reach x the face width), outer what the mask reads round that (grown again by margin x the face width); None where it does not pay or cannot be."""
+    h, w = shape
+    if MASK_ROI <= 0.5 or lm is None or h * w <= 250000:
+        return None
+    L = np.asarray(lm, np.float64)[:, :2]
+    if not np.isfinite(L).all():
+        return None
+    Wf = float(np.hypot(*(L[16] - L[0])))
+    if Wf <= 4:
+        return None
+    r = reach * Wf + 6
+    x0 = int(max(0, np.floor(L[:, 0].min() - r))); x1 = int(min(w, np.ceil(L[:, 0].max() + r)))
+    y0 = int(max(0, np.floor(L[:, 1].min() - r))); y1 = int(min(h, np.ceil(L[:, 1].max() + r)))
+    mg = int(np.ceil(margin * Wf)) + 10
+    X0, X1, Y0, Y1 = max(0, x0 - mg), min(w, x1 + mg), max(0, y0 - mg), min(h, y1 + mg)
+    if not (x1 > x0 and y1 > y0) or (X1 - X0) * (Y1 - Y0) >= 0.6 * h * w:
+        return None
+    return (y0, y1, x0, x1), (Y0, Y1, X0, X1)
+
+
+def _roi_call(fn, lm, shape, reach: float, margin: float, crops, *rest):
+    """fn(lm, shape, *crops, *rest) made on the face's region (_roi_face) and set into a zero picture of `shape`; None where the region does not apply."""
+    rr = _roi_face(lm, shape, reach, margin)
+    if rr is None:
+        return None
+    (y0, y1, x0, x1), (Y0, Y1, X0, X1) = rr
+    lmc = np.asarray(lm, np.float64).copy()
+    lmc[:, 0] -= X0
+    lmc[:, 1] -= Y0
+    cr = [None if a is None else a[Y0:Y1, X0:X1] for a in crops]
+    loc = fn(lmc.astype(np.asarray(lm).dtype), (Y1 - Y0, X1 - X0), *cr, *rest)
+    out = np.zeros(tuple(shape) + loc.shape[2:], loc.dtype)
+    out[y0:y1, x0:x1] = loc[y0 - Y0:y1 - Y0, x0 - X0:x1 - X0]
+    return out
+
+
+
+def _soft_local(shape, draw, pts, grow: int, sigma: float, gain: float = 1.0):
+    """((y0, y1, x0, x1), soft 0..1 there) of shapes drawn by draw(canvas, (x0, y0)) round the points `pts` (mask px), grown by an ellipse `grow` px wide (0: not)
+    and blurred by sigma: what the same drawn on the whole picture gives, inside a box that holds all of it (0 outside); None where nothing is drawn."""
+    h, w = shape
+    P = np.asarray(pts, np.float64).reshape(-1, 2)
+    P = P[np.isfinite(P).all(1)]
+    if len(P) == 0:
+        return None
+    k_ = (int(round(sigma * 8.0 + 1.0)) | 1) if sigma > 0 else 1
+    R = (grow // 2 if grow > 1 else 0) + k_ // 2 + 3
+    x0 = int(max(0, np.floor(P[:, 0].min()) - R)); x1 = int(min(w, np.ceil(P[:, 0].max()) + R + 1))
+    y0 = int(max(0, np.floor(P[:, 1].min()) - R)); y1 = int(min(h, np.ceil(P[:, 1].max()) + R + 1))
+    if x1 <= x0 or y1 <= y0:
+        return None
+    c = np.zeros((y1 - y0, x1 - x0), np.uint8)
+    draw(c, (x0, y0))
+    if not c.any():
+        return None
+    if grow > 1:
+        c = cv2.dilate(c, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (grow, grow)))
+    f = c.astype(np.float32) / 255.0
+    if sigma > 0:
+        f = cv2.GaussianBlur(f, (0, 0), sigma)
+    if gain != 1.0:
+        f = np.clip(f * gain, 0, 1)
+    return (y0, y1, x0, x1), f
+
+
+def _times_local(m: np.ndarray, sl, fac: np.ndarray) -> np.ndarray:
+    """m with m[box] *= fac (fac at the box), a new array of m's type; m itself is left as it is (it can be a kept mask)."""
+    (y0, y1, x0, x1) = sl
+    o = m.copy()
+    o[y0:y1, x0:x1] = (o[y0:y1, x0:x1] * fac).astype(m.dtype)
+    return o
+
+
+def _hold_yc(mY: np.ndarray, mC: np.ndarray, loc, shY, shC):
+    """mY, mC with (1 - the hold) over the hold's box (loc: _soft_local's (box, soft) on the luma's grid). mC is the hold at the chroma's grid: the
+    same as resizing the whole hold picture where the chroma has the luma's size; otherwise the full hold picture is made and resized (as before)."""
+    (y0, y1, x0, x1), f = loc
+    mY = _times_local(mY, (y0, y1, x0, x1), 1.0 - f)
+    if tuple(shC) == tuple(shY):
+        mC = _times_local(mC, (y0, y1, x0, x1), 1.0 - f)
+    else:
+        full = np.zeros(tuple(shY), np.float32)
+        full[y0:y1, x0:x1] = f
+        mC = mC * cv2.resize(1.0 - full, (shC[1], shC[0]), interpolation=cv2.INTER_LINEAR)       # (as M() does)
+    return mY, mC
+
+
 def wrinkle_masks(lm: np.ndarray, shape, prob: np.ndarray, which: str, fth: float = 1.5,
                   wide: float = 1.0, paint: Optional[np.ndarray] = None) -> np.ndarray:
     """Nasolabial folds ('naso') or the lines down from the mouth corners ('mouth'). lm in mask px.
-    wide > 1: a wider band where the fold is looked for (where it really is differs from face to face)."""
+    wide > 1: a wider band where the fold is looked for (where it really is differs from face to face).
+    MASK_ROI: made on the region round the bands (their extent, the feather's reach) with what it reads round that (lips, wings, the skin map, paint) taken
+    from a wider region still, so every value inside is what the whole picture gives; 0 outside, as it is."""
+    h, w = shape
+    if MASK_ROI > 0.5 and lm is not None and h * w > 250000:
+        try:
+            L = np.asarray(lm, np.float64)[:, :2]
+            Wf = float(np.hypot(*(L[16] - L[0])))
+            if np.isfinite(L).all() and Wf > 4:
+                pts = []
+                for ala, corner in ((L[31], L[48]), (L[35], L[54])):
+                    pts += [ala, corner]
+                pts = np.asarray(pts + [L[8], L[48:60].mean(0)])
+                reach = (0.085 * max(wide, 1.0) + 0.40 + 0.028 * 4.2 * max(fth, 0.5)) * Wf + 6      # the curves' bulge / end / width, the feather
+                x0 = int(max(0, np.floor(pts[:, 0].min() - reach))); x1 = int(min(w, np.ceil(pts[:, 0].max() + reach)))
+                y0 = int(max(0, np.floor(pts[:, 1].min() - reach))); y1 = int(min(h, np.ceil(pts[:, 1].max() + reach)))
+                mg = int(np.ceil(0.20 * Wf)) + 10                                                    # what the terms round the band read (lips, wings, corners, skin map, paint)
+                X0, X1, Y0, Y1 = max(0, x0 - mg), min(w, x1 + mg), max(0, y0 - mg), min(h, y1 + mg)
+                if (X1 - X0) * (Y1 - Y0) < 0.6 * h * w and x1 > x0 and y1 > y0:
+                    lmc = np.asarray(lm, np.float64).copy()
+                    lmc[:, 0] -= X0
+                    lmc[:, 1] -= Y0
+                    pr_ = None if prob is None else prob[Y0:Y1, X0:X1]
+                    pa_ = None if paint is None else paint[Y0:Y1, X0:X1]
+                    loc = _wrinkle_masks_full(lmc.astype(np.asarray(lm).dtype), (Y1 - Y0, X1 - X0), pr_, which, fth, wide, pa_)
+                    out = np.zeros((h, w), loc.dtype)
+                    out[y0:y1, x0:x1] = loc[y0 - Y0:y1 - Y0, x0 - X0:x1 - X0]
+                    return out
+        except Exception:
+            import traceback
+            traceback.print_exc()
+    return _wrinkle_masks_full(lm, shape, prob, which, fth, wide, paint)
+
+
+def _wrinkle_masks_full(lm: np.ndarray, shape, prob: np.ndarray, which: str, fth: float = 1.5,
+                        wide: float = 1.0, paint: Optional[np.ndarray] = None) -> np.ndarray:
     h, w = shape
     m = np.zeros((h, w), np.uint8)
     L = lm[:, :2]
@@ -398,7 +564,18 @@ def _ala_mask(lm: np.ndarray, shape) -> np.ndarray:
 
 def feature_exclusion(lm: np.ndarray, shape) -> np.ndarray:
     """Eyes, brows, lips, mouth, nostrils and nose wings (soft), for things that must stay out of skin
-    averages and fills."""
+    averages and fills (MASK_ROI: on the face's region, the same result)."""
+    try:
+        o_ = _roi_call(_feature_exclusion_full, lm, shape, 0.25, 0.02, [])
+        if o_ is not None:
+            return o_
+    except Exception:
+        import traceback
+        traceback.print_exc()
+    return _feature_exclusion_full(lm, shape)
+
+
+def _feature_exclusion_full(lm: np.ndarray, shape) -> np.ndarray:
     L = lm[:, :2]
     Wf = float(np.hypot(*(L[16] - L[0])))
     m = SK._features_mask(lm, shape)
@@ -454,7 +631,18 @@ DARK_CAP = 0.07           # and never by more than this (luma 0..1)
 
 
 def under_eye_mask(lm: np.ndarray, shape, prob: np.ndarray, fth: float = 1.5) -> np.ndarray:
-    """Crescents under the eyes, from just below the lashes down towards the cheek."""
+    """Crescents under the eyes, from just below the lashes down towards the cheek (MASK_ROI: on the face's region, the same result)."""
+    try:
+        o_ = _roi_call(_under_eye_mask_full, lm, shape, 0.15 + 0.022 * 4.2 * max(fth, 0.5), 0.12, [prob], fth)
+        if o_ is not None:
+            return o_
+    except Exception:
+        import traceback
+        traceback.print_exc()
+    return _under_eye_mask_full(lm, shape, prob, fth)
+
+
+def _under_eye_mask_full(lm: np.ndarray, shape, prob: np.ndarray, fth: float = 1.5) -> np.ndarray:
     h, w = shape
     L = lm[:, :2]
     Wf = float(np.hypot(*(L[16] - L[0])))
@@ -3445,11 +3633,12 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 # wings' outer points), grown by NASO_NOSTRIL_HOLD of the face width, are out of the band
                 try:
                     wfm_ = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
-                    nh_ = np.zeros(m_.shape, np.uint8)
-                    cv2.fillConvexPoly(nh_, cv2.convexHull(np.round(lm[[31, 32, 33, 34, 35], :2]).astype(np.int32)), 255)
                     kn_ = max(3, int(round(NASO_NOSTRIL_HOLD * wfm_)) * 2 + 1)
-                    nh_ = cv2.dilate(nh_, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kn_, kn_)))
-                    m_ = (m_ * (1.0 - cv2.GaussianBlur(nh_.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.4 * NASO_NOSTRIL_HOLD * wfm_)))).astype(m_.dtype)
+                    q_ = np.round(lm[[31, 32, 33, 34, 35], :2]).astype(np.int32)
+                    loc_ = _soft_local(m_.shape, lambda c_, o_: cv2.fillConvexPoly(c_, cv2.convexHull(q_ - np.int32(o_)), 255), q_, kn_,
+                                       max(1.0, 0.4 * NASO_NOSTRIL_HOLD * wfm_))
+                    if loc_ is not None:
+                        m_ = _times_local(m_, loc_[0], 1.0 - loc_[1])
                 except Exception:
                     import traceback
                     traceback.print_exc()
@@ -3488,12 +3677,12 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                             if np.isfinite(kq_[e_, :2]).all() and np.isfinite(kq_[w_, :2]).all():
                                 arms_.append((kq_[e_, :2], kq_[w_, :2]))
                     wfm_ = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
-                    a_ = _hand_area(hl_, shape, float(px.sx), float(px.sy), wfm_, arms_)
+                    a_ = _hand_area_local(hl_, shape, float(px.sx), float(px.sy), wfm_, arms_)
                     if __import__("os").environ.get("IWALY_HAND_GUARD_LOG"):
                         print("hand_guard t", t, "hands", [int(np.isfinite(np.asarray(x)[:, :2]).all(1).sum()) for x in hl_], "arms", len(arms_),
-                              "area", None if a_ is None else round(float(a_.mean()), 4), flush=True)
+                              "area", None if a_ is None else round(float(a_[1].sum()) / float(shape[0] * shape[1]), 4), flush=True)
                     if a_ is not None:
-                        g_ = 1.0 - float(HAND_GUARD) * a_
+                        g_ = (a_[0], 1.0 - float(HAND_GUARD) * a_[1])          # (box, 1 - the hands' area there; 1 outside)
                 except Exception:
                     import traceback
                     traceback.print_exc()
@@ -3502,7 +3691,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
 
         def _hg(m_):
             g_ = hand_guard()
-            return m_ if (g_ is None or m_ is None or g_.shape != m_.shape) else (m_ * g_).astype(m_.dtype)
+            return m_ if (g_ is None or m_ is None or tuple(m_.shape[:2]) != tuple(shape)) else _times_local(m_, g_[0], g_[1])
 
         def mk_neck():
             b_ = base()
@@ -3577,13 +3766,15 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 # (11/24, INT_c001 f119: the left brow made lighter, by the skin stage alone) the brows (their landmarks' hulls, grown) are no skin to smooth
                 try:
                     wfm_ = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
-                    bh_ = np.zeros(m.shape, np.uint8)
-                    for idx_ in (range(17, 22), range(22, 27)):
-                        cv2.fillConvexPoly(bh_, cv2.convexHull(np.round(lm[list(idx_), :2]).astype(np.int32)), 255)
                     kb_ = max(3, int(round(SKIN_BROW_HOLD * wfm_)) * 2 + 1)
-                    bh_ = cv2.dilate(bh_, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kb_, kb_)))
-                    bhf_ = cv2.GaussianBlur(bh_.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.5 * SKIN_BROW_HOLD * wfm_))
-                    m = (m * (1.0 - bhf_)).astype(m.dtype)
+                    qb_ = [np.round(lm[list(idx_), :2]).astype(np.int32) for idx_ in (range(17, 22), range(22, 27))]
+
+                    def _db(c_, o_, qb_=qb_):
+                        for q_ in qb_:
+                            cv2.fillConvexPoly(c_, cv2.convexHull(q_ - np.int32(o_)), 255)
+                    loc_ = _soft_local(m.shape, _db, np.vstack(qb_), kb_, max(1.0, 0.5 * SKIN_BROW_HOLD * wfm_))
+                    if loc_ is not None:
+                        m = _times_local(m, loc_[0], 1.0 - loc_[1])
                 except Exception:
                     import traceback
                     traceback.print_exc()
@@ -3595,11 +3786,10 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                     up_ = L_[27] - L_[8]
                     up_ = up_ / max(1e-6, float(np.hypot(*up_)))
                     br_ = L_[17:27] + up_ * (0.012 * wfm_)
-                    poly_ = np.vstack([br_, (br_ + up_ * (0.9 * wfm_))[::-1]])
-                    fh_ = np.zeros(m.shape, np.uint8)
-                    cv2.fillPoly(fh_, [np.round(poly_).astype(np.int32)], 255)
-                    fhf_ = cv2.GaussianBlur(fh_.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.02 * wfm_))
-                    m = (m * (1.0 - float(np.clip(SKIN_FOREHEAD_HOLD, 0, 1)) * fhf_)).astype(m.dtype)
+                    poly_ = np.round(np.vstack([br_, (br_ + up_ * (0.9 * wfm_))[::-1]])).astype(np.int32)
+                    loc_ = _soft_local(m.shape, lambda c_, o_: cv2.fillPoly(c_, [poly_ - np.int32(o_)], 255), poly_, 0, max(1.0, 0.02 * wfm_))
+                    if loc_ is not None:
+                        m = _times_local(m, loc_[0], 1.0 - float(np.clip(SKIN_FOREHEAD_HOLD, 0, 1)) * loc_[1])
                 except Exception:
                     import traceback
                     traceback.print_exc()
@@ -3608,14 +3798,19 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 # outline, a little in from it, the skin keeps its retouch (an arm across the face does not take the face's retouch away)
                 try:
                     g_ = hand_guard()
-                    if g_ is not None and g_.shape == m.shape and float(g_.min()) < 0.99:
+                    if g_ is not None and tuple(m.shape[:2]) == tuple(shape) and float(g_[1].min()) < 0.99:
                         wfm_ = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
-                        hl_ = np.zeros(m.shape, np.uint8)
-                        cv2.fillConvexPoly(hl_, cv2.convexHull(np.round(lm[0:27, :2]).astype(np.int32)), 255)
                         ke_ = max(3, int(round(HAND_GUARD_SKIN_IN * wfm_)) * 2 + 1)
+                        sg_ = max(1.0, 0.5 * HAND_GUARD_SKIN_IN * wfm_)
+                        (gy0, gy1, gx0, gx1) = g_[0]
+                        # the face's inside on a canvas round the hands' box, wide enough that the erosion and the blur see there what the whole picture shows
+                        mg_ = ke_ // 2 + ((int(round(sg_ * 8.0 + 1.0)) | 1) // 2) + 3
+                        cy0, cy1, cx0, cx1 = max(0, gy0 - mg_), min(shape[0], gy1 + mg_), max(0, gx0 - mg_), min(shape[1], gx1 + mg_)
+                        hl_ = np.zeros((cy1 - cy0, cx1 - cx0), np.uint8)
+                        cv2.fillConvexPoly(hl_, cv2.convexHull(np.round(lm[0:27, :2]).astype(np.int32) - np.int32([cx0, cy0])), 255)
                         hl_ = cv2.erode(hl_, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ke_, ke_)))
-                        inner_ = cv2.GaussianBlur(hl_.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.5 * HAND_GUARD_SKIN_IN * wfm_))
-                        m = (m * (1.0 - (1.0 - g_) * (1.0 - inner_))).astype(m.dtype)
+                        inner_ = cv2.GaussianBlur(hl_.astype(np.float32) / 255.0, (0, 0), sg_)[gy0 - cy0:gy1 - cy0, gx0 - cx0:gx1 - cx0]
+                        m = _times_local(m, g_[0], 1.0 - (1.0 - g_[1]) * (1.0 - inner_))
                 except Exception:
                     import traceback
                     traceback.print_exc()
@@ -7373,14 +7568,15 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                 try:
                     L_ = np.asarray(job.face, np.float64)[:, :2] * y_per_src
                     if np.isfinite(L_[17:27]).all():
-                        bh_ = np.zeros((hY, wY), np.uint8)
-                        for idx_ in (range(17, 22), range(22, 27)):
-                            cv2.fillConvexPoly(bh_, cv2.convexHull(np.round(L_[list(idx_)]).astype(np.int32)), 255)
                         kb_ = max(3, int(round(SKIN_BROW_HOLD * wf)) * 2 + 1)
-                        bh_ = cv2.dilate(bh_, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kb_, kb_)))
-                        bhf_ = cv2.GaussianBlur(bh_.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.5 * SKIN_BROW_HOLD * wf))
-                        mY = mY * (1.0 - bhf_)
-                        mC = mC * M(1.0 - bhf_, (hC, wC))
+                        qb_ = [np.round(L_[list(idx_)]).astype(np.int32) for idx_ in (range(17, 22), range(22, 27))]
+
+                        def _db(c_, o_, qb_=qb_):
+                            for q_ in qb_:
+                                cv2.fillConvexPoly(c_, cv2.convexHull(q_ - np.int32(o_)), 255)
+                        loc_ = _soft_local((hY, wY), _db, np.vstack(qb_), kb_, max(1.0, 0.5 * SKIN_BROW_HOLD * wf))
+                        if loc_ is not None:
+                            mY, mC = _hold_yc(mY, mC, loc_, (hY, wY), (hC, wC))
                 except Exception:
                     import traceback
                     traceback.print_exc()
@@ -7392,12 +7588,10 @@ def process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame,
                         up_ = L_[27] - L_[8]
                         up_ = up_ / max(1e-6, float(np.hypot(*up_)))
                         br_ = L_[17:27] + up_ * (0.012 * wf)
-                        poly_ = np.vstack([br_, (br_ + up_ * (0.9 * wf))[::-1]])
-                        fh_ = np.zeros((hY, wY), np.uint8)
-                        cv2.fillPoly(fh_, [np.round(poly_).astype(np.int32)], 255)
-                        fhf_ = float(np.clip(SKIN_FOREHEAD_HOLD, 0, 1)) * cv2.GaussianBlur(fh_.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.02 * wf))
-                        mY = mY * (1.0 - fhf_)
-                        mC = mC * M(1.0 - fhf_, (hC, wC))
+                        poly_ = np.round(np.vstack([br_, (br_ + up_ * (0.9 * wf))[::-1]])).astype(np.int32)
+                        loc_ = _soft_local((hY, wY), lambda c_, o_: cv2.fillPoly(c_, [poly_ - np.int32(o_)], 255), poly_, 0, max(1.0, 0.02 * wf))
+                        if loc_ is not None:
+                            mY, mC = _hold_yc(mY, mC, (loc_[0], float(np.clip(SKIN_FOREHEAD_HOLD, 0, 1)) * loc_[1]), (hY, wY), (hC, wC))
                 except Exception:
                     import traceback
                     traceback.print_exc()
