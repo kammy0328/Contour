@@ -17,14 +17,15 @@ from PySide6.QtWidgets import QApplication, QWidget
 from . import loader as L
 from .theme import C, font
 
+FADE_IN_S = 0.45
 HEAVY = ("numpy", "cv2", "scipy.optimize", "PyOpenColorIO", "contour.core.colour",
          "contour.core.media", "contour.track.analyze", "contour.retouch.engine", "contour.warp.render")
 
 
 class Splash(QWidget):
     """1.26: a quieter card. A soft shadow, a dark surface that is a shade lighter at the top, a hairline edge and a
-    faint highlight along the top, the wordmark, the loading line (loader.py) and the step under it, the maker and
-    the version at the foot. It fades in, and the step's text fades from one to the next."""
+    faint highlight along the top, the wordmark, the loading line (loader.py) and the step under it, the version at
+    the foot. It fades in (user 11/25: a fade, no rise, no maker's name), and the step's text fades from one to the next."""
     CW, CH = 480, 288        # the card
     M = 28                   # room for the shadow round it
     W, H = CW + 2 * M, CH + 2 * M
@@ -52,14 +53,6 @@ class Splash(QWidget):
     def showEvent(self, e):
         self._t0 = time.perf_counter()
         self._t.start()
-        self.setWindowOpacity(0.0)
-        an = QPropertyAnimation(self, b"windowOpacity", self)
-        an.setDuration(260)
-        an.setStartValue(0.0)
-        an.setEndValue(1.0)
-        an.setEasingCurve(QEasingCurve.OutCubic)
-        self._fade_in = an
-        an.start()
         super().showEvent(e)
 
     def hideEvent(self, e):
@@ -93,8 +86,9 @@ class Splash(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.SmoothPixmapTransform)
-        rise = 6.0 * (1.0 - min(1.0, t / 0.32)) ** 3            # the card settles up into place as it fades in
-        card = QRectF(self.M, self.M + rise, self.CW, self.CH)
+        # it fades in (the whole card, shadow included; painted, so it works where a window's opacity cannot be set)
+        p.setOpacity(1.0 - (1.0 - min(1.0, t / FADE_IN_S)) ** 3)
+        card = QRectF(self.M, self.M, self.CW, self.CH)
         self._shadow(p, card)
         # surface
         path = QPainterPath()
@@ -155,12 +149,10 @@ class Splash(QWidget):
         p.setPen(c1)
         p.drawText(mr, Qt.AlignHCenter | Qt.AlignVCenter, self.msg)
         # foot
-        p.setFont(font(10, 500))
         fc = QColor(C["text3"])
         fc.setAlpha(150)
         p.setPen(fc)
         fr = QRectF(card.left() + 22, card.bottom() - 34, self.CW - 44, 16)
-        p.drawText(fr, Qt.AlignLeft | Qt.AlignVCenter, "DIGITAL APGUJEONG")
         p.setFont(font(10, 400, tabular=True))
         p.drawText(fr, Qt.AlignRight | Qt.AlignVCenter, f"v{self.version}")
         p.end()

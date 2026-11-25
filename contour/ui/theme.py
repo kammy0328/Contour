@@ -86,18 +86,13 @@ QLabel#Big {{ font-size: 26px; font-weight: 600; }}
 QToolTip {{ background: {c['bg3']}; color: {c['text']}; border: 1px solid {c['line2']}; padding: 5px 7px; border-radius: 4px; }}
 
 QPushButton {{ background: {c['bg2']}; border: 1px solid {c['line2']}; border-radius: 6px; padding: 6px 12px; }}
-QPushButton:hover {{ background: {c['bg3']}; }}
-QPushButton:pressed {{ background: {c['bg4']}; }}
+/* (1.26) hover and press of push and tool buttons are eased by motion.py, not switched here */
 QPushButton:disabled {{ color: {c['text3']}; background: {c['bg1']}; border-color: {c['line']}; }}
 QPushButton[kind="primary"] {{ background: {c['accent']}; border: 1px solid {c['accent']}; color: #FFFFFF; font-weight: 600; }}
-QPushButton[kind="primary"]:hover {{ background: {c['accent_hi']}; border-color: {c['accent_hi']}; }}
-QPushButton[kind="primary"]:pressed {{ background: {c['accent_lo']}; }}
 QPushButton[kind="primary"]:disabled {{ background: {c['accent_soft']}; border-color: {c['accent_soft']}; color: {c['text3']}; }}
 QPushButton[kind="ghost"] {{ background: transparent; border: 1px solid transparent; }}
-QPushButton[kind="ghost"]:hover {{ background: {c['bg3']}; }}
 QPushButton[kind="danger"]:hover {{ border-color: {c['error']}; color: {c['error']}; }}
 QToolButton {{ background: transparent; border: 1px solid transparent; border-radius: 6px; padding: 4px; }}
-QToolButton:hover {{ background: {c['bg3']}; }}
 QToolButton:checked {{ background: {c['bg4']}; border-color: {c['line2']}; }}
 QToolButton:disabled {{ color: {c['text3']}; }}
 QLabel:disabled, QLineEdit:disabled, QCheckBox:disabled {{ color: {c['text3']}; }}
@@ -179,3 +174,5 @@ def apply(app: QApplication) -> None:
     app.setPalette(pal)
     app.setFont(font(12))
     app.setStyleSheet(stylesheet())
+    from . import motion
+    motion.install(app)
