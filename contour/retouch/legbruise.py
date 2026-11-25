@@ -208,8 +208,15 @@ def fill(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, M: dict, m0: np.ndarray,
     m = (cv2.GaussianBlur(grow, (0, 0), rr * 0.5) * Sf * inner * float(np.clip(k, 0, 1))).astype(np.float32)
     lv = ys + d_
     Yo = Y + m * d_
-    Cbo = Cb + m * (ul * lv - cbs)
-    Cro = Cr + m * (vl * lv - crs)
+    # the colour moved only where the patch is off it: darker than the skin round, or off its hue (clean skin under the patch's rim keeps its
+    # own colour: a skin of another hue round, or a shade, is not laid on it as a grey patch, IWALY_c011 spot try f0..f5)
+    zb = M.get("zb")
+    wc = np.clip(d_ / (1.5 * M["gsd"]), 0, 1)
+    if zb is not None:
+        wc = np.maximum(wc, np.clip((np.abs(zb) - 1.0) / 2.0, 0, 1))
+    wc = cv2.GaussianBlur(wc.astype(np.float32), (0, 0), max(1.0, 0.25 * rr))
+    Cbo = Cb + m * wc * (ul * lv - cbs)
+    Cro = Cr + m * wc * (vl * lv - crs)
     if dbg is not None:
         dbg.update(m=m, T=T, w2=w2, w=w)
     return Yo.astype(Y.dtype), Cbo.astype(Cb.dtype), Cro.astype(Cr.dtype)
