@@ -1087,6 +1087,16 @@ ARMPIT_NEAR_CLOTH = None          # (near, far) of the face width or None: the f
 ARMPIT_CLOSE = 0.0                # of the face width: the fold is a dark valley, and the armpit's mask (the skin's brightness split, the clothes gate) leaves it out as if it were cloth, so the lifts never saw it. A hole or a
                                   # bay in the stage's mask narrower than twice this is closed before the lifts and the flattener (0 = as before)
 ARMPIT_PIT_W = None               # of the face width or None: a second pass of the thin-line filler at this width (the fold is wider than a crease line: 0.04 of the face = 13 px at 330)
+ARMPIT_LEARNED = None             # 2611 IWALY c006 (2026-11-25, user: "겨드랑이 주름을 수동으로 보정했는데 겨드랑이 주름 보정 학습해"): the fold retouch learned from a
+                                  # hand-retouched shot (contour.learn.armpitfit: a blur of sigma_rel face widths at an opacity, its change low-passed by the
+                                  # grain's width so the plate's grain stays). None = off; a dict (the model) or the path of its JSON. Laid on inside the armpit
+                                  # stage's mask at the stage's strength
+ARMPIT_LEARNED_ONLY = True        # with a learned model: the learned retouch in place of the crease lifts and the fold flattener (False: after them)
+ARMPIT_LEARNED_EDGE = (0.025, 0.05)   # the learned blur is held off sharp edges (a finger's outline, the arm's edge): the luma's contrast over 0.01 face widths,
+                                  # off from the first value, fully off at the second (c006 f85 / f126: the folds the hand evened stay under 0.023, a finger's rim
+                                  # in front of the armpit runs to 0.1). None: no edge gate
+ARMPIT_HAND_GUARD = 0.0           # 0..1: the hands (tracked hand points, else the forearm's line past the wrist: _hand_area_local) out of the armpit stage's mask
+                                  # (c006 f85, 596: the zone of the lowered arm lay on her hand across the chest and the learned blur ran over the fingers)
 ARMPIT_FINE = True                # False: the armpit's thin-line filler does without the long-line (strand) finder (the one that also finds hair strands). 2611 IWALY c010 f23 (2026-11-22, user: the arm's own line, green, stays; the fold, red, goes): a
                                   # long soft line along the arm is a long faint dark line to that finder, and the filler took it out with the folds. The valley finder alone looks only at what is short, deep and curved
                                   # across (a crease). True = as the neck lines
@@ -3736,6 +3746,15 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 except Exception:
                     import traceback
                     traceback.print_exc()
+                if ARMPIT_HAND_GUARD > 1e-4:
+                    try:
+                        g_ = hand_guard(ARMPIT_HAND_GUARD, "hand_guard_arm")
+                        af_ = state["armpit_fold"]
+                        if g_ is not None and af_ is not None and tuple(af_.shape[:2]) == tuple(shape):
+                            state["armpit_fold"] = _times_local(af_, g_[0], g_[1])
+                    except Exception:
+                        import traceback
+                        traceback.print_exc()
             return state["armpit_fold"]
 
         tone_on = any(abs(v.get(k, 0)) > 1e-4 for k in ("skin_bright", "skin_warm", "skin_sat", "grain", "redness"))
@@ -3810,11 +3829,12 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
         def mk_mouthl():
             return _hg(_parse_off(_cover_off(wrinkle_masks(lm, shape, pa(), "mouth", fth, 1.5, paint()), base().get("cover"), lm), base().get("parse"), lm))
 
-        def hand_guard():
-            """1 - the hands' area (HAND_GUARD), at `shape`, or None (off / no hands)"""
-            if HAND_GUARD <= 1e-4:
+        def hand_guard(weight=None, key="hand_guard"):
+            """1 - the hands' area (HAND_GUARD, or `weight`), at `shape`, or None (off / no hands)"""
+            wgt_ = HAND_GUARD if weight is None else float(weight)
+            if wgt_ <= 1e-4:
                 return None
-            if "hand_guard" not in state:
+            if key not in state:
                 g_ = None
                 try:
                     hl_ = []
@@ -3839,18 +3859,21 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                         for e_, w_ in ((S.L_EL, S.L_WR), (S.R_EL, S.R_WR)):
                             if np.isfinite(kq_[e_, :2]).all() and np.isfinite(kq_[w_, :2]).all():
                                 arms_.append((kq_[e_, :2], kq_[w_, :2]))
-                    wfm_ = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
+                    if lm is not None:
+                        wfm_ = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
+                    else:
+                        wfm_ = float(job.wf_arm) * float(px.sx) if job.wf_arm > 0 else 0.1 * float(shape[1])
                     a_ = _hand_area_local(hl_, shape, float(px.sx), float(px.sy), wfm_, arms_)
                     if __import__("os").environ.get("IWALY_HAND_GUARD_LOG"):
                         print("hand_guard t", t, "hands", [int(np.isfinite(np.asarray(x)[:, :2]).all(1).sum()) for x in hl_], "arms", len(arms_),
                               "area", None if a_ is None else round(float(a_[1].sum()) / float(shape[0] * shape[1]), 4), flush=True)
                     if a_ is not None:
-                        g_ = (a_[0], 1.0 - float(HAND_GUARD) * a_[1])          # (box, 1 - the hands' area there; 1 outside)
+                        g_ = (a_[0], 1.0 - wgt_ * a_[1])          # (box, 1 - the hands' area there; 1 outside)
                 except Exception:
                     import traceback
                     traceback.print_exc()
-                state["hand_guard"] = g_
-            return state["hand_guard"]
+                state[key] = g_
+            return state[key]
 
         def _hg(m_):
             g_ = hand_guard()
@@ -6251,6 +6274,49 @@ def neck_zone(lm: Optional[np.ndarray], shape, scale: float, wf: float) -> Optio
     return _cached("neckzone", lm, shape, scale, wf, make)
 
 
+class _ArmpitDone(Exception):
+    """the armpit stage ended early (the learned retouch in place of the rest of it)"""
+
+
+_ARMPIT_LM_CACHE = {}
+
+
+def _armpit_learned_model():
+    """ARMPIT_LEARNED as a model dict (a path is read once), or None."""
+    m = ARMPIT_LEARNED
+    if m is None:
+        return None
+    if isinstance(m, dict):
+        return m if m.get("kind") == "blur" else None
+    try:
+        key = str(m)
+        if key not in _ARMPIT_LM_CACHE:
+            import json as _json
+            _ARMPIT_LM_CACHE[key] = _json.load(open(key, encoding="utf-8"))
+        mm = _ARMPIT_LM_CACHE[key]
+        return mm if mm.get("kind") == "blur" else None
+    except Exception:
+        return None
+
+
+def _armpit_learned_apply(Y, Cb, Cr, mA, kA, wfA, model):
+    """The learned armpit retouch (contour.learn.armpitfit.apply) on the luma and chroma planes, the mask and the face width taken to the chroma's size."""
+    from ..learn import armpitfit as _AF
+    if ARMPIT_LEARNED_EDGE is not None:
+        # sharp edges (a finger's rim, the arm's outline) keep out of the blur: the luma's contrast over 0.01 face widths
+        Yb_ = cv2.GaussianBlur(Y.astype(np.float32), (0, 0), max(0.6, 0.0045 * float(wfA)))
+        g_ = np.hypot(cv2.Sobel(Yb_, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(Yb_, cv2.CV_32F, 0, 1, ksize=3)) / 8.0 * (0.01 * float(wfA))
+        e_ = _ss(float(ARMPIT_LEARNED_EDGE[0]), float(ARMPIT_LEARNED_EDGE[1]), g_)
+        r_ = max(1, int(round(0.012 * float(wfA))))
+        e_ = cv2.GaussianBlur(cv2.dilate(e_, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r_ + 1, 2 * r_ + 1))), (0, 0), max(0.8, 0.6 * r_))
+        mA = mA * (1.0 - np.clip(e_, 0.0, 1.0))
+    hC, wC = Cb.shape[:2]
+    mC = mA if mA.shape == (hC, wC) else cv2.resize(mA.astype(np.float32), (wC, hC), interpolation=cv2.INTER_AREA)
+    wfC = wfA * float(wC) / float(Y.shape[1])
+    Yo, (Cbo, Cro) = _AF.apply(Y, mA.astype(np.float32), model, float(wfA), float(kA), [Cb, Cr], mC, wfC)
+    return Yo, Cbo, Cro
+
+
 def _fold_flat(Y: np.ndarray, m: np.ndarray, wf: float, k: float, eps_mul: float = 1.0, r_mul: float = 1.0) -> np.ndarray:
     """The soft folds of a neck (rings across it, wider and fainter than a line): the faint light and dark
     bands between the size of the skin's texture and a twelfth of the face are taken out with an edge-keeping
@@ -8176,6 +8242,10 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                         if skin_ok and ARMPIT_LIFT_INSET > 1e-6:
                             mA = mA * _skin_inner(bmY, ARMPIT_EDGE_CLOSE * wfA, ARMPIT_LIFT_INSET * wfA)
                         mA_hold = mA
+                        lm_ = _armpit_learned_model()
+                        if lm_ is not None and ARMPIT_LEARNED_ONLY:
+                            Y, Cb, Cr = _armpit_learned_apply(Y, Cb, Cr, mA, kA, wfA, lm_)
+                            raise _ArmpitDone()
                         Y1, Cb, Cr = _crease_lift(Y, Cb, Cr, mA, kA, wA, None, None, fine_lines=bool(ARMPIT_FINE), gain=gA, thin_rng=ARMPIT_THIN, band=ARMPIT_BAND)
                         if ARMPIT_THIN is not None or abs(gA - 1.0) > 1e-3 or ARMPIT_BAND:
                             # the lines budget is judged on what the neck lines' own tests would lift (what it was set against), not on the fuller fill of the armpit's creases
@@ -8197,6 +8267,8 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                             mF = mA * _skin_inner(bmY, ARMPIT_EDGE_CLOSE * wfA, ARMPIT_FOLD_INSET * wfA)
                         kF = kA * float(np.clip(ARMPIT_FLAT, 0.0, 1.0))
                         Y = _fold_flat(Y1, mF, wfA, kF, ARMPIT_FLAT_EPS, ARMPIT_FLAT_R) if kF > 1e-4 else Y1
+                        if lm_ is not None:
+                            Y, Cb, Cr = _armpit_learned_apply(Y, Cb, Cr, mA_hold, kA, wfA, lm_)
                         if ARMPIT_LINE_HOLD > 1e-4 and job.arm_axes:
                             # a hanging arm's own line stays (the lifts and the flattener took it for a crease): given back from the picture before the stage
                             try:
@@ -8224,6 +8296,8 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                             except Exception:
                                 import traceback
                                 traceback.print_exc()
+            except _ArmpitDone:
+                pass
             except Exception:
                 import traceback
                 traceback.print_exc()
