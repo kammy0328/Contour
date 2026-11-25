@@ -10,6 +10,7 @@ Filter = edge-preserving guided filter: the large-scale tone is evened out, a ch
 from __future__ import annotations
 
 import threading
+import zlib
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -219,8 +220,12 @@ _PLANE_TLS = _thr_planes.local()    # each thread keeps the planes of the frame 
 
 def _chroma_planes(rgb_u8: np.ndarray):
     """Luma and the smoothed Cr, Cb of a frame, as float32. A crowd frame asks for them once per person (the colour
-    model is per person, the planes are not): kept for the frame the thread is working on, the same values as before."""
-    key = (rgb_u8.__array_interface__["data"][0], rgb_u8.shape, hash(rgb_u8[::7, ::11].tobytes()))
+    model is per person, the planes are not): kept for the frame the thread is working on, the same values as before.
+    The frame is known by all of its bytes (1.26): the key was its memory address and a sparse sample of it, and a
+    new frame put where the last one was, alike at the sampled pixels, got the last frame's planes (a frame's skin
+    then came now and then from the frame before it: the renders of one cut were not always the same)."""
+    a = np.ascontiguousarray(rgb_u8)
+    key = (a.shape, str(a.dtype), zlib.crc32(a), zlib.adler32(a))
     ent = getattr(_PLANE_TLS, "planes", None)
     if ent is not None and ent[0] == key:
         return ent[1]
