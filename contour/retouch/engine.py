@@ -7704,7 +7704,9 @@ def _fold_heal(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, Y0: np.ndarray, ba
 
 def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
     """The last pass (FINAL_*): see the constants. Y0/Cb0/Cr0: the planes as they came in."""
-    if not (FINAL_NOSE > 1e-4 or FINAL_MOLE > 1e-4 or FINAL_BUMP > 1e-4 or FINAL_LONG > 1e-4 or FINAL_CHIN > 1e-4 or FINAL_NASO > 1e-4 or FOLD_HEAL > 1e-4):
+    slid_ = any(float(getattr(j_, "v", {}).get("bumps", 0.0)) > 1e-4 or float(getattr(j_, "v", {}).get("chin_lines", 0.0)) > 1e-4 for j_ in rf.jobs)
+    if not (FINAL_NOSE > 1e-4 or FINAL_MOLE > 1e-4 or FINAL_BUMP > 1e-4 or FINAL_LONG > 1e-4 or FINAL_CHIN > 1e-4 or FINAL_NASO > 1e-4 or FOLD_HEAL > 1e-4
+            or slid_):
         return Y, Cb, Cr
     hY, wY = Y.shape
     hC, wC = Cb.shape
@@ -7747,11 +7749,12 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
                     lm_ = _final_long_lines(Y0, reg, wf if job.wf_src > 0 else (float(job.wf_arm) * y_per_src if job.wf_arm > 0 else wf))
                     if lm_ is not None:
                         give = np.maximum(give, lm_ * float(np.clip(FINAL_LONG, 0, 1)))
-            if FINAL_BUMP > 1e-4 and spot_reg is not None and job.wf_src > 0:
+            kbump_ = max(float(FINAL_BUMP), float(job.v.get("bumps", 0.0)))         # (1.26.2) the 요철 slider, or the setting for every face
+            if kbump_ > 1e-4 and spot_reg is not None and job.wf_src > 0:
                 bb = _final_bumps(Y0, spot_reg, wf, lmY, Y)
                 if bb is not None:
                     bm, bf = bb
-                    bm = bm * float(np.clip(FINAL_BUMP, 0, 1)) * yaw_gate(job.face)
+                    bm = bm * float(np.clip(kbump_, 0, 1)) * yaw_gate(job.face)
                     if FINAL_BUMP_NOSE > 1e-4 and lmY is not None:
                         # (ENDING 03:37:09, user 11/24: the nose bridge's highlight blinked) a highlight on the nose sits right at the bump's brightness threshold and
                         # is filled on some frames only: no bump fill on the nose
@@ -7798,8 +7801,9 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
                 if kh_ > 1e-4:
                     kh_ *= 1.0 - (1.0 - MOUTH_OPEN_KEEP) * mouth_open(job.face)
                     Y, Cb, Cr = _fold_heal(Y, Cb, Cr, Y0, M(job.masks["naso"], (hY, wY)), lmY, wf, kh_)
-            if FINAL_CHIN > 1e-4 and lmY is not None and skin is not None:
-                Y = _final_chin(Y, lmY, skin, wf, float(np.clip(FINAL_CHIN, 0, 1)) * _face_big(job.face, wf, y_per_src))
+            kfc_ = max(float(FINAL_CHIN), float(job.v.get("chin_lines", 0.0)))     # (1.26.2) the 턱주름 slider, or the setting for every face
+            if kfc_ > 1e-4 and lmY is not None and skin is not None:
+                Y = _final_chin(Y, lmY, skin, wf, float(np.clip(kfc_, 0, 1)) * _face_big(job.face, wf, y_per_src))
         except Exception:
             import traceback
             traceback.print_exc()
@@ -8392,7 +8396,8 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                 Cb = _fold_fill(Cb, mC, exC, 0.7 * k, max(0.8, sf * wf * cs), max(1.5, ss * wf * cs), False)
                 Cr = _fold_fill(Cr, mC, exC, 0.7 * k, max(0.8, sf * wf * cs), max(1.5, ss * wf * cs), False)
         # 2a. fine lines on the face skin, and a pebbled chin (both only where they are found)
-        if (FACE_LINES > 1e-4 or CHIN_DIMPLE > 1e-4) and "skin" in job.masks and job.face is not None and v["skin"] > 1e-4:
+        kchin_ = max(float(CHIN_DIMPLE), float(v.get("chin_lines", 0.0)))      # (1.26.2) the 턱주름 slider, or the setting for every face
+        if (FACE_LINES > 1e-4 or kchin_ > 1e-4) and "skin" in job.masks and job.face is not None and v["skin"] > 1e-4:
             lmY = np.asarray(job.face, np.float32)[:, :2] * y_per_src
             skY = M(job.masks["skin"], (hY, wY))
             if FACE_LINES > 1e-4:
@@ -8410,8 +8415,8 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                     pass
                 Y, Cb, Cr = _crease_lift(Y, Cb, Cr, mfl, float(np.clip(FACE_LINES, 0, 1)), max(1.5, 0.012 * wf),
                                          None, jaw_hold(job.face, (hY, wY), y_per_src, wf))
-            if CHIN_DIMPLE > 1e-4:
-                Y = _chin_dimple(Y, lmY, skY, wf, float(np.clip(CHIN_DIMPLE, 0, 1)) * _face_big(job.face, wf, y_per_src))
+            if kchin_ > 1e-4:
+                Y = _chin_dimple(Y, lmY, skY, wf, float(np.clip(kchin_, 0, 1)) * _face_big(job.face, wf, y_per_src))
         # 2a'. frown lines between the brows and across the top of the nose (thin creases only)
         if FROWN_LINES > 1e-4 and "skin" in job.masks and job.face is not None and v["skin"] > 1e-4:
             try:
