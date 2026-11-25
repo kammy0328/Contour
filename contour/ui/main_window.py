@@ -1168,7 +1168,23 @@ class MainWindow(QMainWindow):
                 sh_.open_cut(cut)
             except Exception:
                 traceback.print_exc()
-            self._open_done.emit(seq, cid, sh_)
+            try:
+                import shiboken6
+                alive = shiboken6.isValid(self)
+            except Exception:
+                alive = True
+            if not alive:                       # the window was closed meanwhile: nobody to hand it to
+                if sh_ is not None:
+                    try:
+                        sh_.open_cut(None)
+                    except Exception:
+                        pass
+                return
+            try:
+                self._open_done.emit(seq, cid, sh_)
+            except RuntimeError:
+                if sh_ is not None:
+                    sh_.open_cut(None)
         threading.Thread(target=work, name="diap-opencut", daemon=True).start()
 
     def _cut_opened_bg(self, seq: int, cid: str, sh):
