@@ -1265,7 +1265,31 @@ class MainWindow(QMainWindow):
             elif tr is not None and st is not None and st.has_face and not blocked:
                 self._ensure_facelayer(tr)
             self.refresher.kick()                 # marks left from the last time it was open
+            QTimer.singleShot(800, self._prewarm_skin)
         self._refresh_all()
+
+    def _prewarm_skin(self):
+        """(1.26.1) A cut with no face retouch on yet, open and left alone: its frame's detections and colour models made
+        ahead on a thread (session.prewarm_skin), so the first 표준 / 약하게 / 강하게 shows in about a second, not ten.
+        Not with retouch values on (the frame's result is being made then, and comes first), nor while playing."""
+        s = self.session
+        cut = s.cut
+        if cut is None or not cut.analyzed or s.tracker is None or self.job is not None or self.viewer.playing:
+            return
+        from ..core.params import SKIN_LEVEL_VALUES
+        keys = {k for v in SKIN_LEVEL_VALUES.values() for k in v}
+        for p_ in cut.targets():
+            pp = cut.params.get(p_.id)
+            if pp is None:
+                continue
+            if pp.skin_basic or any((c_ := pp.amounts.get(k)) is not None and (abs(c_.base) > 1e-4 or c_.keys) for k in keys):
+                return
+        ep, t0, t = s.epoch, s.last_touch, int(self.frame)
+
+        def stop():
+            return s.epoch != ep or s.last_touch != t0 or self.viewer.playing or self.job is not None
+
+        threading.Thread(target=lambda: s.prewarm_skin(t, stop), name="diap-prewarm", daemon=True).start()
 
     def _ensure_facelayer(self, tr):
         """Cuts analysed before 1.9 have no face layer (parsing, steady skin colour): build it once, in the
@@ -2889,6 +2913,7 @@ class MainWindow(QMainWindow):
         elif self.session.proxy is not None:
             fps = self.session.cut.info.fps
             self.viewer.playing = True
+            self.viewer._play_orig_run = False
             self.cache_worker.kick(self.frame)
             self._clock_start(fps)
             self.play_timer.start(max(1, int(round(1000 / max(1.0, float(fps or 24.0))))))
@@ -2967,6 +2992,7 @@ class MainWindow(QMainWindow):
         self.viewer._img_cache.clear()
         self.viewer._last_res = None
         self.viewer._skin_last = None
+        self.viewer._play_orig_run = False
         self.tlstrip.set_current(cut.id)
         self.cutlist.show_current(cut.id)
         self.activity.set_cut(prj.name, cut)

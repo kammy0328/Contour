@@ -1,6 +1,7 @@
 """Image viewer: result / original / side-by-side / wipe, skeleton editing, overlays."""
 from __future__ import annotations
 
+import traceback
 from typing import List, Optional, Tuple
 
 import cv2
@@ -249,15 +250,21 @@ class Viewer(QWidget):
             return self._img_cache[key]
         if not self.s.interactive:
             pa = self.s.play_get(self.t)
+            if pa is not None and self.playing and getattr(self, "_play_orig_run", False) and not self._results_ahead():
+                pa = None                   # (1.26.1) in a run of originals: it stays one until results are ready ahead
             if pa is not None:
+                self._play_orig_run = False
                 img = np_to_qimage(pa)
                 self._store_img(key, img)
                 self._last_res = (self.t, img)
                 return img
-        a = self.s.cached_result(self.t)
+        a = self.s.cached_result(self.t) if not (self.playing and getattr(self, "_play_orig_run", False)) else None
         if a is None and self.playing:
-            # playback never waits: frames not computed yet show the original, marked
+            # playback never waits: frames not computed yet show the original, marked. (1.26.1) And it goes on with
+            # originals until the results are ready for the next half second: a played stretch that had a finished
+            # frame here and there went retouched, original, retouched (it looked like stutter, the user 11/26)
             self._play_raw = True
+            self._play_orig_run = True
             self.preview.request((self.t, rkey))
             return self._qimg("orig")
         if a is None and self._last_res is not None and self._last_res[0] == self.t:
@@ -316,12 +323,33 @@ class Viewer(QWidget):
         for w in (self.preview, self.skin_worker, self.orig_loader):
             w.wait(wait_ms)
 
+    AHEAD = 12      # frames of results ready ahead before playback goes from originals back to results
+
+    def _results_ahead(self) -> bool:
+        s = self.s
+        try:
+            n = s.proxy.n if s.proxy is not None else 0
+            a, b = s.cut.work_range if s.cut is not None else (0, n)
+            return all(s.play_has(f) for f in range(self.t, min(b, self.t + self.AHEAD)))
+        except Exception:
+            return False
+
     def _compute_preview(self, key):
         t, rkey = key
         if self.s.cut is None:
             return None
         self.s.preview_wait += 1             # the playback cache steps aside after the frame it is on
         try:
+            if not self.playing and not getattr(self.s, "interactive", False):
+                # (1.26.1) first this frame's own masks with the new values, shown at once; then the result held
+                # steady with the frames round it replaces it (the first change of a value took 4 to 40 s to show)
+                try:
+                    q = self.s.render_quick(t) if hasattr(self.s, "render_quick") else None
+                except Exception:
+                    traceback.print_exc()
+                    q = None
+                if q is not None:
+                    self.preview.ready.emit(key, (t,) + tuple(q) + ("quick",))
             r = self.s.render(t)             # key, picture and the generation it was made in: one opening of the cut
         finally:
             self.s.preview_wait -= 1
@@ -330,11 +358,19 @@ class Viewer(QWidget):
     def _preview_ready(self, key, payload):
         if payload is None:
             return
-        t, rkey, a, ep = payload
+        quick = len(payload) > 4 and payload[4] == "quick"
+        t, rkey, a, ep = payload[:4]
         if self.s.cut is None or ep != getattr(self.s, "epoch", ep):
             return                      # made for a cut (or an opening of it) that is no longer the open one
         img = np_to_qimage(a)
+        if quick:
+            # shown until the steady result comes (the one asked for is still being made: the spinner goes on)
+            if t == self.t and not (self._last_res is not None and self._last_res[0] == t and getattr(self, "_last_full", None) == (t, self.s.result_key(t))):
+                self._last_res = (t, img)
+                self.update()
+            return
         self._store_img(("result", rkey), img)
+        self._last_full = (t, rkey)
         if t == self.t:
             self._last_res = (t, img)
             self.update()

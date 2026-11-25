@@ -2264,8 +2264,12 @@ STEADY_SIGMA = 1.0
 STEADY_LRU = 7
 
 
-def prepare(cut, tracker, t: int, cache: Optional[dict] = None, steady: bool = True) -> Optional[RetouchFrame]:
+def prepare(cut, tracker, t: int, cache: Optional[dict] = None, steady: bool = True, quick: bool = False) -> Optional[RetouchFrame]:
     """Values and masks for frame t, held steady through time.
+
+    quick (1.26.1, the preview's first picture after a change): this frame's own masks (kept, so the steady masks made
+    right after use them) with the values of now, not averaged with the frames around it (which need those frames'
+    masks: five frames' worth of work instead of one the first time a value is switched on).
 
     Every mask is built from one frame's pixels (colour, brightness, the parser's view), and small changes in
     those (grain, a light flicker, the neck sliding into shadow) made its edges shake or a mask blink on and off
@@ -2302,6 +2306,10 @@ def prepare(cut, tracker, t: int, cache: Optional[dict] = None, steady: bool = T
                 jj.skin.strength = float(np.clip(jj.v["skin"], 0, 1))
                 jj.skin.keep = jj.keep
             rf.jobs.append(jj)
+        if quick:
+            for jj in rf.jobs:                  # (the kept masks whole again, as _steady gives the ones it does not steady)
+                jj.masks = {n_: _mask_unpack(m_, np.float16) for n_, m_ in jj.masks.items()}
+            return rf
         return _steady(cut, tracker, st, rf, cache)
     except Exception:
         import traceback

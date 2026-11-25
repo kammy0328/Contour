@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import threading
 import time
+import traceback
 from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -483,6 +484,93 @@ class EditSession:
             if img is None or self.epoch != ep:
                 return None
         return key, img, ep
+
+    def prewarm_skin(self, t: int, stop=None) -> bool:
+        """(1.26.1) A cut just opened: what the face retouch needs of frame t made ahead, on the caller's thread, while
+        nobody works on it, with every value the basic adjustment can switch on, on a copy of the cut (the cut itself
+        is not touched). The first 표준 / 약하게 / 강하게 of the frame then finds the frame's detections, colour models and
+        face layer made (they are kept by what they are made from, whatever values are on): measured 11 s for the first
+        picture of a 6-person 2560 px frame cold, under 1 s warm. False when another cut was opened or work came first."""
+        import copy as _copy
+        with self._lock:
+            ep, cut, tr, masks = self.epoch, self.cut, self.tracker, self._mask_cache
+        if cut is None or tr is None or tr.store is None or not cut.analyzed:
+            return False
+        from ..core.params import SKIN_LEVEL_VALUES
+        from ..core.project import Curve
+        from ..retouch.engine import prepare
+        top = {}
+        for vals in SKIN_LEVEL_VALUES.values():
+            for k, v in vals.items():
+                top[k] = max(top.get(k, 0.0), float(v))
+        c2 = _copy.deepcopy(cut)
+        for person in c2.targets():
+            pp = c2.params_for(person.id)
+            for k, v in top.items():
+                cur = pp.amounts.get(k)
+                if v > 0 and (cur is None or (abs(cur.base) < 1e-4 and not cur.keys)):
+                    pp.amounts[k] = Curve(base=v)
+        if stop is not None and stop():
+            return False
+        with self._compute:
+            with self._lock:
+                if self.epoch != ep or self.cut is not cut:
+                    return False
+            if stop is not None and stop():
+                return False
+            try:
+                prepare(c2, tr, t, masks, quick=True)
+            except Exception:
+                traceback.print_exc()
+                return False
+            # the tracker's table of raw frames was made for the copy's values: started again for the cut's own
+            tr.__dict__.pop("_steady_lru", None)
+            tr.__dict__.pop("_steady_sig", None)
+        return True
+
+    def render_quick(self, t: int):
+        """(key, picture, generation): the first picture of frame t after a change (1.26.1, the user: "바로 바로 적용되게
+        못하나? 로딩이 너무 오래 걸려"). This frame's own masks (engine.prepare quick: kept, so the steady result made right
+        after uses them) with the values of now, laid on at half size and its change added back onto the full picture
+        (as while a slider is dragged). None when the full result is there already or there is nothing to retouch."""
+        with self._lock:
+            ep = self.epoch
+            cut, tr, px, masks = self.cut, self.tracker, self.proxy, self._mask_cache
+            if cut is None or px is None or tr is None or tr.store is None or not cut.analyzed:
+                return None
+            if self.result_key(t) in self._cache:
+                return None
+            key = ("quick", t, self.vers["geo"], self.vers["ret"], self.vers["trk"], self.cut_key, self.src_key)
+            img = self._cache.get(key)
+        if img is not None:
+            return key, img, ep
+        img = self.frame(t)
+        if img is None:
+            return None
+        from ..retouch.engine import apply_rgb, prepare
+        with self._compute:
+            with self._lock:
+                if self.epoch != ep:
+                    return None
+            try:
+                rf = prepare(cut, tr, t, masks, quick=True)
+            except Exception:
+                traceback.print_exc()
+                rf = None
+            if rf is not None and not rf.empty():
+                h, w = img.shape[:2]
+                small = cv2.resize(img, (w // 2, h // 2), interpolation=cv2.INTER_AREA)
+                ds = apply_rgb(small, rf, px.sx * 0.5).astype(np.int16) - small.astype(np.int16)
+                d = cv2.resize(ds, (w, h), interpolation=cv2.INTER_LINEAR)
+                img = np.clip(img.astype(np.int16) + d, 0, 255).astype(np.uint8)
+            fr = self.field(t, None)
+            with self._lock:
+                if self.epoch != ep:
+                    return None
+            out = img if fr is None or fr.empty() else F.warp_image(img, fr)
+        if not self._put(key, out, ep):
+            return None
+        return key, out, ep
 
     def result(self, t: int, final: bool = False) -> Optional[np.ndarray]:
         r = self.render(t, final)
