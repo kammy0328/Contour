@@ -25,6 +25,7 @@ class ParamDef:
     unit: str = "%"          # % (signed) | pct (unsigned %) | deg
     kind: str = "body"
     tip: str = ""
+    hidden: bool = False     # (1.26) not shown in the panel unless a project has a value for it (the engine still does what it says)
 
 
 GROUPS: List[Tuple[str, str, str]] = [
@@ -99,16 +100,15 @@ PARAMS: List[ParamDef] = [
     ParamDef("dark_circle", "다크서클", "skin", 0, 100, unit="pct", kind="skin",
              tip="눈 밑 어둡고 푸른 그늘을 볼 피부 밝기·색으로 끌어올립니다"),
     ParamDef("shine", "번들거림", "skin", 0, 100, unit="pct", kind="skin",
-             tip="이마·코·볼의 하얗게 번들거리는 유분 광만 눌러 줍니다"),
+             tip="이마·코·볼의 하얗게 번들거리는 유분 광만 눌러 줍니다", hidden=True),
     ParamDef("redness", "홍조", "skin", 0, 100, unit="pct", kind="skin",
              tip="볼·코 주변의 붉은 기를 얼굴 피부톤으로 가라앉힙니다 (입술은 그대로)"),
     ParamDef("neck_lines", "목주름", "skin", 0, 100, unit="pct", kind="skin",
              tip="목의 가로 주름 골만 주변 피부로 채웁니다 (목 그늘과 결은 그대로)"),
     ParamDef("neck_bumps", "목 닭살", "skin", 0, 100, unit="pct", kind="skin",
              tip="목의 오돌토돌한 닭살 결을 부드럽게 눌러 줍니다. 최대로 올려도 결은 남고, 목걸이·옷깃·목 그늘은 그대로"),
-    ParamDef("skin_bright", "피부 밝기", "skin", -30, 30, kind="skin"),
-    ParamDef("skin_warm", "피부 톤", "skin", -30, 30, kind="skin", tip="− 차갑게 / + 따뜻하게"),
-    ParamDef("skin_sat", "피부 채도", "skin", -40, 40, kind="skin"),
+    ParamDef("eye_white", "눈 흰자 정리", "skin", 0, 100, unit="pct", kind="color",
+             tip="흰자의 점, 얼룩, 실핏줄, 홍채 옆 멍 같은 그늘을 지웁니다. 흰자의 톤, 음영, 그레인과 속눈썹은 그대로 둡니다 (눈이 보이는 샷에만)"),
     ParamDef("grain", "그레인", "skin", 0, 100, unit="pct", kind="skin", tip="피부 영역에 필름 그레인 (매끈해진 피부에 질감)"),
     ParamDef("grain_color", "색상 그레인", "skin", 0, 100, unit="pct", kind="skin", tip="0이면 모노크롬 그레인"),
     # ---- body skin (1.23): its own switches and values, apart from the face's; 0 = off
@@ -120,12 +120,18 @@ PARAMS: List[ParamDef] = [
     ParamDef("knee_tone", "무릎 얼룩 정리", "bodyskin", 0, 100, unit="pct", kind="skin",
              tip="무릎의 멍 같은 얼룩, 붉은 기, 주변 다리색과 안 맞는 자국을 다리의 피부색·밝기에 맞춥니다. 그레인·모공·잔털은 원본 그대로 두고, "
                  "무릎뼈의 입체감(밝은 쪽)도 남깁니다. 양말·옷·다른 인물은 건드리지 않습니다"),
+    ParamDef("leg_bruise", "다리 멍 정리", "bodyskin", 0, 100, unit="pct", kind="skin",
+             tip="허벅지·종아리의 멍(푸르거나 거무스름한 자국)을 둘레 피부의 밝기·색으로 채웁니다. 다리 사이 틈, 옷 밑단 그늘, 다리 음영, "
+                 "모공·잔털·그레인과 작은 점은 그대로 둡니다. 작은 잡티는 '몸 잡티 제거'가 맡습니다"),
     ParamDef("knee_fold", "무릎 접힘선 제거", "bodyskin", 0, 100, unit="pct", kind="skin",
              tip="무릎 접힘선을 주변 피부로 메웁니다. 현재 보이는 본인 피부에만 적용하며 강도에 키프레임을 줄 수 있습니다"),
     ParamDef("belly_fold", "뱃살 주름 제거", "bodyskin", 0, 100, unit="pct", kind="skin",
              tip="배에 접혀 생긴 주름(가로 골)만 찾아 주변 피부로 메웁니다. 주름이 없는 프레임은 그대로입니다. "
                  "튀어나온 윤곽을 살짝 넣는 것은 '몸 > 뱃살'로"),
     # ---- colour
+    ParamDef("skin_bright", "피부 밝기", "color", -30, 30, kind="skin"),
+    ParamDef("skin_warm", "피부 톤", "color", -30, 30, kind="skin", tip="− 차갑게 / + 따뜻하게"),
+    ParamDef("skin_sat", "피부 채도", "color", -40, 40, kind="skin"),
     ParamDef("lip_hue", "입술 색조", "color", -40, 40, unit="deg", kind="color", tip="− 쪽이 핑크/보라, + 쪽이 코랄/오렌지"),
     ParamDef("lip_sat", "입술 채도", "color", -60, 60, kind="color"),
     ParamDef("lip_bright", "입술 밝기", "color", -40, 40, kind="color"),
@@ -134,8 +140,8 @@ PARAMS: List[ParamDef] = [
     ParamDef("shading", "쉐딩", "color", 0, 100, unit="pct", kind="color", tip="콧대 옆, 광대 아래, 턱선 안쪽을 어둡게 (윤곽)"),
     ParamDef("highlight", "하이라이트", "color", 0, 100, unit="pct", kind="color", tip="콧대, 광대 위, 이마 가운데, 턱 끝을 밝게"),
     ParamDef("teeth", "치아 미백", "color", 0, 100, unit="pct", kind="color"),
-    ParamDef("eye_white", "눈 흰자", "color", 0, 100, unit="pct", kind="color", tip="실핏줄과 누런 기를 걷어 깨끗한 흰색으로"),
-    ParamDef("knee_dark", "무릎 어두움", "color", 0, 100, unit="pct", kind="color", tip="무릎의 어둡고 붉은 부분을 주변 피부톤에 맞춥니다"),
+    ParamDef("knee_dark", "무릎 어두움", "color", 0, 100, unit="pct", kind="color", tip="무릎의 어둡고 붉은 부분을 주변 피부톤에 맞춥니다",
+             hidden=True),
 ]
 
 PARAM: Dict[str, ParamDef] = {p.key: p for p in PARAMS}
@@ -149,8 +155,8 @@ RETOUCH_KEYS = [p.key for p in PARAMS if p.kind in ("skin", "color")]
 # body skin (1.23). Each effect is on when its value is above 0; a new person has both at 0 (off). The regions are
 # apart from the face's 보정 부위: an older project's body regions there (목, 어깨·쇄골, 팔, 손, 다리 under the face's
 # 피부결) keep working as they did
-BODY_SKIN_KEYS = ["body_skin", "body_blemish", "knee_tone", "knee_fold", "belly_fold"]
-BODY_START = {"body_skin": 50.0, "body_blemish": 50.0, "knee_tone": 70.0, "knee_fold": 70.0, "belly_fold": 70.0}        # the value an effect starts from when it is switched on
+BODY_SKIN_KEYS = ["body_skin", "body_blemish", "knee_tone", "knee_fold", "leg_bruise", "belly_fold"]
+BODY_START = {"body_skin": 50.0, "body_blemish": 50.0, "knee_tone": 70.0, "knee_fold": 70.0, "leg_bruise": 80.0, "belly_fold": 70.0}        # the value an effect starts from when it is switched on
 BODY_REGIONS: List[Tuple[str, str]] = [("neck", "목·어깨"), ("arm", "팔·손"), ("torso", "몸통 앞면·등"), ("leg", "다리")]
 BODY_ALL = "all"                                               # 전신: every part of the body there is, the face left out
 # body parts that have a measured width (range multiplier)
@@ -191,13 +197,30 @@ SKIN_REMOVE: List[Tuple[str, str, str]] = [("mouth", "mouth_lines", "입가주�
 SKIN_REMOVE_VALUES: Dict[str, float] = {"light": 25, "std": 40, "strong": 80}
 SKIN_REMOVE_VALUES_V1: Dict[str, float] = {"light": 25, "std": 40, "strong": 60}     # before 1.18 (cut 024: folds stayed)
 SKIN_BASIC_KEYS: List[str] = list(SKIN_LEVEL_VALUES["std"]) + [k for _, k, _ in SKIN_REMOVE]
+# (2026-11-25, the user: "기본 조정에서 눈, 무릎, 팔꿈치에 대한 보정 기능을 ... 4단 선택으로") the parts of the basic adjustment, each with its own
+# 끄기 / 약하게 / 표준 / 강하게: part -> (detail slider, label), the slider's value at each step. A part whose slider the app does not have yet is
+# shown but not used
+SKIN_PARTS: List[Tuple[str, Tuple[str, ...], str]] = [("eye", ("eye_white",), "눈 흰자 정리"), ("knee", ("knee_tone", "knee_fold"), "무릎 멍·주름"),
+                                                    ("leg", ("leg_bruise",), "다리 멍"),
+                                                    ("elbow", ("elbow_tone",), "팔꿈치 주름·멍")]
+SKIN_PART_LEVELS: List[Tuple[str, str]] = [("off", "끄기"), ("light", "약하게"), ("std", "표준"), ("strong", "강하게")]
+SKIN_PART_VALUES: Dict[str, Dict[str, float]] = {"eye": {"off": 0, "light": 60, "std": 100, "strong": 100},
+                                                 "knee": {"off": 0, "light": 50, "std": 70, "strong": 100},
+                                                 "leg": {"off": 0, "light": 50, "std": 80, "strong": 100},
+                                                 "elbow": {"off": 0, "light": 50, "std": 70, "strong": 100}}
 
 
-def skin_basic_values(level: str, remove) -> Dict[str, float]:
-    """The detail slider values of a basic adjustment: level (light | std | strong) and the switches set to 제거."""
+def skin_basic_values(level: str, remove, parts=None) -> Dict[str, float]:
+    """The detail slider values of a basic adjustment: level (light | std | strong), the switches set to 제거, and the parts' steps
+    (SKIN_PARTS: {part: off | light | std | strong}; None: the parts' sliders are not part of it, as before 1.26)."""
     level = level if level in SKIN_LEVEL_VALUES else "std"
     out = {k: float(v) for k, v in SKIN_LEVEL_VALUES[level].items()}
     rm = set(remove or ())
     for sw, key, _ in SKIN_REMOVE:
         out[key] = float(SKIN_REMOVE_VALUES[level]) if sw in rm else 0.0
+    if parts is not None:
+        for sw, keys, _ in SKIN_PARTS:
+            for key in keys:
+                if key in PARAM:
+                    out[key] = float(SKIN_PART_VALUES[sw].get(str(parts.get(sw, "off")), 0.0))
     return out

@@ -10,6 +10,7 @@ Filter = edge-preserving guided filter: the large-scale tone is evened out, a ch
 from __future__ import annotations
 
 import threading
+import zlib
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -219,8 +220,12 @@ _PLANE_TLS = _thr_planes.local()    # each thread keeps the planes of the frame 
 
 def _chroma_planes(rgb_u8: np.ndarray):
     """Luma and the smoothed Cr, Cb of a frame, as float32. A crowd frame asks for them once per person (the colour
-    model is per person, the planes are not): kept for the frame the thread is working on, the same values as before."""
-    key = (rgb_u8.__array_interface__["data"][0], rgb_u8.shape, hash(rgb_u8[::7, ::11].tobytes()))
+    model is per person, the planes are not): kept for the frame the thread is working on, the same values as before.
+    The frame is known by all of its bytes (1.26): the key was its memory address and a sparse sample of it, and a
+    new frame put where the last one was, alike at the sampled pixels, got the last frame's planes (a frame's skin
+    then came now and then from the frame before it: the renders of one cut were not always the same)."""
+    a = np.ascontiguousarray(rgb_u8)
+    key = (a.shape, str(a.dtype), zlib.crc32(a), zlib.adler32(a))
     ent = getattr(_PLANE_TLS, "planes", None)
     if ent is not None and ent[0] == key:
         return ent[1]
@@ -926,6 +931,10 @@ TEX_FS = True
 FS_S = (0.0006, 0.0012, 0.0024, 0.0048, 0.0096, 0.0192)   # band upper edges (Gaussian sigma), of the face width
 FS_G = (1.35, 0.70, 0.36, 0.33, 0.45, 0.80)               # gain of each band at the reference strength
 FS_SHAPE = (1.0, 1.0, 1.0, 0.7, 0.42, 0.6)                # share of each band's change left where the engine marks shape (nose)
+FS_NORM = 0.0     # > 0: the bands are taken with blurs of the skin alone (normalised by the skin area's own weight, full from this value of the
+                  # mask up): the background, hair or a lip beside the skin is not averaged in, so the skin along the face's outline is not darkened
+                  # (or lightened) by the step to what lies beyond it (2611 IWALY 11/24: a dark band along the cheek's contour, ENDING f26, INT_c006 f90).
+                  # 0 = the plain blurs, as before
 FS_REF = 0.70                                              # skin slider of the reference
 # keep the picture's own grain (user 2026-11-14 22:51): in every band the part of each pixel's value up to FS_GRAIN times
 # that band's grain level is left as it is; only what stands out above the grain (pores, pits, bumps) is scaled.
@@ -1061,11 +1070,18 @@ def smooth_channel(I: np.ndarray, mask: np.ndarray, strength: float, keep: float
         prev = roi
         ps = 0.0
         acc = np.zeros_like(roi)
+        wsup = np.clip(m / FS_NORM, 0.0, 1.0).astype(np.float32) if FS_NORM > 0 else None
         for i_, (fs_, g_) in enumerate(zip(FS_S, FS_G)):
             s_ = fs_ * wf_
             if s_ < ps + 0.15:
                 continue
-            cur = cv2.GaussianBlur(prev, (0, 0), float(np.sqrt(s_ * s_ - ps * ps)))
+            sg_ = float(np.sqrt(s_ * s_ - ps * ps))
+            if wsup is not None:
+                # the blur of the skin alone: what lies beyond the skin area does not enter the skin's bands
+                den_ = cv2.GaussianBlur(wsup, (0, 0), sg_)
+                cur = np.where(den_ > 1e-3, cv2.GaussianBlur(prev * wsup, (0, 0), sg_) / np.maximum(den_, 1e-3), prev).astype(np.float32)
+            else:
+                cur = cv2.GaussianBlur(prev, (0, 0), sg_)
             b_ = prev - cur
             prev = cur
             ps = s_

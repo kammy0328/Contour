@@ -182,8 +182,31 @@ def _speed_xmeml(ci) -> float:
     return 100.0
 
 
+def _main_sequence(root):
+    """The edit itself among the sequences of an xmeml file: one that no clip item of another sequence uses as a nested
+    sequence, the longest of those. An export with nested sequences (Premiere XtoCC: 2611 LNGSHOT BEEP BEEP) lists the
+    nested ones first, as sequences of their own."""
+    defs = [s for s in root.iter("sequence") if s.find("media") is not None]
+    if not defs:
+        return None
+    used = set()
+    for s in defs:
+        for ci in s.iter("clipitem"):
+            for n in ci.findall("sequence"):
+                if n.get("id"):
+                    used.add(n.get("id"))
+    top = [s for s in defs if not s.get("id") or s.get("id") not in used] or defs
+
+    def length(s):
+        d = _num(s.findtext("duration"))
+        return (d or 0, sum(1 for _ in s.iter("clipitem")))
+    return max(top, key=length)
+
+
 def _read_xmeml(root) -> Timeline:
-    seq = root.find("sequence")
+    seq = _main_sequence(root)
+    if seq is None:
+        seq = root.find("sequence")
     if seq is None:
         seq = next(root.iter("sequence"), None)
     if seq is None:

@@ -111,6 +111,7 @@ class ReshapeTab(_Tab):
         self.face_mask_info = self.cloth_mask_info = None
         self.level = None
         self.switches: Dict[str, Wd.Segmented] = {}
+        self.parts: Dict[str, Wd.Segmented] = {}
         self.wrows: Dict[str, Wd.ParamRow] = {}
         add = self.add
         if part == "body":
@@ -165,6 +166,8 @@ class ReshapeTab(_Tab):
                 r.keyToggled.connect(self.ctl.toggle_param_key)
                 self.rows[d.key] = r
                 bl.addWidget(r)
+                if d.hidden:
+                    r.setVisible(False)
                 if d.key == "sculpt":
                     bl.addWidget(self._sculpt_row())
                 if d.key == "body_sculpt":
@@ -191,7 +194,8 @@ class ReshapeTab(_Tab):
         self.body_mark_btns: Dict[str, QPushButton] = {}
         self.body_detail = self.body_size = self.body_mark_r = self.body_mark_info = self.body_note = None
         if part == "skin":
-            self.add(self._body_skin_box())
+            # (1.26) in the detail view only: the basic adjustment stays short (its parts set the knees)
+            add(self._body_skin_box())
         btns = QHBoxLayout()
         reset = Wd.button("초기화", "ghost", "refresh-cw",
                           "이 인물의 피부·색 보정 값을 처음으로" if part == "skin" else "이 인물의 몸매·얼굴형 값을 처음으로")
@@ -267,6 +271,8 @@ class ReshapeTab(_Tab):
         switch("knee_tone", "무릎 얼룩 정리")
         v.addSpacing(4)
         switch("knee_fold", "무릎 접힘선 제거")
+        v.addSpacing(4)
+        switch("leg_bruise", "다리 멍 정리")
         v.addSpacing(4)
         switch("belly_fold", "뱃살 주름 제거")
         v.addSpacing(4)
@@ -432,6 +438,21 @@ class ReshapeTab(_Tab):
             seg.changed.connect(lambda k, sw=sw: self.ctl.apply_skin_basic(switch=(sw, k == "remove")))
             v.addWidget(Wd.FieldRow(lab, seg, tips.get(sw, "")))
             self.switches[sw] = seg
+        # (1.26) the parts, each with its own step: the eye whites, the knees, the elbows
+        from ..core.params import SKIN_PARTS, SKIN_PART_LEVELS, PARAM as _P
+        v.addSpacing(4)
+        v.addWidget(Wd.label("부위 보정", "", 12))
+        ttips = {"eye": "흰자의 점, 얼룩, 실핏줄, 홍채 옆 그늘을 지웁니다 (흰자 톤, 음영, 그레인과 속눈썹은 그대로). 눈이 보이는 샷에만 적용됩니다",
+                 "knee": "무릎의 멍, 얼룩과 접힘선을 정리합니다 (세부 조정의 무릎 얼룩 정리, 무릎 접힘선 제거)", "elbow": "팔꿈치의 주름과 멍을 정리합니다"}
+        for sw, keys, lab in SKIN_PARTS:
+            ready = all(k_ in _P for k_ in keys)
+            seg = Wd.Segmented(SKIN_PART_LEVELS, compact=True)
+            seg.set_current("")
+            seg.changed.connect(lambda k, sw=sw: self.ctl.apply_skin_basic(part=(sw, k)))
+            row = Wd.FieldRow(lab if ready else lab + " (준비 중)", seg, ttips.get(sw, ""))
+            v.addWidget(row)
+            seg.setProperty("ready", ready)
+            self.parts[sw] = seg
         self.basic_note = Wd.label("고른 값은 세부 조정 슬라이더에 그대로 들어갑니다. 세부 조정에서 값을 바꾸면 "
                                    "여기 선택이 해제됩니다.", "Faint", 11)
         self.basic_note.setWordWrap(True)
@@ -452,10 +473,15 @@ class ReshapeTab(_Tab):
         rm = set(sb.get("remove", [])) if sb else set()
         for sw, seg in self.switches.items():
             seg.set_current(("remove" if sw in rm else "keep") if sb else "")
+        parts = sb.get("parts") if sb else None
+        for sw, seg in self.parts.items():
+            seg.set_current(str((parts or {}).get(sw, "off")) if (sb and parts is not None) else "")
         for w_ in [self.level] + list(self.switches.values()):
             w_.setEnabled(enabled)
+        for seg in self.parts.values():
+            seg.setEnabled(enabled and bool(seg.property("ready")))
         if sb:
-            vals = skin_basic_values(sb["level"], sb.get("remove", []))
+            vals = skin_basic_values(sb["level"], sb.get("remove", []), parts)
             self.level_info.setText(" · ".join(f"{PARAM[k].label} {v:.0f}" for k, v in vals.items() if v > 0))
         elif pp is not None and pp.retouch_active():
             self.level_info.setText("세부 조정에서 직접 맞춘 값입니다")
@@ -728,11 +754,7 @@ class ReshapeTab(_Tab):
         v.addWidget(Wd.label("보정 부위", "", 12))
         v.addWidget(self.skin_scope)
         v.addWidget(Wd.label("K: 피부·색 보정 영역 보기 (변형 결과를 따라 움직입니다)", "Faint", 11))
-        row, self.face_mask_info, b = self._mask_row("얼굴·목 마스크 다시 계산",
-                                                    "이 컷의 얼굴·목 영역만 지금 설정의 모델로 다시 찾습니다.\n"
-                                                    "관절 추적·인물·보정값·키프레임과 의상 마스크는 그대로입니다.")
-        b.clicked.connect(lambda: self.ctl.recompute_face_masks())
-        v.addWidget(row)
+        # (the face and neck mask's line and its recalculation are in 추적 > 고급, 1.26)
         return w
 
     def _grain_gate(self, grain: float):
@@ -821,6 +843,10 @@ class ReshapeTab(_Tab):
             else:
                 r.set_value(0)
                 r.set_key_state("none")
+            from ..core.params import PARAM as _PRM
+            if _PRM[k].hidden:
+                # (1.26: 번들거림, 무릎 어두움) shown only while this person has a value for it (a project of before)
+                r.setVisible(bool(pp is not None and pp._active(k)))
         if self.part == "skin":
             self._fill_basic(pp, enabled)
             self._fill_body(pp, enabled, t)
@@ -1013,12 +1039,27 @@ class TrackTab(_Tab):
         # the matte follows the edits by itself (분석 시작 makes it, edits refresh their frames): forcing it is
         # for a matte that looks wrong
         self.add(Wd.Section("고급"))
-        self.rematte = Wd.button("인물 매트 강제 갱신", "", "layers",
+        # (1.26) the name says when it is for: the line above says the matte is up to date with the models, which a matte that came out
+        # wrong on a frame can still be
+        self.rematte = Wd.button("매트가 이상할 때 다시 만들기", "", "layers",
                                  "관절 수정·인물 합치기 뒤 바뀐 구간의 매트는 자동으로 다시 만들어집니다. 매트가 이상할 "
                                  "때만 쓰세요: 지금의 추적(수정한 관절 포함)으로 컷 전체의 인물 매트를 다시 만들고 몸 폭·"
                                  "윤곽 점을 다시 잽니다. 다시 분석할 필요는 없습니다")
         self.rematte.clicked.connect(self.ctl.rebuild_matte)
         self.add(self.rematte)
+        w3 = QWidget()
+        h3 = QHBoxLayout(w3)
+        h3.setContentsMargins(0, 2, 0, 2)
+        h3.setSpacing(6)
+        self.face_mask_info = Wd.label("", "Faint", 11)
+        self.face_mask_info.setWordWrap(True)
+        self.face_mask_btn = Wd.button("얼굴·목 마스크 다시 계산", "", "refresh-cw")
+        self.face_mask_btn.setToolTip("이 컷의 얼굴·목 영역만 지금 설정의 모델로 다시 찾습니다.\n"
+                                      "관절 추적·인물·보정값·키프레임과 의상 마스크는 그대로입니다.")
+        self.face_mask_btn.clicked.connect(lambda: self.ctl.recompute_face_masks())
+        h3.addWidget(self.face_mask_info, 1)
+        h3.addWidget(self.face_mask_btn)
+        self.add(w3)
         self.lay.addStretch(1)
 
     def refresh(self):
@@ -1054,6 +1095,12 @@ class TrackTab(_Tab):
         self.pkg_info.setVisible(bool(txt))
         self.pkg_btn.setVisible(blocked)
         self.rematte.setEnabled(bool(cut.analyzed and st is not None))
+        self.face_mask_btn.setEnabled(bool(cut.analyzed and st is not None))
+        try:
+            from ..track import facelayer as FL
+            self.face_mask_info.setText(ReshapeTab.mask_text("얼굴·목 마스크", FL.info(s.tracker)) if (s.tracker is not None and st is not None) else "")
+        except Exception:
+            self.face_mask_info.setText("")
         sel = self.ctl.selection
         self.sel_label.setText(f"선택: {sel[0]}~{sel[1]} 프레임 ({sel[1] - sel[0] + 1}f)" if sel else "선택된 구간 없음")
         self.reanalyse.setEnabled(bool(sel and cut.analyzed and st is not None))
@@ -1212,8 +1259,11 @@ class OutputTab(_Tab):
         self._filling = True
         info = cut.info
         tc = f" · TC {info.timecode}" if info.timecode else ""
+        # (1.26) what the file says of its colour; what it does not say is left out (it showed "? / ? / bt709")
+        tags = [x for x in (info.color_primaries, info.color_trc, info.color_matrix) if x and x != "unknown"]
+        col = " / ".join(dict.fromkeys(tags)) if tags else "색 정보 표기 없음"
         self.src.setText(f"{info.codec} {info.pix_fmt} · {info.width}×{info.height} · {info.fps:.3f} fps{tc}\n"
-                         f"{info.color_primaries or '?'} / {info.color_trc or '?'} / {info.color_matrix or '?'} · {info.color_range}")
+                         f"{col} · {info.color_range}")
         cm = manager()
         if self.cs.count() == 0:
             self.cs.addItem("Rec.709 (변환 없음)", "")

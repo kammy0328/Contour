@@ -98,6 +98,8 @@ class Job:
     body_size: float = 0.4                 # 0..1 largest spot taken by the body blemish removal
     bdet: Optional[dict] = None            # the body's spot candidates of this frame (retouch.bodyspots)
     bmarks: Optional[list] = None          # the operator's body spot marks as they lie on this frame
+    forehead_hold: Optional[float] = None  # the forehead's hold from the skin stage of this frame (SKIN_FOREHEAD_HOLD / SKIN_FOREHEAD_AUTO); None = SKIN_FOREHEAD_HOLD
+    forehead_cover: Optional[float] = None # how much of the lower forehead hair covers on this frame (SKIN_FOREHEAD_AUTO), for the record
     tone: Optional[dict] = None            # where the knees and the belly are (retouch.bodytone.person_geometry), source px
     focus_w: float = 1.0                   # the share of the retouch this person gets by the focus of its face (FOCUS_GATE), kept so prepare() can apply it again after it reads the slider values
     naso_pres: Optional[float] = None      # how far a nasolabial crease is there on this frame (FOLD_PRESENT), measured once
@@ -208,6 +210,41 @@ def _face_hair_hold(parse, cloth, lm, shape):
     return np.maximum(core, cv2.GaussianBlur(core, (0, 0), sigma))
 
 
+def _forehead_cover(parse, alpha, lm):
+    """How much of the lower forehead (FOREHEAD_BAND above the brows) is not face skin to the face parser: bangs over it. 0..1, or None
+    (no parser, no brows, or too little of the band inside the person's matte and the picture)."""
+    if parse is None or parse.get("skin") is None or lm is None:
+        return None
+    L = np.asarray(lm[:, :2], np.float64)
+    if not np.isfinite(L[[0, 8, 16, 17, 21, 22, 26, 27]]).all():
+        return None
+    sk = parse["skin"]
+    h, w = sk.shape[:2]
+    wf = float(np.hypot(*(L[16] - L[0])))
+    if wf < 8:
+        return None
+    up = L[27] - L[8]
+    up = up / max(1e-6, float(np.hypot(*up)))
+    a_, b_ = FOREHEAD_BAND
+    br = L[17:27]
+    poly = np.vstack([br + up * (a_ * wf), (br + up * (b_ * wf))[::-1]])
+    x0, y0 = np.floor(poly.min(0)).astype(int)
+    x1, y1 = np.ceil(poly.max(0)).astype(int) + 1
+    x0, y0, x1, y1 = max(0, x0), max(0, y0), min(w, x1), min(h, y1)
+    if x1 - x0 < 3 or y1 - y0 < 3:
+        return None
+    band = np.zeros((y1 - y0, x1 - x0), np.uint8)
+    cv2.fillPoly(band, [np.round(poly - [x0, y0]).astype(np.int32)], 1)
+    wgt = band.astype(np.float32)
+    if alpha is not None and alpha.shape[:2] == (h, w):
+        wgt = wgt * np.clip(alpha[y0:y1, x0:x1], 0, 1)
+    full = float(band.sum())
+    if full < 9 or float(wgt.sum()) < 0.4 * full:
+        return None
+    skin = _ss(0.3, 0.7, sk[y0:y1, x0:x1].astype(np.float32))
+    return float(1.0 - (skin * wgt).sum() / max(1e-6, float(wgt.sum())))
+
+
 def _fold_fade(mask, lm):
     """FOLD_EDGE_FADE (Mac IWALY): the fold band's mask fades in from its own edge (_feather_fold); off: the mask as it is (1.25.0)."""
     return _feather_fold(mask, lm) if FOLD_EDGE_FADE > 1e-4 else mask
@@ -246,7 +283,12 @@ NASO_NOSTRIL_HOLD = 0.0     # of the face width: the nostrils and the nose's bas
 GPU_MASKS = None            # (11/24) 1: the Gaussian blurs of the mask making and the apply on the GPU (gpuops; same result as OpenCV); 0: OpenCV; None: env IWALY_GPU_MASKS
 SKIN_FS_G = None            # (2611 IWALY INT, 11/24: the pebbled skin of INT_c001 / c006 / c007 / c010 stayed) the gains of the skin stage's texture bands (skin.FS_G, finest
                             # to widest), set from here so a batch's settings can carry them; None = skin.FS_G as it is. INT_c006 f90 / INT_c001 f119: (1.35, 0.70, 0.30, 0.20, 0.20, 0.45)
+SKIN_FS_NORM = None          # the skin stage's bands from blurs of the skin alone (skin.FS_NORM, set from here like SKIN_FS_G; None = skin.FS_NORM as it is)
 SKIN_FOREHEAD_HOLD = 0.0    # 0..1: the forehead above the brows kept out of the skin stage (bangs over it: the strands flickered, INT_c005 11/24). 0 = as before
+SKIN_FOREHEAD_AUTO = None   # (lo, hi): the forehead hold follows how much of the forehead hair covers on each frame (the face parser's skin over the lower
+                            # forehead, inside the person's matte): none held under lo, all over hi (11/24 user: "앞머리가 이마 면적을 많이 차지하면 보정 의미가
+                            # 없다", INT_c005). The hold is then the larger of this and SKIN_FOREHEAD_HOLD. None = off, as before
+FOREHEAD_BAND = (0.03, 0.25)  # of the face width above the brows: the part of the forehead whose cover is measured
 SKIN_BROW_HOLD = 0.0        # of the face width: the brows grown by this are kept out of the skin stage (0 = off, as before)
 HAND_GUARD_SKIN_IN = 0.04   # of the face width: the skin stage is held off a hand only outside the face's outline moved in by this
 HAND_GUARD_FEATHER = 0.03
@@ -1045,6 +1087,16 @@ ARMPIT_NEAR_CLOTH = None          # (near, far) of the face width or None: the f
 ARMPIT_CLOSE = 0.0                # of the face width: the fold is a dark valley, and the armpit's mask (the skin's brightness split, the clothes gate) leaves it out as if it were cloth, so the lifts never saw it. A hole or a
                                   # bay in the stage's mask narrower than twice this is closed before the lifts and the flattener (0 = as before)
 ARMPIT_PIT_W = None               # of the face width or None: a second pass of the thin-line filler at this width (the fold is wider than a crease line: 0.04 of the face = 13 px at 330)
+ARMPIT_LEARNED = None             # 2611 IWALY c006 (2026-11-25, user: "겨드랑이 주름을 수동으로 보정했는데 겨드랑이 주름 보정 학습해"): the fold retouch learned from a
+                                  # hand-retouched shot (contour.learn.armpitfit: a blur of sigma_rel face widths at an opacity, its change low-passed by the
+                                  # grain's width so the plate's grain stays). None = off; a dict (the model) or the path of its JSON. Laid on inside the armpit
+                                  # stage's mask at the stage's strength
+ARMPIT_LEARNED_ONLY = True        # with a learned model: the learned retouch in place of the crease lifts and the fold flattener (False: after them)
+ARMPIT_LEARNED_EDGE = (0.025, 0.05)   # the learned blur is held off sharp edges (a finger's outline, the arm's edge): the luma's contrast over 0.01 face widths,
+                                  # off from the first value, fully off at the second (c006 f85 / f126: the folds the hand evened stay under 0.023, a finger's rim
+                                  # in front of the armpit runs to 0.1). None: no edge gate
+ARMPIT_HAND_GUARD = 0.0           # 0..1: the hands (tracked hand points, else the forearm's line past the wrist: _hand_area_local) out of the armpit stage's mask
+                                  # (c006 f85, 596: the zone of the lowered arm lay on her hand across the chest and the learned blur ran over the fingers)
 ARMPIT_FINE = True                # False: the armpit's thin-line filler does without the long-line (strand) finder (the one that also finds hair strands). 2611 IWALY c010 f23 (2026-11-22, user: the arm's own line, green, stays; the fold, red, goes): a
                                   # long soft line along the arm is a long faint dark line to that finder, and the filler took it out with the folds. The valley finder alone looks only at what is short, deep and curved
                                   # across (a crease). True = as the neck lines
@@ -1765,6 +1817,9 @@ def teeth_mask(lm: np.ndarray, rgb_f: np.ndarray) -> np.ndarray:
 EYE_WHITE_V2 = 0.0   # 0/1 (2611 IWALY INT, user 2026-11-24: "핏줄만 제거, 눈썹이나 다른 곳으로 번지면 안 되고, 흔적 없이 깨끗한 흰자"): the sclera found by its red channel (the veins
                      # are red and stay in the mask; the v1 mask weighted by brightness and low saturation left the veins themselves out), inside the eye's own landmarks only, and the
                      # veins filled from the white round them (dark -> up to the local white, red -> down to the white's own chroma) instead of lifting / bleaching the whole white
+EYE_WHITE_CLEAN = 1.0         # 0..1 (2026-11-25, IU NES BASE_CL_29; the user: "점, 얼룩, 실핏줄, 멍이 있으면 지워져야 해"): the eye-white slider runs the white's
+                              # cleanup of retouch.eyeclean (spots, stains, veins and the shade beside the iris off, the white's tone, shading and grain kept)
+                              # instead of the vein filling (EYE_WHITE_V2) or the v1 lift; 0 = those as before
 EYE_WHITE_MIN_WF = None       # face width in SOURCE px under which the eye-white stage is not run at all (a wide shot: the whites are a few pixels, nothing to see,
                                # only time spent); None = every face (2611 IWALY, user 11/24: "눈이 디테일하게 보이는 샷에서만")
 EYE_WHITE_V2_SHRINK = 0.88     # the eye's landmark polygon shrunk towards its middle by this (the lid's edge and the lash line stay out)
@@ -2172,7 +2227,7 @@ def _focus_w(tracker, st, p: int, t: int, px) -> float:
 
 def _focus_scale(v: dict, w: float) -> dict:
     """The person's values times the focus weight w: the face's keys only (the body's stay: a face out of focus says nothing of the body)."""
-    return {k: (x if (k.startswith("body_") or k.startswith("knee")) else x * w) for k, x in v.items()}
+    return {k: (x if (k.startswith("body_") or k.startswith("knee") or k.startswith("leg_")) else x * w) for k, x in v.items()}
 
 
 def _parse_visible(tracker, pid: int, t: int, face: np.ndarray, px) -> float:
@@ -2674,7 +2729,7 @@ def _knee_off(v):
     return v
 
 
-BODY_EFFECTS = ("body_skin", "body_blemish", "knee_tone", "knee_fold", "belly_fold")   # the values that bring the body skin's area with them
+BODY_EFFECTS = ("body_skin", "body_blemish", "knee_tone", "knee_fold", "leg_bruise", "belly_fold")   # the values that bring the body skin's area with them
 BDET_NOW = True            # a job that came without its spots (a single frame, a test) has them found on the plane
 
 
@@ -3691,6 +3746,15 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 except Exception:
                     import traceback
                     traceback.print_exc()
+                if ARMPIT_HAND_GUARD > 1e-4:
+                    try:
+                        g_ = hand_guard(ARMPIT_HAND_GUARD, "hand_guard_arm")
+                        af_ = state["armpit_fold"]
+                        if g_ is not None and af_ is not None and tuple(af_.shape[:2]) == tuple(shape):
+                            state["armpit_fold"] = _times_local(af_, g_[0], g_[1])
+                    except Exception:
+                        import traceback
+                        traceback.print_exc()
             return state["armpit_fold"]
 
         tone_on = any(abs(v.get(k, 0)) > 1e-4 for k in ("skin_bright", "skin_warm", "skin_sat", "grain", "redness"))
@@ -3765,11 +3829,12 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
         def mk_mouthl():
             return _hg(_parse_off(_cover_off(wrinkle_masks(lm, shape, pa(), "mouth", fth, 1.5, paint()), base().get("cover"), lm), base().get("parse"), lm))
 
-        def hand_guard():
-            """1 - the hands' area (HAND_GUARD), at `shape`, or None (off / no hands)"""
-            if HAND_GUARD <= 1e-4:
+        def hand_guard(weight=None, key="hand_guard"):
+            """1 - the hands' area (HAND_GUARD, or `weight`), at `shape`, or None (off / no hands)"""
+            wgt_ = HAND_GUARD if weight is None else float(weight)
+            if wgt_ <= 1e-4:
                 return None
-            if "hand_guard" not in state:
+            if key not in state:
                 g_ = None
                 try:
                     hl_ = []
@@ -3794,18 +3859,21 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                         for e_, w_ in ((S.L_EL, S.L_WR), (S.R_EL, S.R_WR)):
                             if np.isfinite(kq_[e_, :2]).all() and np.isfinite(kq_[w_, :2]).all():
                                 arms_.append((kq_[e_, :2], kq_[w_, :2]))
-                    wfm_ = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
+                    if lm is not None:
+                        wfm_ = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
+                    else:
+                        wfm_ = float(job.wf_arm) * float(px.sx) if job.wf_arm > 0 else 0.1 * float(shape[1])
                     a_ = _hand_area_local(hl_, shape, float(px.sx), float(px.sy), wfm_, arms_)
                     if __import__("os").environ.get("IWALY_HAND_GUARD_LOG"):
                         print("hand_guard t", t, "hands", [int(np.isfinite(np.asarray(x)[:, :2]).all(1).sum()) for x in hl_], "arms", len(arms_),
                               "area", None if a_ is None else round(float(a_[1].sum()) / float(shape[0] * shape[1]), 4), flush=True)
                     if a_ is not None:
-                        g_ = (a_[0], 1.0 - float(HAND_GUARD) * a_[1])          # (box, 1 - the hands' area there; 1 outside)
+                        g_ = (a_[0], 1.0 - wgt_ * a_[1])          # (box, 1 - the hands' area there; 1 outside)
                 except Exception:
                     import traceback
                     traceback.print_exc()
-                state["hand_guard"] = g_
-            return state["hand_guard"]
+                state[key] = g_
+            return state[key]
 
         def _hg(m_):
             g_ = hand_guard()
@@ -3896,7 +3964,19 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 except Exception:
                     import traceback
                     traceback.print_exc()
-            if SKIN_FOREHEAD_HOLD > 1e-4 and lm is not None and np.isfinite(lm[[8, 17, 21, 22, 26, 27], :2]).all():
+            fh_ = float(SKIN_FOREHEAD_HOLD)
+            if SKIN_FOREHEAD_AUTO is not None and lm is not None:
+                try:
+                    cov_ = _forehead_cover(base().get("parse"), base().get("alpha"), lm)
+                    if cov_ is not None:
+                        lo_, hi_ = SKIN_FOREHEAD_AUTO
+                        fh_ = max(fh_, float(_ss(float(lo_), float(hi_), np.float32(cov_))))
+                        job.forehead_cover = float(cov_)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+            job.forehead_hold = fh_
+            if fh_ > 1e-4 and lm is not None and np.isfinite(lm[[8, 17, 21, 22, 26, 27], :2]).all():
                 # (11/24, INT_c005: bangs cover the forehead, the skin stage on the strands flickered) the forehead above the brows is no skin to smooth
                 try:
                     L_ = np.asarray(lm[:, :2], np.float64)
@@ -3907,7 +3987,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                     poly_ = np.round(np.vstack([br_, (br_ + up_ * (0.9 * wfm_))[::-1]])).astype(np.int32)
                     loc_ = _soft_local(m.shape, lambda c_, o_: cv2.fillPoly(c_, [poly_ - np.int32(o_)], 255), poly_, 0, max(1.0, 0.02 * wfm_))
                     if loc_ is not None:
-                        m = _times_local(m, loc_[0], 1.0 - float(np.clip(SKIN_FOREHEAD_HOLD, 0, 1)) * loc_[1])
+                        m = _times_local(m, loc_[0], 1.0 - float(np.clip(fh_, 0, 1)) * loc_[1])
                 except Exception:
                     import traceback
                     traceback.print_exc()
@@ -4006,6 +4086,12 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                     # (the legs' widths are the median of the neighbouring pictures': the measure of one picture jumps, the leg does not)
                     job.tone = BTN.person_geometry_t(st.final[p], st.widths[p] if getattr(st, "widths", None) is not None else None, int(t))
 
+                if v.get("leg_bruise", 0) > 1e-4 and "leg" in body_scope_set(bscope):
+                    # 다리 멍 정리 (retouch.legbruise): the thighs and the calves, their widths the median of the pictures round
+                    from . import legbruise as LBR
+                    legs_ = LBR.legs_of_t(st.final[p], st.widths[p] if getattr(st, "widths", None) is not None else None, int(t), BTN.GEO_WIN)
+                    if legs_:
+                        job.tone = dict(job.tone or {}, legs=legs_)
                 if v.get("knee_fold", 0) > 1e-4 or v.get("knee_tone", 0) > 1e-4:
                     # Use measured segmentation only. Pose-based label fallback can assign an occluder to this knee.
                     seg = tracker.seglab.get(t) if tracker.seglab.exists() else None
@@ -5048,7 +5134,106 @@ def _det_wanted(v) -> bool:
     return any(v.get(k, 0) > 1e-4 for k in ("blemish", "neck_lines", "neck_bumps"))
 
 
+DET_CACHE: Optional[str] = None   # (11/24) a folder: the score maps of each frame and person kept there and used again while everything they are
+                                  # made from is the same (the original's piece, the masks there, the landmarks, the face's size, the detector's settings
+                                  # and code). A render again after a fix of the apply (most feedback) skips the detection, the most of the masks'
+                                  # time (78 %, 2611 IWALY c057). None: off (the app). The batch sets it per cut
+_DETC = {"hit": 0, "miss": 0, "fail": 0}
+_DETC_CODE: list = []
+
+
+def _det_key(cut, px, t: int, job, lm, rgb_u8) -> Optional[str]:
+    """What the score maps of _det_raw_make depend on, as one hash (None: not to be kept)."""
+    import hashlib
+    import inspect
+    from . import spotnet_run as SR
+    v = job.v
+    use_sk = v.get("blemish", 0) > 1e-4
+    use_nk = _det_wanted(v)
+    sk = job.masks.get("skinx") if use_sk else None
+    nk = job.masks.get("neck") if use_nk else None
+    if sk is None and nk is None:
+        return None
+    h = hashlib.blake2b(digest_size=20)
+    if not _DETC_CODE:
+        src_ = []
+        for mod in (DT, SR):
+            try:
+                src_.append(open(mod.__file__, "rb").read())
+            except Exception:
+                src_.append(repr(mod).encode())
+        src_.append(inspect.getsource(_det_raw_make).encode() + inspect.getsource(_det_fuse).encode())
+        _DETC_CODE.append(hashlib.blake2b(b"\0".join(src_), digest_size=16).hexdigest())
+    _det_cfg()
+    cfg = {k: v_ for k, v_ in vars(DT).items() if k.isupper() and isinstance(v_, (int, float, str, tuple, bool, type(None)))}
+    scfg = {k: (str(v_) if k == "MODEL" else v_) for k, v_ in vars(SR).items() if k.isupper() and isinstance(v_, (int, float, str, tuple, bool, type(None), type(SR.MODEL)))}
+    try:
+        from ..warp.render import _vs_for
+        vs_ = repr(_vs_for(cut))
+    except Exception:
+        vs_ = "?"
+    try:
+        st_ = os.stat(str(cut.source))
+        srcid = f"{cut.source}|{st_.st_size}|{int(st_.st_mtime)}"
+    except Exception:
+        srcid = str(getattr(cut, "source", ""))
+    h.update(repr((_DETC_CODE[0], sorted(cfg.items()), sorted(scfg.items()), SR.available(), vs_, srcid, int(t), DET_WF_MAX, DET_SRC, DET_SRC_GAIN,
+                   float(px.sx), float(px.sy), tuple(rgb_u8.shape), float(job.wf_src), float(job.blemish_size), use_sk, use_nk)).encode())
+    h.update(np.ascontiguousarray(np.asarray(lm, np.float32)).tobytes())
+    for m in (sk, nk):
+        if m is None:
+            h.update(b"none")
+        else:
+            a = np.ascontiguousarray(m)
+            h.update(repr((a.shape, str(a.dtype))).encode())
+            h.update(a.tobytes())
+    if not DET_SRC:
+        h.update(np.ascontiguousarray(rgb_u8).tobytes())
+    return h.hexdigest()
+
+
 def _det_raw(cut, px, t: int, job, lm: np.ndarray, rgb_u8: np.ndarray) -> Optional[dict]:
+    """_det_raw_make, kept in DET_CACHE when it is set."""
+    if not DET_CACHE:
+        return _det_raw_make(cut, px, t, job, lm, rgb_u8)
+    try:
+        key = _det_key(cut, px, t, job, lm, rgb_u8)
+    except Exception:
+        _DETC["fail"] += 1
+        key = None
+    if key is None:
+        return _det_raw_make(cut, px, t, job, lm, rgb_u8)
+    path = os.path.join(DET_CACHE, key[:2], key + ".npz")
+    if os.path.exists(path):
+        try:
+            with np.load(path, allow_pickle=False) as z:
+                if int(z["none"]):
+                    _DETC["hit"] += 1
+                    return None
+                maps = {k[2:]: z[k] for k in z.files if k.startswith("m_")}
+                d = dict(box=tuple(float(x) for x in z["box"]), maps=maps, thumb=z["thumb"], src=bool(z["src"]), wf=float(z["wf"]))
+            _DETC["hit"] += 1
+            return d
+        except Exception:
+            _DETC["fail"] += 1
+    d = _det_raw_make(cut, px, t, job, lm, rgb_u8)
+    _DETC["miss"] += 1
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + f".{os.getpid()}.{threading.get_ident()}.tmp"
+        with open(tmp, "wb") as f:
+            if d is None:
+                np.savez(f, none=np.array(1))
+            else:
+                np.savez_compressed(f, none=np.array(0), box=np.array(d["box"], np.float64), thumb=d["thumb"], src=np.array(bool(d.get("src"))),
+                                    wf=np.array(float(d["wf"])), **{"m_" + k: m for k, m in d["maps"].items()})
+        os.replace(tmp, path)
+    except Exception:
+        _DETC["fail"] += 1
+    return d
+
+
+def _det_raw_make(cut, px, t: int, job, lm: np.ndarray, rgb_u8: np.ndarray) -> Optional[dict]:
     """One frame's score maps for a job, on the best picture there is of its face and neck: a piece of the original
     at (up to) its own resolution where the analysis picture is a reduced copy (a 4K original seen at 1920: fine
     lines and small spots are gone from the copy), else the analysis picture itself. Never a reduced picture made
@@ -6087,6 +6272,49 @@ def neck_zone(lm: Optional[np.ndarray], shape, scale: float, wf: float) -> Optio
         out[y0:y1, x0:x1] = 1.0 - _ss(0.34 * wf, 0.48 * wf, dist)
         return out
     return _cached("neckzone", lm, shape, scale, wf, make)
+
+
+class _ArmpitDone(Exception):
+    """the armpit stage ended early (the learned retouch in place of the rest of it)"""
+
+
+_ARMPIT_LM_CACHE = {}
+
+
+def _armpit_learned_model():
+    """ARMPIT_LEARNED as a model dict (a path is read once), or None."""
+    m = ARMPIT_LEARNED
+    if m is None:
+        return None
+    if isinstance(m, dict):
+        return m if m.get("kind") == "blur" else None
+    try:
+        key = str(m)
+        if key not in _ARMPIT_LM_CACHE:
+            import json as _json
+            _ARMPIT_LM_CACHE[key] = _json.load(open(key, encoding="utf-8"))
+        mm = _ARMPIT_LM_CACHE[key]
+        return mm if mm.get("kind") == "blur" else None
+    except Exception:
+        return None
+
+
+def _armpit_learned_apply(Y, Cb, Cr, mA, kA, wfA, model):
+    """The learned armpit retouch (contour.learn.armpitfit.apply) on the luma and chroma planes, the mask and the face width taken to the chroma's size."""
+    from ..learn import armpitfit as _AF
+    if ARMPIT_LEARNED_EDGE is not None:
+        # sharp edges (a finger's rim, the arm's outline) keep out of the blur: the luma's contrast over 0.01 face widths
+        Yb_ = cv2.GaussianBlur(Y.astype(np.float32), (0, 0), max(0.6, 0.0045 * float(wfA)))
+        g_ = np.hypot(cv2.Sobel(Yb_, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(Yb_, cv2.CV_32F, 0, 1, ksize=3)) / 8.0 * (0.01 * float(wfA))
+        e_ = _ss(float(ARMPIT_LEARNED_EDGE[0]), float(ARMPIT_LEARNED_EDGE[1]), g_)
+        r_ = max(1, int(round(0.012 * float(wfA))))
+        e_ = cv2.GaussianBlur(cv2.dilate(e_, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r_ + 1, 2 * r_ + 1))), (0, 0), max(0.8, 0.6 * r_))
+        mA = mA * (1.0 - np.clip(e_, 0.0, 1.0))
+    hC, wC = Cb.shape[:2]
+    mC = mA if mA.shape == (hC, wC) else cv2.resize(mA.astype(np.float32), (wC, hC), interpolation=cv2.INTER_AREA)
+    wfC = wfA * float(wC) / float(Y.shape[1])
+    Yo, (Cbo, Cro) = _AF.apply(Y, mA.astype(np.float32), model, float(wfA), float(kA), [Cb, Cr], mC, wfC)
+    return Yo, Cbo, Cro
 
 
 def _fold_flat(Y: np.ndarray, m: np.ndarray, wf: float, k: float, eps_mul: float = 1.0, r_mul: float = 1.0) -> np.ndarray:
@@ -7724,6 +7952,21 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
             Y = Y + wy * (knee_input[0] - Y)
             Cb = Cb + wc * (knee_input[1] - Cb)
             Cr = Cr + wc * (knee_input[2] - Cr)
+        # 0c3. leg bruises (1.26): a bruise on a thigh or a calf filled with the leg's own light and colour round it; the grain stays
+        if job.tone and job.tone.get("legs") and bmY is not None and v.get("leg_bruise", 0) > 1e-4:
+            try:
+                from . import legbruise as LBR
+                regL = bmY
+                for nm_ in ("skinx", "neck"):
+                    if nm_ in job.masks:
+                        regL = regL * (1.0 - np.clip(M(job.masks[nm_], (hY, wY)), 0, 1))
+                legsY = [(ax_ * y_per_src, ay_ * y_per_src, bx_ * y_per_src, by_ * y_per_src, hf_ * y_per_src)
+                         for (ax_, ay_, bx_, by_, hf_) in job.tone["legs"]]
+                with _tm("apply.leg_bruise"):
+                    Y, Cb, Cr = LBR.clean_planes(Y, Cb, Cr, regL, legsY, float(np.clip(v["leg_bruise"], 0, 1)))
+            except Exception:
+                import traceback
+                traceback.print_exc()
         # 0d. belly creases (1.25): the folds a bent trunk makes, filled from the skin round them; none found, nothing changed
         if job.tone and job.tone.get("belly") and v.get("belly_fold", 0) > 1e-4:
             try:
@@ -7879,7 +8122,8 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                 except Exception:
                     import traceback
                     traceback.print_exc()
-            if SKIN_FOREHEAD_HOLD > 1e-4 and job.face is not None:
+            fh_ = float(SKIN_FOREHEAD_HOLD if getattr(job, "forehead_hold", None) is None else job.forehead_hold)
+            if fh_ > 1e-4 and job.face is not None:
                 # (11/24, INT_c005 f0: the hold in the mask stage did not reach the smoothing) the forehead above the brows taken out here, on the picture's own grid
                 try:
                     L_ = np.asarray(job.face, np.float64)[:, :2] * y_per_src
@@ -7890,12 +8134,14 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                         poly_ = np.round(np.vstack([br_, (br_ + up_ * (0.9 * wf))[::-1]])).astype(np.int32)
                         loc_ = _soft_local((hY, wY), lambda c_, o_: cv2.fillPoly(c_, [poly_ - np.int32(o_)], 255), poly_, 0, max(1.0, 0.02 * wf))
                         if loc_ is not None:
-                            mY, mC = _hold_yc(mY, mC, (loc_[0], float(np.clip(SKIN_FOREHEAD_HOLD, 0, 1)) * loc_[1]), (hY, wY), (hC, wC))
+                            mY, mC = _hold_yc(mY, mC, (loc_[0], float(np.clip(fh_, 0, 1)) * loc_[1]), (hY, wY), (hC, wC))
                 except Exception:
                     import traceback
                     traceback.print_exc()
             if SKIN_FS_G is not None and len(SKIN_FS_G) == len(SK.FS_S):
                 SK.FS_G = tuple(float(g_) for g_ in SKIN_FS_G)      # (11/24) the texture bands' gains set from the engine's settings (control.json engine_cfg)
+            if SKIN_FS_NORM is not None:
+                SK.FS_NORM = float(SKIN_FS_NORM)
             if SKIN_EDGE_KEEP > 1e-4:
                 try:
                     er_ = _skin_edge_ramp(M(job.masks["skin"], (hY, wY)), wf)
@@ -7996,6 +8242,10 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                         if skin_ok and ARMPIT_LIFT_INSET > 1e-6:
                             mA = mA * _skin_inner(bmY, ARMPIT_EDGE_CLOSE * wfA, ARMPIT_LIFT_INSET * wfA)
                         mA_hold = mA
+                        lm_ = _armpit_learned_model()
+                        if lm_ is not None and ARMPIT_LEARNED_ONLY:
+                            Y, Cb, Cr = _armpit_learned_apply(Y, Cb, Cr, mA, kA, wfA, lm_)
+                            raise _ArmpitDone()
                         Y1, Cb, Cr = _crease_lift(Y, Cb, Cr, mA, kA, wA, None, None, fine_lines=bool(ARMPIT_FINE), gain=gA, thin_rng=ARMPIT_THIN, band=ARMPIT_BAND)
                         if ARMPIT_THIN is not None or abs(gA - 1.0) > 1e-3 or ARMPIT_BAND:
                             # the lines budget is judged on what the neck lines' own tests would lift (what it was set against), not on the fuller fill of the armpit's creases
@@ -8017,6 +8267,8 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                             mF = mA * _skin_inner(bmY, ARMPIT_EDGE_CLOSE * wfA, ARMPIT_FOLD_INSET * wfA)
                         kF = kA * float(np.clip(ARMPIT_FLAT, 0.0, 1.0))
                         Y = _fold_flat(Y1, mF, wfA, kF, ARMPIT_FLAT_EPS, ARMPIT_FLAT_R) if kF > 1e-4 else Y1
+                        if lm_ is not None:
+                            Y, Cb, Cr = _armpit_learned_apply(Y, Cb, Cr, mA_hold, kA, wfA, lm_)
                         if ARMPIT_LINE_HOLD > 1e-4 and job.arm_axes:
                             # a hanging arm's own line stays (the lifts and the flattener took it for a crease): given back from the picture before the stage
                             try:
@@ -8044,6 +8296,8 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                             except Exception:
                                 import traceback
                                 traceback.print_exc()
+            except _ArmpitDone:
+                pass
             except Exception:
                 import traceback
                 traceback.print_exc()
@@ -8335,7 +8589,17 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
             k = float(np.clip(v["eye_white"], 0, 1))
             mY = M(job.masks["eyew"], (hY, wY))
             mC = M(job.masks["eyew"], (hC, wC))
-        if "eyew" in job.masks and v["eye_white"] > 1e-4 and EYE_WHITE_V2 > 1e-4:
+        if "eyew" in job.masks and v["eye_white"] > 1e-4 and EYE_WHITE_CLEAN > 1e-4 and job.face is not None:
+            # 흰자 정리 (retouch.eyeclean): spots, stains, veins and the shade beside the iris taken off the white, its tone, shading and grain kept
+            try:
+                from . import eyeclean as EC
+                lmY_ = np.asarray(job.face, np.float32)[:, :2] * y_per_src
+                kk_ = k * float(np.clip(EYE_WHITE_CLEAN, 0, 1)) * float(np.clip(getattr(job, "face_w", 1.0), 0, 1))
+                Y, Cb, Cr = EC.clean_planes(Y, Cb, Cr, lmY_, kk_, EC.MIN_EYE_PX)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+        elif "eyew" in job.masks and v["eye_white"] > 1e-4 and EYE_WHITE_V2 > 1e-4:
             Y, Cb, Cr = _eye_white_apply_v2(Y, Cb, Cr, mY, mC, wf, cs, k)
         elif "eyew" in job.masks and v["eye_white"] > 1e-4:
             # thin red veins: even out locally first
