@@ -85,10 +85,14 @@ def test_wide_mean_on_a_reduced_picture_agrees_with_the_exact_one(monkeypatch):
     assert _peak(fast["dark"], 120, 150) > 0.5 and _peak(fast["line"], 230, 240) > 0.5
 
 
-def test_dip_along_the_mouth_fold_goes_only_when_the_fold_is_to_go():
+def test_dip_along_the_mouth_fold_goes_only_when_the_fold_is_to_go(monkeypatch):
     """2611 cut 011 (j2721): the dip at the mouth's corner is the face's own shade, so the spot finder leaves it; but
-    before 1.19 the blemish step took it, and with 팔자주름·입가주름 asked for the user wants it gone. Then it counts."""
+    before 1.19 the blemish step took it, and with 팔자주름·입가주름 asked for the user wants it gone. Then it counts.
+    (1.26.2: that old spot finder along the folds is off by default, FOLD_ZONE_OLD, as the IWALY work was reviewed: it took the
+    dark nostril and the nose wing too; the fold stages and the last pass take the corner now. Checked here with it switched on.)"""
     from contour.retouch import engine as RE
+    assert RE.FOLD_ZONE_OLD is False
+    monkeypatch.setattr(RE, "FOLD_ZONE_OLD", True)
     from test_detect import _g
     Y0, Cb, Cr, m, xx, yy = _skin(seed=21)
     Y = (Y0 * (1 - 0.13 * _g(xx, yy, 121, 226, 5.5))).astype(np.float32)
