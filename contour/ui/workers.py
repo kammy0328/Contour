@@ -165,6 +165,9 @@ def _release(own: dict) -> None:
                 pass
 
 
+READY_AFTER = 4          # frames of the next cut decoded before playback may go on into it
+
+
 class NextCutPrep:
     """Playback going on into the next cut: that cut is opened in a session of its own on a background thread, its
     first frames decoded and as many results as time allows rendered into that session's playback cache. When the
@@ -200,7 +203,11 @@ class NextCutPrep:
                     self.failed = True
                     return
                 a, b = cut.work_range
-                for t in range(a, min(b, a + head)):          # the originals of the first frames, decoded
+                # (1.26.1) ready after the first few originals, not after 2 s of them: a 4K original decodes at a few
+                # frames a second beside playback, and the end of the cut came before 48 were in (the last frame
+                # stood for seconds). The rest of the head is decoded after, while playback can go on into it.
+                first = min(b, a + min(head, READY_AFTER))
+                for t in range(a, first):
                     if stop.is_set():
                         return
                     sh.frame(t)
@@ -208,6 +215,10 @@ class NextCutPrep:
                     return
                 self.session = sh
                 self.ready = True
+                for t in range(first, min(b, a + head)):
+                    if stop.is_set():
+                        return
+                    sh.frame(t)
                 for t in range(a, b):                          # then results, as far as time allows
                     if stop.is_set():
                         return

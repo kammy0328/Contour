@@ -56,6 +56,49 @@ def ensure_space(path: Path, total: int, what: str) -> None:
             "공간이 넉넉한 드라이브로 바꾸세요.")
 
 
+class _FrameFile:
+    """The frames of a raw uint8 file read with plain reads, not a memory map (1.26.1). A page of a mapped file that
+    cannot be read (a project on a network drive answering late or not at all while a proxy is built over it) is not
+    an error Python can catch: Windows ends the process ('Windows fatal exception: page error', 11/26, the
+    retouch preview reading a matte of a project on Y:). A failed read here raises OSError, which the callers handle.
+    One handle, reads one at a time; dropping the object closes the file (a file in use cannot be replaced on Windows)."""
+
+    def __init__(self, path, shape):
+        import threading
+        self.path = Path(path)
+        self.shape = tuple(int(v) for v in shape)
+        self.nbytes = int(np.prod(self.shape))
+        self._f = None
+        self._lock = threading.Lock()
+
+    def read(self, i: int) -> np.ndarray:
+        a = np.empty(self.shape, np.uint8)
+        with self._lock:
+            if self._f is None:
+                self._f = open(self.path, "rb", buffering=0)
+            self._f.seek(int(i) * self.nbytes)
+            n = self._f.readinto(memoryview(a).cast("B"))
+        if n != self.nbytes:
+            raise OSError(f"{self.path.name}: frame {i}: {n} of {self.nbytes} bytes")
+        return a
+
+    def close(self) -> None:
+        with self._lock:
+            f, self._f = self._f, None
+        if f is not None:
+            try:
+                f.close()
+            except OSError:
+                pass
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+
 class Proxy:
     """A whole cut decoded once into a file. Optional since 1.18: frames come from the original (frames.SourceFrames)
     when there is none; this file only makes repeated access faster."""
@@ -143,7 +186,7 @@ class Proxy:
 
     def open(self) -> None:
         if self._mm is None and self.path.exists():
-            self._mm = np.memmap(self.path, dtype=np.uint8, mode="r", shape=(self.n_file, self.h, self.w, 3))
+            self._mm = _FrameFile(self.path, (self.h, self.w, 3))
 
     def close(self) -> None:
         self._mm = None
@@ -154,11 +197,18 @@ class Proxy:
 
     # ------------------------------------------------------------------ access
     def frame(self, i: int) -> np.ndarray:
-        self.open()
-        if self._mm is None:
-            return np.zeros((self.h, self.w, 3), np.uint8)
         i = int(np.clip(i, 0, self.n - 1)) + self.offset
-        return np.array(self._mm[i])      # copy: never hand out views of the mapping (Windows file locks)
+        for k in range(3):
+            self.open()
+            mm = self._mm
+            if mm is None:
+                break
+            try:
+                return mm.read(i)
+            except (OSError, ValueError):
+                self._mm = None             # (a read that failed: a new handle, then black after three tries)
+                time.sleep(0.05 * (k + 1))
+        return np.zeros((self.h, self.w, 3), np.uint8)
 
     def gray(self, i: int) -> np.ndarray:
         g = self._gray_cache.get(i)
@@ -296,11 +346,18 @@ class MatteStore:
         return np.memmap(self.path, dtype=np.uint8, mode="w+", shape=(self.n, self.h, self.w))
 
     def get(self, i: int) -> Optional[np.ndarray]:
-        if not self.exists():
+        """Frame i, or None (no store, or it could not be read). The file's size is checked when it is opened, not on
+        every frame (two requests per frame to a network drive)."""
+        mm = self._mm
+        if mm is None:
+            if not self.exists():
+                return None
+            mm = self._mm = _FrameFile(self.path, (self.h, self.w))
+        try:
+            return mm.read(int(np.clip(i, 0, self.n - 1)))
+        except (OSError, ValueError):
+            self._mm = None
             return None
-        if self._mm is None:
-            self._mm = np.memmap(self.path, dtype=np.uint8, mode="r", shape=(self.n, self.h, self.w))
-        return np.array(self._mm[int(np.clip(i, 0, self.n - 1))])
 
     def close(self):
         self._mm = None

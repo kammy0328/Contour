@@ -168,6 +168,8 @@ def resolve_task(session, pid: int, t: int = 0, frame_end: Optional[int] = None,
 
 
 class MainWindow(QMainWindow):
+    _open_done = Signal(int, str, object)      # (open sequence, cut id, the session it was opened in): a cut opened on a thread
+
     def __init__(self):
         super().__init__()
         from .thumbs import ThumbCache
@@ -251,7 +253,8 @@ class MainWindow(QMainWindow):
         self.cutlist = CutList(self.session)
         self.cutlist.setMinimumWidth(250)
         self.cutlist.setMaximumWidth(340)
-        self.cutlist.cutSelected.connect(self.open_cut)
+        self._open_done.connect(self._cut_opened_bg)
+        self.cutlist.cutSelected.connect(self._open_cut_clicked)
         self.cutlist.addRequested.connect(self.add_cuts)
         self.cutlist.action.connect(self._cut_action)
         self.cutlist.menuRequested.connect(self._cut_menu)
@@ -293,7 +296,7 @@ class MainWindow(QMainWindow):
         from .tlstrip import TimelineStrip
         from .batchrun import BatchRunner
         self.tlstrip = TimelineStrip(self.session)
-        self.tlstrip.cutSelected.connect(self.open_cut)
+        self.tlstrip.cutSelected.connect(self._open_cut_clicked)
         self.tlstrip.action.connect(self._tl_action)
         self.tlstrip.menuRequested.connect(self._cut_menu)
         self.tlstrip.stateRequested.connect(self._state_menu)
@@ -925,7 +928,12 @@ class MainWindow(QMainWindow):
             self.show_error("저장 실패", f"{e}\n{traceback.format_exc()}")
             return False
         try:
-            self._clear_recovery(Path(self.session.project.path))
+            # the recovery copies go once they are out of date: only when the autosave wrote one since (the search of
+            # every cut's folder for them took seconds on a network drive, on every save)
+            pp = str(self.session.project.path)
+            if getattr(self, "_recovery_at", None) != pp or getattr(self, "_recovery_written", True):
+                self._clear_recovery(Path(pp))
+                self._recovery_at, self._recovery_written = pp, False
             self._collect_learning()
         except Exception:
             traceback.print_exc()
@@ -960,6 +968,7 @@ class MainWindow(QMainWindow):
         try:
             d = Path(prj.path) / "autosave"
             d.mkdir(exist_ok=True)
+            self._recovery_written = True           # (save() clears the recovery copies only after one was written)
             data = {"meta": {"time": time.time(), "cut": cut.id if cut is not None else None, "version": APP_VERSION},
                     "project": prj.to_dict()}
             tmp = d / "recovery.json.tmp"
@@ -1091,12 +1100,27 @@ class MainWindow(QMainWindow):
         self.cutlist.refresh(added[0].id)
         self.open_cut(added[0].id)
 
-    def open_cut(self, cid: str):
+    def _open_cut_clicked(self, cid: str):
+        """A cut picked in the cut list, the timeline strip or with the next / previous cut keys: opened on a thread."""
+        self.open_cut(cid, background=True)
+
+    def open_cut(self, cid: str, background: bool = False):
+        """background (1.26.1, the user: "컷 넘기거나 다른 컷 선택해서 넘어가는데 약간 프리징"): the cut's frames source and its
+        tracks are opened in a session of their own on a thread and taken over when ready (as playback into the
+        next cut does), so the window never stands while a project on a network drive reads them. The cut left is
+        saved only when it has changes (it was written again on every switch: project.json, its backup, the tracks and
+        a search of every cut's folder for recovery files)."""
         prj = self.session.project
         if prj is None:
             return
         cut = prj.cut(cid)
         if cut is None or (self.session.cut is not None and self.session.cut.id == cid and self.session.proxy):
+            if cut is not None and getattr(self, "_opening_cut", None) not in (None, cid):
+                self._open_seq = getattr(self, "_open_seq", 0) + 1      # back on the open cut: the one being opened is dropped
+                self._opening_cut = None
+                self._open_wait(False)
+            return
+        if getattr(self, "_opening_cut", None) == cid:
             return
         if self.job is not None:
             self.toast("진행 중인 작업이 끝난 뒤 컷을 바꿀 수 있습니다.", kind="warn")
@@ -1106,16 +1130,88 @@ class MainWindow(QMainWindow):
             self.toast("일괄 분석 중인 컷입니다. 분석이 끝나면 열 수 있습니다.", kind="warn")
             return
         self.stop_play()
-        if self.session.cut is not None and not self.save():
+        if self.session.cut is not None and self.session.dirty and not self.save():
             # the open cut's tracks and edits are written with the project: never dropped unsaved
             self.toast("저장하지 못해 컷을 바꾸지 않았습니다", kind="error")
             self.cutlist.refresh(self.session.cut.id)
             return
-        self._switch_undo(cut.id)
         self.refresher.cancel()
-        # 1.22.1: no proxy-size question here any more (it came back on every unanalysed cut when closed); the size
-        # is 설정 > 프록시 해상도, and the proxy is made in the background by 설정 > 프록시 만들기
-        self.session.open_cut(cut)
+        sh = self.next_prep.take(cid)             # opened ahead for playback into it: nothing to wait for
+        if sh is not None:
+            self._open_seq = getattr(self, "_open_seq", 0) + 1
+            self._opening_cut = None
+            self._open_wait(False)
+            self._switch_undo(cut.id)
+            self.session.adopt(sh)
+            self._cut_entered(cut)
+            return
+        if not background:
+            self._open_seq = getattr(self, "_open_seq", 0) + 1
+            self._opening_cut = None
+            self._open_wait(False)
+            self._switch_undo(cut.id)
+            # 1.22.1: no proxy-size question here any more (it came back on every unanalysed cut when closed); the size
+            # is 설정 > 프록시 해상도, and the proxy is made in the background by 설정 > 프록시 만들기
+            self.session.open_cut(cut)
+            self._cut_entered(cut)
+            return
+        seq = self._open_seq = getattr(self, "_open_seq", 0) + 1
+        self._opening_cut = cid
+        self.tlstrip.set_current(cut.id)
+        self._open_wait(True, cut.name)
+
+        def work():
+            sh_ = None
+            try:
+                sh_ = EditSession()
+                sh_.project = prj
+                sh_.open_cut(cut)
+            except Exception:
+                traceback.print_exc()
+            self._open_done.emit(seq, cid, sh_)
+        threading.Thread(target=work, name="diap-opencut", daemon=True).start()
+
+    def _cut_opened_bg(self, seq: int, cid: str, sh):
+        """On the UI thread: a cut opened on a thread. Taken over when it is still the one asked for, else closed."""
+        prj = self.session.project
+        cut = prj.cut(cid) if prj is not None else None
+        stale = (seq != getattr(self, "_open_seq", 0) or cut is None or sh is None or sh.project is not prj
+                 or self.job is not None or (sh.cut is not None and sh.cut.id != cid))
+        if stale:
+            if sh is not None:
+                threading.Thread(target=lambda: sh.open_cut(None), name="diap-closecut", daemon=True).start()
+            if seq == getattr(self, "_open_seq", 0):
+                self._opening_cut = None
+                self._open_wait(False)
+            return
+        self._opening_cut = None
+        self._open_wait(False)
+        if self.session.dirty and self.session.cut is not None and self.session.cut.id != cid and not self.save():
+            threading.Thread(target=lambda: sh.open_cut(None), name="diap-closecut", daemon=True).start()
+            self.toast("저장하지 못해 컷을 바꾸지 않았습니다", kind="error")
+            self.cutlist.refresh(self.session.cut.id)
+            return
+        self._switch_undo(cut.id)
+        self.session.adopt(sh)
+        self._cut_entered(cut)
+
+    def _open_wait(self, on: bool, name: str = ""):
+        """While a cut opens on a thread: the cut left stays on screen with a note, and nothing can change it."""
+        for w_ in (self.inspector, self.timeline):
+            try:
+                w_.setEnabled(not on)
+            except Exception:
+                pass
+        if on:
+            self.viewer.message = f"{name} 여는 중…"
+            self.viewer.update()
+        elif self.viewer.message.endswith("여는 중…"):
+            self.viewer.message = ""
+            self.viewer.update()
+
+    def _cut_entered(self, cut):
+        """The rest of opening a cut, on the UI thread, once the session has it."""
+        prj = self.session.project
         self.viewer._img_cache.clear()            # cached pictures are per frame number, not per cut
         if hasattr(self.viewer, "_last_res"):
             self.viewer._last_res = None
@@ -1900,7 +1996,7 @@ class MainWindow(QMainWindow):
             j = i + d
             nxt = ids[j] if 0 <= j < len(ids) else None
         if nxt:
-            self.open_cut(nxt)
+            self.open_cut(nxt, background=True)
             self.cutlist.refresh(nxt)
 
     def _tl_action(self, action: str, ids: list):
