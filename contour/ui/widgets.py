@@ -669,18 +669,22 @@ class FieldRow(QWidget):
 # --------------------------------------------------------------------------- busy overlay
 
 class Spinner(QWidget):
-    """A thin arc that turns and breathes (its length eases in and out). Runs only while visible."""
+    """A small ring for inline waits (saving, a list loading): its head bright, its tail fading out behind it, turning
+    clockwise by the clock (1.26: quick through the middle of a turn, slower at its ends). Runs only while visible."""
+
+    PERIOD = 1.1
 
     def __init__(self, size: int = 18, width: float = 2.0, color: str = "", parent=None):
         super().__init__(parent)
         self.setFixedSize(size, size)
         self._w = width
         self._col = color or C["accent"]
-        self._a = 0.0
+        import time as _time
+        self._clock = _time.perf_counter
+        self._t0 = self._clock()
         self._t = QTimer(self)
         self._t.setInterval(16)
-        self._t.timeout.connect(self._tick)
-        self._n = 0
+        self._t.timeout.connect(self.update)
 
     def showEvent(self, e):
         self._t.start()
@@ -690,23 +694,37 @@ class Spinner(QWidget):
         self._t.stop()
         super().hideEvent(e)
 
-    def _tick(self):
-        self._a = (self._a + 6.0) % 360.0
-        self._n += 1
-        self.update()
-
     def paintEvent(self, e):
         import math
+        from PySide6.QtGui import QBrush, QConicalGradient
+        from .loader import ease_in_out
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         r = QRectF(self._w, self._w, self.width() - 2 * self._w, self.height() - 2 * self._w)
-        p.setPen(QPen(qc("line2"), self._w))
+        p.setPen(QPen(QColor(255, 255, 255, 18), self._w))
         p.drawEllipse(r)
-        span = 70 + 160 * (0.5 - 0.5 * math.cos(self._n * 0.05))
-        pen = QPen(QColor(self._col), self._w)
-        pen.setCapStyle(Qt.RoundCap)
+        k, fr = divmod((self._clock() - self._t0) / self.PERIOD, 1.0)
+        h = (k + 0.25 * fr + 0.75 * ease_in_out(fr)) * 360.0
+        th = (90.0 - h) % 360.0                       # the head (Qt angles: counter-clockwise from 3 o'clock)
+        tail = 200.0 + 60.0 * math.sin(math.pi * fr)
+        g = QConicalGradient(r.center(), th)
+        for i in range(13):
+            c = QColor(self._col)
+            c.setAlphaF((1 - i / 12) ** 1.8)
+            g.setColorAt(i / 12 * tail / 360, c)
+        c = QColor(self._col)
+        c.setAlphaF(0.0)
+        g.setColorAt(min(0.999, tail / 360 + 0.002), c)
+        g.setColorAt(1.0, c)
+        pen = QPen(QBrush(g), self._w)
+        pen.setCapStyle(Qt.FlatCap)
         p.setPen(pen)
-        p.drawArc(r, int(-self._a * 16), int(-span * 16))
+        p.drawArc(r, int(th * 16), int(tail * 16))
+        a = math.radians(th)
+        hp = QPointF(r.center().x() + r.width() / 2 * math.cos(a), r.center().y() - r.height() / 2 * math.sin(a))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(self._col))
+        p.drawEllipse(hp, self._w / 2, self._w / 2)
         p.end()
 
 
@@ -781,44 +799,47 @@ class BusyOverlay(QWidget):
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setObjectName("BusyOverlay")
         # only the overlay itself is dimmed: a bare "background" rule would also paint every child (the button)
-        self.setStyleSheet("QWidget#BusyOverlay { background: rgba(18,18,18,0.82); }")
+        self.setStyleSheet("QWidget#BusyOverlay { background: rgba(10,10,10,0.74); }")
         self._t0 = 0.0
         self._est = 0.0
+        # (1.26) the card of the splash: a dark surface a shade lighter at the top, a hairline edge; the loading line
+        # (loader.LineLoader) sweeps until the work reports how far it is, then fills
         box = QWidget(self)
         box.setObjectName("BusyBox")
-        box.setStyleSheet(f"QWidget#BusyBox {{ background: {C['bg2']}; border: 1px solid {C['line2']}; border-radius: 12px; }}"
-                          "QLabel { background: transparent; }")
+        box.setStyleSheet("QWidget#BusyBox { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #232325, stop:1 #1A1A1B);"
+                          " border: 1px solid rgba(255,255,255,0.08); border-radius: 14px; }"
+                          "QLabel { background: transparent; border: none; }")
         bl = QVBoxLayout(box)
-        bl.setContentsMargins(22, 18, 22, 18)
-        bl.setSpacing(10)
+        bl.setContentsMargins(24, 20, 24, 18)
+        bl.setSpacing(0)
         self.title = QLabel("")
         self.title.setFont(font(14, 600))
-        self.spinner = Spinner(18, 2.0)
         self.msg = QLabel("")
         self.msg.setObjectName("Muted")
         self.msg.setFont(font(12, 400, tabular=True))
-        self.bar = QProgressBar()
+        from .loader import LineLoader
+        self.bar = LineLoader(3)
         self.bar.setRange(0, 1000)
-        self.bar.setFixedHeight(6)
+        self.spinner = self.bar                       # (1.25 and before had a spinner beside the title)
         self.cancel = button("취소", "")
         self.cancel.setMinimumWidth(64)
-        self.cancel.setMinimumHeight(30)
+        self.cancel.setMinimumHeight(28)
         self.cancel.clicked.connect(self.cancelRequested.emit)
         self.eta = QLabel("")
-        self.eta.setFont(font(12, 400, tabular=True))
+        self.eta.setFont(font(11, 400, tabular=True))
         self.eta.setObjectName("Faint")
-        row = QHBoxLayout()
-        row.addWidget(self.msg, 1)
-        row.addWidget(self.cancel)
-        th = QHBoxLayout()
-        th.setSpacing(10)
-        th.addWidget(self.spinner)
-        th.addWidget(self.title, 1)
-        bl.addLayout(th)
+        bl.addWidget(self.title)
+        bl.addSpacing(4)
+        bl.addWidget(self.msg)
+        bl.addSpacing(14)
         bl.addWidget(self.bar)
+        bl.addSpacing(12)
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        row.addWidget(self.eta, 1)
+        row.addWidget(self.cancel)
         bl.addLayout(row)
-        bl.addWidget(self.eta)
-        box.setFixedWidth(420)
+        box.setFixedWidth(440)
         self.box = box
         self.hide()
 
