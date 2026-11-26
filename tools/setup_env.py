@@ -135,6 +135,68 @@ def gpu_step(run=None, gpu=None, runtimes=None, say=None, alt_dir=None) -> str:
         _sh.rmtree(alt, ignore_errors=True)
 
 
+RTX_EP = "onnxruntime-ep-nv-tensorrt-rtx-cu12==0.5.0"      # the version checked (contour/track/backend.py RTX_VERSION)
+
+
+def gpu_name() -> str:
+    """The first NVIDIA GPU's name ('' when nvidia-smi does not answer)."""
+    try:
+        kw = dict(capture_output=True, text=True, timeout=10)
+        if os.name == "nt":
+            kw["creationflags"] = 0x08000000
+        r = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], **kw)
+        return (r.stdout or "").strip().splitlines()[0].strip() if r.returncode == 0 and (r.stdout or "").strip() else ""
+    except Exception:
+        return ""
+
+
+def rtx_devices() -> int:
+    """How many GPUs of this computer NVIDIA's TensorRT for RTX plugin takes (asked in a child process; -1: not installed or
+    it could not be asked)."""
+    code = ("import sys; sys.path.insert(0, %r)\n"
+            "from contour.track import backend as BK\n"
+            "r = BK.rtx()\n"
+            "print('RTX', len(r['devices']) if r.get('state') in ('ok', 'no_device') else -1, r.get('state'), r['why'])") % str(APP)
+    p = subprocess.run([str(PY), "-c", code], capture_output=True, text=True)
+    for ln in (p.stdout or "").splitlines():
+        if ln.startswith("RTX "):
+            try:
+                return int(ln.split()[1])
+            except (ValueError, IndexError):
+                return -1
+    return -1
+
+
+def rtx_step(g: str, run=None, say=None, name=None, devices=None) -> str:
+    """(1.27) NVIDIA's TensorRT for RTX provider beside the CUDA runtime, on a computer whose GPU it runs on (RTX 30 series and
+    later): SAM 3.1's encoder, 42 % of an analysis, runs six times faster on it. A plugin of the runtime, about 115 MB to download;
+    nothing depends on it: no GPU for it, no connection, an install that fails all leave the app on CUDA as before. Returns
+    'on' | 'off' | 'none' (not for this computer)."""
+    run = run or globals()["run"]
+    say = say or globals()["say"]
+    name = gpu_name() if name is None else name
+    devices = devices or rtx_devices
+    if g != "CUDA" or "RTX" not in name.upper():
+        return "none"
+    n = devices()
+    if n > 0:
+        return "on"
+    if n == 0:
+        # installed before, and this GPU is not one it takes: its 280 MB are of no use here
+        run([PY, "-m", "pip", "uninstall", "-y", RTX_EP.split("==")[0]])
+        return "none"
+    say(f"[3/5] {name}: TensorRT RTX 가속 구성요소 설치 (약 115MB)")
+    if run([PY, "-m", "pip", "install", "--no-warn-script-location", "--no-deps", RTX_EP]) != 0:
+        say("[3/5] TensorRT RTX 구성요소를 받지 못했습니다. CUDA로 실행합니다 (설치 파일을 다시 실행하면 다시 시도합니다)")
+        return "off"
+    n = devices()
+    if n > 0:
+        return "on"
+    say("[3/5] 이 GPU는 TensorRT RTX 대상이 아니어서 구성요소를 다시 지웁니다 (CUDA로 실행)")
+    run([PY, "-m", "pip", "uninstall", "-y", RTX_EP.split("==")[0]])
+    return "none"
+
+
 def ffmpeg_found() -> bool:
     # in a child process: the packages were installed after this one started (its import caches miss them)
     code = ("import sys; sys.path.insert(0, %r); from contour.core import media as M; "
@@ -200,6 +262,12 @@ def main():
     if not ci:
         g = gpu_step()
         say(f"[3/5] 추론 장치: {g}")
+        try:
+            r = rtx_step(g)
+            if r != "none":
+                say("[3/5] TensorRT RTX 가속: " + ("사용" if r == "on" else "쓰지 않음"))
+        except Exception as e:
+            say(f"[3/5] TensorRT RTX 확인 실패 ({e}): CUDA로 실행합니다")
 
     # 4. ffmpeg: packed into the installer ({app}\ffmpeg\bin); only checked here
     try:

@@ -110,6 +110,19 @@ def preview_rgb(planes, pf: str, maxv: float, width: int = 480) -> np.ndarray:
     return (np.clip(rgb, 0, 1) * 255 + 0.5).astype(np.uint8)
 
 
+def pace_text(done: int, total: int, elapsed: float) -> str:
+    """"12/40 · 프레임당 9.4초 · 남은 시간 4분 23초": where a render is, its pace and what is left. Frames a second when
+    it is that fast; seconds a frame when a frame takes a second or more (a 4K frame with four faces takes nine: the
+    line said "0.1 fps" from the first frame to the last), and hours when it is that long."""
+    if done <= 0 or elapsed <= 0:
+        return f"{max(0, done)}/{total}"          # nothing to tell a pace from yet
+    fps = done / max(elapsed, 1e-3)
+    eta = max(0, total - done) / max(fps, 1e-3)
+    pace = f"{fps:.1f} fps" if fps >= 1.0 else f"프레임당 {1.0 / max(fps, 1e-6):.1f}초"
+    left = f"{int(eta // 3600)}시간 {int(eta % 3600 // 60)}분" if eta >= 3600 else f"{int(eta // 60)}분 {int(eta % 60)}초"
+    return f"{done}/{total} · {pace} · 남은 시간 {left}"
+
+
 def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progress: Progress = None,
                cancel: Optional[Callable[[], bool]] = None, ext_writer=None,
                preview: Optional[Callable[[int, np.ndarray], None]] = None) -> RenderReport:
@@ -299,12 +312,14 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
     import threading
     from collections import deque
     from concurrent.futures import ThreadPoolExecutor
+    from ..core import perf as PF
     parallel = not out.matte_person
     n_workers = max(1, min(4, (os.cpu_count() or 2) // 2)) if parallel else 1
     if parallel and os.environ.get("CONTOUR_RENDER_THREADS", "").isdigit():
         n_workers = max(1, int(os.environ["CONTOUR_RENDER_THREADS"]))
     prep_lock = threading.Lock()
     warper = [None, False]                 # GPU warper (None = CPU), decided
+    gate = PF.FrameGate(n_workers if parallel else 1, people=sum(1 for p_ in cut.targets()) or 1, megapixels=W * H / 1e6)
 
     def do_warp(planes_, fr_):
         if warper[0] is not None:
@@ -325,6 +340,10 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
     # (CONTOUR_RAW_PROCS): retouch.rawpool. What a frame gets is the same; a frame no helper made is made here as before.
     from ..retouch import rawpool as RP
     raw_pool = RP.start_for_render(project, cut, tracker, a, b)
+    # (1.27) without helper processes: the next frames' own masks made ahead in threads of this process, where the computer has
+    # the memory and the cores (retouch.rawahead, core.perf.raw_ahead). The same masks; the serial stage waits on them less.
+    from ..retouch import rawahead as RA
+    raw_ahead = RA.start_for_render(cut, tracker, a, b) if raw_pool is None else None
 
     # the retouch of each frame done in helper processes when the environment asks for them (CONTOUR_APPLY_PROCS): retouch.applypool
     from ..retouch import applypool as AP
@@ -338,6 +357,13 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
                 rep.accel = (rep.accel + " · " if rep.accel else "") + f"보정 도우미 {sa_.get('helpers')}개 ({sa_.get('done')}/{sa_.get('done', 0) + sa_.get('local', 0)})"
             except Exception:
                 pass
+        if raw_ahead is not None:
+            sr_ = RA.stop_for_render(tracker)
+            if sr_ is not None:
+                try:
+                    rep.raw_ahead = sr_
+                except Exception:
+                    pass
         st_ = RP.stop_for_render(tracker) if raw_pool is not None else None
         if st_ is not None:
             try:
@@ -347,6 +373,10 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
             rep.accel = (rep.accel + " · " if rep.accel else "") + f"준비 도우미 {st_.get('helpers')}개 ({st_.get('taken')}/{st_.get('taken', 0) + st_.get('local', 0)})"
 
     def process(t_, planes_):
+        with gate.frame(t_):
+            return _process(t_, planes_)
+
+    def _process(t_, planes_):
         if knee_look is not None:
             rf_, fi_ = knee_look.get(t_)
         else:
@@ -354,10 +384,17 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
                 rf_ = RE.prepare(cut, tracker, t_)
                 fi_ = F.build_input(cut, tracker, t_)
         if rf_ is not None and not rf_.empty():
-            res_ = apply_pool.apply(t_, planes_, rf_) if apply_pool is not None else None
-            if res_ is None:
-                RE.masks_f32(rf_)
-                res_ = RE.apply_planes(planes_, subs, maxv, pf, rf_, 1.0, disp_, info.color_range)
+            # (1.27) how many frames are retouched at once goes by the memory the computer has left (perf.FrameGate): told
+            # here whether the whole frame is worked on (a body effect) or the people's pieces
+            try:
+                gate.hint(any(RE.roi_job_ok(j_) is not True for j_ in rf_.jobs))
+            except Exception:
+                gate.hint(True)
+            with gate.apply(t_):
+                res_ = apply_pool.apply(t_, planes_, rf_) if apply_pool is not None else None
+                if res_ is None:
+                    RE.masks_f32(rf_)
+                    res_ = RE.apply_planes(planes_, subs, maxv, pf, rf_, 1.0, disp_, info.color_range)
             planes_ = res_
         fr_ = F.compute_field(fi_, W, H, grid_step)
         if not warper[1] and not fr_.empty():
@@ -395,10 +432,8 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
             _write_matte(matte_writers["warp"], wm, is_exr, seq_offset + t_)
         rep.frames += 1
         if progress:
-            el = time.time() - t_start
-            fps = rep.frames / max(el, 1e-3)
-            eta = (n - rep.frames) / max(fps, 1e-3)
-            progress(rep.frames / max(1, n), f"렌더 {rep.frames}/{n} · {fps:.1f} fps · 남은 시간 {int(eta // 60)}분 {int(eta % 60)}초")
+            note_ = gate.summary()              # (said while it renders too: why this render takes fewer frames at once than the computer's cores allow)
+            progress(rep.frames / max(1, n), "렌더 " + pace_text(rep.frames, n, time.time() - t_start) + (" · " + note_ if note_ else ""))
 
     if parallel and n_workers > 1:
         pool = ThreadPoolExecutor(max_workers=n_workers)
@@ -428,6 +463,7 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
             if knee_look is not None:
                 knee_look.stop()
             stop_raw()
+            gate.close()
             pool.shutdown(wait=False, cancel_futures=True)
             reader.close()
             if writer and ext_writer is None:
@@ -438,6 +474,7 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
         if knee_look is not None:
             knee_look.stop()
         pool.shutdown(wait=True, cancel_futures=True)
+        gate.close()
         a_range = range(0)
     else:
         a_range = range(a, b)
@@ -499,6 +536,8 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
     rep.seconds = time.time() - t_start
     if parallel and n_workers > 1:
         rep.accel = (rep.accel + " · " if rep.accel else "") + f"프레임 {n_workers}개 동시 처리"
+        if gate.summary():
+            rep.accel += " (" + gate.summary() + ")"
     return rep
 
 

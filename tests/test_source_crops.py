@@ -171,3 +171,61 @@ def test_two_regions_are_read_side_by_side(vids, monkeypatch):
     procs = [r[0]._proc for r in sc._readers.values()]
     sc.close()
     assert all(pr.poll() is not None for pr in procs) and not sc._readers
+
+
+def test_pool_floor_keeps_the_newest_frames_of_a_kind_and_lets_go_when_told():
+    """1.27: a kind of frames with a floor keeps its newest frames whatever the limit says (the whole frames of an 8K source:
+    the limit holds three); other frames go first; unfloor makes them ordinary again."""
+    from contour.core.frames import FramePool
+    fr = lambda: np.zeros((10, 10, 10), np.uint8)             # 1000 bytes
+    p = FramePool(2500)
+    for i in range(8):
+        p.put(("src", "whole", i), fr(), floor=5)
+        p.put(("view", i), fr())                               # the viewer's frames of the same cut: no floor
+    assert [i for i in range(8) if p.get(("src", "whole", i)) is not None] == [3, 4, 5, 6, 7]
+    assert sum(p.get(("view", i)) is not None for i in range(8)) == 0 and p.bytes == 5000      # over the limit by the floor alone
+    p.put(("other", "whole", 0), fr())                         # no floor of its own: it is what goes
+    assert p.get(("other", "whole", 0)) is not None or p.bytes == 5000
+    p.unfloor(("src", "whole"))
+    assert p.bytes <= 2500 and p.get(("src", "whole", 7)) is not None
+    q = FramePool(2500)
+    for i in range(8):
+        q.put(("src", "whole", i), fr())                       # as before 1.27: the limit alone
+    assert q.bytes <= 2500
+
+
+def test_whole_frames_stay_while_people_of_several_frames_are_cut_from_them(vids, monkeypatch):
+    """A pool too small for the whole frames (an 8K source in the default pool): three frames worked on side by side, each by
+    several people, still read once each by one reader; closing the source lets the frames go."""
+    import threading
+    from contour.core import frames as FR, media as MD
+    from contour.core.colour import PASSTHROUGH, ViewSettings, manager
+    info = MD.probe(str(vids["prores"]))
+    vs = ViewSettings(input_cs=PASSTHROUGH)
+    small = FR.FramePool(int(info.width * info.height * 6 * 1.5))        # room for one whole frame and a half
+    monkeypatch.setattr(FR, "_pool", small)
+    sc = FR.SourceCrops(info, manager(), vs)
+    boxes = [(4, 4, 60, 60), (230, 150, 300, 230), (100, 60, 200, 180)]
+    full = [_full(info, i, manager(), vs) for i in range(6)]
+    got, errs = {}, []
+
+    def one(k, i):
+        try:
+            got[(k, i)] = sc.piece(i, boxes[k])
+        except Exception as e:                      # pragma: no cover
+            errs.append(e)
+    for i0 in (0, 3):                                           # frames 0..2 side by side, then 3..5
+        one(0, i0)                                              # (the render's own frame is asked first, the ones ahead after it)
+        ths = [threading.Thread(target=one, args=(k, i)) for i in (i0 + 2, i0, i0 + 1) for k in range(3)]
+        for th in ths:
+            th.start()
+        for th in ths:
+            th.join(60)
+    assert not errs, errs
+    for (k, i), a in got.items():
+        b = boxes[k]
+        assert np.array_equal(a, full[i][b[1]:b[3], b[0]:b[2]]), (k, i)
+    assert sc.seeks == 1                                        # never back for a frame that had been dropped
+    assert small.bytes > small.limit
+    sc.close()
+    assert small.bytes <= small.limit

@@ -422,7 +422,12 @@ def occlusion_fade(store: TrackStore, frame_range: Tuple[int, int], min_size: fl
     P = store.face.shape[0]
     for p in range(P):
         det = np.nan_to_num(yn[p, :, 0, 2]) > 0
-        sc = np.where(np.isfinite(f106[p, :, :, 2]).all(1), np.nanmean(f106[p, :, 27:68, 2], 1), np.nan)
+        # the mean score of the frames whose landmarks are all there (only those are averaged: a frame without any
+        # made numpy warn "Mean of empty slice" into the log at every analysis; the values are the same)
+        okf = np.isfinite(f106[p, :, :, 2]).all(1)
+        sc = np.full(len(okf), np.nan, f106.dtype)
+        if okf.any():
+            sc[okf] = np.nanmean(f106[p][okf][:, 27:68, 2], 1)
         typ = sc[det & np.isfinite(sc)]
         if len(typ) < 3:
             continue

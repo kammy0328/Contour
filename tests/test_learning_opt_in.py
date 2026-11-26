@@ -195,7 +195,13 @@ def test_an_older_project_is_told_once_and_the_caches_it_needs_are_used(win, qap
     monkeypatch.setattr(ID, "refit", lambda *a, **k: ran.append("identity-refit"))
     monkeypatch.setattr(win.models_page, "train", lambda *a, **k: ran.append("train"))
     assert win.models_page.maybe_self_train() is False
+
+    def relinked():                              # (1.27) the linking is worked out on a thread: until it is done and put in
+        import threading
+        assert until(lambda: not [t for t in threading.enumerate() if t.name == "diap-relink" and t.is_alive()])
+        qapp.processEvents()
     win._relink(quiet=True)
+    relinked()
     assert ran == []
     # opened again: not told twice; the file still says what it said
     win.toasts.clear()
@@ -205,4 +211,5 @@ def test_an_older_project_is_told_once_and_the_caches_it_needs_are_used(win, qap
     win.session.project.set_learn(True)
     assert win._learn_allowed()
     win._relink(quiet=True)
+    relinked()
     assert "identity-refit" in ran

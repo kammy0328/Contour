@@ -490,7 +490,8 @@ def _borrowed(st, t, pr, insts, assigned, merged, sx, sy, use_final, W: int, H: 
 
 def decode_frame(seg, rgb, st, t: int, sx: float, sy: float, W: int, H: int, mw: int, mh: int,
                  use_final: bool, finder=None, heads: Optional[dict] = None, info: Optional[dict] = None,
-                 repose: Optional[Callable] = None, cancel_check: Optional[Callable] = None) -> Tuple[dict, List[np.ndarray]]:
+                 repose: Optional[Callable] = None, cancel_check: Optional[Callable] = None,
+                 full: Optional[dict] = None) -> Tuple[dict, List[np.ndarray]]:
     """Everybody on frame t: (pid -> dict(p, bx, pos, neg, canvas (matte size mask logits), src), extra).
 
     With `finder` (SAM 3.1's "person" finder): the frame is first split into the people in it, each a mask of their
@@ -502,14 +503,18 @@ def decode_frame(seg, rgb, st, t: int, sx: float, sy: float, W: int, H: int, mw:
 
     info (a dict, filled when given): "repose": [(pid, p, record)] tracks that carried someone else's skeleton and
     now have the instance their own box is on (the caller re-estimates their pose there); "extras": [record] the
-    people nobody tracks, tall enough and not a part of a tracked person."""
+    people nobody tracks, tall enough and not a part of a tracked person.
+
+    full: seg.encode(rgb) when the caller has it already (1.27: run() has the whole frame encoded ahead, beside the
+    work on the frame before)."""
     pr = prompts(st, t, sx, sy, W, H, use_final)
     dec, extra = {}, []
     if not pr:
         return dec, extra
     _check = cancel_check or (lambda: None)
     _check()
-    full = seg.encode(rgb)
+    if full is None:
+        full = seg.encode(rgb)
     _check()
     insts = []
     if finder is not None:
@@ -713,13 +718,40 @@ def run(st, proxy, matte, seglab, a: int, b: int, seg_key: str, use_final: bool,
         for t in range(a, min(b, a + 4)):
             matter(cv2.resize(analysis_view(np.asarray(proxy.frame(t))), (mw, mh), interpolation=cv2.INTER_AREA))
         matter.reset()
+    # (1.27) the frames read, and the whole frame encoded where it has people to cut out, a few ahead in a thread of
+    # their own (track/ahead.py): the frame's own work (finder, close-ups, clicks, the matte) no longer waits for the
+    # next frame's decoding and encoding, nor they for it. The same frame, the same encoding: LNGSHOT 024, 30 frames,
+    # 1.21 -> 1.00 s a frame on CUDA with every matte and label the same (j2885a).
+    def _whole(t_, rgb_):
+        try:
+            if not prompts(st, t_, sx, sy, W, H, use_final):
+                return None
+        except Exception:
+            return None                     # the pass asks itself and meets what there is to meet
+        return seg.encode(rgb_)
+
+    from .ahead import FramesAhead
+    reader = FramesAhead(proxy, a, b, extra=_whole)
+    # ... and the last thing done with a frame, the masks put together into the matte and its labels and written (a quarter
+    # to a third of a second of blurs and morphology at matte size), in a thread behind the pass while it goes on with the
+    # next frame. One frame after the other there, in the pass's order; an error there is met by the pass.
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+    finisher = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sam-finish") if reader.n > 0 else None
+    behind: "deque" = deque()
+
+    def _finish(t_, logits_, rvm_, heads_, extra_):
+        al_, lb_ = combine(logits_, rvm_, (mh, mw), heads_, extra_)
+        mm[t_] = al_
+        lm[t_] = lb_
+
     try:
         for t in range(a, b):
             if cancel and cancel():
                 from .analyze import Cancelled
                 raise Cancelled()           # not "break": the caller went on with the rest of the analysis
             # dark or colour-lit frames: what SAM and RVM see only (never the output)
-            rgb = analysis_view(np.asarray(proxy.frame(t)))
+            rgb, full_ = reader.get(t)
             rvm = None
             small = cv2.resize(rgb, (mw, mh), interpolation=cv2.INTER_AREA)
             if matter is not None:
@@ -731,7 +763,7 @@ def run(st, proxy, matte, seglab, a: int, b: int, seg_key: str, use_final: bool,
                     from .analyze import Cancelled
                     raise Cancelled()
             dec, extra = decode_frame(seg, rgb, st, t, sx, sy, W, H, mw, mh, use_final, finder, heads, info,
-                                      repose if finder is not None else None, cancel_check=_chk)
+                                      repose if finder is not None else None, cancel_check=_chk, full=full_)
             if info and info.get("repose"):
                 heads = head_priors(st, t, mw, mh, W, H, sx, sy, use_final)
                 if collect is not None:
@@ -748,15 +780,23 @@ def run(st, proxy, matte, seglab, a: int, b: int, seg_key: str, use_final: bool,
                 if collect is not None:
                     collect.setdefault("src", {})[t] = fr
                     collect.setdefault("extras", {})[t] = list((info or {}).get("extras", []))
-            al, lb = combine(logits, rvm, (mh, mw), heads, extra)
-            mm[t] = al
-            lm[t] = lb
+            if finisher is not None:
+                behind.append(finisher.submit(_finish, t, logits, rvm, heads, extra))
+                while behind and (len(behind) > 2 or behind[0].done()):
+                    behind.popleft().result()
+            else:
+                _finish(t, logits, rvm, heads, extra)
             if progress:
                 progress((t - a + 1) / max(1, b - a), f"SAM 인물 분할 {t - a + 1}/{b - a}")
+        while behind:
+            behind.popleft().result()
     finally:
+        reader.close()
+        if finisher is not None:
+            finisher.shutdown(wait=True, cancel_futures=True)     # (nothing written after the pass has ended)
         mm.flush()
         lm.flush()
-        del mm, lm
+        mm = lm = None                      # the maps let go before the files are closed (_finish, done by now, names them too)
         matte.close()
         seglab.close()
     return stats

@@ -241,10 +241,8 @@ def render_timeline(project: Project, exp: TimelineExport, progress: Callable = 
         if f <= shown[0] and not force:
             return
         shown[0] = max(shown[0], f)
-        el = time.time() - t0
-        fps = done[0] / max(el, 1e-3)
-        eta = max(0, total - done[0]) / max(fps, 1e-3)
-        progress(shown[0], f"{msg[0]} · {done[0]}/{total} · {fps:.1f} fps · 남은 시간 {int(eta // 60)}분 {int(eta % 60)}초")
+        from .render import pace_text
+        progress(shown[0], f"{msg[0]} · " + pace_text(min(done[0], total), total, time.time() - t0))
 
     def tick():
         # one per frame the encoder took (every mode, every kind of shot): the bar only goes up and ends at 100 %

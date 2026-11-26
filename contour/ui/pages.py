@@ -248,12 +248,18 @@ class RenderQueuePage(QWidget):
         self.now_bar.setRange(0, 1000)
         self.now_bar.setTextVisible(False)
         self.now_bar.setFixedHeight(8)
+        # (1.27) the bar's own track is the card's colour: how far there is to go could not be seen
+        self.now_bar.setStyleSheet(f"QProgressBar {{ background: {C['bg0'] if 'bg0' in C else '#000'}; border-radius: 4px; }}"
+                                   f"QProgressBar::chunk {{ border-radius: 4px; }}")
         self.now_msg = Wd.label("", "Faint", 12)
         for w in (self.now_title, self.now_fmt, self.now_path):
             v.addWidget(w)
         v.addStretch(1)
         v.addWidget(self.now_bar)
         v.addWidget(self.now_msg)
+        # (1.27) what the render does side by side on this computer, while it runs (it was told only when it was done)
+        self.now_perf = Wd.label("", "Faint", 11)
+        v.addWidget(self.now_perf)
         h.addLayout(v, 1)
         return f
 
@@ -266,6 +272,7 @@ class RenderQueuePage(QWidget):
             self.now_path.setText("")
             self.now_bar.setValue(0)
             self.now_msg.setText("")
+            self.now_perf.setText("")
             self.now_img.setPixmap(QPixmap())
             return
         no = f"{it.cut_no} · " if it.cut_no else ""
@@ -275,9 +282,17 @@ class RenderQueuePage(QWidget):
         self.now_path.setText(self._out_label(it)[0])
         self.now_bar.setValue(int(it.progress * 1000))
         self.now_msg.setText(it.message)
+        self.now_perf.setText(self._perf_line() if it.kind != "timeline" else "")
         pm = self._thumbs.get(it.id)
         if pm is not None:
             self.now_img.setPixmap(pm.scaled(320, 180, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def _perf_line(self) -> str:
+        try:
+            from ..core import perf
+            return "속도 설정 · " + perf.summary()
+        except Exception:
+            return ""
 
     def _on_preview(self, iid: str, frame: int, rgb):
         from .viewer import np_to_qimage

@@ -12,6 +12,7 @@ DIAP runs these programs and models. The models are downloaded on first use (설
 | Python, NumPy, SciPy, OpenCV, OpenColorIO, ONNX Runtime, ONNX | the app itself | PSF, BSD-3-Clause, Apache-2.0, MIT (each package's own files) |
 | PySide6 (Qt) | the window | LGPL-3.0 |
 | PyTorch, torchvision (installed with the learning features) | GPU retouch steps, learning | BSD-3-Clause |
+| NVIDIA TensorRT for RTX execution provider for ONNX Runtime (`onnxruntime-ep-nv-tensorrt-rtx-cu12`, put in by the installer only on a computer with an RTX 30 series or later GPU; not shipped with DIAP) | running SAM 3.1's image encoder faster on those GPUs | the plugin: Apache-2.0; the TensorRT for RTX runtime inside it: NVIDIA Software License Agreement for TensorRT-RTX (its text is in the package's folder; redistribution only as that licence allows, so DIAP downloads it from PyPI on the user's computer instead of carrying a copy) |
 
 ## Models used by default
 

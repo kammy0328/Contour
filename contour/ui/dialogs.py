@@ -184,6 +184,28 @@ class SettingsDialog(QDialog):
         gl_.addWidget(self.gpu, 1)
         gl_.addWidget(diag)
         form.addRow("추론 장치", grow)
+        # (1.27) TensorRT for RTX beside CUDA, for the models checked on it (track/backend.py RTX_OK); nothing of it on a Mac
+        self.rtx = QCheckBox("TensorRT RTX 가속")
+        self.rtx.setChecked(str(getattr(s, "rtx", "off") or "off") == "auto")
+        self.rtx.setToolTip("켜면 RTX 30 시리즈 이상에서 SAM 인물 분할의 인코더를 TensorRT RTX로 실행합니다: 분석이 컷당 15~20% 더 빨라지고 "
+                            "GPU 메모리를 덜 씁니다 (기본은 꺼짐). 추론 장치가 자동 또는 CUDA일 때만 쓰고, 쓰지 못하면 CUDA로 실행하며 사유는 진단에 적습니다.\n"
+                            "매트는 CUDA와 거의 같지만(사람 영역 일치 99.95% 이상) 완전히 같지는 않아서, 화면 가장자리의 얼굴이나 가려진 관절처럼 "
+                            "애매한 곳의 분석 결과가 달라질 수 있습니다. GPU나 드라이버가 바뀐 뒤 처음 한 번은 준비하느라 10~15초 더 걸립니다.")
+        try:
+            from ..track import backend as _BK
+            rtx_txt = _BK.rtx_brief()
+        except Exception:
+            rtx_txt = ""
+        self.rtx_info = Wd.label(rtx_txt, "Faint", 11)
+        rrow = QWidget()
+        rl_ = QHBoxLayout(rrow)
+        rl_.setContentsMargins(0, 0, 0, 0)
+        rl_.addWidget(self.rtx)
+        rl_.addWidget(self.rtx_info, 1)
+        self.gpu.currentIndexChanged.connect(lambda *_: self.rtx.setEnabled(self.gpu.currentData() in ("auto", "cuda")))
+        self.rtx.setEnabled(self.gpu.currentData() in ("auto", "cuda"))
+        if _sys.platform == "win32" or _sys.platform.startswith("linux"):
+            form.addRow("", rrow)
         mb = QPushButton("모델 관리…")
         mb.setToolTip("작업별로 필요한 모델과 이 컴퓨터에 있는 모델, 모델 패키지 가져오기(인터넷 없이 폴더·zip에서)")
         mb.clicked.connect(self._models)
@@ -353,6 +375,14 @@ class SettingsDialog(QDialog):
             s.gpu = self.gpu.currentData()
             from ..track.models import reset_providers
             reset_providers()
+        rtx = "auto" if self.rtx.isChecked() else "off"
+        if str(getattr(s, "rtx", "off") or "off") != rtx:
+            s.rtx = rtx
+            try:                                 # the sessions kept between uses were opened by the choice before
+                from ..track import models as _M
+                _M._drop_kept()
+            except Exception:
+                pass
         s.save()
         configure_ffmpeg()
         manager(BUILTIN_STUDIO)

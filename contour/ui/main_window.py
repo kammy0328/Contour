@@ -169,6 +169,7 @@ def resolve_task(session, pid: int, t: int = 0, frame_end: Optional[int] = None,
 
 class MainWindow(QMainWindow):
     _open_done = Signal(int, str, object)      # (open sequence, cut id, the session it was opened in): a cut opened on a thread
+    _relinked = Signal(int, object, str)       # (relink sequence, (project, snapshot, plan, quiet), error): people linked on a thread
 
     def __init__(self):
         super().__init__()
@@ -254,6 +255,7 @@ class MainWindow(QMainWindow):
         self.cutlist.setMinimumWidth(250)
         self.cutlist.setMaximumWidth(340)
         self._open_done.connect(self._cut_opened_bg)
+        self._relinked.connect(self._relink_done)
         self.cutlist.cutSelected.connect(self._open_cut_clicked)
         self.cutlist.addRequested.connect(self.add_cuts)
         self.cutlist.action.connect(self._cut_action)
@@ -1527,8 +1529,24 @@ class MainWindow(QMainWindow):
             m.addSeparator()
             acts[m.addAction("이름 바꾸기")] = "rename"
             acts[m.addAction("원본 파일 위치 열기")] = "reveal"
+        # (1.27) the cut's pictures from another file of the same shot (a cleaned plate, a new export): the analysis and the values stay
+        m.addSeparator()
+        if n == 1:
+            a = m.addAction("소스 교체 (Replace)…")
+            a.setToolTip("이 컷의 영상을 같은 샷의 다른 파일(클리닝본, 새 출력본)로 바꿉니다. 분석과 보정 값은 그대로 남습니다")
+            acts[a] = "replace"
+        a = m.addAction("폴더에서 소스 교체…" + tag)
+        a.setToolTip("폴더에서 타임코드가 맞는 파일을 찾아 선택한 컷의 영상을 바꿉니다. 맞는 파일이 없는 컷은 그대로 둡니다")
+        acts[a] = "replace_folder"
+        if n == 1:
+            from ..core import replace as RPL
+            if RPL.can_undo(c0):
+                was_ = Path(str((c0.replaced.get("info") or {}).get("path", "") or c0.replaced.get("source", ""))).name
+                acts[m.addAction(f"교체 전 소스로 되돌리기 ({was_})")] = "replace_back"
             if not c0.tl:
+                m.addSeparator()
                 acts[m.addAction("프로젝트에서 제거")] = "remove"
+        m.setToolTipsVisible(True)
         a = m.exec(gpos)
         if a not in acts:
             return
@@ -1576,8 +1594,127 @@ class MainWindow(QMainWindow):
             self.toast(f"{n}컷을 렌더 목록에 추가했습니다.")
         elif act.startswith("reviewed:"):
             self._tl_action(act, [c.id for c in cuts])
+        elif act == "replace":
+            self.replace_cut_source(c0.id)
+        elif act == "replace_folder":
+            self.replace_cut_sources_from_folder([c.id for c in cuts])
+        elif act == "replace_back":
+            self.replace_cut_source_back(c0.id)
         else:
             self._cut_action(act, c0.id)
+
+    # ---- (1.27) 소스 교체: a cut's pictures from another file of the same shot; what was analysed and every value stay (core/replace.py)
+    def _replace_ready(self) -> bool:
+        why = self._busy_with()
+        if why:
+            self.toast("소스 교체: " + why, kind="warn")
+            return False
+        return True
+
+    def _replace_done(self, cuts: list) -> None:
+        """After cuts' sources changed: saved, the open cut read again from its new file, lists and thumbnails."""
+        prj = self.session.project
+        cur = self.session.cut
+        self.session.dirty = True
+        if cur is not None and any(c is cur for c in cuts):
+            if not self._reopen_cut():                 # (saves first)
+                prj.save()
+        else:
+            prj.save()
+            self.session.dirty = False
+        for c in cuts:
+            try:
+                self.thumbcache.refresh(c.id, front=False)
+            except Exception:
+                pass
+        self.cutlist.update_rows()
+        try:
+            self.tlstrip.refresh()
+            self.tlstrip.set_current(cur.id if cur is not None else None)
+        except Exception:
+            pass
+
+    def replace_cut_source(self, cid: str, path: str = "", ask: bool = True) -> bool:
+        """The cut's pictures from another file (the dialog when no path is given). True when it was replaced."""
+        from ..core import replace as RPL
+        prj = self.session.project
+        cut = prj.cut(cid) if prj is not None else None
+        if cut is None or not self._replace_ready():
+            return False
+        if not path:
+            start = str(getattr(self, "_replace_dir", "") or Path(str(cut.info.path)).parent)
+            path, _ = QFileDialog.getOpenFileName(self, f"소스 교체: {cut.name}", start, "영상 (*.mov *.mp4 *.mxf *.mkv *.avi *.m4v);;모든 파일 (*)")
+            if not path:
+                return False
+        self._replace_dir = str(Path(path).parent)
+        r = RPL.check(cut, path)
+        if not r["ok"]:
+            if ask:
+                QMessageBox.warning(self, "소스 교체", f"'{cut.name}'의 소스를 바꾸지 못했습니다.\n\n{r['why']}")
+            else:
+                self.toast(f"{cut.name}: {r['why']}", kind="warn")
+            return False
+        if ask:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                sim = RPL.similarity(cut, r["info"])
+            finally:
+                QApplication.restoreOverrideCursor()
+            if sim is not None and sim < RPL.SIM_WARN:
+                if QMessageBox.question(self, "소스 교체", f"새 파일의 화면이 '{cut.name}'과(와) 많이 다릅니다 (일치도 {max(0.0, sim) * 100:.0f}%).\n"
+                                        "다른 샷이면 분석(추적, 매트)이 맞지 않습니다. 그래도 교체할까요?",
+                                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+                    return False
+        RPL.apply(prj, cut, r["info"], r["how"])
+        self._replace_done([cut])
+        self.toast(f"{cut.name}: 소스를 {Path(path).name}(으)로 교체했습니다 ({r['how']}로 맞춤, {cut.info.frames}프레임). 분석과 보정 값은 그대로입니다", "ok")
+        return True
+
+    def replace_cut_sources_from_folder(self, ids: list, folder: str = "") -> int:
+        """Every listed cut whose frames a file of the folder holds by timecode reads from that file. Returns how many."""
+        from ..core import replace as RPL
+        prj = self.session.project
+        cuts = [c for c in (prj.cut(i) for i in ids) if c is not None] if prj is not None else []
+        if not cuts or not self._replace_ready():
+            return 0
+        if not folder:
+            start = str(getattr(self, "_replace_dir", "") or Path(str(cuts[0].info.path)).parent)
+            folder = QFileDialog.getExistingDirectory(self, f"소스 교체: 파일이 있는 폴더 ({len(cuts)}컷)", start)
+            if not folder:
+                return 0
+        self._replace_dir = str(folder)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            res = RPL.find_in_folder(cuts, folder)
+        finally:
+            QApplication.restoreOverrideCursor()
+        hit = [r for r in res if r["ok"]]
+        if not hit:
+            QMessageBox.information(self, "소스 교체", "폴더에서 선택한 컷과 타임코드가 맞는 파일을 찾지 못했습니다.\n\n"
+                                    + "\n".join(f"{r['cut'].name}: {r['why']}" for r in res[:8]) + ("\n…" if len(res) > 8 else ""))
+            return 0
+        lines = [f"{r['cut'].name}  ←  {Path(r['file']).name}" + (f"  (같은 구간의 파일 {len(r['others']) + 1}개 중 가장 새 것)" if r.get("others") else "") for r in hit]
+        miss = len(res) - len(hit)
+        if QMessageBox.question(self, "소스 교체", f"{len(hit)}컷의 소스를 교체합니다 (타임코드로 맞춤). 분석과 보정 값은 그대로 남습니다."
+                                + (f"\n맞는 파일이 없는 {miss}컷은 그대로 둡니다." if miss else "") + "\n\n" + "\n".join(lines[:14])
+                                + ("\n…" if len(lines) > 14 else ""), QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) != QMessageBox.Yes:
+            return 0
+        for r in hit:
+            RPL.apply(prj, r["cut"], r["info"], r["how"])
+        self._replace_done([r["cut"] for r in hit])
+        self.toast(f"{len(hit)}컷의 소스를 교체했습니다" + (f" (맞는 파일 없음 {miss}컷)" if miss else "") + ". 분석과 보정 값은 그대로입니다", "ok")
+        return len(hit)
+
+    def replace_cut_source_back(self, cid: str) -> bool:
+        from ..core import replace as RPL
+        prj = self.session.project
+        cut = prj.cut(cid) if prj is not None else None
+        if cut is None or not RPL.can_undo(cut) or not self._replace_ready():
+            return False
+        RPL.undo(prj, cut)
+        self._replace_done([cut])
+        self.toast(f"{cut.name}: 교체 전 소스({Path(str(cut.info.path)).name})로 되돌렸습니다", "ok")
+        return True
 
     def _after_status_change(self):
         cid = self.session.cut.id if self.session.cut else None
@@ -2087,7 +2224,7 @@ class MainWindow(QMainWindow):
         elif action == "members":
             from .members import MembersDialog
             if not prj.members:
-                self._relink(quiet=True)
+                self._relink(quiet=True, wait=True)      # the panel shows the members: linked before it opens
             MembersDialog(self).exec()
         elif action.startswith("status:"):
             from ..learn import statuscal as SC
@@ -2475,28 +2612,99 @@ class MainWindow(QMainWindow):
             log_event("analysis", prj.name, new.name, frames=new.info.frames, auto_ok=new.stats.auto_ok_rate,
                       persons=len(new.persons), batch=True)
 
-    def _relink(self, quiet: bool = False) -> Optional[dict]:
-        """Identity self-learning on the newest cuts, then people linked across the timeline."""
+    RELINKING = "인물 연결 중"
+
+    def _relink(self, quiet: bool = False, wait: bool = False) -> Optional[dict]:
+        """Identity self-learning on the newest cuts, then people linked across the timeline.
+
+        Worked out on a thread from a snapshot of the project and put into the project by _relink_done (1.27: the
+        learning's fit and the linking stood on the UI thread a second after every analysis: 7 to 21 s without a
+        window that answers, with a timeline of 80 cuts). A newer call takes the place of one on its way.
+        wait=True (the people panel opened on a project never linked): linked here and now, without the learning;
+        the linking's result is returned."""
         prj = self.session.project
         if prj is None:
             return None
+        from ..track import xlink as XL
+        seq = self._relink_seq = getattr(self, "_relink_seq", 0) + 1
+        if wait:
+            try:
+                r = XL.link(prj)
+            except Exception as e:
+                traceback.print_exc()
+                if not quiet:
+                    self.toast(f"인물 연결 실패: {e}", "error")
+                return None
+            self._relink_show(r, quiet)
+            return r
+        learn = self._learn_allowed()
         try:
-            from ..learn import identity as ID
-            from ..track import xlink as XL
-            if self._learn_allowed():
-                ID.refit()
-            r = XL.link(prj)
+            snap = XL.snapshot(prj)
         except Exception as e:
             traceback.print_exc()
             if not quiet:
                 self.toast(f"인물 연결 실패: {e}", "error")
             return None
+
+        def work():
+            pl, err = None, ""
+            try:
+                if learn:                        # (_learn_allowed, asked above on the UI thread)
+                    from ..learn import identity as ID
+                    ID.refit()
+                pl = XL.plan(snap)
+            except Exception as e:
+                traceback.print_exc()
+                err = str(e)
+            try:
+                import shiboken6
+                if shiboken6.isValid(self):      # the window closed meanwhile: nobody to hand it to
+                    self._relinked.emit(seq, (prj, snap, pl, quiet), err)
+            except RuntimeError:
+                pass
+        self.saved_lbl.start(self.RELINKING)     # (the top bar: it goes on behind the work; the save after it takes its place)
+        threading.Thread(target=work, name="diap-relink", daemon=True).start()
+        return None
+
+    def _relink_done(self, seq: int, job, err: str):
+        """On the UI thread: a linking worked out on a thread. Put into the project when it is still the newest one
+        asked for and the project is as it was read."""
+        prj, snap, pl, quiet = job
+        if seq != getattr(self, "_relink_seq", 0):
+            return                               # a newer one is on its way (or was done at once)
+        if self.session.project is not prj:
+            self.saved_lbl.clear(self.RELINKING)
+            return                               # another project is open
+        if pl is None:
+            self.saved_lbl.clear(self.RELINKING)
+            if not quiet:
+                self.toast(f"인물 연결 실패: {err}", "error")
+            return
+        if self.job is not None:
+            # an analysis (or another job) is writing the open cut: put in when it is done (it asks for a newer
+            # linking itself when it ends, which drops this one)
+            QTimer.singleShot(2000, lambda: self._relink_done(seq, job, err))
+            return
+        from ..track import xlink as XL
+        if (prj.members or {}) != snap["members"] or list(getattr(prj, "member_cannot", []) or []) != snap["cannot"]:
+            self._relink(quiet=quiet)            # the members were changed by hand meanwhile: from what they are now
+            return
+        try:
+            r = XL.apply(prj, pl)
+        except Exception as e:
+            traceback.print_exc()
+            self.saved_lbl.clear(self.RELINKING)
+            if not quiet:
+                self.toast(f"인물 연결 실패: {e}", "error")
+            return
+        self._relink_show(r, quiet)
+
+    def _relink_show(self, r: dict, quiet: bool):
         self.session.dirty = True
         self.save()
         self._refresh_all()
         if not quiet:
             self.toast(f"인물 연결: 여러 컷에 나오는 멤버 {r['multi']}명" + (f" · 확인 필요 {r['low']}명 (인물 버튼)" if r["low"] else ""), "ok")
-        return r
 
     def _batch_all_done(self, done: int, failed: int):
         dlg = getattr(self, "_batch_dlg", None)
@@ -4787,10 +4995,21 @@ class MainWindow(QMainWindow):
                 e.ignore()
                 return
             self._close_saved = True
-        if self.queue_page.job is not None:
-            if QMessageBox.question(self, "렌더 중", "렌더가 진행 중입니다. 종료하면 현재 렌더는 취소됩니다. 종료할까요?") != QMessageBox.Yes:
-                e.ignore()
-                return
+        # every question before anything is stopped (1.27: "no" to the batch came after the render had been cancelled)
+        render = self.queue_page.job is not None
+        if render and QMessageBox.question(self, "렌더 중", "렌더가 진행 중입니다. 종료하면 현재 렌더는 취소됩니다. 종료할까요?") != QMessageBox.Yes:
+            e.ignore()
+            return
+        if self.batch.busy and QMessageBox.question(
+                self, "일괄 분석 중", "일괄 분석이 진행 중입니다. 종료하면 지금 컷의 분석은 버려집니다. 종료할까요?") != QMessageBox.Yes:
+            e.ignore()
+            return
+        # Saved (or not to be) and nothing more to ask: the window goes from the screen now and the work in the
+        # background is stopped behind it. The waits below are up to 5 s each (the render, the proxies, a job, the
+        # frame cache), and the window stood there meanwhile without answering, as if stuck.
+        if self._close_saved or getattr(self, "_discard_on_close", False):
+            self.hide()
+        if render and self.queue_page.job is not None:
             self.queue_page.job.cancel()
             self.queue_page.job.wait(5000)
         try:
@@ -4799,9 +5018,6 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         if self.batch.busy:
-            if QMessageBox.question(self, "일괄 분석 중", "일괄 분석이 진행 중입니다. 종료하면 지금 컷의 분석은 버려집니다. 종료할까요?") != QMessageBox.Yes:
-                e.ignore()
-                return
             self.batch.kill()
         self.refresher.enabled = False           # a running matte refresh is dropped: its marks are saved with the cut
         self.refresher.cancel()
@@ -4816,6 +5032,7 @@ class MainWindow(QMainWindow):
                 and not self._save_or_ask("종료"):
             e.ignore()
             return
+        self.hide()                              # (a job was running: saved only now)
         self.activity.flush()
         self.edit_worker.stop()
         self.edit_worker.wait(3000)

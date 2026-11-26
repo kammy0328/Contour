@@ -2444,11 +2444,19 @@ def _raw_cached(cut, tracker, s: int, cache):
         for j in rf.jobs:                   # (a helper sends the masks packed: here they are what this function keeps, whole float16 arrays)
             j.masks = {k: _mask_unpack(v, np.float16) for k, v in j.masks.items()}
     else:
-        with _tm("raw"):
-            rf = _prepare_raw(cut, tracker, s, cache)
-        if rf is not None:
-            for j in rf.jobs:
-                j.masks = {k: _raw_keep(v) for k, v in j.masks.items()}
+        # (1.27, retouch.rawahead) a render on a computer with memory and cores to spare has the next frames' own masks made
+        # ahead in threads: taken from there (already kept as below); a frame not made there is made here as before
+        ahead = tracker.__dict__.get("_raw_ahead") if cache is None else None
+        made = False
+        if ahead is not None:
+            with _tm("raw.ahead"):
+                made, rf = ahead.take(s)
+        if not made:
+            with _tm("raw"):
+                rf = _prepare_raw(cut, tracker, s, cache)
+            if rf is not None:
+                for j in rf.jobs:
+                    j.masks = {k: _raw_keep(v) for k, v in j.masks.items()}
     lru[s] = rf
     while len(lru) > STEADY_LRU:
         lru.popitem(last=False)
@@ -5775,11 +5783,40 @@ CHIN_KEEP_EDGE = 0.05
 CHIN_EDGE_GATE = True
 
 
-def chin_zone(shape, lm: np.ndarray, wf: float) -> Optional[np.ndarray]:
+# (1.27, LNGSHOT BEEP BEEP 11/27, the user: "턱주름 ... 안된 거 확인되면 알아서 해결"; QA c046 t18, c034 t7, c084 t18: the pebbles stayed with 턱주름 at 100) with
+# the keep-outs above the zone is a thin strip on a face whose mouth is open (the lower lip comes down to the chin's ball: CHIN_KEEP_LIP takes most of what
+# is left), and on a chin in hard light the edge gate holds the pebbles themselves (each one has a steep edge of light). The pebbled way (the slider
+# 자갈턱 넓게, "chin_pebble", a person's share 0..1; CHIN_PEBBLE: the same for every face): the chin's stages work on the whole chin, with only
+# CHIN_PEBBLE_KEEP (lip, outline) kept clear and without the edge gate; what the last pass takes from a point is bounded (CHIN_PEBBLE_CAP of the luma, soft:
+# a pebble is a few levels high, a shape is more); a face turned away (face_turn from CHIN_PEBBLE_YAW[0], none of it from [1]: its chin landmarks lie
+# anywhere) keeps the stages of 1.26.2. It is not the default and has no finder of its own: tried for every face it lifted the shade under the lower lip
+# (c072 t41: 24 levels), the edge of a hard light on the chin (c087 t28, c027 t70) and the shade under the jaw of a face looking down (c024 t22: a light
+# patch of 27 levels), the very things the keep-outs and the edge gate are for; neither the dimple measure nor the direction of the gradients (a long edge
+# against pebbles lying every way) told these from a pebbled chin in side light. So it is the operator's to switch on where the pebbles stay.
+CHIN_PEBBLE = 0.0
+CHIN_PEBBLE_KEEP = (0.05, 0.03)
+CHIN_PEBBLE_CAP = 0.05
+CHIN_PEBBLE_YAW = (0.60, 0.80)
+
+
+def _pebble_share(lm: Optional[np.ndarray], v: Optional[dict] = None) -> float:
+    """0..1: how far the chin's stages work the pebbled way on this face: the person's 자갈턱 넓게 (or CHIN_PEBBLE), none of it on a face turned away
+    (CHIN_PEBBLE_YAW)."""
+    g = float(np.clip(max(float(CHIN_PEBBLE), float((v or {}).get("chin_pebble", 0.0) or 0.0)), 0.0, 1.0))
+    if g <= 1e-4 or lm is None:
+        return 0.0
+    if CHIN_PEBBLE_YAW is not None:
+        lo, hi = float(CHIN_PEBBLE_YAW[0]), float(CHIN_PEBBLE_YAW[1])
+        g *= float(1.0 - np.clip((face_turn(lm) - lo) / max(hi - lo, 1e-3), 0.0, 1.0))
+    return g
+
+
+def chin_zone(shape, lm: np.ndarray, wf: float, pebble: bool = False) -> Optional[np.ndarray]:
     """The chin between the lower lip and the jaw (soft), lm in px of `shape`: off the lower lip's shade and the face's outline
-    (CHIN_KEEP_LIP, CHIN_KEEP_EDGE)."""
+    (CHIN_KEEP_LIP, CHIN_KEEP_EDGE; pebble: CHIN_PEBBLE_KEEP, the zone of the pebbled way)."""
     if lm is None or not np.isfinite(lm[[57, 8], :2]).all():
         return None
+    keep_lip, keep_edge = (float(CHIN_PEBBLE_KEEP[0]), float(CHIN_PEBBLE_KEEP[1])) if pebble else (float(CHIN_KEEP_LIP), float(CHIN_KEEP_EDGE))
     a, b = lm[57, :2], lm[8, :2]
     c = 0.4 * a + 0.6 * b
     v = b - a
@@ -5791,26 +5828,26 @@ def chin_zone(shape, lm: np.ndarray, wf: float) -> Optional[np.ndarray]:
                 float(np.degrees(np.arctan2(v[1], v[0]))), 0, 360, 255, -1)
     z = cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.03 * wf))
     r = _roi(z, 2)
-    if r is None or (CHIN_KEEP_LIP <= 1e-4 and CHIN_KEEP_EDGE <= 1e-4):
+    if r is None or (keep_lip <= 1e-4 and keep_edge <= 1e-4):
         return z
     # (the zone's box, grown by what the blurs below reach: they work on that piece of the picture only)
-    g = int(max(CHIN_KEEP_LIP, CHIN_KEEP_EDGE) * wf * 2) + 8
+    g = int(max(keep_lip, keep_edge) * wf * 2) + 8
     y0, y1, x0, x1 = max(0, r[0] - g), min(shape[0], r[1] + g), max(0, r[2] - g), min(shape[1], r[3] + g)
     o = np.float32([x0, y0])
     keep = np.ones((y1 - y0, x1 - x0), np.float32)
-    if CHIN_KEEP_LIP > 1e-4 and np.isfinite(lm[48:60, :2]).all():
+    if keep_lip > 1e-4 and np.isfinite(lm[48:60, :2]).all():
         lip = np.zeros(keep.shape, np.uint8)
         cv2.fillConvexPoly(lip, cv2.convexHull(np.round(lm[48:60, :2] - o).astype(np.int32)), 255)
-        kl = max(3, int(round(CHIN_KEEP_LIP * wf)) * 2 + 1)
+        kl = max(3, int(round(keep_lip * wf)) * 2 + 1)
         lip = cv2.dilate(lip, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kl, kl)))
-        keep *= 1.0 - cv2.GaussianBlur(lip.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.15 * CHIN_KEEP_LIP * wf))
-    if CHIN_KEEP_EDGE > 1e-4 and np.isfinite(lm[0:17, :2]).all():
+        keep *= 1.0 - cv2.GaussianBlur(lip.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.15 * keep_lip * wf))
+    if keep_edge > 1e-4 and np.isfinite(lm[0:17, :2]).all():
         hull = np.zeros(keep.shape, np.uint8)
         pts = lm[0:17, :2] if not np.isfinite(lm[17:27, :2]).all() else np.vstack([lm[0:17, :2], lm[17:27, :2]])
         cv2.fillConvexPoly(hull, cv2.convexHull(np.round(pts - o).astype(np.int32)), 255)
-        ke = max(3, int(round(CHIN_KEEP_EDGE * wf)) * 2 + 1)
+        ke = max(3, int(round(keep_edge * wf)) * 2 + 1)
         hull = cv2.erode(hull, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ke, ke)))
-        keep *= cv2.GaussianBlur(hull.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.25 * CHIN_KEEP_EDGE * wf))
+        keep *= cv2.GaussianBlur(hull.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.25 * keep_edge * wf))
     z[y0:y1, x0:x1] *= keep
     return z
 
@@ -5827,31 +5864,64 @@ def _dimple_map(Y: np.ndarray, wf: float) -> np.ndarray:
     return np.sqrt(np.maximum(xx * yy - xy * xy, 0)) * sg * sg / base
 
 
-def _chin_dimple(Y: np.ndarray, lm: Optional[np.ndarray], skin: np.ndarray, wf: float, k: float) -> np.ndarray:
-    """Soften a pebbled chin (the chin muscle pulled tight). How pebbled the chin is, is measured on this very
-    frame: on a frame where the chin is smooth the amount is 0 and nothing is touched, and it rises with the
-    dimples. The broad light and shade of the chin stay as they are."""
-    z = chin_zone(Y.shape, lm, wf)
-    if z is None:
-        return Y
-    r_ = _roi(z, int(0.15 * wf) + 8)
+def _chin_weight(Y: np.ndarray, lm: Optional[np.ndarray], skin: np.ndarray, wf: float, pad: int, k: float, measured: bool, share: float = 0.0):
+    """Where the chin's stages work and how much: (box y0, y1, x0, x1; the weight on the box, k at most) or None. The way of 1.26.2 (the zone with its
+    keep-outs, off steep edges) and the pebbled way (the wider zone, no edge gate), mixed by the face's share of the pebbled way (_pebble_share).
+    measured: each way's weight times how pebbled its zone is on this frame (the 90th percentile of the dimple measure between CHIN_LO and CHIN_HI: a
+    smooth chin gets nothing, and nothing is done below 0.02)."""
+    g = float(np.clip(share, 0.0, 1.0))
+    z0 = chin_zone(Y.shape, lm, wf) if g < 0.999 else None
+    z1 = chin_zone(Y.shape, lm, wf, pebble=True) if g > 1e-4 else None
+    if z0 is None and z1 is None:
+        return None
+    r_ = _roi(z0 if z1 is None else (z1 if z0 is None else np.maximum(z0, z1)), pad)
     if r_ is None:
-        return Y
+        return None
     y0, y1, x0, x1 = r_
     roi = Y[y0:y1, x0:x1].astype(np.float32)
-    zz, ss = z[y0:y1, x0:x1], skin[y0:y1, x0:x1]
-    reg = (zz > 0.5) & (ss > 0.5)
-    if reg.sum() < 40:
+    ss = skin[y0:y1, x0:x1] if measured else np.clip(skin[y0:y1, x0:x1], 0, 1)
+    dm = _dimple_map(roi, wf) if measured else None
+
+    def amount(zz):
+        if not measured:
+            return float(k)
+        reg = (zz > 0.5) & (ss > 0.5)
+        if reg.sum() < 40:
+            return 0.0
+        amt = float(np.clip((float(np.percentile(dm[reg], 90)) - CHIN_LO) / (CHIN_HI - CHIN_LO), 0, 1)) * k
+        return amt if amt >= 0.02 else 0.0
+
+    m = None
+    if z0 is not None:
+        zz = z0[y0:y1, x0:x1]
+        a0 = amount(zz)
+        if a0 > 0.0:
+            m = (zz * ss * a0).astype(np.float32)
+            if CHIN_EDGE_GATE:
+                ek_ = SK.edge_keep(roi, wf)
+                if ek_ is not None:
+                    m = m * (1.0 - ek_)
+            if z1 is not None:
+                m = (1.0 - g) * m
+    if z1 is not None:
+        zz = z1[y0:y1, x0:x1]
+        a1 = amount(zz)
+        if a1 > 0.0:
+            m1 = g * (zz * ss * a1).astype(np.float32)
+            m = m1 if m is None else m + m1
+    if m is None:
+        return None
+    return (y0, y1, x0, x1), m, roi
+
+
+def _chin_dimple(Y: np.ndarray, lm: Optional[np.ndarray], skin: np.ndarray, wf: float, k: float, share: float = 0.0) -> np.ndarray:
+    """Soften a pebbled chin (the chin muscle pulled tight). How pebbled the chin is, is measured on this very
+    frame: on a frame where the chin is smooth the amount is 0 and nothing is touched, and it rises with the
+    dimples. The broad light and shade of the chin stay as they are. share: of the pebbled way (_pebble_share)."""
+    w_ = _chin_weight(Y, lm, skin, wf, int(0.15 * wf) + 8, k, True, share)
+    if w_ is None:
         return Y
-    s = float(np.percentile(_dimple_map(roi, wf)[reg], 90))
-    amt = float(np.clip((s - CHIN_LO) / (CHIN_HI - CHIN_LO), 0, 1)) * k
-    if amt < 0.02:
-        return Y
-    m = (zz * ss * amt).astype(np.float32)
-    if CHIN_EDGE_GATE:
-        ek_ = SK.edge_keep(roi, wf)
-        if ek_ is not None:
-            m = m * (1.0 - ek_)
+    (y0, y1, x0, x1), m, roi = w_
     r = max(2, int(round(0.03 * wf)))
     out = SK.smooth_channel(roi, m, 1.0, 0.0, r, eps=0.003, relative=True)
     d = out - roi
@@ -5875,8 +5945,21 @@ def neck_axis(lm: Optional[np.ndarray]):
     return None if n < 1e-3 else (float(v[0] / n), float(v[1] / n))
 
 
-_MCACHE: dict = {}
+_MCACHE = __import__("collections").OrderedDict()
 _MC_LOCK = threading.Lock()         # (people of a frame are prepared side by side: PREP_THREADS)
+MCACHE_N = 48                       # masks kept at most
+MCACHE_BYTES = 192 * 2 ** 20        # ... and their bytes (1.27): a mask is the size of the picture it is for, and with a body effect that is the whole
+                                    # frame (4K: 33 MB a mask, nearly all of it zeros round one face): 48 of them were up to 1.6 GB held between frames
+                                    # (IWALY c004, 6 people: four kinds of mask, about 1 GB at the render's highest point, j2905). The least
+                                    # recently used go first; a mask asked for again is made again (a hull, a dilation and a blur in a small window)
+
+
+def _mc_bytes(v) -> int:
+    if isinstance(v, np.ndarray):
+        return int(v.nbytes)
+    if isinstance(v, (tuple, list)):
+        return sum(_mc_bytes(x) for x in v)
+    return 0
 
 
 def _cached(name: str, lm: np.ndarray, shape, scale: float, wf: float, make):
@@ -5885,13 +5968,17 @@ def _cached(name: str, lm: np.ndarray, shape, scale: float, wf: float, make):
     key = (name, np.asarray(lm[:, :2], np.float32).tobytes(), tuple(shape), float(scale), float(wf))
     with _MC_LOCK:
         hit = _MCACHE.get(key)
+        if hit is not None:
+            _MCACHE.move_to_end(key)
     if hit is None:
-        if len(_MCACHE) > 48:
-            with _MC_LOCK:
-                _MCACHE.clear()
         hit = make()                # (made outside the lock: the same mask made twice by two threads is the same mask)
         with _MC_LOCK:
             _MCACHE[key] = hit
+            _MCACHE.move_to_end(key)
+            size = sum(_mc_bytes(v) for v in _MCACHE.values())
+            while len(_MCACHE) > 1 and (len(_MCACHE) > MCACHE_N or size > MCACHE_BYTES):
+                _, old = _MCACHE.popitem(last=False)
+                size -= _mc_bytes(old)
     return hit
 
 
@@ -7021,6 +7108,57 @@ def _keep_fine(before: np.ndarray, after: np.ndarray, m: np.ndarray, rows: Optio
     return after + np.clip(m * 4.0, 0, 1) * (fb - fa)
 
 
+# (1.27, LNGSHOT BEEP BEEP 11/27, the user: "피부 보정 Bananas 때처럼", "납품본의 피부를 기준으로 맞춰") 질감 유지 below its default thins the skin's finest
+# texture too. The stage above leaves everything finer than GRAIN_SIGMA exactly as the original has it (the user of 11/14: the grain stays) and takes
+# down what stands out at the pores' size and above; the delivered hand retouch of LNGSHOT BANANAS does something else as well: fitted band by band at
+# the picture's own pixels on 22 faces 300 to 1650 px wide (j2912b4: the slope of after on before per band, on the skin and beside it), it takes about a
+# sixth off every band finer than about 3 px of a 2160-line picture, evenly over the skin (0.83 to 0.86 of the band left; what is not skin 0.99), less of
+# the wider ones (0.92 left at 4 px, 0.95 at 5.6, 0.97 at 8, all of it from 16 px on). DIAP's 표준 left 96 % of that band, the hand 71 to 87 % (the
+# sheets of 11/27). Linear and without a threshold (nothing that can switch from frame to frame), inside the stage's own mask (the features, strands,
+# paint and what is held are out of it), of the original's bands (so the grain given back and what is taken here do not add up twice).
+# FINE_THIN: the share of the finest bands taken at 질감 유지 FINE_THIN_KEEP[1] and 피부 at the reference (skin.FS_REF); nothing from FINE_THIN_KEEP[0]
+# up (the slider's default: every project as it was), more below FINE_THIN_KEEP[1] in line, up to FINE_THIN_MAX times. 0 = off.
+FINE_THIN = 0.16
+FINE_THIN_KEEP = (0.45, 0.15)
+FINE_THIN_MAX = 1.5
+FINE_THIN_MIX = ((2.8, 0.45), (4.0, 0.20), (5.6, 0.15), (8.0, 0.10), (11.3, 0.10))    # (sigma in px of a 2160-line picture, weight): the mix of blurs that is left of the bands
+# the hand took less of a small face (the same fit: faces under 600 px 0.91 to 0.94 of the band left, 600 to 900 px 0.83 to 0.86, 1650 px 0.85; of the faces
+# of 300 to 440 px half were not thinned at all): the share grows with the face's width (px of a 2160-line picture) from nothing at the first to all of it at
+# the second. A face in a full shot keeps what little fine detail it has
+FINE_THIN_WF = (150.0, 600.0)
+
+
+def fine_thin_amount(keep: float, strength: float, wf: Optional[float] = None) -> float:
+    """The share of the finest bands taken for a 질감 유지 (0..1), a 피부 value (0..1) and a face width (px of a 2160-line picture; None: a large
+    face): 0 at the slider's default and above."""
+    if FINE_THIN <= 0:
+        return 0.0
+    k0, k1 = FINE_THIN_KEEP
+    a = float(np.clip((k0 - float(keep)) / max(1e-6, k0 - k1), 0.0, FINE_THIN_MAX))
+    if wf is not None and FINE_THIN_WF is not None:
+        a *= float(np.clip((float(wf) - FINE_THIN_WF[0]) / max(1e-6, FINE_THIN_WF[1] - FINE_THIN_WF[0]), 0.0, 1.0))
+    return float(FINE_THIN * a * np.clip(float(strength) / max(1e-6, getattr(SK, "FS_REF", 0.70)), 0.0, 1.5))
+
+
+def _thin_fine(before: np.ndarray, after: np.ndarray, m: np.ndarray, amount: float, rows: Optional[int] = None) -> np.ndarray:
+    """after with the finest texture of before thinned by `amount` inside m (FINE_THIN: the bands below a few pixels, the widths following the
+    picture's height; rows: the plane's height when before and after are a piece of it)."""
+    if amount < 1e-4 or before.shape != after.shape or m is None or m.shape != after.shape:
+        return after
+    sc = float(rows or _ph(after.shape[0])) / 2160.0
+    r = _roi(m, int(3 * FINE_THIN_MIX[-1][0] * sc) + 3)
+    if r is None:
+        return after
+    y0, y1, x0, x1 = r
+    b = np.ascontiguousarray(before[y0:y1, x0:x1], np.float32)
+    mix = np.zeros_like(b)
+    for sg, w in FINE_THIN_MIX:
+        mix += float(w) * cv2.GaussianBlur(b, (0, 0), max(0.5, float(sg) * sc))
+    out = after.astype(np.float32, copy=True)
+    out[y0:y1, x0:x1] -= float(amount) * np.clip(m[y0:y1, x0:x1], 0.0, 1.0) * (b - mix)
+    return out
+
+
 def _redness(Cb, Cr, Y, mC, mY, k: float, wf: float, cs: float):
     """Bring red patches (cheeks, around the nose) back to the face's own skin colour."""
     r = _roi(mC, 4)
@@ -7314,6 +7452,37 @@ def _nose_points_ok(L: np.ndarray, wf: float) -> np.ndarray:
     for i in (39, 42):
         ok[i] = float(np.linalg.norm(L[i] - t)) <= 0.45 * wf
     return ok
+
+
+# (1.27, LNGSHOT BEEP BEEP 11/27, the user: "코 뾰루지" in the list of what is to go) a pimple on the nose stayed: the blemish stage fills a red spot there
+# as anywhere on the skin, and the nose's give-back above (FINAL_NOSE) then took the fill back whole (the colour all of it, the light all but the finest),
+# as it takes back whatever a stage does to the nose. A red spot the blemish stage filled (detect's "red": compact, redder than the skin round it both
+# ways; the folds from the wings are not looked at) is now left out of the give-back, with the reach of its fill; inside the nostrils' own area nothing
+# is left out (a nostril's dark red inside is the nose's, and stays). Dark spots on the nose stay as they were (a nostril, a shade and a mole look alike
+# there). 0 = as before 1.27.
+NOSE_PIMPLE = 1.0
+
+
+def _nostril_zone(L: np.ndarray, shape, wf: float) -> Optional[np.ndarray]:
+    """0..1: the nostrils' own area (the ellipse skin._features_mask leaves out, grown by 0.02 of the face width, soft). L: (68, 2) px of shape."""
+    try:
+        ns = np.asarray(L[31:36], np.float64)
+        if not np.isfinite(ns).all() or not np.isfinite(L[[27, 33]]).all():
+            return None
+        nw = float(np.hypot(*(ns[-1] - ns[0])))
+        if nw < 2:
+            return None
+        up = np.asarray(L[27], np.float64) - np.asarray(L[33], np.float64)
+        up = up / max(float(np.hypot(*up)), 1e-6)
+        c = ns.mean(0) + up * 0.08 * nw
+        ang = float(np.degrees(np.arctan2(ns[-1][1] - ns[0][1], ns[-1][0] - ns[0][0])))
+        g = 0.02 * wf
+        m = np.zeros(shape, np.uint8)
+        cv2.ellipse(m, (int(round(c[0])), int(round(c[1]))), (max(1, int(round(nw * SK.NOSTRIL_RX + g))), max(1, int(round(nw * SK.NOSTRIL_RY + g)))),
+                    ang, 0, 360, 255, -1)
+        return cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0), max(0.8, 0.008 * wf))
+    except Exception:
+        return None
 
 
 def _nose_give_back(Y: np.ndarray, Y0: np.ndarray, w: np.ndarray, s: float) -> np.ndarray:
@@ -7630,21 +7799,13 @@ def _final_long_lines(Y0: np.ndarray, region: np.ndarray, wf: float) -> Optional
     return out
 
 
-def _final_chin(Y: np.ndarray, lm: np.ndarray, skin: np.ndarray, wf: float, k: float) -> np.ndarray:
-    """The pits and bumps of a pebbled chin taken out: the band FINAL_CHIN_BAND of the luma, on the chin's zone of the skin."""
-    z = chin_zone(Y.shape, lm, wf)
-    if z is None:
+def _final_chin(Y: np.ndarray, lm: np.ndarray, skin: np.ndarray, wf: float, k: float, share: float = 0.0) -> np.ndarray:
+    """The pits and bumps of a pebbled chin taken out: the band FINAL_CHIN_BAND of the luma, on the chin's zone of the skin. share: of the pebbled
+    way (_pebble_share)."""
+    w_ = _chin_weight(Y, lm, skin, wf, int(0.1 * wf) + 8, float(k), False, share)
+    if w_ is None:
         return Y
-    r = _roi(z, int(0.1 * wf) + 8)
-    if r is None:
-        return Y
-    y0, y1, x0, x1 = r
-    roi = Y[y0:y1, x0:x1].astype(np.float32)
-    m = z[y0:y1, x0:x1] * np.clip(skin[y0:y1, x0:x1], 0, 1) * float(k)
-    if CHIN_EDGE_GATE:
-        ek_ = SK.edge_keep(roi, wf)
-        if ek_ is not None:
-            m = m * (1.0 - ek_)
+    (y0, y1, x0, x1), m, roi = w_
     s0, s1 = max(0.8, FINAL_CHIN_BAND[0] * wf), max(2.0, FINAL_CHIN_BAND[1] * wf)
     band = cv2.GaussianBlur(roi, (0, 0), s0) - cv2.GaussianBlur(roi, (0, 0), s1)
     if FINAL_CHIN_LIGHT is not None:
@@ -7654,7 +7815,13 @@ def _final_chin(Y: np.ndarray, lm: np.ndarray, skin: np.ndarray, wf: float, k: f
         b2 = cv2.GaussianBlur(roi, (0, 0), s0) - cv2.GaussianBlur(roi, (0, 0), s2)
         band = np.where(band > 0, np.clip(np.minimum(band, np.maximum(b2, 0.0)), 0.0, FINAL_CHIN_LIGHT_MAX), band)
     out = Y.astype(np.float32, copy=True)
-    out[y0:y1, x0:x1] = roi - m * band
+    if share > 1e-4 and CHIN_PEBBLE_CAP is not None and CHIN_PEBBLE_CAP > 1e-5:
+        # (the pebbled way) what is taken from a point is bounded, softly
+        cap = float(CHIN_PEBBLE_CAP)
+        corr = m * band
+        out[y0:y1, x0:x1] = roi - (corr + float(np.clip(share, 0, 1)) * (cap * np.tanh(corr / cap) - corr))
+    else:
+        out[y0:y1, x0:x1] = roi - m * band
     return out
 
 
@@ -7867,8 +8034,9 @@ def _fold_heal(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, Y0: np.ndarray, ba
     return Y, Cb, Cr
 
 
-def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
-    """The last pass (FINAL_*): see the constants. Y0/Cb0/Cr0: the planes as they came in."""
+def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M, spots=None):
+    """The last pass (FINAL_*): see the constants. Y0/Cb0/Cr0: the planes as they came in. spots: {id(job): where the blemish stage filled a red
+    spot, 0..1 at Y's size} (NOSE_PIMPLE)."""
     slid_ = any(float(getattr(j_, "v", {}).get(k_, 0.0)) > 1e-4 for j_ in rf.jobs for k_ in ("bumps", "chin_lines", "nasolabial"))
     if not (FINAL_NOSE > 1e-4 or FINAL_MOLE > 1e-4 or FINAL_BUMP > 1e-4 or FINAL_LONG > 1e-4 or FINAL_CHIN > 1e-4 or FINAL_NASO > 1e-4 or FOLD_HEAL > 1e-4
             or slid_):
@@ -7886,6 +8054,27 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
                 nm = _nose_area(lmY, (hY, wY), wf)
                 if nm is not None:
                     nm = nm * float(np.clip(FINAL_NOSE, 0, 1))
+                    rs_ = spots.get(id(job)) if spots else None
+                    if rs_ is not None and NOSE_PIMPLE > 1e-4 and rs_.shape == nm.shape:
+                        # (NOSE_PIMPLE) a red spot filled on the nose stays filled: out of the give-back, with the fill's own reach
+                        try:
+                            rr_ = _roi(nm, 2)
+                            if rr_ is not None:
+                                c0, c1, d0, d1 = rr_
+                                sub_ = np.clip(rs_[c0:c1, d0:d1] * 2.0, 0.0, 1.0)
+                                if float(sub_.max()) > 0.1:
+                                    sz_ = float(spot_size(job, wf))
+                                    kd_ = max(3, int(round(0.6 * sz_)) | 1)
+                                    kp_ = cv2.dilate(sub_, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kd_, kd_)))
+                                    kp_ = cv2.GaussianBlur(kp_, (0, 0), max(1.0, 0.3 * sz_))
+                                    nz_ = _nostril_zone(lmY, (hY, wY), wf)
+                                    if nz_ is not None:
+                                        kp_ = kp_ * (1.0 - np.clip(nz_[c0:c1, d0:d1], 0.0, 1.0))
+                                    nm = nm.copy()
+                                    nm[c0:c1, d0:d1] *= 1.0 - float(np.clip(NOSE_PIMPLE, 0, 1)) * np.clip(kp_, 0.0, 1.0)
+                        except Exception:
+                            import traceback
+                            traceback.print_exc()
                     s_ = max(1.0, FINAL_NOSE_SIG * wf)
                     r_ = _roi(nm, int(3 * s_) + 2)
                     if r_ is not None:
@@ -7970,7 +8159,7 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
                     Y, Cb, Cr = _fold_heal(Y, Cb, Cr, Y0, M(job.masks["naso"], (hY, wY)), lmY, wf, kh_)
             kfc_ = max(float(FINAL_CHIN), float(job.v.get("chin_lines", 0.0)))     # (1.26.2) the 턱주름 slider, or the setting for every face
             if kfc_ > 1e-4 and lmY is not None and skin is not None:
-                Y = _final_chin(Y, lmY, skin, wf, float(np.clip(kfc_, 0, 1)) * _face_big(job.face, wf, y_per_src))
+                Y = _final_chin(Y, lmY, skin, wf, float(np.clip(kfc_, 0, 1)) * _face_big(job.face, wf, y_per_src), _pebble_share(job.face, job.v))
         except Exception:
             import traceback
             traceback.print_exc()
@@ -8018,6 +8207,7 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
     Cb = Cb.astype(np.float32, copy=True)
     Cr = Cr.astype(np.float32, copy=True)
     Y_in, Cb_in, Cr_in = Y.copy(), Cb.copy(), Cr.copy()
+    red_filled_: dict = {}                         # id(job) -> where the blemish stage filled a red spot (NOSE_PIMPLE)
 
     def M(m, shape):
         if m.shape == shape:
@@ -8180,6 +8370,8 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                 R_ = R_ * (1.0 - prot_)
             Yin_, Cbin_, Crin_ = Y, Cb, Cr
             Y, Cb, Cr = _spot_fill(Y, Cb, Cr, reg, S_, R_, k, size, cs)
+            if NOSE_PIMPLE > 1e-4 and R_ is not None and reg is not None:
+                red_filled_[id(job)] = (np.clip(R_, 0, 1) * np.clip(reg * 1.5, 0, 1) * k).astype(np.float32)     # (for the last pass: a pimple on the nose stays filled)
             # the dips along the folds beside the mouth are the face's own shade, so the detector leaves them. But
             # when the user asked for those folds to go (팔자주름, 입가주름) they are to go too: there the spot finder
             # of before 1.19 still runs, as it did (2611 cut 011, j2721: the hollow at the mouth's corner was left
@@ -8351,6 +8543,7 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                 Ys1 = SK.smooth_channel(Ysi, mY, job.skin.strength, job.keep, r, relative=True)
                 if GRAIN_KEEP:
                     Ys1 = _keep_fine(Ysi, Ys1, mY)
+                Ys1 = _thin_fine(Ysi, Ys1, mY, fine_thin_amount(job.keep, job.skin.strength, wf * 2160.0 / max(1.0, float(_ph(hY)))))
                 dS = Ys1 - Ysi
                 if Ysi is not Ys0:
                     Ys1 = Ys0 + dS
@@ -8366,6 +8559,7 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                 Y = SK.smooth_channel(Yi_, mY, job.skin.strength, job.keep, r, relative=True)
                 if GRAIN_KEEP:
                     Y = _keep_fine(Yi_, Y, mY)
+                Y = _thin_fine(Yi_, Y, mY, fine_thin_amount(job.keep, job.skin.strength, wf * 2160.0 / max(1.0, float(_ph(hY)))))
                 if Yi_ is not Y0_:
                     Y = Y0_ + (Y - Yi_)
             rc = max(1, int(round(r * cs)))
@@ -8583,7 +8777,7 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                 Y, Cb, Cr = _crease_lift(Y, Cb, Cr, mfl, float(np.clip(FACE_LINES, 0, 1)), max(1.5, 0.012 * wf),
                                          None, jaw_hold(job.face, (hY, wY), y_per_src, wf))
             if kchin_ > 1e-4:
-                Y = _chin_dimple(Y, lmY, skY, wf, float(np.clip(kchin_, 0, 1)) * _face_big(job.face, wf, y_per_src))
+                Y = _chin_dimple(Y, lmY, skY, wf, float(np.clip(kchin_, 0, 1)) * _face_big(job.face, wf, y_per_src), _pebble_share(job.face, v))
         # 2a'. frown lines between the brows and across the top of the nose (thin creases only)
         if FROWN_LINES > 1e-4 and "skin" in job.masks and job.face is not None and v["skin"] > 1e-4:
             try:
@@ -8836,7 +9030,7 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                         for ci, Cx in enumerate((Cb, Cr)):
                             nc = _grain((c1 - c0, d1 - d0), sizec * 1.3, seed + 7 + ci)
                             Cx[c0:c1, d0:d1] += mC[c0:c1, d0:d1] * nc * (0.016 * cg)
-    Y, Cb, Cr = _final_pass(Y, Cb, Cr, Y_in, Cb_in, Cr_in, rf, y_per_src, M)
+    Y, Cb, Cr = _final_pass(Y, Cb, Cr, Y_in, Cb_in, Cr_in, rf, y_per_src, M, red_filled_)
     if holds:
         # Clip all accumulated retouch, including the last landmark-only passes and source-space lift.
         hold = holds[0].astype(np.float32)

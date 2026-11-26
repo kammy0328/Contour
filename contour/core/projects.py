@@ -195,6 +195,8 @@ def rename(path: str, new_name: str) -> str:
     tmp.replace(f)
     if dst != old:
         os.replace(old, dst)          # same drive: a rename, nothing copied
+        from .project import forget_dirs
+        forget_dirs()
     _replace_known(str(old), str(dst))
     return str(dst)
 

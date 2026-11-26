@@ -49,7 +49,11 @@ class FrameError(RuntimeError):
 
 # ---------------------------------------------------------------------------------------------- the memory pool
 class FramePool:
-    """Decoded frames of every source, least recently used out first, at most `limit` bytes."""
+    """Decoded frames of every source, least recently used out first, at most `limit` bytes.
+
+    (1.27) A kind of frames (a key without its frame number) can have a floor: its newest frames stay whatever the limit
+    says. The whole frames the people of a frame are cut from (SourceCrops, SHARED_DECODE) are 200 to 400 MB each at 8K, the
+    limit holds three of them, and a frame two people still wanted was gone: the reader went back for it, every frame."""
 
     def __init__(self, limit: int):
         self.limit = int(limit)
@@ -57,6 +61,7 @@ class FramePool:
         self.bytes = 0
         self.peak = 0
         self._lock = threading.Lock()
+        self._floors: dict = {}             # kind (key[:-1]) -> how many of its newest frames are never dropped for room
 
     def get(self, key) -> Optional[np.ndarray]:
         with self._lock:
@@ -65,35 +70,61 @@ class FramePool:
                 self._d.move_to_end(key)
             return a
 
-    def put(self, key, a: np.ndarray) -> None:
+    def _make_room(self, keep_one: bool) -> None:
+        """Called with the lock held: the least recently used out until the limit holds, but for the floors."""
+        if self.bytes <= self.limit:
+            return
+        held = set()
+        if self._floors:
+            left = dict(self._floors)
+            for k in reversed(self._d):
+                n = left.get(k[:-1], 0)
+                if n > 0:
+                    left[k[:-1]] = n - 1
+                    held.add(k)
+        for k in list(self._d):
+            if self.bytes <= self.limit or (keep_one and len(self._d) <= 1):
+                break
+            if k in held:
+                continue
+            self.bytes -= self._d.pop(k).nbytes
+
+    def put(self, key, a: np.ndarray, floor: int = 0) -> None:
         with self._lock:
             old = self._d.pop(key, None)
             if old is not None:
                 self.bytes -= old.nbytes
             self._d[key] = a
             self.bytes += a.nbytes
-            while self.bytes > self.limit and len(self._d) > 1:
-                _, x = self._d.popitem(last=False)
-                self.bytes -= x.nbytes
+            if floor > 0:
+                self._floors[key[:-1]] = int(floor)
+            self._make_room(True)
             self.peak = max(self.peak, self.bytes)
 
     def drop(self, owner) -> None:
         with self._lock:
             for k in [k for k in self._d if k[0] == owner]:
                 self.bytes -= self._d.pop(k).nbytes
+            for kd in [kd for kd in self._floors if kd and kd[0] == owner]:
+                self._floors.pop(kd, None)
+
+    def unfloor(self, kind) -> None:
+        """The frames of this kind are ordinary frames again (their source was closed): out when room is needed."""
+        with self._lock:
+            if self._floors.pop(tuple(kind), None) is not None:
+                self._make_room(True)
 
     def clear(self) -> None:
         with self._lock:
             self._d.clear()
+            self._floors.clear()
             self.bytes = 0
             self.peak = 0
 
     def set_limit(self, limit: int) -> None:
         with self._lock:
             self.limit = int(limit)
-            while self.bytes > self.limit and self._d:
-                _, x = self._d.popitem(last=False)
-                self.bytes -= x.nbytes
+            self._make_room(False)
 
 
 _pool: Optional[FramePool] = None
@@ -362,6 +393,8 @@ class SourceFrames:
 
 # ---------------------------------------------------------------------------------------------- pieces of the original
 CROP_READERS = 8            # piece readers kept open at once (faces and, since 1.23, bodies of one cut)
+WHOLE_KEEP = 5          # (1.27) whole frames of a source that stay in the pool whatever its limit (the frame being worked on and the ones made
+                        # ahead of it, FramePool's floor): 5 x 53 MB at 4K, 5 x 200 MB at 8K
 SHARED_DECODE = True    # (1.26.3) every piece of a frame cut from one decode of the whole frame (one reader, the frames kept in the pool), not a reader
                         # of its own a region that decoded the whole frame again (4 faces and their bodies: 5 to 8 decodes of a 4K frame, the
                         # retouch waiting on them: LNGSHOT j2849). A piece made smaller is resized here (area), as ffmpeg's area scaler did.
@@ -436,7 +469,7 @@ class SourceCrops:
                     w_ = np.dstack([r_, g_, b_]).astype(np.float32)
                 else:
                     w_ = planes[0]
-                p.put((self.base, "whole", r[1]), w_)
+                p.put((self.base, "whole", r[1]), w_, floor=WHOLE_KEEP)
                 if r[1] == i:
                     got = w_
                 r[1] += 1
@@ -474,6 +507,10 @@ class SourceCrops:
                 except Exception:
                     pass
                 self._full = None
+        try:
+            pool().unfloor((self.base, "whole"))        # (1.27) its whole frames no longer held against the pool's limit
+        except Exception:
+            pass
         with self._lock:
             keys = list(self._readers)
         for k in keys:
@@ -484,6 +521,12 @@ class SourceCrops:
             for k in list(self._readers):
                 self._drop(k)
             self._rlocks.clear()
+
+    def __del__(self):
+        try:
+            pool().unfloor((self.base, "whole"))
+        except Exception:
+            pass
 
     def _grid(self, box) -> Tuple[int, int, int, int]:
         W, H = int(self.info.width), int(self.info.height)

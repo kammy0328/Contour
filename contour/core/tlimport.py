@@ -157,10 +157,13 @@ def link_bake_proxy(project: Project, px=None) -> int:
     if px is None:
         return 0
     view = px.meta().get("view")
+    baked = (project.timeline or {}).get("baked") or ""
     n = 0
     for c in project.timeline_cuts():
         if view and not same_view(c, view):
             continue                # seen in another colour space or LUT than the bake's proxy: its own proxy
+        if baked and not reads_bake(c, baked):
+            continue                # (1.27) its pictures come from another file now (소스 교체): its own proxy
         link_shared(project.proxy_dir(c), px, int(getattr(c.info, "offset", 0)))
         n += 1
     return n
@@ -178,10 +181,17 @@ def same_view(cut, view_key: str) -> bool:
         return True
 
 
+def reads_bake(cut, baked: str) -> bool:
+    """The shot's pictures are a stretch of the baked film itself (not of a file put in its place: core/replace.py)."""
+    return _same_file(str(getattr(cut.info, "path", "") or cut.source), baked)
+
+
 def shares_bake(project: Project, cut) -> bool:
     """The shot's proxy is a stretch of the bake's one proxy (else it has its own)."""
     tlm = project.timeline or {}
     if not (cut.tl and tlm.get("baked") and Path(tlm["baked"]).exists()):
+        return False
+    if not reads_bake(cut, tlm["baked"]):
         return False
     ref = bake_view_cut(project)
     try:
