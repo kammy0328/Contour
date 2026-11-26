@@ -604,6 +604,17 @@ class MainWindow(QMainWindow):
         a_review_img.setToolTip("위 리포트에, 문제가 큰 프레임의 화면 그림(추적 뼈대·인물 영역 표시)을 더합니다. "
                                 "영상 프레임이 리포트 폴더에 들어가므로 밖으로 내보낼 때 주의하세요")
         a_review_img.setEnabled(self.session.project is not None)
+        from ..retouch import looks as LK
+        look_m = m.addMenu("보정 버전")
+        look_m.setToolTip("이 프로젝트가 쓰는 얼굴 보정 기본값. 이전 버전으로 납품한 프로젝트는 그 버전을 고르면 다시 렌더해도 같은 결과가 나옵니다")
+        look_m.setEnabled(self.session.project is not None)
+        look_acts = {}
+        cur_look = (self.session.project.look if self.session.project is not None else "") or LK.LOOK
+        for nm_ in LK.names():
+            a_ = look_m.addAction(LK.label(nm_))
+            a_.setCheckable(True)
+            a_.setChecked(nm_ == cur_look)
+            look_acts[a_] = nm_
         a_relink = m.addAction("원본 다시 연결…")
         a_relink.setToolTip("원본 영상·LUT의 위치가 바뀌었을 때(다른 컴퓨터, 다른 드라이브, Windows ↔ Mac) 폴더를 골라 같은 이름의 "
                             "파일을 찾아 연결합니다. 크기·프레임 속도·프레임 수가 같은 파일만 연결하고, 분석 결과와 보정값은 그대로 둡니다")
@@ -637,6 +648,8 @@ class MainWindow(QMainWindow):
             self.make_ai_review()
         elif act == a_review_img:
             self.make_ai_review(images=True)
+        elif act in look_acts:
+            self.set_look(look_acts[act])
         elif act == a_relink:
             self.relink_media()
         elif act == a_reveal:
@@ -713,6 +726,11 @@ class MainWindow(QMainWindow):
         if not self.close_project():
             self.toast("지금 프로젝트를 저장하지 못해 새 프로젝트를 열지 않았습니다", kind="error")
             return
+        try:
+            from ..retouch import looks as LK
+            LK.use(prj.look)                        # (1.26.3) the retouch's look the project keeps, for the preview and the renders
+        except Exception:
+            traceback.print_exc()
         self.session.project = prj
         self._undo_by_cut.clear()
         self.undo_stack, self.redo_stack = [], []
@@ -739,6 +757,7 @@ class MainWindow(QMainWindow):
         self._tell_legacy(prj)
         self._tell_learning(prj)
         self._tell_missing(prj)
+        self._tell_look(prj)
 
     def relink_media(self, folder: str = ""):
         """원본 다시 연결: the media this computer does not find, looked for by name under a folder and connected
@@ -786,6 +805,42 @@ class MainWindow(QMainWindow):
                            "고르면 다시 이어집니다 (분석 결과와 보정값은 그대로입니다).", kind="warn")
         except Exception:
             traceback.print_exc()
+
+    def _tell_look(self, prj):
+        """(1.26.3) Once per project made before the looks were kept (no look in its file) with retouch work in it: the face retouch's
+        defaults changed in 1.26.2, and a cut delivered before rendered again now comes out with another skin. Which look is kept is
+        chosen in the project menu (보정 버전); opening changes nothing."""
+        try:
+            from ..retouch import looks as LK
+            from ..core.workstate import _active
+            if prj.look or not any(_active(c) for c in prj.cuts):
+                return
+            key = str(prj.created or prj.path)
+            s_ = settings()
+            seen_ = list(getattr(s_, "look_notified", None) or [])
+            if key in seen_:
+                return
+            self.toast(f"1.26.2부터 얼굴 보정 기본값이 바뀌었습니다. 이 프로젝트를 이전 버전으로 이미 납품했다면, 프로젝트 메뉴 > 보정 버전에서 "
+                       f"{sorted(LK.LOOKS)[-1]}을 고르면 그때와 같은 결과로 렌더됩니다 (지금은 {LK.LOOK}).", kind="warn")
+            s_.look_notified = (seen_ + [key])[-500:]
+            s_.save()
+        except Exception:
+            traceback.print_exc()
+
+    def set_look(self, look: str) -> None:
+        """(1.26.3) The project menu's 보정 버전: the look this project keeps from now on (the preview and every render)."""
+        from ..retouch import looks as LK
+        prj = self.session.project
+        if prj is None or not LK.known(look):
+            return
+        if look == (prj.look or LK.LOOK) and prj.look:
+            return
+        prj.look = look
+        LK.use(look)
+        self.session.look_changed()
+        self.session.dirty = True
+        self.viewer.update()
+        self.toast(f"이 프로젝트의 보정 버전: {LK.label(look)}", "ok")
 
     def _tell_learning(self, prj):
         """Once per project made before 1.24 whose file said (or left out, which meant) that it is in the learning

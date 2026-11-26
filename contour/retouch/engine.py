@@ -7292,6 +7292,7 @@ FINAL_NASO = 0.0           # 0..1: the nasolabial folds (팔자주름) and the s
                            # corner and on below it, FINAL_NASO_W of the face width wide), what is darker than its surroundings at the fold's scale (FINAL_NASO_BAND) is lifted;
                            # hair strands (far darker, thin) and the nose / the lips are left. Works where the skin mask or the fold finder missed the fold (a turned, tilted, blurred face)
 FINAL_NASO_W = 0.10
+FINAL_NASO_SLIDER = True  # (1.26.2) the 팔자주름 slider drives the last pass's fold lift too (False: FINAL_NASO alone, as 1.26.1: retouch/looks.py)
 FINAL_NASO_SKIN = float(__import__('os').environ.get('IWALY_FINAL_NASO_SKIN', '1'))   # 0..1: the last pass's fold work only where the skin mask is skin (0 = the zone from the landmarks alone, as before)
 FINAL_NASO_DEEP = (0.13, 0.20)   # see _final_naso
 FINAL_NASO_NOSE_GAP = 0.04  # of the face width: the zone stays this far from the nose (soft)
@@ -7869,7 +7870,8 @@ def _fold_heal(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, Y0: np.ndarray, ba
 
 def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
     """The last pass (FINAL_*): see the constants. Y0/Cb0/Cr0: the planes as they came in."""
-    slid_ = any(float(getattr(j_, "v", {}).get(k_, 0.0)) > 1e-4 for j_ in rf.jobs for k_ in ("bumps", "chin_lines", "nasolabial"))
+    slid_ = any(float(getattr(j_, "v", {}).get(k_, 0.0)) > 1e-4 for j_ in rf.jobs
+                for k_ in (("bumps", "chin_lines", "nasolabial") if FINAL_NASO_SLIDER else ("bumps", "chin_lines")))
     if not (FINAL_NOSE > 1e-4 or FINAL_MOLE > 1e-4 or FINAL_BUMP > 1e-4 or FINAL_LONG > 1e-4 or FINAL_CHIN > 1e-4 or FINAL_NASO > 1e-4 or FOLD_HEAL > 1e-4
             or slid_):
         return Y, Cb, Cr
@@ -7941,7 +7943,7 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
                     import traceback
                     traceback.print_exc()
             in_band_ = FINAL_NASO_IN_BAND > 1e-4
-            kfn_ = max(float(FINAL_NASO), float(np.clip(job.v.get("nasolabial", 0.0), 0, 1)))     # (1.26.2) the 팔자주름 slider drives the last pass too (the batch had FINAL_NASO 1 with the amount 100)
+            kfn_ = max(float(FINAL_NASO), float(np.clip(job.v.get("nasolabial", 0.0), 0, 1)) if FINAL_NASO_SLIDER else 0.0)   # (1.26.2) the 팔자주름 slider drives the last pass too (the batch had FINAL_NASO 1 with the amount 100)
             if kfn_ > 1e-4 and lmY is not None and job.wf_src > 0 and (not in_band_ or "naso" in job.masks):
                 kn_ = float(np.clip(kfn_, 0, 1)) * yaw_gate(job.face)
                 if FOLD_PRESENT is not None:

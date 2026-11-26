@@ -120,8 +120,11 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
     (1.26.3) For its time a render sets ffmpeg's threads (one a reader: the frame and a piece of each face and body are read at once; three for the
     ProRes writer) and reads the pictures of the people's skin colour models side by side first, as the 2611 IWALY batches did (core/perf.py)."""
     from ..core import perf as PF
+    from ..retouch import looks as LK
     keep_ = (M.READER_THREADS, M.ENCODE_THREADS)
     M.READER_THREADS, M.ENCODE_THREADS = PF.ff_decode_threads(), PF.ff_encode_threads()
+    held_ = LK.held(project)
+    held_.__enter__()
     try:
         try:
             if tracker is not None and progress is not None:
@@ -133,6 +136,17 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
             pw_ = {}
         rep = _render_cut(project, cut, tracker, out, progress, cancel, ext_writer, preview)
         try:
+            # (1.26.3) the look of this render on the cut; a render of a cut made before with another look says so (the skin comes out otherwise)
+            now_ = LK.current()
+            was_ = str(getattr(cut, "render_look", "") or "")
+            if was_ and was_ != now_:
+                rep.warnings.append(f"이 컷은 이전에 {was_} 보정으로 렌더했습니다. 지금은 {now_} 보정이라 피부 결과가 이전 납품본과 다를 수 있습니다 "
+                                    "(프로젝트 메뉴 > 보정 버전)")
+            if not getattr(rep, "cancelled", False) and not getattr(rep, "error", ""):
+                cut.render_look = now_
+        except Exception:
+            pass
+        try:
             rep.prewarm = pw_
             rep.accel = (rep.accel + " · " if rep.accel else "") + PF.summary()
         except Exception:
@@ -140,6 +154,7 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
         return rep
     finally:
         M.READER_THREADS, M.ENCODE_THREADS = keep_
+        held_.__exit__(None, None, None)
 
 
 def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progress: Progress = None,

@@ -233,6 +233,16 @@ class EditSession:
             self.tracker.save()
         self.dirty = False
 
+    def look_changed(self) -> None:
+        """(1.26.3) The project's look (retouch/looks.py) was switched: every mask and result made with the other one is dropped."""
+        with self._lock:
+            self._mask_cache = {}
+            if self.tracker is not None:
+                self.tracker.__dict__.pop("_steady_lru", None)
+                self.tracker.__dict__.pop("_steady_sig", None)
+                self.tracker.__dict__.pop("_skin_models", None)
+        self.touch("ret")
+
     def touch(self, kind: str = "all") -> None:
         """Something changed. kind: 'geo' (shape sliders, protection), 'ret' (retouch sliders),
         'trk' (tracking / joints) or 'all'. Only caches that depend on it are dropped."""
