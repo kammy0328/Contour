@@ -31,3 +31,13 @@ def test_final_pass_runs_for_the_nasolabial_slider():
     src = inspect.getsource(E._final_pass)
     assert '"nasolabial"' in src.split("if not (")[0]
     assert 'kfn_ = max(float(FINAL_NASO), float(np.clip(job.v.get("nasolabial", 0.0), 0, 1)))' in src
+
+
+def test_the_mac_batchs_face_settings_are_defaults():
+    # (the Mac IWALY batch's reviewed face settings, missed by the first comparison: user 11/26 "배치 전용 설정이 적용 안된게 또 있을까?";
+    # the LNGSHOT QA at 4K showed what they guard against)
+    from contour.retouch import skin as SK
+    assert E.SKIN_EDGE_KEEP == 0.04 and E.FACE_HAIR_HOLD == 1.0 and E.FACE_NOSE_ADD == 0.8
+    assert E.FOLD_EDGE_FADE == 1.0 and E.FINAL_NASO_IN_BAND == 1.0 and E.FOLD_LEVEL_LIFT_ONLY is True
+    assert tuple(SK.FS_EDGE_GRAD) == (0.03, 0.08)
+    assert E.CHIN_KEEP_LIP > 0 and E.CHIN_KEEP_EDGE > 0 and E.FINAL_BUMP_EDGE > 0 and E.FACE_GAP_BRIDGE == 2

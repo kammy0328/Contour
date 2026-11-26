@@ -939,8 +939,9 @@ FS_NORM = 0.0     # > 0: the bands are taken with blurs of the skin alone (norma
 # falling off at the jaw's and the cheek's outline and the shade beside the nose lost contrast too: a light line inside the jaw and the
 # cheek's contour, a dark one along the nasolabial shade) where the picture's light changes steeply at a scale of FS_EDGE_SIG of the face
 # width (the slope over that width, of the local level: an edge of the face's light and shade; texture has next to none at that scale),
-# the bands from FS_EDGE_BAND on are not scaled: fully from FS_EDGE_GRAD[1], not at all below FS_EDGE_GRAD[0] (soft, no step). None = off.
-FS_EDGE_GRAD = None
+# the bands from FS_EDGE_BAND on are not scaled: fully from FS_EDGE_GRAD[1], not at all below FS_EDGE_GRAD[0] (soft, no step). None = off
+# (as before 1.26.2).
+FS_EDGE_GRAD = (0.03, 0.08)
 FS_EDGE_SIG = 0.008
 FS_EDGE_BAND = 2
 FS_REF = 0.70                                              # skin slider of the reference

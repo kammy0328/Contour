@@ -4917,14 +4917,15 @@ def _fold_level(Y: np.ndarray, band: np.ndarray, skin: np.ndarray, excl: Optiona
     return out
 
 
-# (Mac IWALY, 11/24; default off = 1.25.0's face) the Mac batch's own face changes, on in its control.json engine_cfg
-FACE_HAIR_HOLD = 0.0       # > 0: hair / cover over the face (face parsing + the hair class) takes the face's retouch back there (job mask face_hold)
-FOLD_EDGE_FADE = 0.0       # > 0: the nasolabial / mouth line bands fade in from their own edge (no rim)
-FINAL_NASO_IN_BAND = 0.0   # > 0: the last pass's nasolabial lift only inside the nasolabial band's mask
-FOLD_LEVEL_LIFT_ONLY = False   # True: the fold levelling only lifts (a fold is darker than the skin round it; nothing in its band is darkened)
-SKIN_EDGE_KEEP = 0.0      # > 0: the skin smoothing fades in from the skin area's own edge over this many face widths (the jaw's contour
+# (Mac IWALY, 11/24) the Mac batch's own face changes, on in its control.json engine_cfg; the app's defaults since 1.26.2 (2611 LNGSHOT QA
+# 11/26, 4K close-ups: without them a beanie's knit and the hair over the forehead were smoothed and a line ran inside the jaw's outline)
+FACE_HAIR_HOLD = 1.0       # > 0: hair / cover over the face (face parsing + the hair class) takes the face's retouch back there (job mask face_hold)
+FOLD_EDGE_FADE = 1.0       # > 0: the nasolabial / mouth line bands fade in from their own edge (no rim)
+FINAL_NASO_IN_BAND = 1.0   # > 0: the last pass's nasolabial lift only inside the nasolabial band's mask
+FOLD_LEVEL_LIFT_ONLY = True   # True: the fold levelling only lifts (a fold is darker than the skin round it; nothing in its band is darkened)
+SKIN_EDGE_KEEP = 0.04      # > 0: the skin smoothing fades in from the skin area's own edge over this many face widths (the jaw's contour
                           # against the neck's shade was smoothed away: a bright band inside the jaw line and a dark one under it, c016 f38)
-FACE_NOSE_ADD = 0.0       # > 0: the nose (bridge, tip, wings from the landmarks) is added to the skin area at this weight where the skin
+FACE_NOSE_ADD = 0.8       # > 0: the nose (bridge, tip, wings from the landmarks) is added to the skin area at this weight where the skin
                           # model left it out (a shiny nose tip is not 'skin coloured': the nose was not retouched at all, c016)
 
 
