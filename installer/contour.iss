@@ -63,10 +63,12 @@ Name: "{app}\Cloud\data"; Permissions: users-modify
 Source: "{#Src}\cloud\*"; DestDir: "{app}\Cloud"; Excludes: "__pycache__,*.pyc"; Flags: ignoreversion
 Source: "{#Py}\*"; DestDir: "{app}\python"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#Ffm}\bin\*"; DestDir: "{app}\ffmpeg\bin"; Flags: ignoreversion
+Source: "{#Ffm}\LICENSE*"; DestDir: "{app}\ffmpeg"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#Src}\app.py"; DestDir: "{app}\app"; Flags: ignoreversion
 Source: "{#Src}\requirements.txt"; DestDir: "{app}\app"; Flags: ignoreversion
 Source: "{#Src}\requirements-learn.txt"; DestDir: "{app}\app"; Flags: ignoreversion
 Source: "{#Src}\README.md"; DestDir: "{app}\app"; Flags: ignoreversion
+Source: "{#Src}\THIRD_PARTY_NOTICES.md"; DestDir: "{app}\app"; Flags: ignoreversion
 Source: "{#Src}\contour\*"; DestDir: "{app}\app\contour"; Excludes: "__pycache__,*.pyc"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#Src}\tools\*"; DestDir: "{app}\app\tools"; Excludes: "__pycache__,*.pyc"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#Src}\assets\*"; DestDir: "{app}\app\assets"; Flags: ignoreversion recursesubdirs createallsubdirs

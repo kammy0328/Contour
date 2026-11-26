@@ -90,6 +90,8 @@ def cloth_model() -> str:
             v = ""
     # a missing garment-word file never brings parse_clothes in by itself: run() says so and leaves the clothing
     # undecided
+    if v == "parse_clothes" and os.environ.get("DIAP_NONCOMMERCIAL", "") != "1":
+        return DEFAULT_MODEL           # (1.26.3) a non-commercial model only where it is asked for on purpose (THIRD_PARTY_NOTICES.md)
     return v if v in ("sam31", "parse_clothes") else DEFAULT_MODEL
 
 
