@@ -5783,11 +5783,40 @@ CHIN_KEEP_EDGE = 0.05
 CHIN_EDGE_GATE = True
 
 
-def chin_zone(shape, lm: np.ndarray, wf: float) -> Optional[np.ndarray]:
+# (1.27, LNGSHOT BEEP BEEP 11/27, the user: "턱주름 ... 안된 거 확인되면 알아서 해결"; QA c046 t18, c034 t7, c084 t18: the pebbles stayed with 턱주름 at 100) with
+# the keep-outs above the zone is a thin strip on a face whose mouth is open (the lower lip comes down to the chin's ball: CHIN_KEEP_LIP takes most of what
+# is left), and on a chin in hard light the edge gate holds the pebbles themselves (each one has a steep edge of light). The pebbled way (the slider
+# 자갈턱 넓게, "chin_pebble", a person's share 0..1; CHIN_PEBBLE: the same for every face): the chin's stages work on the whole chin, with only
+# CHIN_PEBBLE_KEEP (lip, outline) kept clear and without the edge gate; what the last pass takes from a point is bounded (CHIN_PEBBLE_CAP of the luma, soft:
+# a pebble is a few levels high, a shape is more); a face turned away (face_turn from CHIN_PEBBLE_YAW[0], none of it from [1]: its chin landmarks lie
+# anywhere) keeps the stages of 1.26.2. It is not the default and has no finder of its own: tried for every face it lifted the shade under the lower lip
+# (c072 t41: 24 levels), the edge of a hard light on the chin (c087 t28, c027 t70) and the shade under the jaw of a face looking down (c024 t22: a light
+# patch of 27 levels), the very things the keep-outs and the edge gate are for; neither the dimple measure nor the direction of the gradients (a long edge
+# against pebbles lying every way) told these from a pebbled chin in side light. So it is the operator's to switch on where the pebbles stay.
+CHIN_PEBBLE = 0.0
+CHIN_PEBBLE_KEEP = (0.05, 0.03)
+CHIN_PEBBLE_CAP = 0.05
+CHIN_PEBBLE_YAW = (0.60, 0.80)
+
+
+def _pebble_share(lm: Optional[np.ndarray], v: Optional[dict] = None) -> float:
+    """0..1: how far the chin's stages work the pebbled way on this face: the person's 자갈턱 넓게 (or CHIN_PEBBLE), none of it on a face turned away
+    (CHIN_PEBBLE_YAW)."""
+    g = float(np.clip(max(float(CHIN_PEBBLE), float((v or {}).get("chin_pebble", 0.0) or 0.0)), 0.0, 1.0))
+    if g <= 1e-4 or lm is None:
+        return 0.0
+    if CHIN_PEBBLE_YAW is not None:
+        lo, hi = float(CHIN_PEBBLE_YAW[0]), float(CHIN_PEBBLE_YAW[1])
+        g *= float(1.0 - np.clip((face_turn(lm) - lo) / max(hi - lo, 1e-3), 0.0, 1.0))
+    return g
+
+
+def chin_zone(shape, lm: np.ndarray, wf: float, pebble: bool = False) -> Optional[np.ndarray]:
     """The chin between the lower lip and the jaw (soft), lm in px of `shape`: off the lower lip's shade and the face's outline
-    (CHIN_KEEP_LIP, CHIN_KEEP_EDGE)."""
+    (CHIN_KEEP_LIP, CHIN_KEEP_EDGE; pebble: CHIN_PEBBLE_KEEP, the zone of the pebbled way)."""
     if lm is None or not np.isfinite(lm[[57, 8], :2]).all():
         return None
+    keep_lip, keep_edge = (float(CHIN_PEBBLE_KEEP[0]), float(CHIN_PEBBLE_KEEP[1])) if pebble else (float(CHIN_KEEP_LIP), float(CHIN_KEEP_EDGE))
     a, b = lm[57, :2], lm[8, :2]
     c = 0.4 * a + 0.6 * b
     v = b - a
@@ -5799,26 +5828,26 @@ def chin_zone(shape, lm: np.ndarray, wf: float) -> Optional[np.ndarray]:
                 float(np.degrees(np.arctan2(v[1], v[0]))), 0, 360, 255, -1)
     z = cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.03 * wf))
     r = _roi(z, 2)
-    if r is None or (CHIN_KEEP_LIP <= 1e-4 and CHIN_KEEP_EDGE <= 1e-4):
+    if r is None or (keep_lip <= 1e-4 and keep_edge <= 1e-4):
         return z
     # (the zone's box, grown by what the blurs below reach: they work on that piece of the picture only)
-    g = int(max(CHIN_KEEP_LIP, CHIN_KEEP_EDGE) * wf * 2) + 8
+    g = int(max(keep_lip, keep_edge) * wf * 2) + 8
     y0, y1, x0, x1 = max(0, r[0] - g), min(shape[0], r[1] + g), max(0, r[2] - g), min(shape[1], r[3] + g)
     o = np.float32([x0, y0])
     keep = np.ones((y1 - y0, x1 - x0), np.float32)
-    if CHIN_KEEP_LIP > 1e-4 and np.isfinite(lm[48:60, :2]).all():
+    if keep_lip > 1e-4 and np.isfinite(lm[48:60, :2]).all():
         lip = np.zeros(keep.shape, np.uint8)
         cv2.fillConvexPoly(lip, cv2.convexHull(np.round(lm[48:60, :2] - o).astype(np.int32)), 255)
-        kl = max(3, int(round(CHIN_KEEP_LIP * wf)) * 2 + 1)
+        kl = max(3, int(round(keep_lip * wf)) * 2 + 1)
         lip = cv2.dilate(lip, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kl, kl)))
-        keep *= 1.0 - cv2.GaussianBlur(lip.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.15 * CHIN_KEEP_LIP * wf))
-    if CHIN_KEEP_EDGE > 1e-4 and np.isfinite(lm[0:17, :2]).all():
+        keep *= 1.0 - cv2.GaussianBlur(lip.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.15 * keep_lip * wf))
+    if keep_edge > 1e-4 and np.isfinite(lm[0:17, :2]).all():
         hull = np.zeros(keep.shape, np.uint8)
         pts = lm[0:17, :2] if not np.isfinite(lm[17:27, :2]).all() else np.vstack([lm[0:17, :2], lm[17:27, :2]])
         cv2.fillConvexPoly(hull, cv2.convexHull(np.round(pts - o).astype(np.int32)), 255)
-        ke = max(3, int(round(CHIN_KEEP_EDGE * wf)) * 2 + 1)
+        ke = max(3, int(round(keep_edge * wf)) * 2 + 1)
         hull = cv2.erode(hull, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ke, ke)))
-        keep *= cv2.GaussianBlur(hull.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.25 * CHIN_KEEP_EDGE * wf))
+        keep *= cv2.GaussianBlur(hull.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.25 * keep_edge * wf))
     z[y0:y1, x0:x1] *= keep
     return z
 
@@ -5835,31 +5864,64 @@ def _dimple_map(Y: np.ndarray, wf: float) -> np.ndarray:
     return np.sqrt(np.maximum(xx * yy - xy * xy, 0)) * sg * sg / base
 
 
-def _chin_dimple(Y: np.ndarray, lm: Optional[np.ndarray], skin: np.ndarray, wf: float, k: float) -> np.ndarray:
-    """Soften a pebbled chin (the chin muscle pulled tight). How pebbled the chin is, is measured on this very
-    frame: on a frame where the chin is smooth the amount is 0 and nothing is touched, and it rises with the
-    dimples. The broad light and shade of the chin stay as they are."""
-    z = chin_zone(Y.shape, lm, wf)
-    if z is None:
-        return Y
-    r_ = _roi(z, int(0.15 * wf) + 8)
+def _chin_weight(Y: np.ndarray, lm: Optional[np.ndarray], skin: np.ndarray, wf: float, pad: int, k: float, measured: bool, share: float = 0.0):
+    """Where the chin's stages work and how much: (box y0, y1, x0, x1; the weight on the box, k at most) or None. The way of 1.26.2 (the zone with its
+    keep-outs, off steep edges) and the pebbled way (the wider zone, no edge gate), mixed by the face's share of the pebbled way (_pebble_share).
+    measured: each way's weight times how pebbled its zone is on this frame (the 90th percentile of the dimple measure between CHIN_LO and CHIN_HI: a
+    smooth chin gets nothing, and nothing is done below 0.02)."""
+    g = float(np.clip(share, 0.0, 1.0))
+    z0 = chin_zone(Y.shape, lm, wf) if g < 0.999 else None
+    z1 = chin_zone(Y.shape, lm, wf, pebble=True) if g > 1e-4 else None
+    if z0 is None and z1 is None:
+        return None
+    r_ = _roi(z0 if z1 is None else (z1 if z0 is None else np.maximum(z0, z1)), pad)
     if r_ is None:
-        return Y
+        return None
     y0, y1, x0, x1 = r_
     roi = Y[y0:y1, x0:x1].astype(np.float32)
-    zz, ss = z[y0:y1, x0:x1], skin[y0:y1, x0:x1]
-    reg = (zz > 0.5) & (ss > 0.5)
-    if reg.sum() < 40:
+    ss = skin[y0:y1, x0:x1] if measured else np.clip(skin[y0:y1, x0:x1], 0, 1)
+    dm = _dimple_map(roi, wf) if measured else None
+
+    def amount(zz):
+        if not measured:
+            return float(k)
+        reg = (zz > 0.5) & (ss > 0.5)
+        if reg.sum() < 40:
+            return 0.0
+        amt = float(np.clip((float(np.percentile(dm[reg], 90)) - CHIN_LO) / (CHIN_HI - CHIN_LO), 0, 1)) * k
+        return amt if amt >= 0.02 else 0.0
+
+    m = None
+    if z0 is not None:
+        zz = z0[y0:y1, x0:x1]
+        a0 = amount(zz)
+        if a0 > 0.0:
+            m = (zz * ss * a0).astype(np.float32)
+            if CHIN_EDGE_GATE:
+                ek_ = SK.edge_keep(roi, wf)
+                if ek_ is not None:
+                    m = m * (1.0 - ek_)
+            if z1 is not None:
+                m = (1.0 - g) * m
+    if z1 is not None:
+        zz = z1[y0:y1, x0:x1]
+        a1 = amount(zz)
+        if a1 > 0.0:
+            m1 = g * (zz * ss * a1).astype(np.float32)
+            m = m1 if m is None else m + m1
+    if m is None:
+        return None
+    return (y0, y1, x0, x1), m, roi
+
+
+def _chin_dimple(Y: np.ndarray, lm: Optional[np.ndarray], skin: np.ndarray, wf: float, k: float, share: float = 0.0) -> np.ndarray:
+    """Soften a pebbled chin (the chin muscle pulled tight). How pebbled the chin is, is measured on this very
+    frame: on a frame where the chin is smooth the amount is 0 and nothing is touched, and it rises with the
+    dimples. The broad light and shade of the chin stay as they are. share: of the pebbled way (_pebble_share)."""
+    w_ = _chin_weight(Y, lm, skin, wf, int(0.15 * wf) + 8, k, True, share)
+    if w_ is None:
         return Y
-    s = float(np.percentile(_dimple_map(roi, wf)[reg], 90))
-    amt = float(np.clip((s - CHIN_LO) / (CHIN_HI - CHIN_LO), 0, 1)) * k
-    if amt < 0.02:
-        return Y
-    m = (zz * ss * amt).astype(np.float32)
-    if CHIN_EDGE_GATE:
-        ek_ = SK.edge_keep(roi, wf)
-        if ek_ is not None:
-            m = m * (1.0 - ek_)
+    (y0, y1, x0, x1), m, roi = w_
     r = max(2, int(round(0.03 * wf)))
     out = SK.smooth_channel(roi, m, 1.0, 0.0, r, eps=0.003, relative=True)
     d = out - roi
@@ -7737,21 +7799,13 @@ def _final_long_lines(Y0: np.ndarray, region: np.ndarray, wf: float) -> Optional
     return out
 
 
-def _final_chin(Y: np.ndarray, lm: np.ndarray, skin: np.ndarray, wf: float, k: float) -> np.ndarray:
-    """The pits and bumps of a pebbled chin taken out: the band FINAL_CHIN_BAND of the luma, on the chin's zone of the skin."""
-    z = chin_zone(Y.shape, lm, wf)
-    if z is None:
+def _final_chin(Y: np.ndarray, lm: np.ndarray, skin: np.ndarray, wf: float, k: float, share: float = 0.0) -> np.ndarray:
+    """The pits and bumps of a pebbled chin taken out: the band FINAL_CHIN_BAND of the luma, on the chin's zone of the skin. share: of the pebbled
+    way (_pebble_share)."""
+    w_ = _chin_weight(Y, lm, skin, wf, int(0.1 * wf) + 8, float(k), False, share)
+    if w_ is None:
         return Y
-    r = _roi(z, int(0.1 * wf) + 8)
-    if r is None:
-        return Y
-    y0, y1, x0, x1 = r
-    roi = Y[y0:y1, x0:x1].astype(np.float32)
-    m = z[y0:y1, x0:x1] * np.clip(skin[y0:y1, x0:x1], 0, 1) * float(k)
-    if CHIN_EDGE_GATE:
-        ek_ = SK.edge_keep(roi, wf)
-        if ek_ is not None:
-            m = m * (1.0 - ek_)
+    (y0, y1, x0, x1), m, roi = w_
     s0, s1 = max(0.8, FINAL_CHIN_BAND[0] * wf), max(2.0, FINAL_CHIN_BAND[1] * wf)
     band = cv2.GaussianBlur(roi, (0, 0), s0) - cv2.GaussianBlur(roi, (0, 0), s1)
     if FINAL_CHIN_LIGHT is not None:
@@ -7761,7 +7815,13 @@ def _final_chin(Y: np.ndarray, lm: np.ndarray, skin: np.ndarray, wf: float, k: f
         b2 = cv2.GaussianBlur(roi, (0, 0), s0) - cv2.GaussianBlur(roi, (0, 0), s2)
         band = np.where(band > 0, np.clip(np.minimum(band, np.maximum(b2, 0.0)), 0.0, FINAL_CHIN_LIGHT_MAX), band)
     out = Y.astype(np.float32, copy=True)
-    out[y0:y1, x0:x1] = roi - m * band
+    if share > 1e-4 and CHIN_PEBBLE_CAP is not None and CHIN_PEBBLE_CAP > 1e-5:
+        # (the pebbled way) what is taken from a point is bounded, softly
+        cap = float(CHIN_PEBBLE_CAP)
+        corr = m * band
+        out[y0:y1, x0:x1] = roi - (corr + float(np.clip(share, 0, 1)) * (cap * np.tanh(corr / cap) - corr))
+    else:
+        out[y0:y1, x0:x1] = roi - m * band
     return out
 
 
@@ -8099,7 +8159,7 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M, spots=None):
                     Y, Cb, Cr = _fold_heal(Y, Cb, Cr, Y0, M(job.masks["naso"], (hY, wY)), lmY, wf, kh_)
             kfc_ = max(float(FINAL_CHIN), float(job.v.get("chin_lines", 0.0)))     # (1.26.2) the 턱주름 slider, or the setting for every face
             if kfc_ > 1e-4 and lmY is not None and skin is not None:
-                Y = _final_chin(Y, lmY, skin, wf, float(np.clip(kfc_, 0, 1)) * _face_big(job.face, wf, y_per_src))
+                Y = _final_chin(Y, lmY, skin, wf, float(np.clip(kfc_, 0, 1)) * _face_big(job.face, wf, y_per_src), _pebble_share(job.face, job.v))
         except Exception:
             import traceback
             traceback.print_exc()
@@ -8717,7 +8777,7 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                 Y, Cb, Cr = _crease_lift(Y, Cb, Cr, mfl, float(np.clip(FACE_LINES, 0, 1)), max(1.5, 0.012 * wf),
                                          None, jaw_hold(job.face, (hY, wY), y_per_src, wf))
             if kchin_ > 1e-4:
-                Y = _chin_dimple(Y, lmY, skY, wf, float(np.clip(kchin_, 0, 1)) * _face_big(job.face, wf, y_per_src))
+                Y = _chin_dimple(Y, lmY, skY, wf, float(np.clip(kchin_, 0, 1)) * _face_big(job.face, wf, y_per_src), _pebble_share(job.face, v))
         # 2a'. frown lines between the brows and across the top of the nose (thin creases only)
         if FROWN_LINES > 1e-4 and "skin" in job.masks and job.face is not None and v["skin"] > 1e-4:
             try:
