@@ -2444,11 +2444,19 @@ def _raw_cached(cut, tracker, s: int, cache):
         for j in rf.jobs:                   # (a helper sends the masks packed: here they are what this function keeps, whole float16 arrays)
             j.masks = {k: _mask_unpack(v, np.float16) for k, v in j.masks.items()}
     else:
-        with _tm("raw"):
-            rf = _prepare_raw(cut, tracker, s, cache)
-        if rf is not None:
-            for j in rf.jobs:
-                j.masks = {k: _raw_keep(v) for k, v in j.masks.items()}
+        # (1.27, retouch.rawahead) a render on a computer with memory and cores to spare has the next frames' own masks made
+        # ahead in threads: taken from there (already kept as below); a frame not made there is made here as before
+        ahead = tracker.__dict__.get("_raw_ahead") if cache is None else None
+        made = False
+        if ahead is not None:
+            with _tm("raw.ahead"):
+                made, rf = ahead.take(s)
+        if not made:
+            with _tm("raw"):
+                rf = _prepare_raw(cut, tracker, s, cache)
+            if rf is not None:
+                for j in rf.jobs:
+                    j.masks = {k: _raw_keep(v) for k, v in j.masks.items()}
     lru[s] = rf
     while len(lru) > STEADY_LRU:
         lru.popitem(last=False)

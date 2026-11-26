@@ -110,6 +110,19 @@ def preview_rgb(planes, pf: str, maxv: float, width: int = 480) -> np.ndarray:
     return (np.clip(rgb, 0, 1) * 255 + 0.5).astype(np.uint8)
 
 
+def pace_text(done: int, total: int, elapsed: float) -> str:
+    """"12/40 · 프레임당 9.4초 · 남은 시간 4분 23초": where a render is, its pace and what is left. Frames a second when
+    it is that fast; seconds a frame when a frame takes a second or more (a 4K frame with four faces takes nine: the
+    line said "0.1 fps" from the first frame to the last), and hours when it is that long."""
+    if done <= 0 or elapsed <= 0:
+        return f"{max(0, done)}/{total}"          # nothing to tell a pace from yet
+    fps = done / max(elapsed, 1e-3)
+    eta = max(0, total - done) / max(fps, 1e-3)
+    pace = f"{fps:.1f} fps" if fps >= 1.0 else f"프레임당 {1.0 / max(fps, 1e-6):.1f}초"
+    left = f"{int(eta // 3600)}시간 {int(eta % 3600 // 60)}분" if eta >= 3600 else f"{int(eta // 60)}분 {int(eta % 60)}초"
+    return f"{done}/{total} · {pace} · 남은 시간 {left}"
+
+
 def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progress: Progress = None,
                cancel: Optional[Callable[[], bool]] = None, ext_writer=None,
                preview: Optional[Callable[[int, np.ndarray], None]] = None) -> RenderReport:
@@ -299,6 +312,7 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
     import threading
     from collections import deque
     from concurrent.futures import ThreadPoolExecutor
+    from ..core import perf as PF
     parallel = not out.matte_person
     n_workers = max(1, min(4, (os.cpu_count() or 2) // 2)) if parallel else 1
     if parallel and os.environ.get("CONTOUR_RENDER_THREADS", "").isdigit():
@@ -325,6 +339,10 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
     # (CONTOUR_RAW_PROCS): retouch.rawpool. What a frame gets is the same; a frame no helper made is made here as before.
     from ..retouch import rawpool as RP
     raw_pool = RP.start_for_render(project, cut, tracker, a, b)
+    # (1.27) without helper processes: the next frames' own masks made ahead in threads of this process, where the computer has
+    # the memory and the cores (retouch.rawahead, core.perf.raw_ahead). The same masks; the serial stage waits on them less.
+    from ..retouch import rawahead as RA
+    raw_ahead = RA.start_for_render(cut, tracker, a, b) if raw_pool is None else None
 
     # the retouch of each frame done in helper processes when the environment asks for them (CONTOUR_APPLY_PROCS): retouch.applypool
     from ..retouch import applypool as AP
@@ -338,6 +356,13 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
                 rep.accel = (rep.accel + " · " if rep.accel else "") + f"보정 도우미 {sa_.get('helpers')}개 ({sa_.get('done')}/{sa_.get('done', 0) + sa_.get('local', 0)})"
             except Exception:
                 pass
+        if raw_ahead is not None:
+            sr_ = RA.stop_for_render(tracker)
+            if sr_ is not None:
+                try:
+                    rep.raw_ahead = sr_
+                except Exception:
+                    pass
         st_ = RP.stop_for_render(tracker) if raw_pool is not None else None
         if st_ is not None:
             try:
@@ -395,11 +420,9 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
             _write_matte(matte_writers["warp"], wm, is_exr, seq_offset + t_)
         rep.frames += 1
         if progress:
-            el = time.time() - t_start
-            fps = rep.frames / max(el, 1e-3)
-            eta = (n - rep.frames) / max(fps, 1e-3)
-            progress(rep.frames / max(1, n), f"렌더 {rep.frames}/{n} · {fps:.1f} fps · 남은 시간 {int(eta // 60)}분 {int(eta % 60)}초")
+            progress(rep.frames / max(1, n), "렌더 " + pace_text(rep.frames, n, time.time() - t_start))
 
+    held = [0]                             # frames waited for because memory was short
     if parallel and n_workers > 1:
         pool = ThreadPoolExecutor(max_workers=n_workers)
         pending: "deque" = deque()
@@ -415,6 +438,14 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
                 if planes is None:
                     rep.warnings.append(f"프레임 {t}에서 디코딩이 끝났습니다.")
                     break
+                # (1.27) short of memory: the frames in the making are finished and written, one after the other, before another
+                # is started (IWALY c004, 6 people with body retouch on the 31 GB PC with 12 GB in use by other programs: the
+                # computer's memory was full with four frames at once, j2896a). The same frames in the same order.
+                while pending and PF.short_of_memory():
+                    t0_, fut = pending.popleft()
+                    _, fr0, outp0 = fut.result()
+                    write_frame(t0_, outp0, fr0)
+                    held[0] += 1
                 pending.append((t, pool.submit(process, t, planes)))
                 while len(pending) > n_workers * 2 or (pending and pending[0][1].done()):
                     t0_, fut = pending.popleft()
@@ -499,6 +530,8 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
     rep.seconds = time.time() - t_start
     if parallel and n_workers > 1:
         rep.accel = (rep.accel + " · " if rep.accel else "") + f"프레임 {n_workers}개 동시 처리"
+        if held[0]:
+            rep.accel += f" (메모리가 부족해 {held[0]}번은 앞 프레임이 끝나기를 기다림)"
     return rep
 
 
