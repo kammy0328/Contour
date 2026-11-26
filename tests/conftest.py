@@ -26,6 +26,14 @@ def home(tmp_path, monkeypatch):
     S._settings = None
     PC._cache = None                 # the finished frames kept for playback, and what cuts were left with
     PC.revisions().forget()
+    try:                             # (1.27) the sessions kept between uses and what is known of TensorRT RTX: every test its own
+        import contour.track.models as TM
+        import contour.track.backend as TB
+        TM._kept.clear()
+        TM._rtx_failed.clear()
+        TB._rtx = None
+    except Exception:
+        pass
     yield h
     S._settings = None
     PC._cache = None

@@ -24,10 +24,11 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+RTX_EP = "NvTensorRTRTXExecutionProvider"       # NVIDIA's TensorRT for RTX: a plugin of onnxruntime, used beside CUDA (see rtx() below)
 PROVIDER = {"cuda": "CUDAExecutionProvider", "dml": "DmlExecutionProvider", "coreml": "CoreMLExecutionProvider",
-            "cpu": "CPUExecutionProvider"}
+            "cpu": "CPUExecutionProvider", "rtx": RTX_EP}
 BACKEND = {v: k for k, v in PROVIDER.items()}
-LABEL = {"cuda": "CUDA", "dml": "DirectML", "coreml": "Core ML", "cpu": "CPU"}
+LABEL = {"cuda": "CUDA", "dml": "DirectML", "coreml": "Core ML", "cpu": "CPU", "rtx": "TensorRT RTX"}
 ORDER = {"win32": ("cuda", "dml", "cpu"), "darwin": ("coreml", "cpu")}
 ORDER_OTHER = ("cuda", "cpu")
 
@@ -71,6 +72,134 @@ def coreml_files() -> Dict[str, dict]:
     if os.environ.get("DIAP_COREML_CACHE"):
         o["ModelCacheDirectory"] = os.environ["DIAP_COREML_CACHE"]
     return {n: dict(o) for n in names}
+
+# ------------------------------------------------------------------------------------------------- TensorRT for RTX
+# (1.27) NVIDIA's TensorRT for RTX execution provider: a plugin of onnxruntime (pip onnxruntime-ep-nv-tensorrt-rtx-cu12, put in by
+# tools/setup_env.py on a computer whose GPU it runs on: RTX 30 series and later), used beside the CUDA runtime, never instead of it. Only
+# the model FILES listed here are opened on it, each after it was run on both with the same input and what the analysis makes of the outputs
+# agreed. A file not listed, no plugin, no device, a session that does not open or a run that fails: CUDA, as before.
+#   image-encoder-gpu.onnx  SAM 3.1's image encoder (42 % of an analysis): 0.49 -> 0.076 s a picture on an RTX 4070 Ti, the people's labels of a
+#                           whole SAM pass IoU 0.9994 to 0.9999 against CUDA's, the matte more than 32/255 off on 0.03 % of the people's pixels,
+#                           GPU memory of the pass 10 -> 5.7 GB (LNGSHOT 012 and 024, j2875 / j2885, 11/26). TensorRT 10's own fp16 attention
+#                           is wrong on this graph (j2861..j2867): that provider is not used.
+# Off unless the user switches it on (settings().rtx, 설정 > TensorRT RTX 가속): the mattes agree to IoU 0.9995, but what the analysis decides
+# from them where it is in doubt does not always (LNGSHOT 024, j2897: a face at the frame's edge known on 26 frames instead of 32, joints a
+# couple of pixels off on a quarter of the points, far off where a limb is hidden; 012: faces the same). Every model on it ("*") was slower
+# than the encoder alone (024: 103 s against 88, 012: 108 against 85): only the encoder is listed.
+RTX_OK: Dict[str, dict] = {"image-encoder-gpu.onnx": {}}
+RTX_PACKAGE = "onnxruntime-ep-nv-tensorrt-rtx-cu12"
+RTX_VERSION = "0.5.0"                   # the version checked (setup_env.py installs this one)
+_rtx: Optional[dict] = None
+
+
+def rtx_files() -> Dict[str, dict]:
+    """The model files TensorRT RTX is used for: RTX_OK, or what DIAP_RTX_FILES names (file names separated by commas,
+    '*' for every model: for trying a model on it before it is listed)."""
+    v = os.environ.get("DIAP_RTX_FILES", "").strip()
+    if not v:
+        return RTX_OK
+    if v == "*":
+        return {"*": {}}
+    return {n.strip(): {} for n in v.split(",") if n.strip()}
+
+
+def rtx(refresh: bool = False) -> dict:
+    """The TensorRT RTX plugin on this computer, looked at once: {"devices": the GPUs it runs on ([]: not used), "why": the reason
+    when there is none, "version": the plugin's, "name": the provider's name}. Nothing is opened here; the plugin's library is
+    given to onnxruntime (once a process) and asked which devices it takes."""
+    global _rtx
+    with _lock:
+        if _rtx is not None and not refresh:
+            return _rtx
+        d = dict(devices=[], why="", version="", name=RTX_EP, state="off")     # state: ok | off | no_plugin | no_device | error
+        try:
+            if system() == "darwin":
+                d["why"] = "macOS에는 없음"
+            elif os.environ.get("DIAP_RTX", "1") == "0":
+                d["why"] = "꺼짐 (DIAP_RTX=0)"
+            else:
+                import onnxruntime as ort
+                if not hasattr(ort, "register_execution_provider_library") or not hasattr(ort, "get_ep_devices"):
+                    d["why"] = f"ONNX Runtime {ort.__version__}에는 플러그인 실행 장치가 없음"
+                    d["state"] = "error"
+                else:
+                    try:
+                        import onnxruntime_ep_nv_tensorrt_rtx as ep
+                        lib_of, name_of = ep.get_library_path, ep.get_ep_name
+                    except (ImportError, AttributeError):
+                        ep = None
+                        d["state"] = "no_plugin"
+                        d["why"] = "TensorRT RTX 구성요소가 설치되어 있지 않음 (설치 파일을 다시 실행하면 RTX 30 이상에서 설치됩니다)"
+                    if ep is not None:
+                        from . import models as M
+                        M._preload_cuda()                       # the plugin uses the CUDA runtime's libraries (pip's nvidia-* wheels)
+                        lib, name = str(lib_of()), str(name_of())
+                        d["name"] = name
+                        try:
+                            from importlib import metadata
+                            d["version"] = metadata.version(RTX_PACKAGE)
+                        except Exception:
+                            d["version"] = str(getattr(ep, "__version__", ""))
+                        if os.name == "nt":
+                            try:
+                                os.add_dll_directory(os.path.dirname(lib))
+                            except Exception:
+                                pass
+                            os.environ["PATH"] = os.path.dirname(lib) + os.pathsep + os.environ.get("PATH", "")
+                        try:
+                            ort.register_execution_provider_library(name, lib)
+                        except Exception as e:
+                            if "already" not in str(e).lower():
+                                raise
+                        d["devices"] = [x for x in ort.get_ep_devices() if x.ep_name == name]
+                        PROVIDER["rtx"] = name
+                        BACKEND[name] = "rtx"
+                        d["state"] = "ok" if d["devices"] else "no_device"
+                        if not d["devices"]:
+                            d["why"] = "이 GPU는 TensorRT RTX 대상이 아님 (RTX 30 시리즈 이상)"
+        except Exception as e:
+            d["devices"] = []
+            d["state"] = "error"
+            d["why"] = f"TensorRT RTX를 불러오지 못함 ({str(e)[:160]})"
+        _rtx = d
+        return d
+
+
+def rtx_brief() -> str:
+    """A short line for the settings, without loading anything: whether the plugin is installed, and what an analysis of this
+    run has found of it ('' on a Mac: nothing to say). 진단 tells the rest."""
+    if system() == "darwin":
+        return ""
+    r = _rtx
+    if r is not None:
+        if r.get("devices"):
+            return f"사용 가능 (TensorRT RTX {r.get('version', '')})".replace(" )", ")")
+        return str(r.get("why") or "쓰지 않음")
+    try:
+        import importlib.util
+        have = importlib.util.find_spec("onnxruntime_ep_nv_tensorrt_rtx") is not None
+    except Exception:
+        have = False
+    if not have:
+        return "구성요소 없음 (RTX 30 이상: 설치 파일을 다시 실행하면 설치됩니다)"
+    return "설치됨 · 분석할 때 이 GPU에서 쓸 수 있는지 확인합니다"
+
+
+def rtx_for(path, want: str = "auto", allow: str = "auto") -> Tuple[list, str]:
+    """(devices, why not) for one model file: the TensorRT RTX devices its session is given when the file is one checked on it
+    (rtx_files) and the settings allow it: 추론 장치 자동 or CUDA, 'TensorRT RTX 가속' not switched off. ([], "") for a file that is
+    not listed: nothing to say."""
+    files = rtx_files()
+    name = Path(str(path)).name
+    if "*" not in files and name not in files:
+        return [], ""
+    if want not in ("auto", "cuda"):
+        return [], ""
+    if str(allow or "auto") == "off":
+        return [], "TensorRT RTX 가속이 설정에서 꺼져 있음"
+    r = rtx()
+    return list(r["devices"]), ("" if r["devices"] else r["why"])
+
 
 # models that are not moved to the CPU when the GPU has no memory left for them: one run there takes minutes (the
 # SAM 3.1 encoder: 206 s a picture on 16 threads), so the analysis says what to do instead of seeming to hang
@@ -311,7 +440,9 @@ def summary_label(default: str) -> str:
     acc = sorted({e for e in eff if e != "cpu"})
     if not acc:
         return "CPU"
-    return LABEL.get(acc[0], acc[0]) + (" (일부 CPU)" if "cpu" in eff else "")
+    # (1.27) CUDA with the models that run on TensorRT RTX beside it: both named
+    names = [LABEL.get(a, a) for a in acc] if set(acc) == {"cuda", "rtx"} else [LABEL.get(acc[0], acc[0])]
+    return " + ".join(names) + (" (일부 CPU)" if "cpu" in eff else "")
 
 
 def diagnostics() -> dict:
@@ -338,8 +469,14 @@ def diagnostics() -> dict:
         warn.append(dtext)
     if system() == "win32" and "cuda" not in offered() and g.get("vendor") == "nvidia":
         warn.append("NVIDIA GPU가 있지만 설치된 ONNX Runtime에 CUDA가 없습니다 (DirectML 또는 CPU로 실행)")
+    try:
+        r_ = rtx() if (want in ("auto", "cuda") and "cuda" in offered()) else dict(devices=[], why="", version="")
+        rtx_d = dict(devices=len(r_.get("devices") or []), why=r_.get("why", ""), version=r_.get("version", ""),
+                     files=sorted(rtx_files()))
+    except Exception as e:
+        rtx_d = dict(devices=0, why=str(e)[:160], version="", files=[])
     return dict(system=f"{platform.system()} {platform.release()} {platform.machine()}", python=platform.python_version(),
-                onnxruntime=ort_v, packages=pk, available=avail, offered=offered(), setting=want, gpu=g,
+                onnxruntime=ort_v, packages=pk, available=avail, offered=offered(), setting=want, gpu=g, rtx=rtx_d,
                 driver=dstate, pinned=dict(onnxruntime=ORT_PINNED, cuda=CUDA_RUNTIME, cudnn=CUDNN_RUNTIME,
                                            driver_min=".".join(str(x) for x in DRIVER_MIN.get(system(), ())),
                                            driver_checked=".".join(str(x) for x in DRIVER_BUILT.get(system(), ()))),
@@ -365,6 +502,11 @@ def text(d: Optional[dict] = None) -> str:
     if "cuda" in (d.get("offered") or []) or g.get("vendor") == "nvidia":
         L.append(f"확인된 조합: ONNX Runtime {p.get('onnxruntime')} + CUDA {p.get('cuda')} + cuDNN {p.get('cudnn')}.x, "
                  f"NVIDIA 드라이버 {p.get('driver_checked')} 이상 (최소 {p.get('driver_min')})")
+    rx = d.get("rtx") or {}
+    if rx.get("devices"):
+        L.append(f"TensorRT RTX {rx.get('version') or ''}: 사용 ({', '.join(rx.get('files') or [])})".replace("  ", " "))
+    elif rx.get("why") and g.get("vendor") == "nvidia":
+        L.append(f"TensorRT RTX: 쓰지 않음 ({rx['why']})")
     if d.get("system", "").startswith("Darwin"):
         L.append("Core ML로 실행하는 모델: " + (", ".join(d.get("coreml_models") or []) or "없음 (확인된 모델이 아직 없어 CPU로 실행)"))
     for w in d.get("warnings") or []:

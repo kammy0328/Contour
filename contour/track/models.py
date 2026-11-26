@@ -554,13 +554,18 @@ class Session:
 
     RETRIES = 2
 
-    def __init__(self, sess, path, shrink: bool = False, verify: bool = False, asked=None):
+    def __init__(self, sess, path, shrink: bool = False, verify: bool = False, asked=None, rtx: bool = False):
         self._s = sess
         self._path = str(path)
         self._ro = None
         self._verify = bool(verify)          # the first run's record tells which provider ran each operator
         self._ran = False
         self._asked = list(asked or [])
+        # (1.27) a session on TensorRT RTX: its runs one at a time (the provider's own rule for one session is not written
+        # down; a run is 0.08 s), and a run it cannot make moves the model to CUDA for the rest of the process
+        self._rtx = bool(rtx)
+        self._rtx_lock = threading.Lock() if rtx else None
+        self.last_used = time.monotonic()
         # the name of the input whose first dimension is a batch of items that do not depend on each other (set
         # by the model's owner, e.g. the pose crops of one frame): with no GPU memory left the batch is halved
         self.batch_input: Optional[str] = None
@@ -578,14 +583,22 @@ class Session:
         ours = self._ro is not None and "run_options" not in k and len(a) < 3
         if ours:
             k["run_options"] = self._ro
+        self.last_used = time.monotonic()
         for attempt in range(self.RETRIES + 1):
             try:
                 t0 = time.perf_counter()
-                out = self._s.run(*a, **k)
+                lk = self._rtx_lock
+                if lk is not None:
+                    with lk:
+                        out = self._s.run(*a, **k)
+                else:
+                    out = self._s.run(*a, **k)
                 if not self._ran:
                     self._first_run(time.perf_counter() - t0)
                 return out
             except Exception as e:
+                if self._rtx and not is_oom(e) and self._to_cuda(e):
+                    return self.run(*a, **k)
                 if ours and _no_pool(e):
                     # the session has no memory pool of the kind the option names (opened on the CPU alone, or an
                     # accelerator with a pool of another kind): the run is made without it, from now on
@@ -603,6 +616,30 @@ class Session:
                     return self._without_memory(e, a, k)
                 free_gpu_memory()
                 time.sleep(1.5 * (attempt + 1))
+
+    def serialize(self) -> "Session":
+        """The runs of this session one at a time from now on (SAM 3.1's encoder: a second run beside the first took its GPU
+        memory twice, 10 -> 11.8 GB on a 12 GB card; the frames encoded ahead and a close-up's encoding now take turns)."""
+        if self._rtx_lock is None:
+            self._rtx_lock = threading.Lock()
+        return self
+
+    def _to_cuda(self, err) -> bool:
+        """(TensorRT RTX) a run the provider could not make: the model is opened on CUDA, as it was before 1.27, and stays there
+        for the rest of this process (said in the diagnostics, with the error). False when that did not work either."""
+        from . import backend as BK
+        name = Path(self._path).name
+        sys.stderr.write(f"TENSORRT RTX {name}: run failed, going on with CUDA: {str(err)[:300]}\n")
+        try:
+            _rtx_failed.add(str(self._path))
+            s2 = _session_raw(Path(self._path))
+        except Exception as e:
+            sys.stderr.write(f"TENSORRT RTX {name}: CUDA session failed too: {str(e)[:300]}\n")
+            return False
+        self._s, self._ro, self._verify, self._asked = s2._s, s2._ro, s2._verify, s2._asked
+        self._rtx, self._ran = False, False             # (the lock stays: runs one at a time on CUDA too)
+        BK.note(self._path, reasons=[f"TensorRT RTX 실행 오류로 CUDA로 전환 ({str(err)[:120]})"])
+        return True
 
     def _cpu_twin(self, err):
         """(Mac, Core ML) a run Core ML cannot make (a picture with no detection gives a tensor with no elements, which the
@@ -721,6 +758,145 @@ def take_cpu_fallbacks() -> List:
 
 _prof_n = [0]
 _verified: set = set()          # model files whose first run was looked at in this process (once is enough)
+_rtx_failed: set = set()        # model files TensorRT RTX could not open or run in this process: CUDA from then on
+
+
+def rtx_cache_dir() -> Path:
+    """Where TensorRT RTX keeps what it compiled for this GPU. Beside the models, on this computer; made again by itself
+    when it is gone."""
+    if os.environ.get("DIAP_RTX_CACHE"):                    # (a test's own folder)
+        d = Path(os.environ["DIAP_RTX_CACHE"])
+    else:
+        try:
+            d = settings().models_path / "rtx_cache"
+        except Exception:
+            d = Path(tempfile.gettempdir()) / "diap_rtx_cache"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+RTX_COMPILED = True     # a model's compiled copy is kept and opened the next time (0.9 s against 8 to 13: the batch analysis opens every model once a cut)
+RTX_COMPILED_MIN_FREE = 3 << 30      # free space the drive keeps after a compiled copy (SAM 3.1's encoder: 0.9 GB) is written
+
+
+def _rtx_compiled_dir(path: Path) -> Path:
+    """The folder of this model file's compiled copy: one for the file as it is now, this GPU, its driver and this version of
+    the plugin (any of them changed: compiled again, the old copy removed)."""
+    import hashlib
+    from . import backend as BK
+    p = Path(path)
+    try:
+        st = p.stat()
+        ident = f"{p.name}|{st.st_size}|{st.st_mtime_ns}"
+    except OSError:
+        ident = p.name
+    g = BK.gpu()
+    r = BK.rtx()
+    key = hashlib.sha256(f"{ident}|{g.get('name')}|{g.get('driver')}|{r.get('version')}".encode()).hexdigest()[:12]
+    return rtx_cache_dir() / f"{p.stem}.{key}"
+
+
+def _rtx_open(path: Path, devices: list, cache: Path, write_to: Optional[Path] = None):
+    import onnxruntime as ort
+    so = _options(False)
+    if write_to is not None:
+        # onnxruntime's "EP context" model: the provider's compiled engine written beside a small model that names it
+        so.add_session_config_entry("ep.context_enable", "1")
+        so.add_session_config_entry("ep.context_file_path", str(write_to))
+        so.add_session_config_entry("ep.context_embed_mode", "0")
+    so.add_provider_for_devices(devices, {"nv_runtime_cache_path": str(cache)})
+    return ort.InferenceSession(str(path), sess_options=so)
+
+
+def _rtx_compile(path: Path, devices: list, d: Path, ctx_name: str) -> bool:
+    """Writes the model's compiled copy into folder d (whole or not at all): compiled by a session of its own that is closed
+    before the folder gets its name (an open session holds the engine file). False when there is no room for it, the
+    provider wrote none, or anything failed: the model is then opened as it is."""
+    import gc
+    name = Path(path).name
+    root = rtx_cache_dir()
+    for old in root.glob("*.tmp*"):                         # left by a process that ended while compiling
+        try:
+            if time.time() - old.stat().st_mtime > 600:
+                shutil.rmtree(old, ignore_errors=True)
+        except OSError:
+            pass
+    tmp = d.with_name(d.name + f".tmp{os.getpid()}")
+    try:
+        free = shutil.disk_usage(root).free
+        need = Path(path).stat().st_size + sum(f.stat().st_size for f in Path(path).parent.glob(name + ".*") if f.is_file())
+        if free < need + RTX_COMPILED_MIN_FREE:
+            sys.stderr.write(f"TENSORRT RTX {name}: no room for a compiled copy ({free / 1e9:.1f} GB free), compiled every time\n")
+            return False
+        for old in root.glob(Path(path).stem + ".*"):       # this model's copies for another driver or plugin version
+            if old.is_dir() and old != d and ".tmp" not in old.name:
+                shutil.rmtree(old, ignore_errors=True)
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True)
+        s0 = _rtx_open(Path(path), devices, root, write_to=tmp / ctx_name)
+        del s0
+        gc.collect()
+        if not (tmp / ctx_name).is_file():
+            try:
+                d.with_name(d.name + ".none").write_text("the provider wrote no compiled copy", encoding="utf-8")   # not tried again
+            except OSError:
+                pass
+            return False
+        for k in range(5):
+            try:
+                tmp.rename(d)
+                return True
+            except OSError:
+                if d.exists():
+                    return (d / ctx_name).is_file()         # another process put its own there meanwhile
+                time.sleep(0.3)
+        return False
+    except Exception as e:
+        sys.stderr.write(f"TENSORRT RTX {name}: no compiled copy kept: {str(e)[:200]}\n")
+        return False
+    finally:
+        if tmp.exists():
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _rtx_session(path: Path, devices: list, want: str):
+    """The model's session on TensorRT RTX (backend.rtx_for said it may), or None with the reason noted: the caller goes on
+    with CUDA. The provider compiles the model for this GPU when a session is made (SAM 3.1's encoder: 13 s); the compiled
+    copy is kept beside the models (rtx_cache, 0.9 GB for the encoder) and opened from then on (0.9 s; j2891)."""
+    from . import backend as BK
+    name = Path(path).name
+    t0 = time.perf_counter()
+    try:
+        sess, how = None, "compiled now"
+        d = _rtx_compiled_dir(Path(path)) if RTX_COMPILED and os.environ.get("DIAP_RTX_COMPILED", "1") != "0" else None
+        if d is not None:
+            ctx = d / (Path(path).stem + "_ctx.onnx")
+            if d.exists() and not ctx.is_file():
+                shutil.rmtree(d, ignore_errors=True)
+            made = ctx.is_file() or (not d.with_name(d.name + ".none").exists() and _rtx_compile(Path(path), devices, d, ctx.name))
+            if made:
+                try:
+                    sess, how = _rtx_open(ctx, devices, rtx_cache_dir()), "compiled copy"
+                    if BK.PROVIDER["rtx"] not in list(sess.get_providers()):
+                        raise RuntimeError("the compiled copy did not open on TensorRT RTX")
+                except Exception as e:
+                    # a copy that does not open (damaged, of another build): removed; compiled again the next time
+                    sys.stderr.write(f"TENSORRT RTX {name}: compiled copy not usable: {str(e)[:200]}\n")
+                    sess = None
+                    shutil.rmtree(d, ignore_errors=True)
+        if sess is None:
+            sess, how = _rtx_open(Path(path), devices, rtx_cache_dir()), "compiled now"
+        got = list(sess.get_providers())
+        if BK.PROVIDER["rtx"] not in got:
+            raise RuntimeError(f"세션이 {got}(으)로 열림")
+        BK.note(path, asked=["rtx", "cuda", "cpu"], session=got, setting=want, opened=how,
+                open_ms=round((time.perf_counter() - t0) * 1000.0, 1))
+        return Session(sess, path, asked=["rtx", "cuda", "cpu"], rtx=True)
+    except Exception as e:
+        _rtx_failed.add(str(path))
+        sys.stderr.write(f"TENSORRT RTX {name}: not used, going on with CUDA: {str(e)[:300]}\n")
+        BK.note(path, reasons=[f"TensorRT RTX로 열지 못해 CUDA로 실행 ({str(e)[:120]})"])
+        return None
 
 
 def _options(dml: bool):
@@ -777,6 +953,22 @@ def _session_raw(path: Path):
     on_gpu = any((p if isinstance(p, str) else p[0]) != "CPUExecutionProvider" for p in prov)
     err = None
     name = Path(path).name
+    if "CUDAExecutionProvider" in [p if isinstance(p, str) else p[0] for p in prov] and str(path) not in _rtx_failed:
+        # (1.27) a model checked on TensorRT RTX is opened there first, on a GPU the plugin runs on; anything else: CUDA below
+        try:
+            allow = getattr(settings(), "rtx", "off")
+        except Exception:
+            allow = "off"
+        try:
+            devs, rwhy = BK.rtx_for(path, want, allow)
+        except Exception as e:
+            devs, rwhy = [], f"TensorRT RTX 확인 실패 ({str(e)[:120]})"
+        if devs:
+            s2 = _rtx_session(Path(path), devs, want)
+            if s2 is not None:
+                return s2
+        elif rwhy:
+            why = why + ["TensorRT RTX: " + rwhy]
     # (the GPU memory pool settings are CUDA's and DirectML's, as before; Core ML has no pool of ours)
     pooled = on_gpu and "CoreMLExecutionProvider" not in names
     shrink = pooled and os.environ.get("DIAP_RUN_SHRINK", RUN_SHRINK) == "1" and not name.startswith(
@@ -894,6 +1086,78 @@ def session(path: Path):
         except Exception as second:
             sys.stderr.write(f"MODEL FALLBACK FAILED {p.name}: {str(second)[:200]}\n")
             raise first
+
+
+# ---------------------------------------------------------------------------------------------- sessions kept between uses
+KEEP_S = 120.0          # seconds a session opened with session_kept stays loaded after its last run
+_kept: Dict[tuple, "Session"] = {}
+_kept_lock = threading.Lock()
+_kept_sweeper: List = [None]
+
+
+def _kept_key(path) -> tuple:
+    p = Path(path)
+    try:
+        st = p.stat()
+        return (str(p), st.st_size, st.st_mtime_ns)
+    except OSError:
+        return (str(p), 0, 0)
+
+
+def _drop_kept() -> None:
+    with _kept_lock:
+        _kept.clear()
+
+
+def _sweep_once(now: Optional[float] = None) -> int:
+    """Lets go of the kept sessions not run for KEEP_S seconds; how many are still kept."""
+    now = time.monotonic() if now is None else now
+    with _kept_lock:
+        for k in [k for k, s in _kept.items() if now - getattr(s, "last_used", now) > KEEP_S]:
+            _kept.pop(k, None)
+        return len(_kept)
+
+
+def _sweep_kept() -> None:
+    while True:
+        time.sleep(15.0)
+        if _sweep_once() == 0:
+            with _kept_lock:
+                if not _kept:
+                    _kept_sweeper[0] = None
+                    return
+
+
+def session_kept(path: Path):
+    """session(path), the same one for everybody in this process while it is in use (1.27). SAM 3.1's encoder, decoder and
+    finder were opened by the person matte, by the clothes pass and by every matte made again after an edit, each for
+    itself: 1 to 3 s on CUDA and about 10 on TensorRT RTX every time, and the encoder's GPU memory twice where two of them
+    met. A session here is let go KEEP_S seconds after its last run (its GPU memory with it, once nobody holds it) and
+    at once when the GPU runs out of memory; a model file that was replaced gets a session of its own."""
+    if os.environ.get("DIAP_KEEP_SESSIONS", "1") == "0":
+        return session(path)
+    key = _kept_key(path)
+    with _kept_lock:
+        s = _kept.get(key)
+        if s is not None:
+            s.last_used = time.monotonic()
+            return s
+    s = session(path)                       # (not under the lock: opening takes seconds)
+    with _kept_lock:
+        s0 = _kept.get(key)
+        if s0 is not None:
+            return s0                       # opened by another thread meanwhile: that one for both
+        _kept[key] = s
+        try:
+            s.last_used = time.monotonic()
+        except Exception:
+            pass
+        if _kept_sweeper[0] is None:
+            on_low_gpu_memory(_drop_kept)
+            th = threading.Thread(target=_sweep_kept, name="model-keeper", daemon=True)
+            _kept_sweeper[0] = th
+            th.start()
+    return s
 
 
 def _package_of(path) -> Optional[tuple]:

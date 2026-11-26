@@ -415,24 +415,28 @@ class CutTracker:
         dets: List[List[dict]] = [[] for _ in range(N)]
         raw1: List[List[dict]] = [[] for _ in range(N)]
         t0 = time.time()
-        for t in range(a, b):
-            rgb = analysis_view(np.asarray(proxy.frame(t)))
-            people, raw = detect_people(rgb, det, poses, reid, face_id, face, face_always=(t - a) % 4 == 0)
-            for d, r in zip(people, raw):
-                d["i"] = len(dets[t])
-                dets[t].append(d)
-                raw1[t].append(r)
-            if vt is not None:
-                try:
-                    vt.step(t, rgb, dets[t])
-                except Exception:
-                    import traceback
-                    traceback.print_exc()
-                    vt = None
-            el = time.time() - t0
-            n_done = t - a + 1
-            p1(n_done / max(1, b - a), f"인물·포즈 검출{' + 비디오 추적' if vt is not None else ''} "
-                                       f"{n_done}/{b - a} ({n_done / max(el, 1e-3):.1f} fps)")
+        # (1.27) the frames decoded a few ahead in a thread of their own (track/ahead.py): the detector and the pose models
+        # no longer stand while the next frame is read from the original (0.2 s of a 4K log frame's 0.6 s here)
+        from .ahead import FramesAhead
+        with FramesAhead(proxy, a, b) as reader:
+            for t in range(a, b):
+                rgb, _ = reader.get(t)
+                people, raw = detect_people(rgb, det, poses, reid, face_id, face, face_always=(t - a) % 4 == 0)
+                for d, r in zip(people, raw):
+                    d["i"] = len(dets[t])
+                    dets[t].append(d)
+                    raw1[t].append(r)
+                if vt is not None:
+                    try:
+                        vt.step(t, rgb, dets[t])
+                    except Exception:
+                        import traceback
+                        traceback.print_exc()
+                        vt = None
+                el = time.time() - t0
+                n_done = t - a + 1
+                p1(n_done / max(1, b - a), f"인물·포즈 검출{' + 비디오 추적' if vt is not None else ''} "
+                                           f"{n_done}/{b - a} ({n_done / max(el, 1e-3):.1f} fps)")
 
         # ---------------- association
         p_as = step(0.40, 0.42)
@@ -1969,7 +1973,14 @@ class CutTracker:
             outside = np.ones(st.n, bool)
             outside[a:b] = False
             raw = np.where(outside[:, None, None] & np.isfinite(prev), prev, raw)
-            fbf = np.where(np.isfinite(fb), fb, np.nanmedian(fb, axis=0, keepdims=True) if np.isfinite(fb).any() else 30.0)
+            # a width never measured in this cut takes 30; one measured in some frames takes its median elsewhere (the
+            # median only of those: one never measured made numpy warn "All-NaN slice" into the log at every analysis)
+            fin = np.isfinite(fb)
+            has = fin.any(axis=0)
+            med = np.full((1,) + fb.shape[1:], np.nan, fb.dtype)
+            if has.any():
+                med[0][has] = np.nanmedian(fb[:, has], axis=0)
+            fbf = np.where(fin, fb, med if has.any() else 30.0)
             fbf = np.where(np.isfinite(fbf), fbf, 30.0)
             out["widths"][p] = B.smooth_widths(raw, fbf, st.present[p])
             # body contour points (edge distances along the limbs and torso)

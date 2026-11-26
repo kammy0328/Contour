@@ -432,8 +432,12 @@ class Segmenter31:
         alt = os.environ.get("DIAP_SAM_ENCODER", "")          # another build of the encoder (tests)
         if alt and Path(alt).is_file():
             enc_path = Path(alt)
-        self.enc = M.session(enc_path if enc_path.is_file() else d / "image-encoder.onnx")
-        self.dec = M.session(d / "click-decoder.onnx")
+        # (1.27) the sessions are the process's own (models.session_kept): the person matte, the clothes pass and a matte
+        # made again after an edit use the same ones; the encoder's runs take turns
+        self.enc = M.session_kept(enc_path if enc_path.is_file() else d / "image-encoder.onnx")
+        if hasattr(self.enc, "serialize"):
+            self.enc.serialize()
+        self.dec = M.session_kept(d / "click-decoder.onnx")
         self.enc_in = self.enc.get_inputs()[0]
         self.enc_out = [o.name for o in self.enc.get_outputs()]
         self.dec_in = [i.name for i in self.dec.get_inputs()]
@@ -511,7 +515,7 @@ class Finder31:
         from pathlib import Path
         d = M.ensure_model(key)
         alt = os.environ.get("DIAP_SAM_FINDER", "")              # another build of the finder (Mac Core ML: the fixed inputs folded in)
-        self.sess = M.session(Path(alt) if alt and Path(alt).is_file() else d / "finder-gpu.onnx")
+        self.sess = M.session_kept(Path(alt) if alt and Path(alt).is_file() else d / "finder-gpu.onnx")
         txt = np.load(str(Path(__file__).parent / "data" / "sam31_text_person.npz"))
         self.const = {"text": txt["text"].astype(np.float32), "text_pad": txt["text_pad"],
                       "box_tokens": np.zeros((0, 1, 256), np.float32)}

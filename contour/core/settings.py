@@ -56,6 +56,10 @@ class AppSettings:
     proxy_long_side: int = 1920
     gpu: str = "auto"                     # auto | cuda | dml | coreml | cpu (which a model gets: track/backend.py)
     render_parallel: str = "auto"         # (1.26.3) auto: the people of a frame prepared side by side as the RAM allows (core/perf.py); off: one after the other
+    rtx: str = "off"                      # (1.27) auto: the models checked on NVIDIA's TensorRT for RTX run on it where the GPU takes it (RTX 30 and later; track/backend.py);
+                                          # off (the default, for the user to switch on: 설정 > TensorRT RTX 가속): CUDA only. An analysis with it is a third faster, its mattes
+                                          # the same to IoU 0.9995, but what the analysis decides from them at its margins is not CUDA's (LNGSHOT 024: a face at the frame's
+                                          # edge known on 26 frames, not 32; joints a couple of pixels off on a quarter of the points: j2897)
     accuracy: str = "high"                # high | balanced | fast
     # Both apply only inside a project where learning was switched on by hand (learn.allowed, 1.24): on their own
     # they start nothing. Switching one off here stops it in every project.
