@@ -362,6 +362,9 @@ class SourceFrames:
 
 # ---------------------------------------------------------------------------------------------- pieces of the original
 CROP_READERS = 8            # piece readers kept open at once (faces and, since 1.23, bodies of one cut)
+SHARED_DECODE = True    # (1.26.3) every piece of a frame cut from one decode of the whole frame (one reader, the frames kept in the pool), not a reader
+                        # of its own a region that decoded the whole frame again (4 faces and their bodies: 5 to 8 decodes of a 4K frame, the
+                        # retouch waiting on them: LNGSHOT j2849). A piece made smaller is resized here (area), as ffmpeg's area scaler did.
 CROP_GRID = 96          # the piece decoded is the piece asked for, widened to this grid: a face moving a little
                         # keeps its piece (one reader going on) instead of a new reader every frame
 
@@ -390,6 +393,63 @@ class SourceCrops:
         self._rlocks: dict = {}
         self.decoded = 0
         self.seeks = 0
+        self._full_lock = threading.Lock()          # (SHARED_DECODE) the reader of the whole frame
+        self._full = None                           # [reader, next frame]
+
+    def _whole(self, i: int) -> np.ndarray:
+        """(SHARED_DECODE) Frame i of the original, whole, as the reader gives it ((H, W, 3) uint16 rgb48, or float32 RGB for float
+        sources), kept in the pool for the other pieces of the frame."""
+        p = pool()
+        k = (self.base, "whole", i)
+        a = p.get(k)
+        if a is not None:
+            return a
+        with self._full_lock:
+            a = p.get(k)
+            if a is not None:
+                return a
+            r = self._full
+            if r is not None and not (r[1] <= i <= r[1] + 8):
+                try:
+                    r[0].close()
+                except Exception:
+                    pass
+                r = self._full = None
+            if r is None:
+                pf = "gbrpf32le" if self.info.is_float else "rgb48le"
+                r = self._full = [FrameReader(self.info, i, self.n - i, pf, prefetch=2), i]
+                self.seeks += 1
+            got = None
+            while r[1] <= i:
+                planes = r[0].read()
+                if planes is None:
+                    err = r[0].error_text.strip()
+                    at = r[1]
+                    try:
+                        r[0].close()
+                    except Exception:
+                        pass
+                    self._full = None
+                    raise FrameError(f"원본에서 프레임 {i}을(를) 읽지 못했습니다 ({at}에서 끝남). {err[:300]}")
+                if r[0].layout.pix_fmt == "gbrpf32le":
+                    g_, b_, r_ = planes[0], planes[1], planes[2]
+                    w_ = np.dstack([r_, g_, b_]).astype(np.float32)
+                else:
+                    w_ = planes[0]
+                p.put((self.base, "whole", r[1]), w_)
+                if r[1] == i:
+                    got = w_
+                r[1] += 1
+            return got
+
+    def _from_whole(self, i: int, gb, osz) -> np.ndarray:
+        w_ = self._whole(i)
+        x0, y0, x1, y1 = gb
+        c = w_[y0:y1, x0:x1]
+        rgb = c.astype(np.float32) if c.dtype == np.float32 else c.astype(np.float32) / 65535.0
+        if (rgb.shape[1], rgb.shape[0]) != tuple(osz):
+            rgb = cv2.resize(rgb, (int(osz[0]), int(osz[1])), interpolation=cv2.INTER_AREA)
+        return self.cm.to_display_u8(np.ascontiguousarray(rgb), self.vs)
 
     def _region_lock(self, key) -> "threading.Lock":
         with self._lock:
@@ -407,6 +467,13 @@ class SourceCrops:
                 pass
 
     def close(self) -> None:
+        with self._full_lock:
+            if self._full is not None:
+                try:
+                    self._full[0].close()
+                except Exception:
+                    pass
+                self._full = None
         with self._lock:
             keys = list(self._readers)
         for k in keys:
@@ -442,7 +509,12 @@ class SourceCrops:
             with self._region_lock(key):
                 a = p.get((key, i))
                 if a is None:
-                    a = self._decode(i, gb, (ow, oh), key)
+                    if SHARED_DECODE:
+                        a = self._from_whole(i, gb, (ow, oh))
+                        self.decoded += 1
+                        p.put((key, i), a)
+                    else:
+                        a = self._decode(i, gb, (ow, oh), key)
         # the piece asked for inside the piece decoded
         fx, fy = ow / gw, oh / gh
         xa, ya = int(round((box[0] - gb[0]) * fx)), int(round((box[1] - gb[1]) * fy))

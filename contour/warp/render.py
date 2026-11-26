@@ -115,6 +115,38 @@ def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progres
                preview: Optional[Callable[[int, np.ndarray], None]] = None) -> RenderReport:
     """ext_writer: write the frames into this (an edited timeline's output) instead of a file of its own;
     it is neither closed nor aborted here, and no mattes are written.
+    preview(frame, rgb): about once a second, a small picture of the frame just written.
+
+    (1.26.3) For its time a render sets ffmpeg's threads (one a reader: the frame and a piece of each face and body are read at once; three for the
+    ProRes writer) and reads the pictures of the people's skin colour models side by side first, as the 2611 IWALY batches did (core/perf.py)."""
+    from ..core import perf as PF
+    keep_ = (M.READER_THREADS, M.ENCODE_THREADS)
+    M.READER_THREADS, M.ENCODE_THREADS = PF.ff_decode_threads(), PF.ff_encode_threads()
+    try:
+        try:
+            if tracker is not None and progress is not None:
+                progress(0.0, "피부색 모델 준비 중")
+            pw_ = RE.prewarm_models(cut, tracker) if tracker is not None else {}
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            pw_ = {}
+        rep = _render_cut(project, cut, tracker, out, progress, cancel, ext_writer, preview)
+        try:
+            rep.prewarm = pw_
+            rep.accel = (rep.accel + " · " if rep.accel else "") + PF.summary()
+        except Exception:
+            pass
+        return rep
+    finally:
+        M.READER_THREADS, M.ENCODE_THREADS = keep_
+
+
+def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progress: Progress = None,
+               cancel: Optional[Callable[[], bool]] = None, ext_writer=None,
+               preview: Optional[Callable[[int, np.ndarray], None]] = None) -> RenderReport:
+    """ext_writer: write the frames into this (an edited timeline's output) instead of a file of its own;
+    it is neither closed nor aborted here, and no mattes are written.
     preview(frame, rgb): about once a second, a small picture of the frame just written."""
     rep = RenderReport()
     t_start = time.time()

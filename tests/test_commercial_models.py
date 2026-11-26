@@ -41,6 +41,16 @@ def test_settings_choose_the_models(monkeypatch):
     assert FP.face_model() == FP.DEFAULT_MODEL
 
 
+def test_noncommercial_models_only_on_purpose(monkeypatch):
+    # (1.26.3) a settings file or an environment that names a non-commercial model does not bring it in: DIAP_NONCOMMERCIAL=1 must say so too
+    monkeypatch.delenv("DIAP_NONCOMMERCIAL", raising=False)
+    monkeypatch.setenv("DIAP_FACE_MODEL", "face_parse")
+    monkeypatch.setenv("DIAP_CLOTH_MODEL", "parse_clothes")
+    assert FP.face_model() == FP.DEFAULT_MODEL == "mp" and CL.cloth_model() == CL.DEFAULT_MODEL == "sam31"
+    monkeypatch.setenv("DIAP_NONCOMMERCIAL", "1")
+    assert FP.face_model() == "face_parse" and CL.cloth_model() == "parse_clothes"
+
+
 def test_shipped_multiclass_model_runs():
     p = FP.MPFaceParser()
     pr = p.probs(np.full((512, 512, 3), 128, np.uint8))

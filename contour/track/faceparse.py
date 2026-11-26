@@ -54,6 +54,8 @@ def face_model() -> str:
             v = getattr(settings(), "face_model", "") or ""
         except Exception:
             v = ""
+    if v == "face_parse" and os.environ.get("DIAP_NONCOMMERCIAL", "") != "1":
+        return DEFAULT_MODEL           # (1.26.3) a non-commercial model only where it is asked for on purpose (THIRD_PARTY_NOTICES.md)
     return v if v in ("mp", "face_parse") else DEFAULT_MODEL
 
 

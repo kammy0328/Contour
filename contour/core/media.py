@@ -465,14 +465,20 @@ def _input_args(info: MediaInfo, start: int) -> List[str]:
     return args + ["-i", info.path]
 
 
+# (1.26.3) ffmpeg's own threads: None leaves ffmpeg to choose (every core). A render sets READER_THREADS for its time (core/perf.py: the frame, a piece of
+# each face and body are read at once, each reader taking every core crowded the retouch out) and ENCODE_THREADS for its ProRes writer.
+READER_THREADS: Optional[int] = None
+ENCODE_THREADS: Optional[int] = None
+
+
 class FrameReader:
     """Sequential frame reader with a prefetch thread."""
 
     def __init__(self, info: MediaInfo, start: int, count: int, pix_fmt: str,
                  size: Optional[Tuple[int, int]] = None, rgb_convert: bool = False,
-                 prefetch: int = 3, crop: Optional[Tuple[int, int, int, int]] = None):
+                 prefetch: int = 3, crop: Optional[Tuple[int, int, int, int]] = None, threads: Optional[int] = None):
         """crop: (x, y, w, h) in source pixels, cut out before anything else (size then is the size of the cut-out
-        piece as it is handed out; None: its own size)."""
+        piece as it is handed out; None: its own size). threads: ffmpeg's decoding threads (None: READER_THREADS, then ffmpeg's own choice)."""
         self.info = info
         self.count = max(0, int(count))
         src_w, src_h = (int(crop[2]), int(crop[3])) if crop else (info.width, info.height)
@@ -495,6 +501,9 @@ class FrameReader:
             flags = "area" if resize else "bicubic"
             vf.append("scale=" + ":".join(scale_opts) + f":flags={flags}+accurate_rnd+full_chroma_int+full_chroma_inp")
         cmd = [ffmpeg_bin(), "-hide_banner", "-v", "error", "-nostdin"]
+        nthr_ = threads if threads is not None else READER_THREADS
+        if nthr_:
+            cmd += ["-threads", str(max(1, int(nthr_)))]
         cmd += _input_args(info, start)
         cmd += ["-map", "0:v:0", "-frames:v", str(self.count), "-an", "-sn", "-dn"]
         if vf:
@@ -708,6 +717,8 @@ def prores_args(profile: str, alpha: bool = False, prefer: str = "auto") -> List
             "-pix_fmt", "yuva444p10le" if alpha else enc_fmt]
     if alpha:
         args += ["-alpha_bits", "16"]
+    if ENCODE_THREADS:
+        args += ["-threads", str(max(1, int(ENCODE_THREADS)))]
     return args
 
 

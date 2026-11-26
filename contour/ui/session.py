@@ -512,6 +512,14 @@ class EditSession:
                     pp.amounts[k] = Curve(base=v)
         if stop is not None and stop():
             return False
+        # (1.26.3) the pictures of the people's skin colour models read side by side first (engine.prewarm_models; the same models after)
+        try:
+            from ..retouch.engine import prewarm_models
+            prewarm_models(cut, tr)
+        except Exception:
+            traceback.print_exc()
+        if stop is not None and stop():
+            return False
         with self._compute:
             with self._lock:
                 if self.epoch != ep or self.cut is not cut:

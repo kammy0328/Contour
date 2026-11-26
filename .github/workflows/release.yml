@@ -81,6 +81,8 @@ jobs:
           Expand-Archive build\ffmpeg.zip -DestinationPath build\ffx -Force
           New-Item -ItemType Directory -Force build\ffmpeg\bin | Out-Null
           Get-ChildItem build\ffx -Recurse -Include ffmpeg.exe, ffprobe.exe | Copy-Item -Destination build\ffmpeg\bin
+          # (1.26.3) the build's own licence text (GPL-3.0) goes with it: THIRD_PARTY_NOTICES.md
+          Get-ChildItem build\ffx -Recurse -Include LICENSE, LICENSE.txt | Select-Object -First 1 | Copy-Item -Destination build\ffmpeg\LICENSE.txt
           & build\ffmpeg\bin\ffmpeg.exe -hide_banner -version | Select-Object -First 1
           $enc = & build\ffmpeg\bin\ffmpeg.exe -hide_banner -encoders
           foreach ($e in "prores_ks", "libx265", "hevc_nvenc", "aac") { if (-not ($enc -match " $e ")) { throw "ffmpeg lacks $e" } }
