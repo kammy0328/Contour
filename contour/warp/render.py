@@ -373,7 +373,7 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
             rep.accel = (rep.accel + " · " if rep.accel else "") + f"준비 도우미 {st_.get('helpers')}개 ({st_.get('taken')}/{st_.get('taken', 0) + st_.get('local', 0)})"
 
     def process(t_, planes_):
-        with gate.frame():
+        with gate.frame(t_):
             return _process(t_, planes_)
 
     def _process(t_, planes_):
@@ -390,7 +390,7 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
                 gate.hint(any(RE.roi_job_ok(j_) is not True for j_ in rf_.jobs))
             except Exception:
                 gate.hint(True)
-            with gate.apply():
+            with gate.apply(t_):
                 res_ = apply_pool.apply(t_, planes_, rf_) if apply_pool is not None else None
                 if res_ is None:
                     RE.masks_f32(rf_)
@@ -432,7 +432,8 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
             _write_matte(matte_writers["warp"], wm, is_exr, seq_offset + t_)
         rep.frames += 1
         if progress:
-            progress(rep.frames / max(1, n), "렌더 " + pace_text(rep.frames, n, time.time() - t_start))
+            note_ = gate.summary()              # (said while it renders too: why this render takes fewer frames at once than the computer's cores allow)
+            progress(rep.frames / max(1, n), "렌더 " + pace_text(rep.frames, n, time.time() - t_start) + (" · " + note_ if note_ else ""))
 
     if parallel and n_workers > 1:
         pool = ThreadPoolExecutor(max_workers=n_workers)

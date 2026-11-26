@@ -192,6 +192,83 @@ def test_frame_gate_lets_that_many_retouch_and_one_more_prepare(monkeypatch):
     g.close()
 
 
+def test_frame_gate_lets_the_waiting_frames_go_in_their_own_order(monkeypatch):
+    """A frame that waited was passed by the ones that came after it, again and again (IWALY c004 with two slots, j2907b: prepared
+    eight places late, its neighbours' masks gone from the table of kept frames and made a second time: 29 made for 20)."""
+    monkeypatch.delenv("CONTOUR_FRAME_GATE", raising=False)
+    g = _gate(Mem(free=12.0))
+    g.hint(True)
+    assert g.slots == 1
+    order = []
+    held = g.apply(0)
+    held.__enter__()                                            # the slot is taken
+
+    def one(t):
+        with g.apply(t):
+            order.append(t)
+            time.sleep(0.02)
+    ths = []
+    for t in (7, 5, 6, 3):                                      # they come in another order than their own
+        ths.append(threading.Thread(target=one, args=(t,)))
+        ths[-1].start()
+        t0 = time.time()
+        while len(g._line["applies"]) < len(ths) and time.time() - t0 < 5:
+            time.sleep(0.005)
+    assert g.applies == 1 and order == [] and g.waited == 4
+    late = threading.Thread(target=one, args=(4,))             # one that comes while the others wait takes its own place, not the first
+    late.start()
+    t0 = time.time()
+    while len(g._line["applies"]) < 5 and time.time() - t0 < 5:
+        time.sleep(0.005)
+    held.__exit__(None, None, None)
+    for th in ths + [late]:
+        th.join(5.0)
+    assert order == [3, 4, 5, 6, 7] and g.applies == 0 and g._line["applies"] == [] and g.most == 1
+    # without a number: in the order they came
+    order.clear()
+    held = g.frame()
+    h2 = g.frame()
+    held.__enter__()
+    h2.__enter__()                                              # (a slot and one more: both in)
+
+    def two(i):
+        with g.frame():
+            order.append(i)
+    ths = []
+    for i in range(3):
+        ths.append(threading.Thread(target=two, args=(i,)))
+        ths[-1].start()
+        t0 = time.time()
+        while len(g._line["frames"]) < len(ths) and time.time() - t0 < 5:
+            time.sleep(0.005)
+    held.__exit__(None, None, None)
+    h2.__exit__(None, None, None)
+    for th in ths:
+        th.join(5.0)
+    assert order == [0, 1, 2] and g.frames == 0
+    # a frame that gives up while it waits (an error in its thread) leaves the line
+    held = g.apply(0)
+    held.__enter__()
+    wait0 = g._cond.wait
+    calls = []
+
+    def bad(timeout=None):
+        calls.append(1)
+        raise RuntimeError("stopped")
+    g._cond.wait = bad
+    try:
+        g._enter("applies", 9)
+        raise AssertionError("not raised")
+    except RuntimeError:
+        pass
+    g._cond.wait = wait0
+    assert g._line["applies"] == [] and g.applies == 1
+    held.__exit__(None, None, None)
+    with g.apply(1):
+        assert g.applies == 1
+    g.close()
+
+
 def test_frame_gate_takes_a_slot_away_when_memory_is_short_and_gives_it_back_after_plenty(monkeypatch):
     monkeypatch.delenv("CONTOUR_FRAME_GATE", raising=False)
     m = Mem(free=40.0)
@@ -254,13 +331,19 @@ def _render_threads(monkeypatch, threads: str, free):
     monkeypatch.setenv("CONTOUR_RENDER_THREADS", threads)
     monkeypatch.setenv("CONTOUR_RAW_AHEAD", "0")
     monkeypatch.setattr(perf, "free_gb", lambda *a, **k: free())
-    reps = []
-    inner = RD._render_cut
-    monkeypatch.setattr(RD, "_render_cut", lambda *a, **k: (reps.append(inner(*a, **k)) or reps[-1]))
+    reps, said = [], []
+    inner = getattr(RD._render_cut, "inner", RD._render_cut)      # (the render itself, not this helper's wrapper of an earlier call)
+
+    def with_progress(project, cut, tracker, out, progress=None, *a, **k):
+        reps.append(inner(project, cut, tracker, out, lambda f, m="": said.append(m), *a, **k))
+        return reps[-1]
+    with_progress.inner = inner
+    monkeypatch.setattr(RD, "_render_cut", with_progress)
     pdir, src = BU.copy_fixture(Path(__file__).resolve().parent / "data" / "baseline_1222", Path(tempfile.mkdtemp()))
     prj = Project.load(str(pdir))
     with BU.NoModels():
         out = BU.render_planes(prj, prj.cuts[0])
+    reps[-1].said = said
     return out, reps[-1]
 
 
@@ -274,6 +357,9 @@ def test_short_of_memory_a_render_retouches_fewer_frames_at_once_and_makes_the_s
     short, rs = _render_threads(monkeypatch, "3", lambda: 0.5)
     assert np.array_equal(one, short)
     assert "메모리에 맞춰 한 번에 1프레임까지 보정" in rs.accel
+    # ... and while it renders, in the progress line (a render with room says nothing of it)
+    assert any("메모리에 맞춰 한 번에 1프레임까지 보정" in m for m in rs.said) and all(m.startswith("렌더 ") for m in rs.said if "메모리" in m)
+    assert not any("메모리에 맞춰" in m for m in r3.said) and any(m.startswith("렌더 ") for m in r3.said)
     monkeypatch.setenv("CONTOUR_FRAME_GATE", "0")               # switched off: never held
     out, r = _render_threads(monkeypatch, "3", lambda: 0.5)
     assert np.array_equal(one, out) and "메모리에 맞춰" not in r.accel

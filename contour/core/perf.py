@@ -204,11 +204,13 @@ class FrameGate:
     one waits); after GROW_S seconds in which the least free memory stayed above the reserve and one and a half frames'
     worth, a slot is given back. Nothing changes in a frame: the same frames in the same order, fewer at once.
 
-        with gate.frame():        # around the making of one frame, on its worker thread
+        with gate.frame(t):       # around the making of frame t, on its worker thread
             rf = prepare(...)
             gate.hint(whole_frame)
-            with gate.apply():
+            with gate.apply(t):
                 apply_planes(...)
+
+    Frames that wait go in their own order (the lowest frame first).
 
     CONTOUR_FRAME_GATE=0 switches it off; CONTOUR_RESERVE_GB overrides RENDER_RESERVE_GB."""
     LOW_GB = 1.5            # under this much free memory a slot is taken away
@@ -233,6 +235,8 @@ class FrameGate:
         self.shrunk = 0
         self.grown = 0
         self._hinted = False
+        self._line = {"frames": [], "applies": []}      # who waits, in their order: (the frame's number, when it came)
+        self._seq = 0
         self._cond = threading.Condition()
         self._thread = None
         self._stop = False
@@ -301,7 +305,7 @@ class FrameGate:
     def close(self) -> None:
         self._stop = True
 
-    def _enter(self, what: str) -> None:
+    def _enter(self, what: str, key=None) -> None:
         if not self.on:
             return
         th = self._thread
@@ -310,24 +314,41 @@ class FrameGate:
             self._stop = False
             self._thread = threading.Thread(target=self._watch, name="frame-gate", daemon=True)
             self._thread.start()
+        import heapq
         with self._cond:
-            first = True
-            while True:
-                n = self.frames if what == "frames" else self.applies
-                # frames: the ones retouched and one more being prepared (no limit before the first frame said what
-                # kind they are: frames with nothing to retouch pass through)
-                cap = (self.slots + 1 if self._hinted else self.workers) if what == "frames" else self.slots
-                if n < max(1, cap):
-                    break
-                if first and what == "applies":
-                    self.waited += 1
-                first = False
-                self._cond.wait(0.5)
+            # in the frames' own order: the lowest frame waiting goes first, and one that comes later does not pass one that waits
+            # (without this a waiting frame was passed again and again, IWALY c004 with two slots: a frame prepared eight places
+            # late, its neighbours' masks gone from the table of kept frames and made a second time, 29 made for 20; j2907b)
+            line = self._line[what]
+            self._seq += 1
+            mine = (self._seq if key is None else key, self._seq)
+            heapq.heappush(line, mine)
+            try:
+                first = True
+                while True:
+                    n = self.frames if what == "frames" else self.applies
+                    # frames: the ones retouched and one more being prepared (no limit before the first frame said what
+                    # kind they are: frames with nothing to retouch pass through)
+                    cap = (self.slots + 1 if self._hinted else self.workers) if what == "frames" else self.slots
+                    if n < max(1, cap) and line[0] == mine:
+                        break
+                    if first and what == "applies" and n >= max(1, cap):
+                        self.waited += 1
+                    first = False
+                    self._cond.wait(0.5)
+            except BaseException:
+                line.remove(mine)
+                heapq.heapify(line)
+                self._cond.notify_all()
+                raise
+            heapq.heappop(line)
             if what == "frames":
                 self.frames += 1
             else:
                 self.applies += 1
                 self.most = max(self.most, self.applies)
+            if line:
+                self._cond.notify_all()                 # (the next in line looks for itself)
 
     def _exit(self, what: str) -> None:
         if not self.on:
@@ -339,11 +360,12 @@ class FrameGate:
                 self.applies -= 1
             self._cond.notify_all()
 
-    def frame(self):
-        return _Held(self, "frames")
+    def frame(self, key=None):
+        """`key`: the frame's number (the waiting frames go in that order; None: in the order they came)."""
+        return _Held(self, "frames", key)
 
-    def apply(self):
-        return _Held(self, "applies")
+    def apply(self, key=None):
+        return _Held(self, "applies", key)
 
     def summary(self) -> str:
         if not self.on or not self._hinted or (self.first >= self.workers and not self.shrunk):
@@ -355,13 +377,13 @@ class FrameGate:
 
 
 class _Held:
-    __slots__ = ("g", "what")
+    __slots__ = ("g", "what", "key")
 
-    def __init__(self, g, what):
-        self.g, self.what = g, what
+    def __init__(self, g, what, key=None):
+        self.g, self.what, self.key = g, what, key
 
     def __enter__(self):
-        self.g._enter(self.what)
+        self.g._enter(self.what, self.key)
         return self
 
     def __exit__(self, *exc):
