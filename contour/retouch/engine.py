@@ -5701,6 +5701,9 @@ CHIN_LO, CHIN_HI = 0.02, 0.045
 # chin's ball) lie between them. 0 = as before.
 CHIN_KEEP_LIP = 0.12
 CHIN_KEEP_EDGE = 0.05
+# (1.26.2, LNGSHOT QA 11/26, 024 t22: a face looking down, the shade under the chin inside the zone was lifted into a light patch) the chin's
+# stages stay off steep edges of light and shade too (skin.edge_keep, FS_EDGE_GRAD). False = as before.
+CHIN_EDGE_GATE = True
 
 
 def chin_zone(shape, lm: np.ndarray, wf: float) -> Optional[np.ndarray]:
@@ -5776,6 +5779,10 @@ def _chin_dimple(Y: np.ndarray, lm: Optional[np.ndarray], skin: np.ndarray, wf: 
     if amt < 0.02:
         return Y
     m = (zz * ss * amt).astype(np.float32)
+    if CHIN_EDGE_GATE:
+        ek_ = SK.edge_keep(roi, wf)
+        if ek_ is not None:
+            m = m * (1.0 - ek_)
     r = max(2, int(round(0.03 * wf)))
     out = SK.smooth_channel(roi, m, 1.0, 0.0, r, eps=0.003, relative=True)
     d = out - roi
@@ -7565,6 +7572,10 @@ def _final_chin(Y: np.ndarray, lm: np.ndarray, skin: np.ndarray, wf: float, k: f
     y0, y1, x0, x1 = r
     roi = Y[y0:y1, x0:x1].astype(np.float32)
     m = z[y0:y1, x0:x1] * np.clip(skin[y0:y1, x0:x1], 0, 1) * float(k)
+    if CHIN_EDGE_GATE:
+        ek_ = SK.edge_keep(roi, wf)
+        if ek_ is not None:
+            m = m * (1.0 - ek_)
     s0, s1 = max(0.8, FINAL_CHIN_BAND[0] * wf), max(2.0, FINAL_CHIN_BAND[1] * wf)
     band = cv2.GaussianBlur(roi, (0, 0), s0) - cv2.GaussianBlur(roi, (0, 0), s1)
     if FINAL_CHIN_LIGHT is not None:

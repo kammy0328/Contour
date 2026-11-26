@@ -40,4 +40,4 @@ def test_the_mac_batchs_face_settings_are_defaults():
     assert E.SKIN_EDGE_KEEP == 0.04 and E.FACE_HAIR_HOLD == 1.0 and E.FACE_NOSE_ADD == 0.8
     assert E.FOLD_EDGE_FADE == 1.0 and E.FINAL_NASO_IN_BAND == 1.0 and E.FOLD_LEVEL_LIFT_ONLY is True
     assert tuple(SK.FS_EDGE_GRAD) == (0.03, 0.08)
-    assert E.CHIN_KEEP_LIP > 0 and E.CHIN_KEEP_EDGE > 0 and E.FINAL_BUMP_EDGE > 0 and E.FACE_GAP_BRIDGE == 2
+    assert E.CHIN_KEEP_LIP > 0 and E.CHIN_KEEP_EDGE > 0 and E.FINAL_BUMP_EDGE > 0 and E.FACE_GAP_BRIDGE == 2 and E.CHIN_EDGE_GATE is True

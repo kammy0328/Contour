@@ -970,6 +970,20 @@ import threading as _threading
 _TLS = _threading.local()         # .shape: 0 on shape .. 1 elsewhere, set by the engine for the next luma smoothing of this thread
 
 
+def edge_keep(roi: np.ndarray, wf: float) -> Optional[np.ndarray]:
+    """0..1 (FS_EDGE_GRAD): where the light changes steeply over FS_EDGE_SIG of the face width (an edge of the face's light and shade: the
+    jaw's and the cheek's outline, the shade under the chin), relative to the local level; None when off. Also used by the chin's stages."""
+    if FS_EDGE_GRAD is None:
+        return None
+    se_ = max(1.0, FS_EDGE_SIG * wf)
+    ge_ = cv2.GaussianBlur(roi, (0, 0), se_)
+    gx_ = cv2.Sobel(ge_, cv2.CV_32F, 1, 0, ksize=3) / 8.0
+    gy_ = cv2.Sobel(ge_, cv2.CV_32F, 0, 1, ksize=3) / 8.0
+    gn_ = np.sqrt(gx_ * gx_ + gy_ * gy_) * (2.0 * se_) / (cv2.GaussianBlur(roi, (0, 0), max(2.0, 0.03 * wf)) + 0.02)
+    u_ = np.clip((gn_ - FS_EDGE_GRAD[0]) / max(1e-6, FS_EDGE_GRAD[1] - FS_EDGE_GRAD[0]), 0.0, 1.0)
+    return cv2.GaussianBlur((u_ * u_ * (3.0 - 2.0 * u_)).astype(np.float32), (0, 0), se_)
+
+
 def _box(x: np.ndarray, r: int) -> np.ndarray:
     return cv2.boxFilter(x, -1, (2 * r + 1, 2 * r + 1), normalize=True, borderType=cv2.BORDER_REFLECT)
 
@@ -1080,17 +1094,8 @@ def smooth_channel(I: np.ndarray, mask: np.ndarray, strength: float, keep: float
         ps = 0.0
         acc = np.zeros_like(roi)
         wsup = np.clip(m / FS_NORM, 0.0, 1.0).astype(np.float32) if FS_NORM > 0 else None
-        ekeep_ = None
-        acc_w = None
-        if FS_EDGE_GRAD is not None:
-            se_ = max(1.0, FS_EDGE_SIG * wf_)
-            ge_ = cv2.GaussianBlur(roi, (0, 0), se_)
-            gx_ = cv2.Sobel(ge_, cv2.CV_32F, 1, 0, ksize=3) / 8.0
-            gy_ = cv2.Sobel(ge_, cv2.CV_32F, 0, 1, ksize=3) / 8.0
-            gn_ = np.sqrt(gx_ * gx_ + gy_ * gy_) * (2.0 * se_) / (cv2.GaussianBlur(roi, (0, 0), max(2.0, 0.03 * wf_)) + 0.02)
-            u_ = np.clip((gn_ - FS_EDGE_GRAD[0]) / max(1e-6, FS_EDGE_GRAD[1] - FS_EDGE_GRAD[0]), 0.0, 1.0)
-            ekeep_ = cv2.GaussianBlur((u_ * u_ * (3.0 - 2.0 * u_)).astype(np.float32), (0, 0), se_)
-            acc_w = np.zeros_like(roi)
+        ekeep_ = edge_keep(roi, wf_)
+        acc_w = None if ekeep_ is None else np.zeros_like(roi)
         for i_, (fs_, g_) in enumerate(zip(FS_S, FS_G)):
             s_ = fs_ * wf_
             if s_ < ps + 0.15:
