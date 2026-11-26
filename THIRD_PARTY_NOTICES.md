@@ -23,7 +23,7 @@ DIAP runs these programs and models. The models are downloaded on first use (설
 | MediaPipe Selfie Multiclass (shipped, `contour/track/data`) | face parsing (skin, hair) | Apache-2.0 (`MEDIAPIPE_LICENSE.txt`) |
 | SAM 3.1 (Meta; ONNX export by smile-forge; the GPU graph and text encodings shipped in `contour/track/data`) | people's masks, clothes, body skin | SAM License (`SAM_LICENSE.txt`): commercial use allowed; the licence goes with any copy; no use for ITAR / trade-controlled ends |
 | SAM 2.1 (Meta; ONNX exports by onnx-community, square-zero-labs) | fallback masks, video tracking | Apache-2.0 |
-| Robust Video Matting (PeterL1n) | soft hair edges of the person matte | GPL-3.0 (see "Being replaced") |
+| Robust Video Matting (PeterL1n) | soft hair edges of the person matte | GPL-3.0 (its terms apply when DIAP is handed to others; DIAP is used in house) |
 | DIAP spot detector (shipped, `spotnet_v1.onnx`) | blemish finding | DIAP's own |
 
 ## Not used unless switched on by hand (non-commercial)
@@ -34,8 +34,3 @@ These are off in the app and need `DIAP_NONCOMMERCIAL=1` to be used at all. Thei
 |---|---|
 | SegFormer face parsing (jonathandinu/face-parsing, CelebAMask-HQ) | non-commercial (CelebAMask-HQ) |
 | SegFormer-B2 clothes (mattmdjaga/segformer_b2_clothes, ATR) | NVIDIA Source Code License (non-commercial) |
-
-## Being replaced
-
-Robust Video Matting is GPL-3.0. Before DIAP is sold or handed to others it is replaced by a matte of DIAP's own (SAM 3.1
-masks refined on the picture), tracked in `claude/DIAP_review_1126.md`.

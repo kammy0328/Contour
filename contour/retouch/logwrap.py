@@ -37,6 +37,8 @@ _EPS_L = 2.0e-3        # luma step (source code values) for the view's slope
 _STEPS = 3             # Newton iterations
 _STEP_MAX = 0.05       # per step and channel, source code value units
 _TOTAL_MAX = 0.12      # total change allowed at one pixel
+_DONE = 1.0e-5         # (1.26.3) a pixel whose requested change of the view is met to this is not stepped again (a 10-bit code value is 1e-3: the result moves
+                       # by under a tenth of one; on a skin test 0.03 % of the pixels round to the next code value)
 CROP = True            # transform only the area the retouch can touch (union of the masks plus a margin)
 CROP_MARGIN = 0.8      # of the face width
 
@@ -73,14 +75,22 @@ def display_delta_to_source(cm, vs, src: np.ndarray, disp0: np.ndarray, disp1: n
     best = p.copy()
     f0 = _eval(cm, vs, p.astype(np.float32)).astype(np.float64)
     best_err = np.linalg.norm(target - f0, axis=1)       # doing nothing leaves the whole requested change unmet
-    for _ in range(_STEPS):
-        f0 = _eval(cm, vs, cur.astype(np.float32)).astype(np.float64)
-        J = np.empty((cur.shape[0], 3, 3))
+    f_cur = f0                                         # (1.26.3) the view at `cur`, known already: at p, then at the last step's nxt (the same numbers
+    act = np.nonzero(best_err > _DONE)[0]              # as evaluating it again), the 3 slopes in one call, and a pixel whose change is met (to
+    for _ in range(_STEPS):                            # _DONE of the display range) not stepped again: 13 transforms a pixel at most instead of 16,
+        if act.size == 0:                              # 5 for most (LNGSHOT: the carry back and the transforms were 40 % of a log render's work)
+            break
+        n_ = act.size
+        ca = cur[act]
+        f0 = f_cur[act]
+        q = np.repeat(ca[None], 3, axis=0)
         for k in range(3):
-            q = cur.copy()
-            q[:, k] += _EPS
-            J[:, :, k] = (_eval(cm, vs, q.astype(np.float32)).astype(np.float64) - f0) / _EPS
-        r = target - f0
+            q[k, :, k] += _EPS
+        fq = _eval(cm, vs, q.reshape(-1, 3).astype(np.float32)).astype(np.float64).reshape(3, n_, 3)
+        J = np.empty((n_, 3, 3))
+        for k in range(3):
+            J[:, :, k] = (fq[k] - f0) / _EPS
+        r = target[act] - f0
         # damped least squares; where the display clips or compresses hard the full change cannot be reached and the
         # step would run away, so the step is bounded (trust region) and only an improvement is kept
         JT = np.transpose(J, (0, 2, 1))
@@ -89,12 +99,17 @@ def display_delta_to_source(cm, vs, src: np.ndarray, disp0: np.ndarray, disp1: n
         A = A + lam * np.eye(3)[None]
         step = np.linalg.solve(A, (JT @ r[:, :, None]))[:, :, 0]
         step = np.clip(step, -_STEP_MAX, _STEP_MAX)
-        nxt = np.clip(cur + step, p - _TOTAL_MAX, p + _TOTAL_MAX)
-        err = np.linalg.norm(target - _eval(cm, vs, nxt.astype(np.float32)).astype(np.float64), axis=1)
-        better = err < best_err
-        best[better] = nxt[better]
-        best_err = np.where(better, err, best_err)
-        cur = nxt
+        pa = p[act]
+        nxt = np.clip(ca + step, pa - _TOTAL_MAX, pa + _TOTAL_MAX)
+        fn_ = _eval(cm, vs, nxt.astype(np.float32)).astype(np.float64)
+        err = np.linalg.norm(target[act] - fn_, axis=1)
+        better = err < best_err[act]
+        ib = act[better]
+        best[ib] = nxt[better]
+        best_err[ib] = err[better]
+        cur[act] = nxt
+        f_cur[act] = fn_
+        act = act[best_err[act] > _DONE]
     cur = best
     out[ys, xs] = (cur - p).astype(np.float32)
     return out
