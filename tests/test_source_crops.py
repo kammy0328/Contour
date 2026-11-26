@@ -46,7 +46,7 @@ def test_piece_equals_cut_of_full_frame(vids, kind, tmp_path):
     assert sc.seeks - s0 == 1
     half = sc.piece(3, box, 0.5)
     assert abs(half.shape[0] - 66) <= 1 and abs(half.shape[1] - 70) <= 1
-    proc = next(iter(sc._readers.values()))[0]._proc
+    proc = (sc._full[0] if FR.SHARED_DECODE else next(iter(sc._readers.values()))[0])._proc
     sc.close()
     assert proc.poll() is not None
 
@@ -66,7 +66,44 @@ def test_piece_of_a_timeline_stretch(vids):
     sc.close()
 
 
+def test_pieces_of_a_frame_share_one_decode(vids, monkeypatch):
+    """1.26.3 (SHARED_DECODE): the pieces of every person of a frame are cut from one decode of the whole frame, asked for from several
+    threads at once; the pieces are the pixels of the whole frame, and each frame is read once."""
+    import threading
+    from contour.core import frames as FR, media as MD
+    from contour.core.colour import PASSTHROUGH, ViewSettings, manager
+    FR.pool().clear()
+    info = MD.probe(str(vids["prores"]))
+    vs = ViewSettings(input_cs=PASSTHROUGH)
+    boxes = [(4, 4, 60, 60), (230, 150, 300, 230), (100, 60, 200, 180)]
+    full = [_full(info, i, manager(), vs) for i in (0, 1, 2)]
+    reads = []
+    read0 = FR.FrameReader.read
+    monkeypatch.setattr(FR.FrameReader, "read", lambda self: reads.append(1) or read0(self))
+    sc = FR.SourceCrops(info, manager(), vs)
+    got, errs = {}, []
+
+    def one(k):
+        try:
+            got[k] = [sc.piece(i, boxes[k]) for i in (0, 1, 2)]
+        except Exception as e:                      # pragma: no cover
+            errs.append(e)
+    ths = [threading.Thread(target=one, args=(k,)) for k in range(3)]
+    for th in ths:
+        th.start()
+    for th in ths:
+        th.join(60)
+    assert not errs, errs
+    for k, b in enumerate(boxes):
+        for i in range(3):
+            assert np.array_equal(got[k][i], full[i][b[1]:b[3], b[0]:b[2]]), (k, i)
+    assert len(reads) == 3 and sc.seeks == 1                  # three frames, read once each, by one reader
+    sc.close()
+
+
 def test_two_regions_are_read_side_by_side(vids, monkeypatch):
+    from contour.core import frames as FR
+    monkeypatch.setattr(FR, "SHARED_DECODE", False)          # (the readers of before 1.26.3, one a region)
     """j2799 (three people of a 4K frame, body blemishes): each person's piece of the original waited for the one
     before it under one lock, a third of a second each. Different regions are read at the same time, one region by
     one thread at a time; the pieces are the same."""
