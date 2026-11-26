@@ -168,16 +168,16 @@ def _feather(m: np.ndarray, sig: float) -> np.ndarray:
     return np.clip(f, 0, 1)
 
 
-FOLD_COVER_GUARD = float(__import__('os').environ.get('IWALY_FOLD_COVER_GUARD', '0'))    # 0..1: the fold bands stay off a hand or arm in front of the face and a margin round it (c057 f152: fingers over the mouth, the gaps between them were "folds"); 0 = as before
+FOLD_COVER_GUARD = float(__import__('os').environ.get('IWALY_FOLD_COVER_GUARD', '1'))    # 0..1: the fold bands stay off a hand or arm in front of the face and a margin round it (c057 f152: fingers over the mouth, the gaps between them were "folds"); 0 = as before
 FOLD_COVER_SHARE = (0.03, 0.25)   # of the band on the limb: no turning down below the first, none of the band's work left at the second
 FOLD_COVER_MARGIN = 0.035  # of the face width: how far round the limb's cover the bands stay off
 
 
 FOLD_FEATHER = 0.0         # of the face width: the fold bands' edge feathered by this (Gaussian), so the fill fades out instead of stopping at a rim (c048, 11/24). 0 = as before
-FOLD_PARSE_GUARD = 0.0     # 0..1: the fold bands stay off what the face parser sees as hair, a hand or clothes in front of the face (2611 IWALY feedback 11/23: c043 f161 hair across the nose and cheek, c045 f0 the fist at the mouth);
+FOLD_PARSE_GUARD = 1.0     # 0..1: the fold bands stay off what the face parser sees as hair, a hand or clothes in front of the face (2611 IWALY feedback 11/23: c043 f161 hair across the nose and cheek, c045 f0 the fist at the mouth);
                            # the parser's own skin gate (skin.parse_gate: 1 on skin, down to 0.03 on what lies over it). 0 = as before
-NASO_BULGE = 0.10          # how far out (share of the nose-wing-to-mouth-corner distance) the nasolabial band bulges: a smile pushes the fold out over the raised cheek (c048 f47, c051 f0, c033 f48: the fold was not in the band). 0.10 = as before
-NASO_WIDE_MUL = 1.0        # factor on the width of the nasolabial band of the stages (1 = as before)
+NASO_BULGE = 0.16          # how far out (share of the nose-wing-to-mouth-corner distance) the nasolabial band bulges: a smile pushes the fold out over the raised cheek (c048 f47, c051 f0, c033 f48: the fold was not in the band). 0.10 = as before
+NASO_WIDE_MUL = 1.25        # factor on the width of the nasolabial band of the stages (1 = as before)
 
 
 def _face_hair_hold(parse, cloth, lm, shape):
@@ -272,16 +272,16 @@ def _parse_off(m: np.ndarray, parse, lm) -> np.ndarray:
         return m
 
 
-HAND_GUARD = 0.0          # 0..1 (2611 IWALY INT_c003 f48, 11/24: a fist at the chin; the limb cover missed it, the fold bands and the neck lines lifted the shadows round it into bright
+HAND_GUARD = 1.0          # 0..1 (2611 IWALY INT_c003 f48, 11/24: a fist at the chin; the limb cover missed it, the fold bands and the neck lines lifted the shadows round it into bright
                           # patches that jump from frame to frame): the fold bands (nasolabial, mouth lines) and the neck-line mask stay off every hand's area in the picture, taken
                           # from the hands' own keypoints (tracked, else the whole-body model's sure points), grown by HAND_GUARD_MARGIN of the face width
 HAND_GUARD_MARGIN = 0.07
 HAND_GUARD_REACH = 0.45     # of the forearm (elbow -> wrist): how far past the wrist the hand reaches
 HAND_GUARD_RADIUS = 0.32    # of the forearm: the hand's half width
-DARK_CHROMA = 0.8           # how far the under-eye's colour is taken to the cheek's (11/24, INT_c006: "눈 아래 색 빠짐" at 0.8); 0.8 = as before
-NASO_NOSTRIL_HOLD = 0.0     # of the face width: the nostrils and the nose's base grown by this are out of the nasolabial band (0 = off)
+DARK_CHROMA = 0.3           # how far the under-eye's colour is taken to the cheek's (11/24, INT_c006: "눈 아래 색 빠짐" at 0.8); 0.8 = as before
+NASO_NOSTRIL_HOLD = 0.03     # of the face width: the nostrils and the nose's base grown by this are out of the nasolabial band (0 = off)
 GPU_MASKS = None            # (11/24) 1: the Gaussian blurs of the mask making and the apply on the GPU (gpuops; same result as OpenCV); 0: OpenCV; None: env IWALY_GPU_MASKS
-SKIN_FS_G = None            # (2611 IWALY INT, 11/24: the pebbled skin of INT_c001 / c006 / c007 / c010 stayed) the gains of the skin stage's texture bands (skin.FS_G, finest
+SKIN_FS_G = (1.35, 0.7, 0.3, 0.2, 0.2, 0.45)            # (2611 IWALY INT, 11/24: the pebbled skin of INT_c001 / c006 / c007 / c010 stayed) the gains of the skin stage's texture bands (skin.FS_G, finest
                             # to widest), set from here so a batch's settings can carry them; None = skin.FS_G as it is. INT_c006 f90 / INT_c001 f119: (1.35, 0.70, 0.30, 0.20, 0.20, 0.45)
 SKIN_FS_NORM = None          # the skin stage's bands from blurs of the skin alone (skin.FS_NORM, set from here like SKIN_FS_G; None = skin.FS_NORM as it is)
 SKIN_FOREHEAD_HOLD = 0.0    # 0..1: the forehead above the brows kept out of the skin stage (bangs over it: the strands flickered, INT_c005 11/24). 0 = as before
@@ -289,7 +289,7 @@ SKIN_FOREHEAD_AUTO = None   # (lo, hi): the forehead hold follows how much of th
                             # forehead, inside the person's matte): none held under lo, all over hi (11/24 user: "앞머리가 이마 면적을 많이 차지하면 보정 의미가
                             # 없다", INT_c005). The hold is then the larger of this and SKIN_FOREHEAD_HOLD. None = off, as before
 FOREHEAD_BAND = (0.03, 0.25)  # of the face width above the brows: the part of the forehead whose cover is measured
-SKIN_BROW_HOLD = 0.0        # of the face width: the brows grown by this are kept out of the skin stage (0 = off, as before)
+SKIN_BROW_HOLD = 0.02        # of the face width: the brows grown by this are kept out of the skin stage (0 = off, as before)
 HAND_GUARD_SKIN_IN = 0.04   # of the face width: the skin stage is held off a hand only outside the face's outline moved in by this
 HAND_GUARD_FEATHER = 0.03
 
@@ -2258,6 +2258,40 @@ def _parse_visible(tracker, pid: int, t: int, face: np.ndarray, px) -> float:
 
 VIS_LO = 0.12         # face visibility where the face retouch starts
 VIS_FULL = 0.5        # and where it is at full strength
+# (1.26.2, 2611 LNGSHOT QA 11/26: 068 t31, a 500 px face with a hand passing in front: the tracker lost the face's landmarks on that one frame
+# (visibility 0.57, 0.04, 0.57) and the whole retouch went off for it, a blink) a face missing, or its visibility dipping, for at most
+# FACE_GAP_BRIDGE frames between frames where the person's face is known is taken from those frames (the landmarks in between, the lower
+# of their two weights). 0 = as before.
+FACE_GAP_BRIDGE = 2
+
+
+def _vis_w(vis: float) -> float:
+    return float(np.clip((float(vis) - VIS_LO) / (VIS_FULL - VIS_LO), 0.0, 1.0))
+
+
+def _face_bridge(st, p: int, t: int, n: int):
+    """((landmarks at t from the nearest frames before and after with the face known, within n each side), the lower of their weights)
+    or None."""
+    if n <= 0 or not getattr(st, "has_face", False):
+        return None
+    T = st.present.shape[1]
+    got = []
+    for step in (-1, 1):
+        hit = None
+        for k in range(1, n + 1):
+            u = t + step * k
+            if u < 0 or u >= T or not st.present[p, u]:
+                break
+            if np.isfinite(st.face[p, u, :, :2]).all():
+                hit = (k, np.asarray(st.face[p, u], np.float32), float(st.face_vis[p, u]))
+                break
+        if hit is None:
+            return None
+        got.append(hit)
+    (kb, fb, vb), (kf, ff, vf) = got
+    if kb + kf - 1 > n:
+        return None
+    return fb + (ff - fb) * (kb / float(kb + kf)), min(_vis_w(vb), _vis_w(vf))
 CACHE_BYTES = 900 * 2 ** 20   # the preview's mask cache
 STEADY_R = 2          # frames each side
 STEADY_SIGMA = 1.0
@@ -3483,12 +3517,15 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
         face = None
         fw = 0.0
         fw_doubt = False
+        bridge_ = _face_bridge(st, p, t, FACE_GAP_BRIDGE) if (FACE_GAP_BRIDGE > 0 and p not in doubles) else None
         if st.has_face and np.isfinite(st.face[p, t, :, :2]).all() and p not in doubles:
             face = st.face[p, t]
             # face visibility as a strength: full strength once the face is reasonably sure, so the retouch does
             # not breathe with small confidence changes (a zoom, a turn); it still fades out where the face is
             # really doubtful (heavily covered, carried by motion alone for many frames)
             fw = float(np.clip((float(st.face_vis[p, t]) - VIS_LO) / (VIS_FULL - VIS_LO), 0.0, 1.0))
+            if bridge_ is not None and fw < bridge_[1] - 0.25:
+                fw = bridge_[1]                     # (FACE_GAP_BRIDGE) a dip of a frame or two between surer frames
             fw_doubt = fw < 1.0
             if fw < 1.0 and VIS_PARSE:
                 # the tracker's visibility drops on the frames next to a cover (cut 086: a head passes in front, and
@@ -3496,6 +3533,10 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 # in plain view). The face parser looks at the frame itself: where it is sure of this face's skin
                 # over a good part of the outline, the face is visible
                 fw = max(fw, _parse_visible(tracker, person.id, t, face, px))
+        elif bridge_ is not None and bridge_[1] > 0.0:
+            # (FACE_GAP_BRIDGE) the landmarks lost for a frame or two: from the frames round it
+            face, fw = bridge_[0], bridge_[1]
+            fw_doubt = fw < 1.0
         sc = float(st.scale[p, t]) if np.isfinite(st.scale[p, t]) else 0.0
         job = Job(p, person.id, v, float(np.clip(pp.skin_detail / 100.0, 0, 1)), pp.skin_scope,
                   float(pp.grain_size), face, fw, sc,
@@ -4467,7 +4508,7 @@ def _lift(I: np.ndarray, m: np.ndarray, k: float, sig: float, keep: float = 0.35
 FOLD_OWN = 1.0        # a fold is filled up to this share of its own depth (1.25 overshot: on a face screaming or laughing
                       # the deep fold beside the mouth came out as a pale stripe, cut 097)
 MOUTH_OPEN = (0.30, 0.65)   # mouth opening (gap between the lips over the mouth's width) from which the folds beside the
-MOUTH_OPEN_KEEP = 0.4       # mouth are expression: at the widest only this share of the fold filling is left
+MOUTH_OPEN_KEEP = 0.75       # mouth are expression: at the widest only this share of the fold filling is left
 
 
 def mouth_open(lm: Optional[np.ndarray]) -> float:
@@ -4577,7 +4618,7 @@ FOLD_LEVEL_EDGE = (0.02, 0.03)  # the same round hair strands and sharp edges in
 # middle scale's lift capped at 0.8 %, faded out over a tenth of the face round the nose and the lips, and round every edge). The nasolabial fold's own
 # values, over the general ones (the mouth lines keep theirs): a stronger share of the broad steps, the evening's cap raised, the fades shorter.
 # None = the general values for the nasolabial fold too.
-NASO_FOLD = {"broad": 1.1, "broad_cap": 0.08, "level": 1.7, "excl": (0.05, 0.02), "edge": (0.012, 0.02), "cap": (0.10, 0.004)}
+NASO_FOLD = {"broad": 2.0, "broad_cap": 0.15, "level": 2.0, "excl": (0.05, 0.02), "edge": (0.012, 0.02), "cap": (0.12, 0.004)}
 NECK_LEVEL = 1.25          # the same on the neck (cut 024: the rings and the broad band across the neck stayed)
 NECK_LEVEL_SIG = (0.008, 0.10)
 NECK_LEVEL_CAP = (0.08, 0.008)   # the neck's own cap of the evening (the nasolabial fold's is raised above: the neck keeps this)
@@ -4876,14 +4917,15 @@ def _fold_level(Y: np.ndarray, band: np.ndarray, skin: np.ndarray, excl: Optiona
     return out
 
 
-# (Mac IWALY, 11/24; default off = 1.25.0's face) the Mac batch's own face changes, on in its control.json engine_cfg
-FACE_HAIR_HOLD = 0.0       # > 0: hair / cover over the face (face parsing + the hair class) takes the face's retouch back there (job mask face_hold)
-FOLD_EDGE_FADE = 0.0       # > 0: the nasolabial / mouth line bands fade in from their own edge (no rim)
-FINAL_NASO_IN_BAND = 0.0   # > 0: the last pass's nasolabial lift only inside the nasolabial band's mask
-FOLD_LEVEL_LIFT_ONLY = False   # True: the fold levelling only lifts (a fold is darker than the skin round it; nothing in its band is darkened)
-SKIN_EDGE_KEEP = 0.0      # > 0: the skin smoothing fades in from the skin area's own edge over this many face widths (the jaw's contour
+# (Mac IWALY, 11/24) the Mac batch's own face changes, on in its control.json engine_cfg; the app's defaults since 1.26.2 (2611 LNGSHOT QA
+# 11/26, 4K close-ups: without them a beanie's knit and the hair over the forehead were smoothed and a line ran inside the jaw's outline)
+FACE_HAIR_HOLD = 1.0       # > 0: hair / cover over the face (face parsing + the hair class) takes the face's retouch back there (job mask face_hold)
+FOLD_EDGE_FADE = 1.0       # > 0: the nasolabial / mouth line bands fade in from their own edge (no rim)
+FINAL_NASO_IN_BAND = 1.0   # > 0: the last pass's nasolabial lift only inside the nasolabial band's mask
+FOLD_LEVEL_LIFT_ONLY = True   # True: the fold levelling only lifts (a fold is darker than the skin round it; nothing in its band is darkened)
+SKIN_EDGE_KEEP = 0.04      # > 0: the skin smoothing fades in from the skin area's own edge over this many face widths (the jaw's contour
                           # against the neck's shade was smoothed away: a bright band inside the jaw line and a dark one under it, c016 f38)
-FACE_NOSE_ADD = 0.0       # > 0: the nose (bridge, tip, wings from the landmarks) is added to the skin area at this weight where the skin
+FACE_NOSE_ADD = 0.8       # > 0: the nose (bridge, tip, wings from the landmarks) is added to the skin area at this weight where the skin
                           # model left it out (a shiny nose tip is not 'skin coloured': the nose was not retouched at all, c016)
 
 
@@ -5120,7 +5162,7 @@ def _blemish(Y, Cb, Cr, mY, mC, k: float, size: float, cs: float):
 
 
 # ----------------------------------------------------------------------------- flaws found by detect.py (1.19)
-FOLD_ZONE_OLD = True     # with 팔자주름·입가주름 on, the pre-1.19 spot finder still works along those folds
+FOLD_ZONE_OLD = False     # with 팔자주름·입가주름 on, the pre-1.19 spot finder still works along those folds
 DET_ON = True              # False: every correction looks for its flaw itself, on the frame, at one size (before 1.19)
 DET_SURE = (0.45, 0.85)        # score from which a flaw is sure enough for the grain band inside it to be given up .. in full
 DET_FINE = (0.04, 0.5, 1.2)    # what is finer than this stays inside a filled spot (share of the spot size, px floor and cap):
@@ -5649,11 +5691,24 @@ def _bump_soften(Y, Cb, Cr, mY, mC, k: float, wf: float, cs: float):
 
 CHIN_DIMPLE = 0.0      # 0..1: soften a pebbled chin, only on frames where it shows (set by the caller; no slider yet)
 FACE_LINES = 0.0       # 0..1: fill fine lines on the face skin (forehead, under the eyes, cheeks)
-CHIN_LO, CHIN_HI = 0.045, 0.085
+CHIN_LO, CHIN_HI = 0.02, 0.045
+
+
+# (1.26.2, 2611 LNGSHOT QA 11/26: 046 t12, 065 t18, 026 t17 (a profile), 068 close-ups at 4K: with 턱주름 at 100 the chin's stages lifted the
+# shade right under the lower lip (the lip-chin crease) and the shade under the chin's outline, the chin came out flat; IWALY c005/c006 had the
+# same under the lip on small faces) the chin's zone stays CHIN_KEEP_LIP of the face width off the lower lip (the crease lies about a tenth of
+# the face width under it) and CHIN_KEEP_EDGE inside the face's outline: the crease and the outline are the chin's shape, the pebbles (the
+# chin's ball) lie between them. 0 = as before.
+CHIN_KEEP_LIP = 0.12
+CHIN_KEEP_EDGE = 0.05
+# (1.26.2, LNGSHOT QA 11/26, 024 t22: a face looking down, the shade under the chin inside the zone was lifted into a light patch) the chin's
+# stages stay off steep edges of light and shade too (skin.edge_keep, FS_EDGE_GRAD). False = as before.
+CHIN_EDGE_GATE = True
 
 
 def chin_zone(shape, lm: np.ndarray, wf: float) -> Optional[np.ndarray]:
-    """The chin between the lower lip and the jaw (soft), lm in px of `shape`."""
+    """The chin between the lower lip and the jaw (soft), lm in px of `shape`: off the lower lip's shade and the face's outline
+    (CHIN_KEEP_LIP, CHIN_KEEP_EDGE)."""
     if lm is None or not np.isfinite(lm[[57, 8], :2]).all():
         return None
     a, b = lm[57, :2], lm[8, :2]
@@ -5665,7 +5720,30 @@ def chin_zone(shape, lm: np.ndarray, wf: float) -> Optional[np.ndarray]:
     m = np.zeros(shape, np.uint8)
     cv2.ellipse(m, (int(c[0]), int(c[1])), (max(2, int(0.42 * L)), max(2, int(0.24 * wf))),
                 float(np.degrees(np.arctan2(v[1], v[0]))), 0, 360, 255, -1)
-    return cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.03 * wf))
+    z = cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.03 * wf))
+    r = _roi(z, 2)
+    if r is None or (CHIN_KEEP_LIP <= 1e-4 and CHIN_KEEP_EDGE <= 1e-4):
+        return z
+    # (the zone's box, grown by what the blurs below reach: they work on that piece of the picture only)
+    g = int(max(CHIN_KEEP_LIP, CHIN_KEEP_EDGE) * wf * 2) + 8
+    y0, y1, x0, x1 = max(0, r[0] - g), min(shape[0], r[1] + g), max(0, r[2] - g), min(shape[1], r[3] + g)
+    o = np.float32([x0, y0])
+    keep = np.ones((y1 - y0, x1 - x0), np.float32)
+    if CHIN_KEEP_LIP > 1e-4 and np.isfinite(lm[48:60, :2]).all():
+        lip = np.zeros(keep.shape, np.uint8)
+        cv2.fillConvexPoly(lip, cv2.convexHull(np.round(lm[48:60, :2] - o).astype(np.int32)), 255)
+        kl = max(3, int(round(CHIN_KEEP_LIP * wf)) * 2 + 1)
+        lip = cv2.dilate(lip, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kl, kl)))
+        keep *= 1.0 - cv2.GaussianBlur(lip.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.15 * CHIN_KEEP_LIP * wf))
+    if CHIN_KEEP_EDGE > 1e-4 and np.isfinite(lm[0:17, :2]).all():
+        hull = np.zeros(keep.shape, np.uint8)
+        pts = lm[0:17, :2] if not np.isfinite(lm[17:27, :2]).all() else np.vstack([lm[0:17, :2], lm[17:27, :2]])
+        cv2.fillConvexPoly(hull, cv2.convexHull(np.round(pts - o).astype(np.int32)), 255)
+        ke = max(3, int(round(CHIN_KEEP_EDGE * wf)) * 2 + 1)
+        hull = cv2.erode(hull, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ke, ke)))
+        keep *= cv2.GaussianBlur(hull.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.25 * CHIN_KEEP_EDGE * wf))
+    z[y0:y1, x0:x1] *= keep
+    return z
 
 
 def _dimple_map(Y: np.ndarray, wf: float) -> np.ndarray:
@@ -5701,6 +5779,10 @@ def _chin_dimple(Y: np.ndarray, lm: Optional[np.ndarray], skin: np.ndarray, wf: 
     if amt < 0.02:
         return Y
     m = (zz * ss * amt).astype(np.float32)
+    if CHIN_EDGE_GATE:
+        ek_ = SK.edge_keep(roi, wf)
+        if ek_ is not None:
+            m = m * (1.0 - ek_)
     r = max(2, int(round(0.03 * wf)))
     out = SK.smooth_channel(roi, m, 1.0, 0.0, r, eps=0.003, relative=True)
     d = out - roi
@@ -5843,22 +5925,22 @@ def _things(Y: np.ndarray, m: np.ndarray, wf: float, Cb: Optional[np.ndarray] = 
     return out
 
 
-NASO_REACH = 0.07           # the same in the nasolabial stage. 2611 IWALY c029, c010 (2026-11-22, user): the groove down from the nose wing is
+NASO_REACH = 0.12           # the same in the nasolabial stage. 2611 IWALY c029, c010 (2026-11-22, user): the groove down from the nose wing is
                             # the top of the nasolabial fold and has to be retouched; held as "nose" out to 0.07 of the face width it got a third
                             # of a per cent. Smaller = the fold is taken closer to the wing (the wing itself, inside the landmarks' hull, stays held)
-NASO_WING_TOP = 0.0          # 0..1: the nasolabial band fades out above the nose wings' level (see wrinkle_masks); 0 = as before
-NASO_WING_TOP_FROM = 0.012
-NASO_WING_TOP_TO = 0.05
+NASO_WING_TOP = 1.0          # 0..1: the nasolabial band fades out above the nose wings' level (see wrinkle_masks); 0 = as before
+NASO_WING_TOP_FROM = -0.01
+NASO_WING_TOP_TO = 0.03
 ALA_KEEP = 1.0              # share of the nose wing's own exclusion (_ala_mask) kept in the fold's band (1 = as before; the band is made at the
                             # preparation of the frame)
-NASO_DEEP_NOSE = 0.0        # 2611 IWALY c010 f15, c001 f92 (2026-11-22, user: "콧구멍 사라지고 코라인이 덜 선명해진 오류", the nose wing retouched): the nasolabial stage lifted the nostril's
+NASO_DEEP_NOSE = 1.0        # 2611 IWALY c010 f15, c001 f92 (2026-11-22, user: "콧구멍 사라지고 코라인이 덜 선명해진 오류", the nose wing retouched): the nasolabial stage lifted the nostril's
                             # shade on a turned face (the landmarks' hull missed it). 1 = what the skin smoothing holds as deep (compact, far darker than the skin) is held within NASO_DEEP_REACH of the nose
 NASO_DEEP_REACH = 0.15
-NOSE_SIDES = False          # 2611 IWALY c029 f4/f124, c010 f4/f15, c001 f92 (2026-11-22, user: "코 라인 밝아진 오류", "콧구멍 사라지고 코라인이 덜 선명해진 오류"): the nose's own
+NOSE_SIDES = True          # 2611 IWALY c029 f4/f124, c010 f4/f15, c001 f92 (2026-11-22, user: "코 라인 밝아진 오류", "콧구멍 사라지고 코라인이 덜 선명해진 오류"): the nose's own
                             # outline (the shaded side wall from the inner eye corner down to the wing, the nostril's rim) was lifted by the nasolabial stage: the held hull
                             # was that of the bridge's middle line and the nose's base only (landmarks 27..35), so on a turned face its side wall lay outside it. True = the
                             # hull also takes the inner eye corners (39, 42) and the wings' outer points pushed out by NOSE_SIDES_WING of the base's width
-NOSE_SIDES_WING = 0.12
+NOSE_SIDES_WING = 0.35
 NOSE_REACH = 0.07           # how far past the nose's outline the nose is held (0.14 held the top of the fold
                             # beside the nostril too, which a frown deepens)
 EXT_GUARD = (0.03, 0.10)    # 2611 IWALY c010 (2026-11-22, own review of the user's frame 00:00:58:12): the fold stages worked up to the face's outer edge: on a face turned
@@ -5870,7 +5952,7 @@ EXT_OUTLINE = True          # 2611 IWALY c003 (2026-11-22, user, 00:00:39:17, th
                             # skin (the exclusion is 0 on it, so there is no "exterior" to keep the band from), the band of the fold reached the wall beside the cheek and the fold stages lifted the
                             # wall's pixels next to the face's edge by up to 6.6 % of the brightness (a light strip along the whole cheek). The landmarks' own outline of the face (jaw line and
                             # forehead arc) lay within 2 px of the real edge there: the band is held to it as well (the same distances as EXT_GUARD, inside the outline). False = the parser's exterior only
-FOLD_BASE = {"nasolabial": 0.06, "mouth_lines": 0.06}   # share of a fold's band filled where no fold is found (2611 IWALY c029/c010/c001, user: "팔자주름 제거 안 되어 있음": soft folds the finder misses)
+FOLD_BASE = {"nasolabial": 0.45, "mouth_lines": 0.35}   # share of a fold's band filled where no fold is found (2611 IWALY c029/c010/c001, user: "팔자주름 제거 안 되어 있음": soft folds the finder misses)
 SMALL_WF = (110.0, 200.0)   # face width (px) below which a fold band is softened as a whole
 # 2611 IWALY c005 00:00:44:09, c006 00:00:45:07 (2026-11-23, user: "마스크 오류" beside the nose and at the mouth's corner on the faces of full shots, "팔자주름 안 지워져 있어";
 # the user's retouch reference of c006 45:07): on a small face (130 to 190 px wide) the broad lift and the levelling of a fold's band (FOLD_BROAD, FOLD_LEVEL, NASO_FOLD: set
@@ -5905,7 +5987,7 @@ HOLD_DEEP_K = 0.035         # of the face width: widest dark part held (0.08 too
                             # and the upper lip of a face in hard light for "deep": the middle of the face was left out)
 HOLD_EDGE = (0.35, 0.60)    # light/shade step across a twentieth of the face that is the light's edge
 HOLD_OFF = (0.07, 0.11)
-HOLD_MOLE = (0.30, 0.45)    # depth of a small dark spot that is a mole, kept
+HOLD_MOLE = (0.15, 0.25)    # depth of a small dark spot that is a mole, kept
 HOLD_MOLE_ALONE = 0.10      # of the face width: spots with two or more others this near are rough skin, not moles (0 = off)
 PAINT_HUE = (40.0, 65.0)    # degrees of hue away from the skin at which colour is paint, not skin     # colour (per unit of brightness) away from the face's own skin: clothes, hair, props
 
@@ -5917,7 +5999,7 @@ FS_FOREHEAD = True
 FOLD_TRUST = 1.0       # the stages made for close-ups that lift a wide area (broad lift, levelling) need the nose's landmarks to lie as a nose's do (_nose_plausible); where they do not (a head
                        # rolled on its side, a turned or covered face, 2611 IWALY c025 f89 / 01:36:10, user: "마스크 경계가 너무 잘 보여, 주변에 어두워진 라인") the band they work in is not where the
                        # crease is, and they lifted a crescent of the cheek by 10 %. This share of them is kept there (0 = off for such a face; the thin valley fill stays)
-FOLD_TOTAL_CAP = (0.035, 0.025)   # most the nasolabial / mouth-line stages together may lift / darken the luma of one picture (display luma): the user's references change a crease by +2.4..5 % and its
+FOLD_TOTAL_CAP = (0.045, 0.03)   # most the nasolabial / mouth-line stages together may lift / darken the luma of one picture (display luma): the user's references change a crease by +2.4..5 % and its
                                 # rim by -1.7..2.8 %, never by 10 %. Soft (c tanh(d / c)), so a plateau has no edge. None = off
 
 
@@ -6119,7 +6201,7 @@ def _det_cfg():
         DT.GLINT = tuple(DET_GLINT)
 
 
-MOLE_KEEP = 0.0             # 2611 IWALY c029 f4 (2026-11-22, user: "점 연해졌는데 살려야함"): a small dark spot that is not redder than the skin round it (a mole,
+MOLE_KEEP = 1.0             # 2611 IWALY c029 f4 (2026-11-22, user: "점 연해졌는데 살려야함"): a small dark spot that is not redder than the skin round it (a mole,
                             # a beauty mark) is left to this share by the blemish fill (0 = off: as before; a pimple or its mark is redder and still goes)
 MOLE_DEPTH = (0.10, 0.20)   # how much darker than the skin round it (relative) a spot must be to count as a mole
 MOLE_RED = (0.005, 0.014)   # how much redder (Cr over the skin round it) a dark spot may be and still count as a mole: from the first to the second it fades out
@@ -7113,14 +7195,14 @@ def _grain(shape, size_px: float, seed: int) -> np.ndarray:
 
 # --------------------------------------------------------------------------- the last pass (2611 IWALY, user 2026-11-23: "콧구멍, 코라인, 볼록잡티, 점, 팔라인, 자갈턱 무조건 해결")
 # After every stage: what the user does not want changed is given back from the picture as it came in, whatever stage changed it.
-FINAL_NOSE = 0.0           # 0..1: the nose (its bridge, side walls, wings and nostrils) keeps its shape: the change of every stage there wider than the skin's
+FINAL_NOSE = 1.0           # 0..1: the nose (its bridge, side walls, wings and nostrils) keeps its shape: the change of every stage there wider than the skin's
                            # texture (FINAL_NOSE_SIG of the face width) is taken back; the texture's thinning stays
 FINAL_NOSE_WING = 0.38     # the wings' outer points pushed out by this share of the nose base's width
 FINAL_NOSE_PAD = 0.025     # the nose's area grown by this share of the face width (soft over the same)
 FINAL_NOSE_SIG = 0.008
 FINAL_NOSE_HF = 0.006      # of the change finer than FINAL_NOSE_SIG, the part beyond this (display luma) is taken back too: an edge of the
                            # nose (a wing's crease) the retouch smoothed comes back whole, so no light seam is left beside it (c029 f4)
-FINAL_MOLE = 0.0           # 0..1: small dark round spots that are not redder than the skin round them (moles), found on the picture as it came in, are given back
+FINAL_MOLE = 1.0           # 0..1: small dark round spots that are not redder than the skin round them (moles), found on the picture as it came in, are given back
 FINAL_MOLE_DEPTH = (0.09, 0.14)   # a candidate from the first, kept when its darkest point is past the second (relative to the skin round it)
 FINAL_MOLE_RED = 0.012     # its median Cr over the skin round it at most this (redder: a pimple's mark, which goes)
 FINAL_MOLE_ALONE = 0.06    # of the face width: at most one other candidate this near (pits of rough skin come many together)
@@ -7141,7 +7223,7 @@ FINAL_NASO = 0.0           # 0..1: the nasolabial folds (팔자주름) and the s
                            # corner and on below it, FINAL_NASO_W of the face width wide), what is darker than its surroundings at the fold's scale (FINAL_NASO_BAND) is lifted;
                            # hair strands (far darker, thin) and the nose / the lips are left. Works where the skin mask or the fold finder missed the fold (a turned, tilted, blurred face)
 FINAL_NASO_W = 0.10
-FINAL_NASO_SKIN = float(__import__('os').environ.get('IWALY_FINAL_NASO_SKIN', '0'))   # 0..1: the last pass's fold work only where the skin mask is skin (0 = the zone from the landmarks alone, as before)
+FINAL_NASO_SKIN = float(__import__('os').environ.get('IWALY_FINAL_NASO_SKIN', '1'))   # 0..1: the last pass's fold work only where the skin mask is skin (0 = the zone from the landmarks alone, as before)
 FINAL_NASO_DEEP = (0.13, 0.20)   # see _final_naso
 FINAL_NASO_NOSE_GAP = 0.04  # of the face width: the zone stays this far from the nose (soft)
 FINAL_NASO_BAND = (0.004, 0.06)
@@ -7227,7 +7309,7 @@ def _feature_holes(lm: np.ndarray, shape, wf: float) -> np.ndarray:
     return (cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))) > 0) | (cv2.dilate(e, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ke, ke))) > 0)
 
 
-FOLD_YAW = None        # (lo, hi) or None (off). 2611 IWALY INT_c002 f38..f45 (11/24, user: 코끝 하이라이트 깜빡, 입술 위 보정): a face turned away (towards a profile) has its fold and
+FOLD_YAW = (0.7, 0.85)        # (lo, hi) or None (off). 2611 IWALY INT_c002 f38..f45 (11/24, user: 코끝 하이라이트 깜빡, 입술 위 보정): a face turned away (towards a profile) has its fold and
                       # mouth landmarks squeezed and wrong from frame to frame; the fold stages and the raised-spot fill flickered on and off there. Their strength falls from 1 at a
                       # turn of `lo` to 0 at `hi` (the turn: |left - right| / (left + right) of the nose tip's distances to the face's outline at the nose's height)
 FINAL_WHITE = 0.0       # 0..1: tiny light dots (whiteheads, milia) on the face's skin filled from the skin round them (INT_c005 f82, 11/24). 0 = off
@@ -7235,7 +7317,13 @@ FINAL_WHITE_K = 0.009   # of the face width: the dot's size scale (top-hat)
 FINAL_WHITE_THR = 0.025 # brighter than the local level by this share
 FINAL_WHITE_BUSY = 0.06 # share of the window round a dot that may light up too (more: hair, texture, a glint row: left)
 FINAL_BUMP_NOSE = 0.0   # 0..1: the raised-spot fill kept off the nose (its bridge's highlight is no bump; ENDING: it blinked). 0 = as before
-FINAL_BUMP_LIPS = 0.0   # of the face width (0 = off, as before): how far round the lips the raised-spot fill stays off (the mouth's corner and the lip's highlight are no bumps)
+# (1.26.2, 2611 LNGSHOT QA 11/26, 4K 1:1: 046 t12 and 054 t18 a beanie's knit right above the brows, 054 t18 the cheek's outline against the hair,
+# 021 t13 and 046 t12 the jaw's edge: with 요철 at 100 the raised-spot fill took the knit's ridges and the light side of an outline for bumps; it looked
+# inside the face's outline from the landmarks (the hull of the jaw and the brows) as well as the skin mask) the raised spots are looked for on the skin
+# mask only, FINAL_BUMP_EDGE of the face width inside its edge (a bump's whole size on skin: an outline, a hat's edge, hair over the skin and the
+# features' holes are edges). None: inside the skin mask or the landmarks' outline, as before.
+FINAL_BUMP_EDGE = 0.03
+FINAL_BUMP_LIPS = 0.1   # of the face width (0 = off, as before): how far round the lips the raised-spot fill stays off (the mouth's corner and the lip's highlight are no bumps)
 
 
 def face_turn(lm) -> float:
@@ -7326,7 +7414,11 @@ def _final_bumps(Y0: np.ndarray, region: np.ndarray, wf: float, lm: Optional[np.
     se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kb, kb))
     th = cv2.morphologyEx(rb, cv2.MORPH_TOPHAT, se) / base
     bh = cv2.morphologyEx(rb, cv2.MORPH_BLACKHAT, se) / base
-    cand = (th > FINAL_BUMP_LIGHT[0]) & (region[y0:y1, x0:x1] > 0.5)
+    reg_ = region[y0:y1, x0:x1] > 0.5
+    if FINAL_BUMP_EDGE is not None and FINAL_BUMP_EDGE > 1e-4:
+        ke_ = max(3, int(round(FINAL_BUMP_EDGE * wf)) * 2 + 1)
+        reg_ = cv2.erode(reg_.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ke_, ke_))) > 0
+    cand = (th > FINAL_BUMP_LIGHT[0]) & reg_
     if lm is not None:
         lmr = np.asarray(lm, np.float32)[:, :2] - [x0, y0]
         cand &= ~_feature_holes(lmr, roi.shape, wf)
@@ -7480,6 +7572,10 @@ def _final_chin(Y: np.ndarray, lm: np.ndarray, skin: np.ndarray, wf: float, k: f
     y0, y1, x0, x1 = r
     roi = Y[y0:y1, x0:x1].astype(np.float32)
     m = z[y0:y1, x0:x1] * np.clip(skin[y0:y1, x0:x1], 0, 1) * float(k)
+    if CHIN_EDGE_GATE:
+        ek_ = SK.edge_keep(roi, wf)
+        if ek_ is not None:
+            m = m * (1.0 - ek_)
     s0, s1 = max(0.8, FINAL_CHIN_BAND[0] * wf), max(2.0, FINAL_CHIN_BAND[1] * wf)
     band = cv2.GaussianBlur(roi, (0, 0), s0) - cv2.GaussianBlur(roi, (0, 0), s1)
     if FINAL_CHIN_LIGHT is not None:
@@ -7704,7 +7800,9 @@ def _fold_heal(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, Y0: np.ndarray, ba
 
 def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
     """The last pass (FINAL_*): see the constants. Y0/Cb0/Cr0: the planes as they came in."""
-    if not (FINAL_NOSE > 1e-4 or FINAL_MOLE > 1e-4 or FINAL_BUMP > 1e-4 or FINAL_LONG > 1e-4 or FINAL_CHIN > 1e-4 or FINAL_NASO > 1e-4 or FOLD_HEAL > 1e-4):
+    slid_ = any(float(getattr(j_, "v", {}).get(k_, 0.0)) > 1e-4 for j_ in rf.jobs for k_ in ("bumps", "chin_lines", "nasolabial"))
+    if not (FINAL_NOSE > 1e-4 or FINAL_MOLE > 1e-4 or FINAL_BUMP > 1e-4 or FINAL_LONG > 1e-4 or FINAL_CHIN > 1e-4 or FINAL_NASO > 1e-4 or FOLD_HEAL > 1e-4
+            or slid_):
         return Y, Cb, Cr
     hY, wY = Y.shape
     hC, wC = Cb.shape
@@ -7747,11 +7845,13 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
                     lm_ = _final_long_lines(Y0, reg, wf if job.wf_src > 0 else (float(job.wf_arm) * y_per_src if job.wf_arm > 0 else wf))
                     if lm_ is not None:
                         give = np.maximum(give, lm_ * float(np.clip(FINAL_LONG, 0, 1)))
-            if FINAL_BUMP > 1e-4 and spot_reg is not None and job.wf_src > 0:
-                bb = _final_bumps(Y0, spot_reg, wf, lmY, Y)
+            kbump_ = max(float(FINAL_BUMP), float(job.v.get("bumps", 0.0)))         # (1.26.2) the 요철 slider, or the setting for every face
+            breg_ = spot_reg if (FINAL_BUMP_EDGE is None or skin is None) else skin       # (FINAL_BUMP_EDGE: the skin mask only)
+            if kbump_ > 1e-4 and breg_ is not None and job.wf_src > 0:
+                bb = _final_bumps(Y0, breg_, wf, lmY, Y)
                 if bb is not None:
                     bm, bf = bb
-                    bm = bm * float(np.clip(FINAL_BUMP, 0, 1)) * yaw_gate(job.face)
+                    bm = bm * float(np.clip(kbump_, 0, 1)) * yaw_gate(job.face)
                     if FINAL_BUMP_NOSE > 1e-4 and lmY is not None:
                         # (ENDING 03:37:09, user 11/24: the nose bridge's highlight blinked) a highlight on the nose sits right at the bump's brightness threshold and
                         # is filled on some frames only: no bump fill on the nose
@@ -7772,8 +7872,9 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
                     import traceback
                     traceback.print_exc()
             in_band_ = FINAL_NASO_IN_BAND > 1e-4
-            if FINAL_NASO > 1e-4 and lmY is not None and job.wf_src > 0 and (not in_band_ or "naso" in job.masks):
-                kn_ = float(np.clip(FINAL_NASO, 0, 1)) * yaw_gate(job.face)
+            kfn_ = max(float(FINAL_NASO), float(np.clip(job.v.get("nasolabial", 0.0), 0, 1)))     # (1.26.2) the 팔자주름 slider drives the last pass too (the batch had FINAL_NASO 1 with the amount 100)
+            if kfn_ > 1e-4 and lmY is not None and job.wf_src > 0 and (not in_band_ or "naso" in job.masks):
+                kn_ = float(np.clip(kfn_, 0, 1)) * yaw_gate(job.face)
                 if FOLD_PRESENT is not None:
                     kn_ *= _naso_pres_job(job, Y0, wf, y_per_src)
                 if kn_ > 1e-4:
@@ -7798,8 +7899,9 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
                 if kh_ > 1e-4:
                     kh_ *= 1.0 - (1.0 - MOUTH_OPEN_KEEP) * mouth_open(job.face)
                     Y, Cb, Cr = _fold_heal(Y, Cb, Cr, Y0, M(job.masks["naso"], (hY, wY)), lmY, wf, kh_)
-            if FINAL_CHIN > 1e-4 and lmY is not None and skin is not None:
-                Y = _final_chin(Y, lmY, skin, wf, float(np.clip(FINAL_CHIN, 0, 1)) * _face_big(job.face, wf, y_per_src))
+            kfc_ = max(float(FINAL_CHIN), float(job.v.get("chin_lines", 0.0)))     # (1.26.2) the 턱주름 slider, or the setting for every face
+            if kfc_ > 1e-4 and lmY is not None and skin is not None:
+                Y = _final_chin(Y, lmY, skin, wf, float(np.clip(kfc_, 0, 1)) * _face_big(job.face, wf, y_per_src))
         except Exception:
             import traceback
             traceback.print_exc()
@@ -8392,7 +8494,8 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                 Cb = _fold_fill(Cb, mC, exC, 0.7 * k, max(0.8, sf * wf * cs), max(1.5, ss * wf * cs), False)
                 Cr = _fold_fill(Cr, mC, exC, 0.7 * k, max(0.8, sf * wf * cs), max(1.5, ss * wf * cs), False)
         # 2a. fine lines on the face skin, and a pebbled chin (both only where they are found)
-        if (FACE_LINES > 1e-4 or CHIN_DIMPLE > 1e-4) and "skin" in job.masks and job.face is not None and v["skin"] > 1e-4:
+        kchin_ = max(float(CHIN_DIMPLE), float(v.get("chin_lines", 0.0)))      # (1.26.2) the 턱주름 slider, or the setting for every face
+        if (FACE_LINES > 1e-4 or kchin_ > 1e-4) and "skin" in job.masks and job.face is not None and v["skin"] > 1e-4:
             lmY = np.asarray(job.face, np.float32)[:, :2] * y_per_src
             skY = M(job.masks["skin"], (hY, wY))
             if FACE_LINES > 1e-4:
@@ -8410,8 +8513,8 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                     pass
                 Y, Cb, Cr = _crease_lift(Y, Cb, Cr, mfl, float(np.clip(FACE_LINES, 0, 1)), max(1.5, 0.012 * wf),
                                          None, jaw_hold(job.face, (hY, wY), y_per_src, wf))
-            if CHIN_DIMPLE > 1e-4:
-                Y = _chin_dimple(Y, lmY, skY, wf, float(np.clip(CHIN_DIMPLE, 0, 1)) * _face_big(job.face, wf, y_per_src))
+            if kchin_ > 1e-4:
+                Y = _chin_dimple(Y, lmY, skY, wf, float(np.clip(kchin_, 0, 1)) * _face_big(job.face, wf, y_per_src))
         # 2a'. frown lines between the brows and across the top of the nose (thin creases only)
         if FROWN_LINES > 1e-4 and "skin" in job.masks and job.face is not None and v["skin"] > 1e-4:
             try:
