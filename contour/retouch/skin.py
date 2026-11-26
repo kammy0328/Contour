@@ -935,6 +935,14 @@ FS_NORM = 0.0     # > 0: the bands are taken with blurs of the skin alone (norma
                   # mask up): the background, hair or a lip beside the skin is not averaged in, so the skin along the face's outline is not darkened
                   # (or lightened) by the step to what lies beyond it (2611 IWALY 11/24: a dark band along the cheek's contour, ENDING f26, INT_c006 f90).
                   # 0 = the plain blurs, as before
+# (1.26.2, 2611 LNGSHOT QA 11/26, 4K close-ups 046 t12, 054 t18, 021 t13: the bands' scaling has no threshold, so on a big face the light
+# falling off at the jaw's and the cheek's outline and the shade beside the nose lost contrast too: a light line inside the jaw and the
+# cheek's contour, a dark one along the nasolabial shade) where the picture's light changes steeply at a scale of FS_EDGE_SIG of the face
+# width (the slope over that width, of the local level: an edge of the face's light and shade; texture has next to none at that scale),
+# the bands from FS_EDGE_BAND on are not scaled: fully from FS_EDGE_GRAD[1], not at all below FS_EDGE_GRAD[0] (soft, no step). None = off.
+FS_EDGE_GRAD = None
+FS_EDGE_SIG = 0.008
+FS_EDGE_BAND = 2
 FS_REF = 0.70                                              # skin slider of the reference
 # keep the picture's own grain (user 2026-11-14 22:51): in every band the part of each pixel's value up to FS_GRAIN times
 # that band's grain level is left as it is; only what stands out above the grain (pores, pits, bumps) is scaled.
@@ -1071,6 +1079,17 @@ def smooth_channel(I: np.ndarray, mask: np.ndarray, strength: float, keep: float
         ps = 0.0
         acc = np.zeros_like(roi)
         wsup = np.clip(m / FS_NORM, 0.0, 1.0).astype(np.float32) if FS_NORM > 0 else None
+        ekeep_ = None
+        acc_w = None
+        if FS_EDGE_GRAD is not None:
+            se_ = max(1.0, FS_EDGE_SIG * wf_)
+            ge_ = cv2.GaussianBlur(roi, (0, 0), se_)
+            gx_ = cv2.Sobel(ge_, cv2.CV_32F, 1, 0, ksize=3) / 8.0
+            gy_ = cv2.Sobel(ge_, cv2.CV_32F, 0, 1, ksize=3) / 8.0
+            gn_ = np.sqrt(gx_ * gx_ + gy_ * gy_) * (2.0 * se_) / (cv2.GaussianBlur(roi, (0, 0), max(2.0, 0.03 * wf_)) + 0.02)
+            u_ = np.clip((gn_ - FS_EDGE_GRAD[0]) / max(1e-6, FS_EDGE_GRAD[1] - FS_EDGE_GRAD[0]), 0.0, 1.0)
+            ekeep_ = cv2.GaussianBlur((u_ * u_ * (3.0 - 2.0 * u_)).astype(np.float32), (0, 0), se_)
+            acc_w = np.zeros_like(roi)
         for i_, (fs_, g_) in enumerate(zip(FS_S, FS_G)):
             s_ = fs_ * wf_
             if s_ < ps + 0.15:
@@ -1105,10 +1124,13 @@ def smooth_channel(I: np.ndarray, mask: np.ndarray, strength: float, keep: float
                         b_ = b_ - b_ * np.minimum(1.0, lim_ / np.maximum(np.abs(b_), 1e-9))   # the part above the grain
             if lh_ is not None and i_ >= FS_LINE_BAND:
                 b_ = b_ * (1.0 - FS_LINE_KEEP * lh_)
+            tgt_ = acc_w if (acc_w is not None and i_ >= FS_EDGE_BAND) else acc
             if shp is not None and FS_SHAPE[i_] < 1.0:
-                acc += f_ * (FS_SHAPE[i_] + (1.0 - FS_SHAPE[i_]) * shp) * b_
+                tgt_ += f_ * (FS_SHAPE[i_] + (1.0 - FS_SHAPE[i_]) * shp) * b_
             else:
-                acc += f_ * b_
+                tgt_ += f_ * b_
+        if acc_w is not None:
+            acc = acc + acc_w * (1.0 - ekeep_)        # (FS_EDGE_GRAD) the wider bands not on the face's edges of light and shade
         out = I.astype(np.float32, copy=True)
         out[y0:y1, x0:x1] = roi + m * acc
         return out

@@ -2258,6 +2258,40 @@ def _parse_visible(tracker, pid: int, t: int, face: np.ndarray, px) -> float:
 
 VIS_LO = 0.12         # face visibility where the face retouch starts
 VIS_FULL = 0.5        # and where it is at full strength
+# (1.26.2, 2611 LNGSHOT QA 11/26: 068 t31, a 500 px face with a hand passing in front: the tracker lost the face's landmarks on that one frame
+# (visibility 0.57, 0.04, 0.57) and the whole retouch went off for it, a blink) a face missing, or its visibility dipping, for at most
+# FACE_GAP_BRIDGE frames between frames where the person's face is known is taken from those frames (the landmarks in between, the lower
+# of their two weights). 0 = as before.
+FACE_GAP_BRIDGE = 2
+
+
+def _vis_w(vis: float) -> float:
+    return float(np.clip((float(vis) - VIS_LO) / (VIS_FULL - VIS_LO), 0.0, 1.0))
+
+
+def _face_bridge(st, p: int, t: int, n: int):
+    """((landmarks at t from the nearest frames before and after with the face known, within n each side), the lower of their weights)
+    or None."""
+    if n <= 0 or not getattr(st, "has_face", False):
+        return None
+    T = st.present.shape[1]
+    got = []
+    for step in (-1, 1):
+        hit = None
+        for k in range(1, n + 1):
+            u = t + step * k
+            if u < 0 or u >= T or not st.present[p, u]:
+                break
+            if np.isfinite(st.face[p, u, :, :2]).all():
+                hit = (k, np.asarray(st.face[p, u], np.float32), float(st.face_vis[p, u]))
+                break
+        if hit is None:
+            return None
+        got.append(hit)
+    (kb, fb, vb), (kf, ff, vf) = got
+    if kb + kf - 1 > n:
+        return None
+    return fb + (ff - fb) * (kb / float(kb + kf)), min(_vis_w(vb), _vis_w(vf))
 CACHE_BYTES = 900 * 2 ** 20   # the preview's mask cache
 STEADY_R = 2          # frames each side
 STEADY_SIGMA = 1.0
@@ -3483,12 +3517,15 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
         face = None
         fw = 0.0
         fw_doubt = False
+        bridge_ = _face_bridge(st, p, t, FACE_GAP_BRIDGE) if (FACE_GAP_BRIDGE > 0 and p not in doubles) else None
         if st.has_face and np.isfinite(st.face[p, t, :, :2]).all() and p not in doubles:
             face = st.face[p, t]
             # face visibility as a strength: full strength once the face is reasonably sure, so the retouch does
             # not breathe with small confidence changes (a zoom, a turn); it still fades out where the face is
             # really doubtful (heavily covered, carried by motion alone for many frames)
             fw = float(np.clip((float(st.face_vis[p, t]) - VIS_LO) / (VIS_FULL - VIS_LO), 0.0, 1.0))
+            if bridge_ is not None and fw < bridge_[1] - 0.25:
+                fw = bridge_[1]                     # (FACE_GAP_BRIDGE) a dip of a frame or two between surer frames
             fw_doubt = fw < 1.0
             if fw < 1.0 and VIS_PARSE:
                 # the tracker's visibility drops on the frames next to a cover (cut 086: a head passes in front, and
@@ -3496,6 +3533,10 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 # in plain view). The face parser looks at the frame itself: where it is sure of this face's skin
                 # over a good part of the outline, the face is visible
                 fw = max(fw, _parse_visible(tracker, person.id, t, face, px))
+        elif bridge_ is not None and bridge_[1] > 0.0:
+            # (FACE_GAP_BRIDGE) the landmarks lost for a frame or two: from the frames round it
+            face, fw = bridge_[0], bridge_[1]
+            fw_doubt = fw < 1.0
         sc = float(st.scale[p, t]) if np.isfinite(st.scale[p, t]) else 0.0
         job = Job(p, person.id, v, float(np.clip(pp.skin_detail / 100.0, 0, 1)), pp.skin_scope,
                   float(pp.grain_size), face, fw, sc,
