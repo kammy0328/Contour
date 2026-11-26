@@ -8917,6 +8917,62 @@ APPLY_ROI = 1.0     # (11/24) the apply works person by person on each one's own
                     # where the people's pieces do not overlap, a fraction of the time and memory of the whole 4K frame a person. 0 = the
                     # whole frame for everybody at once, as before
 APPLY_ROI_MARGIN = 1.5   # face widths round a person's masks and landmarks that their piece takes in (the blurs and the local levels of the stages reach that far)
+APPLY_ROI_COVER = 0.8    # (1.26.3) the pieces are used unless their areas add up to more than this share of the picture times the people: the whole frame is not
+                         # "once for all" (every person's stages run on whole-frame arrays then), LNGSHOT 024 (4 faces, pieces 1.05 of the picture): the
+                         # retouch 230 -> 121 s over 12 frames, the file the same (j2851). Before 1.26.3: 0.8 of the picture whatever the people
+APPLY_ROI_PLAIN = True   # (1.26.3) display-referred footage on the people's pieces too (before: only log footage, retouch.logwrap)
+
+
+def roi_pieces(planes, rf: "RetouchFrame", y_per_src: float, dbg=None) -> Optional[list]:
+    """The people's pieces (x0, y0, x1, y1, luma px) of a frame for the apply, or None when it works on the whole frame (a body effect,
+    no face, planes it cannot cut alike, pieces most of the picture)."""
+    say = dbg or (lambda *a: None)
+    if float(APPLY_ROI or 0) <= 0 or len(planes) < 3:
+        return None
+    H, W = planes[0].shape[:2]
+    bad = [(j.pid, roi_job_ok(j, why=True)) for j in rf.jobs]
+    bad = [b for b in bad if b[1] is not True]
+    if bad:
+        say("jobs not on their piece", bad)
+        return None
+    al = 2
+    for pl in planes[1:3]:
+        if W % pl.shape[1] or H % pl.shape[0]:
+            return None
+        al = max(al, W // pl.shape[1], H // pl.shape[0])
+    boxes = []
+    for j in rf.jobs:
+        w_ = []
+        b = roi_job_box(j, (W, H), rf.proxy_wh, y_per_src, float(APPLY_ROI_MARGIN), al, w_)
+        say("job", j.pid, "masks' boxes (proxy px)", w_)
+        if b is None:
+            say("no box", j.pid)
+            return None
+        boxes.append(b)
+    if sum((b[2] - b[0]) * (b[3] - b[1]) for b in boxes) > float(APPLY_ROI_COVER) * W * H * max(1, len(rf.jobs)):
+        say("pieces cover most of the picture", boxes)
+        return None
+    say("on pieces", boxes)
+    return boxes
+
+
+def apply_on_pieces(planes, rf: "RetouchFrame", y_per_src: float, boxes: list, one) -> List[np.ndarray]:
+    """Each person on their own piece, one after the other (a later person's piece is read from the planes the earlier ones left).
+    one(sub_planes, rf_of_the_piece) -> the piece's planes retouched."""
+    H, W = planes[0].shape[:2]
+    out = [np.array(p, copy=True) for p in planes[:3]]
+    for j, (x0, y0, x1, y1) in zip(rf.jobs, boxes):
+        rfj = roi_frame(rf, j, (x0, y0, x1, y1), (W, H), y_per_src)
+        sub = []
+        for pl in out:
+            kx, ky = W // pl.shape[1], H // pl.shape[0]
+            sub.append(pl[y0 // ky:y1 // ky, x0 // kx:x1 // kx])
+        res = one(sub, rfj)
+        for pl, r in zip(out, res[:3]):
+            kx, ky = W // pl.shape[1], H // pl.shape[0]
+            pl[y0 // ky:y1 // ky, x0 // kx:x1 // kx] = r
+        j.naso_pres = rfj.jobs[0].naso_pres
+    return out + list(planes[3:])
 
 
 def roi_job_ok(j, why: bool = False):
@@ -9066,7 +9122,7 @@ def roi_frame(rf: "RetouchFrame", j, box, plane_wh: Tuple[int, int], y_per_src: 
 
 
 def apply_planes(planes: List[np.ndarray], subsample, max_value: float, pix_fmt: str,
-                 rf: Optional[RetouchFrame], y_per_src: float = 1.0, disp=None, rng: Optional[str] = "tv") -> List[np.ndarray]:
+                 rf: Optional[RetouchFrame], y_per_src: float = 1.0, disp=None, rng: Optional[str] = "tv", _roi: bool = True) -> List[np.ndarray]:
     """Render: native planes. YUV planes stay YUV (chroma at its own resolution); float RGB goes through
     Y/Cb/Cr and back. disp = (ColourManager, ViewSettings, range) for footage that is not display-referred
     (log): the finding of what to hold is done on the Rec.709 view, the skin texture is thinned on the original
@@ -9079,6 +9135,16 @@ def apply_planes(planes: List[np.ndarray], subsample, max_value: float, pix_fmt:
             return LW.apply_planes_display(planes, subsample, max_value, pix_fmt, rf, y_per_src,
                                            disp[0], disp[1], disp[2] if len(disp) > 2 else "tv")
     if pix_fmt.startswith("yuv"):
+        if _roi and APPLY_ROI_PLAIN:
+            try:
+                boxes_ = roi_pieces(planes, rf, y_per_src)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                boxes_ = None
+            if boxes_ is not None:
+                return apply_on_pieces(planes, rf, y_per_src, boxes_,
+                                       lambda sub, rfj: apply_planes(sub, subsample, max_value, pix_fmt, rfj, y_per_src, None, rng, _roi=False))
         # the file's own range (limited: Y 64..940 in 10 bits): read as if full range, every retouch that depends on
         # the brightness worked on other values than in the preview (grey 51 + skin brightness 50 %: 86 / 95)
         y0, ys, c0, cs_ = yuv_scale(max_value, rng)
