@@ -169,6 +169,7 @@ def resolve_task(session, pid: int, t: int = 0, frame_end: Optional[int] = None,
 
 class MainWindow(QMainWindow):
     _open_done = Signal(int, str, object)      # (open sequence, cut id, the session it was opened in): a cut opened on a thread
+    _relinked = Signal(int, object, str)       # (relink sequence, (project, snapshot, plan, quiet), error): people linked on a thread
 
     def __init__(self):
         super().__init__()
@@ -254,6 +255,7 @@ class MainWindow(QMainWindow):
         self.cutlist.setMinimumWidth(250)
         self.cutlist.setMaximumWidth(340)
         self._open_done.connect(self._cut_opened_bg)
+        self._relinked.connect(self._relink_done)
         self.cutlist.cutSelected.connect(self._open_cut_clicked)
         self.cutlist.addRequested.connect(self.add_cuts)
         self.cutlist.action.connect(self._cut_action)
@@ -2087,7 +2089,7 @@ class MainWindow(QMainWindow):
         elif action == "members":
             from .members import MembersDialog
             if not prj.members:
-                self._relink(quiet=True)
+                self._relink(quiet=True, wait=True)      # the panel shows the members: linked before it opens
             MembersDialog(self).exec()
         elif action.startswith("status:"):
             from ..learn import statuscal as SC
@@ -2475,28 +2477,99 @@ class MainWindow(QMainWindow):
             log_event("analysis", prj.name, new.name, frames=new.info.frames, auto_ok=new.stats.auto_ok_rate,
                       persons=len(new.persons), batch=True)
 
-    def _relink(self, quiet: bool = False) -> Optional[dict]:
-        """Identity self-learning on the newest cuts, then people linked across the timeline."""
+    RELINKING = "인물 연결 중"
+
+    def _relink(self, quiet: bool = False, wait: bool = False) -> Optional[dict]:
+        """Identity self-learning on the newest cuts, then people linked across the timeline.
+
+        Worked out on a thread from a snapshot of the project and put into the project by _relink_done (1.27: the
+        learning's fit and the linking stood on the UI thread a second after every analysis: 7 to 21 s without a
+        window that answers, with a timeline of 80 cuts). A newer call takes the place of one on its way.
+        wait=True (the people panel opened on a project never linked): linked here and now, without the learning;
+        the linking's result is returned."""
         prj = self.session.project
         if prj is None:
             return None
+        from ..track import xlink as XL
+        seq = self._relink_seq = getattr(self, "_relink_seq", 0) + 1
+        if wait:
+            try:
+                r = XL.link(prj)
+            except Exception as e:
+                traceback.print_exc()
+                if not quiet:
+                    self.toast(f"인물 연결 실패: {e}", "error")
+                return None
+            self._relink_show(r, quiet)
+            return r
+        learn = self._learn_allowed()
         try:
-            from ..learn import identity as ID
-            from ..track import xlink as XL
-            if self._learn_allowed():
-                ID.refit()
-            r = XL.link(prj)
+            snap = XL.snapshot(prj)
         except Exception as e:
             traceback.print_exc()
             if not quiet:
                 self.toast(f"인물 연결 실패: {e}", "error")
             return None
+
+        def work():
+            pl, err = None, ""
+            try:
+                if learn:                        # (_learn_allowed, asked above on the UI thread)
+                    from ..learn import identity as ID
+                    ID.refit()
+                pl = XL.plan(snap)
+            except Exception as e:
+                traceback.print_exc()
+                err = str(e)
+            try:
+                import shiboken6
+                if shiboken6.isValid(self):      # the window closed meanwhile: nobody to hand it to
+                    self._relinked.emit(seq, (prj, snap, pl, quiet), err)
+            except RuntimeError:
+                pass
+        self.saved_lbl.start(self.RELINKING)     # (the top bar: it goes on behind the work; the save after it takes its place)
+        threading.Thread(target=work, name="diap-relink", daemon=True).start()
+        return None
+
+    def _relink_done(self, seq: int, job, err: str):
+        """On the UI thread: a linking worked out on a thread. Put into the project when it is still the newest one
+        asked for and the project is as it was read."""
+        prj, snap, pl, quiet = job
+        if seq != getattr(self, "_relink_seq", 0):
+            return                               # a newer one is on its way (or was done at once)
+        if self.session.project is not prj:
+            self.saved_lbl.clear(self.RELINKING)
+            return                               # another project is open
+        if pl is None:
+            self.saved_lbl.clear(self.RELINKING)
+            if not quiet:
+                self.toast(f"인물 연결 실패: {err}", "error")
+            return
+        if self.job is not None:
+            # an analysis (or another job) is writing the open cut: put in when it is done (it asks for a newer
+            # linking itself when it ends, which drops this one)
+            QTimer.singleShot(2000, lambda: self._relink_done(seq, job, err))
+            return
+        from ..track import xlink as XL
+        if (prj.members or {}) != snap["members"] or list(getattr(prj, "member_cannot", []) or []) != snap["cannot"]:
+            self._relink(quiet=quiet)            # the members were changed by hand meanwhile: from what they are now
+            return
+        try:
+            r = XL.apply(prj, pl)
+        except Exception as e:
+            traceback.print_exc()
+            self.saved_lbl.clear(self.RELINKING)
+            if not quiet:
+                self.toast(f"인물 연결 실패: {e}", "error")
+            return
+        self._relink_show(r, quiet)
+
+    def _relink_show(self, r: dict, quiet: bool):
         self.session.dirty = True
         self.save()
         self._refresh_all()
         if not quiet:
             self.toast(f"인물 연결: 여러 컷에 나오는 멤버 {r['multi']}명" + (f" · 확인 필요 {r['low']}명 (인물 버튼)" if r["low"] else ""), "ok")
-        return r
 
     def _batch_all_done(self, done: int, failed: int):
         dlg = getattr(self, "_batch_dlg", None)
@@ -4787,10 +4860,21 @@ class MainWindow(QMainWindow):
                 e.ignore()
                 return
             self._close_saved = True
-        if self.queue_page.job is not None:
-            if QMessageBox.question(self, "렌더 중", "렌더가 진행 중입니다. 종료하면 현재 렌더는 취소됩니다. 종료할까요?") != QMessageBox.Yes:
-                e.ignore()
-                return
+        # every question before anything is stopped (1.27: "no" to the batch came after the render had been cancelled)
+        render = self.queue_page.job is not None
+        if render and QMessageBox.question(self, "렌더 중", "렌더가 진행 중입니다. 종료하면 현재 렌더는 취소됩니다. 종료할까요?") != QMessageBox.Yes:
+            e.ignore()
+            return
+        if self.batch.busy and QMessageBox.question(
+                self, "일괄 분석 중", "일괄 분석이 진행 중입니다. 종료하면 지금 컷의 분석은 버려집니다. 종료할까요?") != QMessageBox.Yes:
+            e.ignore()
+            return
+        # Saved (or not to be) and nothing more to ask: the window goes from the screen now and the work in the
+        # background is stopped behind it. The waits below are up to 5 s each (the render, the proxies, a job, the
+        # frame cache), and the window stood there meanwhile without answering, as if stuck.
+        if self._close_saved or getattr(self, "_discard_on_close", False):
+            self.hide()
+        if render and self.queue_page.job is not None:
             self.queue_page.job.cancel()
             self.queue_page.job.wait(5000)
         try:
@@ -4799,9 +4883,6 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         if self.batch.busy:
-            if QMessageBox.question(self, "일괄 분석 중", "일괄 분석이 진행 중입니다. 종료하면 지금 컷의 분석은 버려집니다. 종료할까요?") != QMessageBox.Yes:
-                e.ignore()
-                return
             self.batch.kill()
         self.refresher.enabled = False           # a running matte refresh is dropped: its marks are saved with the cut
         self.refresher.cancel()
@@ -4816,6 +4897,7 @@ class MainWindow(QMainWindow):
                 and not self._save_or_ask("종료"):
             e.ignore()
             return
+        self.hide()                              # (a job was running: saved only now)
         self.activity.flush()
         self.edit_worker.stop()
         self.edit_worker.wait(3000)

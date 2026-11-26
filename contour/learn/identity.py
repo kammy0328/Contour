@@ -269,19 +269,45 @@ def refit() -> dict:
         if ok:
             if Wall is not None:
                 thr = _threshold(allpos, allneg, Wall)
-                np.savez_compressed(f, W=Wall, thr=np.array(thr if thr is not None else np.nan),
-                                    meta=np.array(json.dumps(dict(created=time.time(), cuts=len(cuts),
-                                                                  auc_raw=a0, auc_learned=a1))))
+                tmp = f.with_name(f.name + ".tmp")
+                with open(tmp, "wb") as fh:
+                    np.savez_compressed(fh, W=Wall, thr=np.array(thr if thr is not None else np.nan),
+                                        meta=np.array(json.dumps(dict(created=time.time(), cuts=len(cuts),
+                                                                      auc_raw=a0, auc_learned=a1))))
+                _put(tmp, f)
                 r["active"] = True
                 r["thr_learned"] = thr
         else:
             r["reason"] = "처음 보는 영상에서 나아지지 않아 원래 특징 사용"
             if f.exists():
-                f.unlink()
+                _put(None, f)
         res[kind] = r
     _cache.clear()
-    (_dir() / "status.json").write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
+    st = _dir() / "status.json"
+    tmp = st.with_name(st.name + ".tmp")
+    tmp.write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
+    _put(tmp, st)
     return res
+
+
+def _put(tmp: Optional[Path], dst: Path) -> None:
+    """tmp in dst's place in one step (None: dst removed). refit runs on a thread of its own since 1.27 while the
+    linking may read these files on another: a reader gets the old file or the new one, never half of one. A file
+    a reader has open at that moment (Windows) is tried again for a second."""
+    import os
+    for k in range(20):
+        try:
+            if tmp is None:
+                dst.unlink()
+            else:
+                os.replace(tmp, dst)
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError:
+            if k == 19:
+                raise
+            time.sleep(0.05)
 
 
 _cache: Dict[str, tuple] = {}

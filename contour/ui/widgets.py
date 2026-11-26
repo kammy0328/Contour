@@ -790,6 +790,16 @@ class SaveIndicator(QWidget):
         self.check.hide()
         self.text.setStyleSheet("")
 
+    def clear(self, only: str = ""):
+        """Nothing shown (only: just when this text is the one shown: a note of something else stays)."""
+        if only and self.text.text() != only:
+            return
+        self._t.stop()
+        self.spin.hide()
+        self.check.hide()
+        self.text.setStyleSheet("")
+        self.text.setText("")
+
 
 class BusyOverlay(QWidget):
     cancelRequested = Signal()

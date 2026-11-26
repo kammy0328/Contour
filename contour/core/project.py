@@ -682,6 +682,31 @@ class Cut:
         return c
 
 
+_DIRS: Dict[str, float] = {}       # a project's folders this process made or saw there, and when
+DIR_MEMO_S = 20.0                  # for so long a folder is taken to be there still (0: asked every time, as before 1.27)
+
+
+def _made(d: Path) -> Path:
+    """d, made when it is not there. With the project on a network drive every mkdir of a folder that is there is a
+    round trip (two: pathlib asks whether it is a folder when the making fails), and opening one cut asked 46 times
+    (LNGSHOT on Y:, 11/26: seconds when the drive is busy). A folder made or seen is taken to be there for
+    DIR_MEMO_S; one removed from outside meanwhile is made again after that (forget_dirs: at once)."""
+    k = str(d)
+    now = time.monotonic()
+    t = _DIRS.get(k)
+    if t is None or now - t >= DIR_MEMO_S:
+        d.mkdir(parents=True, exist_ok=True)
+        if len(_DIRS) > 4096:
+            _DIRS.clear()
+        _DIRS[k] = now
+    return d
+
+
+def forget_dirs() -> None:
+    """After folders of a project were removed or moved: asked again."""
+    _DIRS.clear()
+
+
 def _complete(meta: Path) -> bool:
     try:
         return bool(json.loads(meta.read_text(encoding="utf-8")).get("complete"))
@@ -713,16 +738,12 @@ class Project:
         return Path(self.path)
 
     def cut_dir(self, cut: Cut) -> Path:
-        d = self.folder / "cuts" / cut.id
-        d.mkdir(parents=True, exist_ok=True)
-        return d
+        return _made(self.folder / "cuts" / cut.id)
 
     def cache_dir(self, cut: Cut) -> Path:
         """Analysis results that only an analysis makes again (mattes, person labels, face layer): kept with the
         project. Proxies are in proxy_dir (this computer's cache)."""
-        d = self.cut_dir(cut) / "cache"
-        d.mkdir(parents=True, exist_ok=True)
-        return d
+        return _made(self.cut_dir(cut) / "cache")
 
     # ------------------------------------------------------------------ proxies (this computer's cache, 1.16)
     def cache_key(self) -> str:

@@ -34,44 +34,64 @@ def _norm(X):
 
 
 class Inst:
-    __slots__ = ("cut", "pid", "faces", "reid", "weight", "name")
+    """One person of one cut, as the linking sees it (the cut by its id: nothing of the project is held)."""
+    __slots__ = ("cid", "pid", "faces", "reid", "weight", "name", "rm", "rn")
 
-    def __init__(self, cut, pid, faces, reid, weight, name):
-        self.cut, self.pid, self.faces, self.reid, self.weight, self.name = cut, pid, faces, reid, weight, name
+    def __init__(self, cid, pid, faces, reid, weight, name):
+        self.cid, self.pid, self.faces, self.reid, self.weight, self.name = cid, pid, faces, reid, weight, name
+        # the body feature's mean and its length, once (every pair asked for them again)
+        self.rm = reid.mean(0) if reid is not None else None
+        self.rn = np.linalg.norm(self.rm) if reid is not None else None
 
 
-def _instances(project) -> List[Inst]:
-    from ..learn import identity as ID
-    Wf, Wr = ID.active("face"), ID.active("reid")
-    out = []
+def snapshot(project) -> dict:
+    """What a linking reads of the project, copied on the caller's thread (no file is read, no folder made), so that
+    the linking itself can run on another thread (plan) and be put into the project afterwards (apply)."""
+    import copy
+    cuts = []
     for c in project.timeline_cuts() or project.cuts:
         if not c.analyzed:
             continue
-        idf = project.cut_dir(c) / "identity.npz"
+        metrics = {r["pid"]: r for r in (c.status or {}).get("metrics", {}).get("persons", [])}
+        people = [dict(pid=q.id, faces=list(q.faces), reid=list(q.reid) if len(q.reid) else [], first=q.first, last=q.last,
+                       name=q.name, m=dict(metrics.get(q.id, {})))
+                  for q in c.persons if q.role != "ignore"]
+        cuts.append(dict(id=c.id, idf=Path(project.folder) / "cuts" / c.id / "identity.npz", people=people))
+    return dict(cuts=cuts, members=copy.deepcopy(project.members or {}),
+                cannot=copy.deepcopy(list(getattr(project, "member_cannot", []) or [])))
+
+
+def _instances(snap: dict) -> List[Inst]:
+    import io
+    from ..learn import identity as ID
+    Wf, Wr = ID.active("face"), ID.active("reid")
+    out = []
+    for c in snap["cuts"]:
         extra = None
-        if idf.exists():
+        try:
+            raw = c["idf"].read_bytes()          # one read (a project on a network drive: a file read in pieces is slow)
+        except OSError:
+            raw = None
+        if raw:
             try:
-                with np.load(idf) as d:
+                with np.load(io.BytesIO(raw)) as d:
                     extra = {k: d[k] for k in ("face", "face_pid", "reid", "reid_pid")}
             except Exception:
                 extra = None
-        metrics = {r["pid"]: r for r in (c.status or {}).get("metrics", {}).get("persons", [])}
-        for q in c.persons:
-            if q.role == "ignore":
-                continue
-            faces = [np.asarray(f, np.float32) for f in q.faces]
-            reid = [np.asarray(q.reid, np.float32)] if q.reid else []
+        for q in c["people"]:
+            faces = [np.asarray(f, np.float32) for f in q["faces"]]
+            reid = [np.asarray(q["reid"], np.float32)] if len(q["reid"]) else []
             if extra is not None:
                 if extra["face"].size:
-                    faces = list(extra["face"][extra["face_pid"] == q.id]) or faces
+                    faces = list(extra["face"][extra["face_pid"] == q["pid"]]) or faces
                 if extra["reid"].size:
-                    reid = list(extra["reid"][extra["reid_pid"] == q.id]) or reid
+                    reid = list(extra["reid"][extra["reid_pid"] == q["pid"]]) or reid
             if not faces and not reid:
                 continue
-            m = metrics.get(q.id, {})
-            w = float(m.get("frames", max(1, q.last - q.first + 1))) * (1.0 + float(m.get("face_px", 0)) / 200.0)
-            out.append(Inst(c, q.id, ID.project(np.stack(faces), Wf) if faces else None,
-                            ID.project(np.stack(reid), Wr) if reid else None, w, q.name))
+            m = q["m"]
+            w = float(m.get("frames", max(1, q["last"] - q["first"] + 1))) * (1.0 + float(m.get("face_px", 0)) / 200.0)
+            out.append(Inst(c["id"], q["pid"], ID.project(np.stack(faces), Wf) if faces else None,
+                            ID.project(np.stack(reid), Wr) if reid else None, w, q["name"]))
     return out
 
 
@@ -88,24 +108,74 @@ def _sim(a: Inst, b: Inst) -> Tuple[float, float]:
         conf = min(1.0, min(len(a.faces), len(b.faces)) / 4.0)
         ev = (s - FACE_SAME) / 0.12
         if a.reid is not None and b.reid is not None:
-            r = float(a.reid.mean(0) @ b.reid.mean(0) / (np.linalg.norm(a.reid.mean(0)) * np.linalg.norm(b.reid.mean(0)) + 1e-9))
+            r = float(a.rm @ b.rm / (a.rn * b.rn + 1e-9))
             ev += 0.3 * (r - REID_SAME) / 0.08
         return ev, 0.5 + 0.5 * conf
     if a.reid is not None and b.reid is not None:
-        ma, mb = a.reid.mean(0), b.reid.mean(0)
-        r = float(ma @ mb / (np.linalg.norm(ma) * np.linalg.norm(mb) + 1e-9))
+        r = float(a.rm @ b.rm / (a.rn * b.rn + 1e-9))
         return (r - REID_SAME) / 0.08, 0.35
     return 0.0, 0.0
 
 
-def link(project, keep_user: bool = True) -> dict:
-    """Assigns Person.member / member_conf on every analysed cut and rebuilds project.members."""
+def _merge(groups: List[List[int]], E: np.ndarray, Wt: np.ndarray, user: set) -> List[List[int]]:
+    """The joining: while a pair of groups has evidence above 0 for "same" (the weighted mean of its people's pairwise
+    evidence; never a pair with a "never one member" between them, never two of the user's members), the best pair
+    becomes one group (a user's member keeps its place). The first of equal pairs in the groups' order wins.
+
+    Until 1.27 every round worked every pair's mean out again from the people's matrix (a round for each join: the
+    cube of the people; 160 people 8 s, 320 a minute, on the UI thread). Here the groups' sums are kept and a join
+    adds two rows: the same pairs in the same order."""
+    G, n = len(groups), len(E)
+    if G < 2:
+        return groups
+    mem = np.zeros((G, n))
+    for g, idx in enumerate(groups):
+        mem[g, idx] = 1.0
+    w64 = Wt.astype(np.float64)
+    SW = mem @ (E.astype(np.float64) * w64) @ mem.T          # a pair of groups: the sum of evidence x weight
+    WW = mem @ w64 @ mem.T                                   #                   the sum of the weights
+    NEG = (mem @ (E <= -49).astype(np.float64) @ mem.T) > 0  #                   a "never" between two of their people
+    alive = np.ones(G, bool)
+    isuser = np.zeros(G, bool)
+    isuser[[g for g in user if 0 <= g < G]] = True
+    ok = np.triu(np.ones((G, G), bool), 1) & ~NEG & (WW > 0) & ~(isuser[:, None] & isuser[None, :])
+    S = np.full((G, G), -np.inf)
+    np.divide(SW, WW, out=S, where=ok)
+    while True:
+        a, b = divmod(int(np.argmax(S)), G)
+        if not S[a, b] > 0.0:
+            break
+        if isuser[b] and not isuser[a]:
+            a, b = b, a
+        groups[a] += groups[b]
+        alive[b] = False
+        for m_ in (SW, WW):
+            m_[a, :] += m_[b, :]
+            m_[:, a] += m_[:, b]
+        NEG[a, :] |= NEG[b, :]
+        NEG[:, a] |= NEG[:, b]
+        S[b, :] = -np.inf
+        S[:, b] = -np.inf
+        v = alive & ~NEG[a] & (WW[a] > 0)
+        if isuser[a]:
+            v &= ~isuser
+        v[a] = False
+        row = np.full(G, -np.inf)
+        np.divide(SW[a], WW[a], out=row, where=v)
+        S[a, a + 1:] = row[a + 1:]
+        S[:a, a] = row[:a]
+    return [g for k, g in enumerate(groups) if alive[k]]
+
+
+def plan(snap: dict, keep_user: bool = True) -> dict:
+    """The linking worked out from a snapshot of the project (any thread: the project itself is not touched): the
+    members, every person's member and confidence, and the counts link() gives."""
     from ..learn import identity as ID
     _THR["face"] = ID.threshold("face", FACE_SAME)
     _THR["reid"] = ID.threshold("reid", REID_SAME)
-    insts = _instances(project)
+    insts = _instances(snap)
     n = len(insts)
-    old = project.members or {}
+    old = snap["members"] or {}
     # fixed links from the user: (cut id, pid) -> member id
     fixed: Dict[Tuple[str, int], str] = {}
     if keep_user:
@@ -117,7 +187,7 @@ def link(project, keep_user: bool = True) -> dict:
     # start: user members as groups, everyone else alone
     by_mid: Dict[str, List[int]] = {}
     for i, it in enumerate(insts):
-        mid = fixed.get((it.cut.id, it.pid))
+        mid = fixed.get((it.cid, it.pid))
         if mid:
             by_mid.setdefault(mid, []).append(i)
     for mid, idx in by_mid.items():
@@ -132,56 +202,23 @@ def link(project, keep_user: bool = True) -> dict:
     Wt = np.zeros((n, n), np.float32)
     for i in range(n):
         for j in range(i + 1, n):
-            if insts[i].cut is insts[j].cut:
+            if insts[i].cid == insts[j].cid:
                 E[i, j] = E[j, i] = -50.0        # same cut: never one member
                 Wt[i, j] = Wt[j, i] = 1.0
                 continue
             e, w = _sim(insts[i], insts[j])
             E[i, j] = E[j, i] = e
             Wt[i, j] = Wt[j, i] = w
-    user_mids = set(by_mid)
-    pos = {(it.cut.id, it.pid): i for i, it in enumerate(insts)}
-    for a_, b_ in getattr(project, "member_cannot", []) or []:
+    pos = {(it.cid, it.pid): i for i, it in enumerate(insts)}
+    for a_, b_ in snap["cannot"] or []:
         i, j = pos.get((a_[0], int(a_[1]))), pos.get((b_[0], int(b_[1])))
         if i is not None and j is not None:
             E[i, j] = E[j, i] = -50.0
             Wt[i, j] = Wt[j, i] = 1.0
-
-    def gscore(a: List[int], b: List[int]) -> float:
-        sub = E[np.ix_(a, b)]
-        w = Wt[np.ix_(a, b)]
-        if (sub <= -49).any():
-            return -99.0
-        if w.sum() <= 0:
-            return -99.0
-        return float((sub * w).sum() / w.sum())
-
-    alive = [True] * len(groups)
-    mid_of_group = {g: mid for g, mid in enumerate(by_mid)}
-    while True:
-        best = (0.0, None, None)
-        for a in range(len(groups)):
-            if not alive[a]:
-                continue
-            for b in range(a + 1, len(groups)):
-                if not alive[b]:
-                    continue
-                if a in mid_of_group and b in mid_of_group:
-                    continue                   # two user members stay apart unless the user merges them
-                s = gscore(groups[a], groups[b])
-                if s > best[0]:
-                    best = (s, a, b)
-        if best[1] is None:
-            break
-        a, b = best[1], best[2]
-        if b in mid_of_group and a not in mid_of_group:
-            a, b = b, a
-        groups[a] += groups[b]
-        alive[b] = False
-    groups = [g for k, g in enumerate(groups) if alive[k]]
+    groups = _merge(groups, E, Wt, set(range(len(by_mid))))
     mids = []
     for k, g in enumerate(groups):
-        mid = next((fixed.get((insts[i].cut.id, insts[i].pid)) for i in g if (insts[i].cut.id, insts[i].pid) in fixed), None)
+        mid = next((fixed.get((insts[i].cid, insts[i].pid)) for i in g if (insts[i].cid, insts[i].pid) in fixed), None)
         mids.append(mid)
     # stable ids and names: reuse an old member when most of its people are here
     members = {}
@@ -194,7 +231,7 @@ def link(project, keep_user: bool = True) -> dict:
             votes: Dict[str, int] = {}
             for i in g:
                 for om, m in old.items():
-                    if [insts[i].cut.id, insts[i].pid] in m.get("people", []) and om not in used:
+                    if [insts[i].cid, insts[i].pid] in m.get("people", []) and om not in used:
                         votes[om] = votes.get(om, 0) + 1
             mid = max(votes, key=votes.get) if votes else None
         if mid is None or mid in used:
@@ -204,37 +241,55 @@ def link(project, keep_user: bool = True) -> dict:
         members[mid] = dict(name=om.get("name") or f"멤버 {chr(65 + rank) if rank < 26 else rank + 1}",
                             color=om.get("color") or MEMBER_COLORS[rank % len(MEMBER_COLORS)],
                             user_named=bool(om.get("user_named")), fixed=om.get("fixed", []),
-                            people=[[insts[i].cut.id, insts[i].pid] for i in g],
-                            cuts=len({insts[i].cut.id for i in g}))
+                            people=[[insts[i].cid, insts[i].pid] for i in g],
+                            cuts=len({insts[i].cid for i in g}))
     # confidence per person: own member against the best other member
     gidx = {i: k for k, g in enumerate(groups) for i in g}
-    k2mid = {k: [m for m, v in members.items() if [insts[groups[k][0]].cut.id, insts[groups[k][0]].pid] in v["people"]][0]
+    k2mid = {k: [m for m, v in members.items() if [insts[groups[k][0]].cid, insts[groups[k][0]].pid] in v["people"]][0]
              for k in range(len(groups))}
     low = 0
+    people = []
     for i, it in enumerate(insts):
         k = gidx[i]
         own = [j for j in groups[k] if j != i]
         s_own = float(np.average(E[i, own], weights=np.maximum(Wt[i, own], 1e-3))) if own else 0.0
         s_other = max([float(np.average(E[i, g], weights=np.maximum(Wt[i, g], 1e-3)))
                        for kk, g in enumerate(groups) if kk != k and not (E[i, g] <= -49).any()] or [-5.0])
-        if (it.cut.id, it.pid) in fixed:
+        if (it.cid, it.pid) in fixed:
             conf = 1.0
         elif not own:
             conf = float(np.clip(0.5 - s_other / 6.0, 0, 1))      # alone: sure if nobody else is close
         else:
             conf = float(1 / (1 + np.exp(-(s_own - s_other) / 1.5)))
-        q = it.cut.person(it.pid)
-        if q is not None:
-            q.member = k2mid[k]
-            q.member_conf = round(conf, 3)
-            m = members[q.member]
-            if m.get("user_named") or len(m["people"]) > 1:
-                q.name = m["name"]
+        people.append((it.cid, it.pid, k2mid[k], round(conf, 3)))
         if conf < CONF_LOW:
             low += 1
+    return dict(members=members, people=people,
+                result=dict(people=n, members=len(members), low=low,
+                            multi=sum(1 for m in members.values() if m["cuts"] > 1)))
+
+
+def apply(project, pl: dict) -> dict:
+    """A plan put into the project (the thread the project is edited on): Person.member / member_conf (and the
+    member's name where it has one) on every cut, project.members."""
+    members = pl["members"]
+    cuts = {c.id: c for c in project.cuts}
+    for cid, pid, mid, conf in pl["people"]:
+        c = cuts.get(cid)
+        q = c.person(pid) if c is not None else None
+        if q is not None:
+            q.member = mid
+            q.member_conf = conf
+            m = members[mid]
+            if m.get("user_named") or len(m["people"]) > 1:
+                q.name = m["name"]
     project.members = members
-    return dict(people=n, members=len(members), low=low,
-                multi=sum(1 for m in members.values() if m["cuts"] > 1))
+    return pl["result"]
+
+
+def link(project, keep_user: bool = True) -> dict:
+    """Assigns Person.member / member_conf on every analysed cut and rebuilds project.members."""
+    return apply(project, plan(snapshot(project), keep_user))
 
 
 # ------------------------------------------------------------------ user decisions

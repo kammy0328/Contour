@@ -1,6 +1,7 @@
 """Per-cut tracking arrays (raw model output, fused tracks, flags, widths, camera motion)."""
 from __future__ import annotations
 
+import io
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -148,10 +149,15 @@ class TrackStore:
     @classmethod
     def load(cls, path: Path) -> Optional["TrackStore"]:
         path = Path(path)
-        if not path.exists():
+        try:
+            # the file in one read (1.27): numpy read every array of the archive in pieces of its own, 160 small
+            # reads a cut, each a round trip with the project on a network drive (LNGSHOT on Y:, 11/26: opening a
+            # cut stood seconds here when the drive was busy)
+            raw = path.read_bytes()
+        except OSError:
             return None
         try:
-            with np.load(path, allow_pickle=False) as d:
+            with np.load(io.BytesIO(raw), allow_pickle=False) as d:
                 st = cls(int(d["n"]), [int(x) for x in d["pids"]])
                 for name in PER_PERSON + ("homog", "homog_ok", "jump"):
                     if name in d.files:
