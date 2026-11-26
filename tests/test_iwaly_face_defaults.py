@@ -30,8 +30,7 @@ def test_final_pass_runs_for_the_nasolabial_slider():
     import inspect
     src = inspect.getsource(E._final_pass)
     assert '"nasolabial"' in src.split("if not (")[0]
-    assert 'kfn_ = max(float(FINAL_NASO), float(np.clip(job.v.get("nasolabial", 0.0), 0, 1)) if FINAL_NASO_SLIDER else 0.0)' in src
-    assert E.FINAL_NASO_SLIDER is True
+    assert 'kfn_ = max(float(FINAL_NASO), float(np.clip(job.v.get("nasolabial", 0.0), 0, 1)))' in src
 
 
 def test_the_mac_batchs_face_settings_are_defaults():

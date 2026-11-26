@@ -593,7 +593,6 @@ class Cut:
     status: dict = field(default_factory=dict)   # beauty status: auto, reason, user, reviewed, metrics, work
     version: int = 1                              # work version (renders are named _v<version>)
     versions: dict = field(default_factory=dict)  # str(version) -> snapshot of the work at that version
-    render_look: str = ""            # (1.26.3) the look the cut's last finished render was made with (retouch/looks.py; "" = never / before 1.26.3)
 
     @property
     def n_frames(self) -> int:
@@ -639,8 +638,6 @@ class Cut:
         }
         if self.model_versions:
             d["model_versions"] = dict(self.model_versions)
-        if self.render_look:
-            d["render_look"] = self.render_look
         return d
 
     @classmethod
@@ -682,7 +679,6 @@ class Cut:
         c.status = dict(d.get("status") or {})
         c.version = max(1, int(d.get("version", 1)))
         c.versions = dict(d.get("versions") or {})
-        c.render_look = str(d.get("render_look", "") or "")
         return c
 
 
@@ -711,7 +707,6 @@ class Project:
     timeline: dict = field(default_factory=dict)   # an edited timeline the cuts come from (see core/timeline.py)
     members: dict = field(default_factory=dict)    # people across cuts: id -> {name, color, user, links}
     member_cannot: list = field(default_factory=list)   # [[cut, pid], [cut, pid]] the user said are different people
-    look: str = ""                    # (1.26.3) the retouch's look this project keeps (retouch/looks.py): "" = the newest (follows the app)
 
     @property
     def folder(self) -> Path:
@@ -798,8 +793,7 @@ class Project:
         return {"format": 1, "name": self.name, "cuts": [c.to_dict() for c in self.cuts], "input_cs": self.input_cs,
                 "created": self.created, "modified": self.modified, "learn": bool(self.learn and self.learn_set),
                 "learn_set": bool(self.learn_set), "client": self.client, "timeline": self.timeline,
-                "members": self.members, "member_cannot": self.member_cannot,
-                **({"look": self.look} if self.look else {})}
+                "members": self.members, "member_cannot": self.member_cannot}
 
     def save(self) -> None:
         self.modified = time.time()
@@ -833,7 +827,6 @@ class Project:
         prj.timeline = dict(d.get("timeline") or {})
         prj.members = dict(d.get("members") or {})
         prj.member_cannot = list(d.get("member_cannot") or [])
-        prj.look = str(d.get("look", "") or "")
         return prj
 
     def timeline_cuts(self) -> List[Cut]:
@@ -849,10 +842,5 @@ class Project:
             folder = Path(parent_dir) / f"{nm}_{n}{PROJECT_EXT}"
             n += 1
         prj = cls(name=nm, path=str(folder))
-        try:
-            from ..retouch.looks import LOOK
-            prj.look = LOOK                # (1.26.3) a new project keeps the look it was made with, whatever an update brings later
-        except Exception:
-            pass
         prj.save()
         return prj
