@@ -5883,8 +5883,21 @@ def neck_axis(lm: Optional[np.ndarray]):
     return None if n < 1e-3 else (float(v[0] / n), float(v[1] / n))
 
 
-_MCACHE: dict = {}
+_MCACHE = __import__("collections").OrderedDict()
 _MC_LOCK = threading.Lock()         # (people of a frame are prepared side by side: PREP_THREADS)
+MCACHE_N = 48                       # masks kept at most
+MCACHE_BYTES = 192 * 2 ** 20        # ... and their bytes (1.27): a mask is the size of the picture it is for, and with a body effect that is the whole
+                                    # frame (4K: 33 MB a mask, nearly all of it zeros round one face): 48 of them were up to 1.6 GB held between frames
+                                    # (IWALY c004, 6 people: four kinds of mask, about 1 GB at the render's highest point, j2905). The least
+                                    # recently used go first; a mask asked for again is made again (a hull, a dilation and a blur in a small window)
+
+
+def _mc_bytes(v) -> int:
+    if isinstance(v, np.ndarray):
+        return int(v.nbytes)
+    if isinstance(v, (tuple, list)):
+        return sum(_mc_bytes(x) for x in v)
+    return 0
 
 
 def _cached(name: str, lm: np.ndarray, shape, scale: float, wf: float, make):
@@ -5893,13 +5906,17 @@ def _cached(name: str, lm: np.ndarray, shape, scale: float, wf: float, make):
     key = (name, np.asarray(lm[:, :2], np.float32).tobytes(), tuple(shape), float(scale), float(wf))
     with _MC_LOCK:
         hit = _MCACHE.get(key)
+        if hit is not None:
+            _MCACHE.move_to_end(key)
     if hit is None:
-        if len(_MCACHE) > 48:
-            with _MC_LOCK:
-                _MCACHE.clear()
         hit = make()                # (made outside the lock: the same mask made twice by two threads is the same mask)
         with _MC_LOCK:
             _MCACHE[key] = hit
+            _MCACHE.move_to_end(key)
+            size = sum(_mc_bytes(v) for v in _MCACHE.values())
+            while len(_MCACHE) > 1 and (len(_MCACHE) > MCACHE_N or size > MCACHE_BYTES):
+                _, old = _MCACHE.popitem(last=False)
+                size -= _mc_bytes(old)
     return hit
 
 

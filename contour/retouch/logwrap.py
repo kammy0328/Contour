@@ -226,17 +226,26 @@ def apply_planes_display(planes: List[np.ndarray], subsample, max_value: float, 
         up = np.zeros_like(disp0)
         up[y0:y1, x0:x1] = cm.to_display(src[y0:y1, x0:x1] + _EPS_L, vs)
     Jv = (up - disp0) / _EPS_L
+    del up
     Jy, Jcb, Jcr = _to_ycc(Jv)
-    sd = {"Y": Ys, "dY": np.zeros_like(Ys), "Jy": Jy.astype(np.float32), "Jcb": Jcb.astype(np.float32),
-          "Jcr": Jcr.astype(np.float32)}
-    Y, Cb, Cr = RE.process_ycc(Y.copy(), Cb.copy(), Cr.copy(), rf, y_per_src, src=sd)
-    disp1 = _from_ycc(Y, Cb, Cr).astype(np.float32)
+    # (1.27) no second copies of the frame's planes here (Y, Cb, Cr are made for this call, the J's are float32 as they come), and what is
+    # done with is let go before the stages run: the whole 4K frame of a body effect is 100 MB an array, and four frames are retouched at once
+    sd = {"Y": Ys, "dY": np.zeros_like(Ys), "Jy": np.asarray(Jy, np.float32), "Jcb": np.asarray(Jcb, np.float32),
+          "Jcr": np.asarray(Jcr, np.float32)}
+    del Jy, Jcb, Jcr
+    Y, Cb, Cr = RE.process_ycc(Y, Cb, Cr, rf, y_per_src, src=sd)
+    disp1 = _from_ycc(Y, Cb, Cr).astype(np.float32, copy=False)
+    del Y, Cb, Cr
     # 1: the texture, already in the original's units
     dS = sd["dY"]
     src2 = src + dS[..., None]
     # 3: whatever else the later steps changed in the view = the view they ended with, less the view the texture alone
-    # predicts (so a pixel only the texture touched gets nothing carried back, and keeps exactly the texture's change)
-    rest = disp1 - (disp0 + Jv * dS[..., None])
+    # predicts (so a pixel only the texture touched gets nothing carried back, and keeps exactly the texture's change):
+    # disp1 - (disp0 + Jv * dS), in one array
+    rest = Jv * dS[..., None]
+    rest += disp0
+    np.subtract(disp1, rest, out=rest)
+    del disp1, Jv
     if box is None:
         dsp2 = cm.to_display(src2, vs) if dS.any() else disp0
         dlog = display_delta_to_source(cm, vs, src2, dsp2, dsp2 + rest)
@@ -244,7 +253,7 @@ def apply_planes_display(planes: List[np.ndarray], subsample, max_value: float, 
         dlog = np.zeros_like(src)
         d2 = cm.to_display(src2[y0:y1, x0:x1], vs) if dS.any() else disp0[y0:y1, x0:x1]
         dlog[y0:y1, x0:x1] = display_delta_to_source(cm, vs, src2[y0:y1, x0:x1], d2, d2 + rest[y0:y1, x0:x1])
-    dlog = dlog + sd["dY"][..., None]
+    dlog += sd["dY"][..., None]
     if not dlog.any():
         return planes
     if pix_fmt.startswith("yuv"):

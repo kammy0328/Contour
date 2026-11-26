@@ -319,6 +319,7 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
         n_workers = max(1, int(os.environ["CONTOUR_RENDER_THREADS"]))
     prep_lock = threading.Lock()
     warper = [None, False]                 # GPU warper (None = CPU), decided
+    gate = PF.FrameGate(n_workers if parallel else 1, people=sum(1 for p_ in cut.targets()) or 1, megapixels=W * H / 1e6)
 
     def do_warp(planes_, fr_):
         if warper[0] is not None:
@@ -372,6 +373,10 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
             rep.accel = (rep.accel + " · " if rep.accel else "") + f"준비 도우미 {st_.get('helpers')}개 ({st_.get('taken')}/{st_.get('taken', 0) + st_.get('local', 0)})"
 
     def process(t_, planes_):
+        with gate.frame():
+            return _process(t_, planes_)
+
+    def _process(t_, planes_):
         if knee_look is not None:
             rf_, fi_ = knee_look.get(t_)
         else:
@@ -379,10 +384,17 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
                 rf_ = RE.prepare(cut, tracker, t_)
                 fi_ = F.build_input(cut, tracker, t_)
         if rf_ is not None and not rf_.empty():
-            res_ = apply_pool.apply(t_, planes_, rf_) if apply_pool is not None else None
-            if res_ is None:
-                RE.masks_f32(rf_)
-                res_ = RE.apply_planes(planes_, subs, maxv, pf, rf_, 1.0, disp_, info.color_range)
+            # (1.27) how many frames are retouched at once goes by the memory the computer has left (perf.FrameGate): told
+            # here whether the whole frame is worked on (a body effect) or the people's pieces
+            try:
+                gate.hint(any(RE.roi_job_ok(j_) is not True for j_ in rf_.jobs))
+            except Exception:
+                gate.hint(True)
+            with gate.apply():
+                res_ = apply_pool.apply(t_, planes_, rf_) if apply_pool is not None else None
+                if res_ is None:
+                    RE.masks_f32(rf_)
+                    res_ = RE.apply_planes(planes_, subs, maxv, pf, rf_, 1.0, disp_, info.color_range)
             planes_ = res_
         fr_ = F.compute_field(fi_, W, H, grid_step)
         if not warper[1] and not fr_.empty():
@@ -422,7 +434,6 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
         if progress:
             progress(rep.frames / max(1, n), "렌더 " + pace_text(rep.frames, n, time.time() - t_start))
 
-    held = [0]                             # frames waited for because memory was short
     if parallel and n_workers > 1:
         pool = ThreadPoolExecutor(max_workers=n_workers)
         pending: "deque" = deque()
@@ -438,14 +449,6 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
                 if planes is None:
                     rep.warnings.append(f"프레임 {t}에서 디코딩이 끝났습니다.")
                     break
-                # (1.27) short of memory: the frames in the making are finished and written, one after the other, before another
-                # is started (IWALY c004, 6 people with body retouch on the 31 GB PC with 12 GB in use by other programs: the
-                # computer's memory was full with four frames at once, j2896a). The same frames in the same order.
-                while pending and PF.short_of_memory():
-                    t0_, fut = pending.popleft()
-                    _, fr0, outp0 = fut.result()
-                    write_frame(t0_, outp0, fr0)
-                    held[0] += 1
                 pending.append((t, pool.submit(process, t, planes)))
                 while len(pending) > n_workers * 2 or (pending and pending[0][1].done()):
                     t0_, fut = pending.popleft()
@@ -459,6 +462,7 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
             if knee_look is not None:
                 knee_look.stop()
             stop_raw()
+            gate.close()
             pool.shutdown(wait=False, cancel_futures=True)
             reader.close()
             if writer and ext_writer is None:
@@ -469,6 +473,7 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
         if knee_look is not None:
             knee_look.stop()
         pool.shutdown(wait=True, cancel_futures=True)
+        gate.close()
         a_range = range(0)
     else:
         a_range = range(a, b)
@@ -530,8 +535,8 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
     rep.seconds = time.time() - t_start
     if parallel and n_workers > 1:
         rep.accel = (rep.accel + " · " if rep.accel else "") + f"프레임 {n_workers}개 동시 처리"
-        if held[0]:
-            rep.accel += f" (메모리가 부족해 {held[0]}번은 앞 프레임이 끝나기를 기다림)"
+        if gate.summary():
+            rep.accel += " (" + gate.summary() + ")"
     return rep
 
 

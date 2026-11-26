@@ -3,6 +3,7 @@ the frames it would have made itself, the helper asks only inside the render's r
 render, and which computers use it (core/perf.raw_ahead)."""
 import tempfile
 import threading
+import time
 import types
 from pathlib import Path
 
@@ -117,6 +118,135 @@ def test_a_render_with_frames_made_ahead_is_the_same_render(monkeypatch):
 
 
 # ------------------------------------------------------------------------------------------------ short of memory
+class Mem:
+    """The computer as a gate sees it: `free` GB free and the process holding `held` GB (both set by the test)."""
+
+    def __init__(self, free, held=1.0):
+        self.free, self.held, self.now = float(free), float(held), 0.0
+
+
+def _gate(mem, workers=4, people=6, mp=8.3):
+    return perf.FrameGate(workers, people, mp, free=lambda: mem.free, held=lambda: mem.held, clock=lambda: mem.now)
+
+
+def test_frame_gate_gives_the_slots_the_memory_has_room_for(monkeypatch):
+    monkeypatch.delenv("CONTOUR_FRAME_GATE", raising=False)
+    monkeypatch.delenv("CONTOUR_RESERVE_GB", raising=False)
+    # IWALY c004 on the 31 GB PC with 12.5 GB in use by other programs: 17.7 GB free at the start, six people, the whole 4K
+    # frame worked on (3.5 GB a frame, 6.4 GB between frames, 3 GB left to the computer): two frames at once
+    g = _gate(Mem(free=17.7))
+    assert g.on and g.slots == 1                                # one, until a frame has said what kind they are
+    g.hint(True)
+    assert g.slots == 2 and abs(g.per - 0.42 * 8.3) < 1e-6
+    g.hint(False)                                               # said once
+    assert g.slots == 2
+    # the same computer, faces only (the people's pieces): four
+    g = _gate(Mem(free=17.7), people=4)
+    g.hint(False)
+    assert g.slots == 4
+    # plenty of memory: as many as the render's workers; hardly any: one
+    for free, want in ((64.0, 4), (9.0, 1), (0.5, 1)):
+        g = _gate(Mem(free=free))
+        g.hint(True)
+        assert g.slots == want
+    # an 8K frame with a body effect on the 31 GB PC: one at a time
+    g = _gate(Mem(free=20.0), mp=33.2)
+    g.hint(True)
+    assert g.slots == 1
+    # memory that cannot be read: as many as asked for
+    g = perf.FrameGate(4, 4, 8.3, free=lambda: -1.0, held=lambda: -1.0)
+    g.hint(True)
+    assert g.slots == 4
+
+
+def test_frame_gate_lets_that_many_retouch_and_one_more_prepare(monkeypatch):
+    monkeypatch.delenv("CONTOUR_FRAME_GATE", raising=False)
+    m = Mem(free=17.7)
+    g = _gate(m)
+    order, holds = [], [threading.Event() for _ in range(4)]
+
+    def frame(i):
+        with g.frame():
+            order.append(("frame", i))
+            g.hint(True)
+            with g.apply():
+                order.append(("apply", i))
+                holds[i].wait(5.0)
+        order.append(("out", i))
+    ths = [threading.Thread(target=frame, args=(i,)) for i in range(4)]
+    for th in ths:
+        th.start()
+    t0 = time.time()
+    while (len([o for o in order if o[0] == "frame"]) < 3 or len([o for o in order if o[0] == "apply"]) < 2) and time.time() - t0 < 5:
+        time.sleep(0.01)
+    time.sleep(0.7)
+    assert len([o for o in order if o[0] == "apply"]) == 2      # two retouched at once (the slots)
+    assert len([o for o in order if o[0] == "frame"]) == 3      # a third prepared meanwhile, the fourth not started
+    assert g.applies == 2 and g.frames == 3 and g.most == 2 and g.waited == 1
+    for h in holds:
+        h.set()
+    for th in ths:
+        th.join(5.0)
+    assert g.applies == 0 and g.frames == 0 and len([o for o in order if o[0] == "out"]) == 4
+    assert "한 번에 2프레임까지" in g.summary()
+    g.close()
+
+
+def test_frame_gate_takes_a_slot_away_when_memory_is_short_and_gives_it_back_after_plenty(monkeypatch):
+    monkeypatch.delenv("CONTOUR_FRAME_GATE", raising=False)
+    m = Mem(free=40.0)
+    g = _gate(m)
+    g.hint(True)
+    assert g.slots == 4
+    g.applies = 4                                               # (as if four were being retouched)
+    m.now, m.free = 5.0, 1.0                                    # the computer's memory nearly gone
+    g.look()
+    assert g.slots == 3 and g.shrunk == 1
+    m.now = 6.0
+    g.look()                                                    # not again within three seconds
+    assert g.slots == 3
+    m.now = 9.0
+    g.look()
+    assert g.slots == 2 and g.shrunk == 2
+    g.applies = 2
+    m.now, m.free = 12.0, 30.0                                  # plenty again: only after GROW_S seconds of it
+    g.look()
+    m.now = 20.0
+    g.look()
+    assert g.slots == 2
+    m.now = 9.0 + g.GROW_S + 0.1
+    g.look()
+    assert g.slots == 3 and g.grown == 1
+    m.now += g.GROW_S + 1
+    m.free = 6.0                                                # free, but less than the reserve and a frame and a half: no more
+    g.look()
+    m.now += g.GROW_S + 1
+    g.look()
+    assert g.slots == 3
+    for _ in range(10):                                         # never under one
+        m.now += 4.0
+        m.free = 0.2
+        g.look()
+    assert g.slots == 1
+    assert "도중에" in g.summary()
+
+
+def test_frame_gate_off_and_reads_this_process(monkeypatch):
+    monkeypatch.setenv("CONTOUR_FRAME_GATE", "0")
+    g = _gate(Mem(free=0.2))
+    assert not g.on and g.slots == 4
+    with g.frame():
+        with g.apply():
+            assert g.applies == 0 and g.summary() == ""
+    monkeypatch.delenv("CONTOUR_FRAME_GATE")
+    assert perf.FrameGate(1, 4).on is False                    # one frame at a time anyway: nothing to hold
+    assert perf.process_gb() > 0.05                            # this process's memory is read here
+    monkeypatch.setenv("CONTOUR_RESERVE_GB", "10")
+    g = _gate(Mem(free=17.7), people=4)
+    g.hint(False)
+    assert g.reserve == 10.0 and g.slots == 1                  # (17.7 - 10 - 5.6) // 2.1
+
+
 def _render_threads(monkeypatch, threads: str, free):
     """The fixture rendered with `threads` frames at once; free(): the computer's free memory in GB as the render sees it."""
     from contour.core.project import Project
@@ -134,20 +264,16 @@ def _render_threads(monkeypatch, threads: str, free):
     return out, reps[-1]
 
 
-def test_short_of_memory_the_render_finishes_its_frames_before_it_starts_another(monkeypatch):
-    """Four frames at once filled the 31 GB PC on a cut of six people (j2896a). With little memory free a frame is started
-    only when the ones before it are written: the same file, told in the render's summary."""
+def test_short_of_memory_a_render_retouches_fewer_frames_at_once_and_makes_the_same_file(monkeypatch):
+    """Four frames at once filled the 31 GB PC on a cut of six people (j2896a). With little memory free the frames are
+    retouched one at a time: the same file, told in the render's summary."""
+    monkeypatch.delenv("CONTOUR_FRAME_GATE", raising=False)
     one, r1 = _render_threads(monkeypatch, "1", lambda: 64.0)
     many, r3 = _render_threads(monkeypatch, "3", lambda: 64.0)
-    assert np.array_equal(one, many) and "기다림" not in r3.accel and "프레임 3개 동시 처리" in r3.accel
+    assert np.array_equal(one, many) and "메모리에 맞춰" not in r3.accel and "프레임 3개 동시 처리" in r3.accel
     short, rs = _render_threads(monkeypatch, "3", lambda: 0.5)
     assert np.array_equal(one, short)
-    assert "메모리가 부족해" in rs.accel and "기다림" in rs.accel
-    # cannot be read, or switched off: never held
-    for free, env in ((lambda: -1.0, None), (lambda: 0.5, "0")):
-        if env is not None:
-            monkeypatch.setenv("CONTOUR_MIN_FREE_GB", env)
-        out, r = _render_threads(monkeypatch, "3", free)
-        assert np.array_equal(one, out) and "기다림" not in r.accel
-    monkeypatch.delenv("CONTOUR_MIN_FREE_GB")
-    assert perf.short_of_memory() is True and perf.short_of_memory(0.1) is False
+    assert "메모리에 맞춰 한 번에 1프레임까지 보정" in rs.accel
+    monkeypatch.setenv("CONTOUR_FRAME_GATE", "0")               # switched off: never held
+    out, r = _render_threads(monkeypatch, "3", lambda: 0.5)
+    assert np.array_equal(one, out) and "메모리에 맞춰" not in r.accel
