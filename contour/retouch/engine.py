@@ -7046,6 +7046,57 @@ def _keep_fine(before: np.ndarray, after: np.ndarray, m: np.ndarray, rows: Optio
     return after + np.clip(m * 4.0, 0, 1) * (fb - fa)
 
 
+# (1.27, LNGSHOT BEEP BEEP 11/27, the user: "피부 보정 Bananas 때처럼", "납품본의 피부를 기준으로 맞춰") 질감 유지 below its default thins the skin's finest
+# texture too. The stage above leaves everything finer than GRAIN_SIGMA exactly as the original has it (the user of 11/14: the grain stays) and takes
+# down what stands out at the pores' size and above; the delivered hand retouch of LNGSHOT BANANAS does something else as well: fitted band by band at
+# the picture's own pixels on 22 faces 300 to 1650 px wide (j2912b4: the slope of after on before per band, on the skin and beside it), it takes about a
+# sixth off every band finer than about 3 px of a 2160-line picture, evenly over the skin (0.83 to 0.86 of the band left; what is not skin 0.99), less of
+# the wider ones (0.92 left at 4 px, 0.95 at 5.6, 0.97 at 8, all of it from 16 px on). DIAP's 표준 left 96 % of that band, the hand 71 to 87 % (the
+# sheets of 11/27). Linear and without a threshold (nothing that can switch from frame to frame), inside the stage's own mask (the features, strands,
+# paint and what is held are out of it), of the original's bands (so the grain given back and what is taken here do not add up twice).
+# FINE_THIN: the share of the finest bands taken at 질감 유지 FINE_THIN_KEEP[1] and 피부 at the reference (skin.FS_REF); nothing from FINE_THIN_KEEP[0]
+# up (the slider's default: every project as it was), more below FINE_THIN_KEEP[1] in line, up to FINE_THIN_MAX times. 0 = off.
+FINE_THIN = 0.16
+FINE_THIN_KEEP = (0.45, 0.15)
+FINE_THIN_MAX = 1.5
+FINE_THIN_MIX = ((2.8, 0.45), (4.0, 0.20), (5.6, 0.15), (8.0, 0.10), (11.3, 0.10))    # (sigma in px of a 2160-line picture, weight): the mix of blurs that is left of the bands
+# the hand took less of a small face (the same fit: faces under 600 px 0.91 to 0.94 of the band left, 600 to 900 px 0.83 to 0.86, 1650 px 0.85; of the faces
+# of 300 to 440 px half were not thinned at all): the share grows with the face's width (px of a 2160-line picture) from nothing at the first to all of it at
+# the second. A face in a full shot keeps what little fine detail it has
+FINE_THIN_WF = (150.0, 600.0)
+
+
+def fine_thin_amount(keep: float, strength: float, wf: Optional[float] = None) -> float:
+    """The share of the finest bands taken for a 질감 유지 (0..1), a 피부 value (0..1) and a face width (px of a 2160-line picture; None: a large
+    face): 0 at the slider's default and above."""
+    if FINE_THIN <= 0:
+        return 0.0
+    k0, k1 = FINE_THIN_KEEP
+    a = float(np.clip((k0 - float(keep)) / max(1e-6, k0 - k1), 0.0, FINE_THIN_MAX))
+    if wf is not None and FINE_THIN_WF is not None:
+        a *= float(np.clip((float(wf) - FINE_THIN_WF[0]) / max(1e-6, FINE_THIN_WF[1] - FINE_THIN_WF[0]), 0.0, 1.0))
+    return float(FINE_THIN * a * np.clip(float(strength) / max(1e-6, getattr(SK, "FS_REF", 0.70)), 0.0, 1.5))
+
+
+def _thin_fine(before: np.ndarray, after: np.ndarray, m: np.ndarray, amount: float, rows: Optional[int] = None) -> np.ndarray:
+    """after with the finest texture of before thinned by `amount` inside m (FINE_THIN: the bands below a few pixels, the widths following the
+    picture's height; rows: the plane's height when before and after are a piece of it)."""
+    if amount < 1e-4 or before.shape != after.shape or m is None or m.shape != after.shape:
+        return after
+    sc = float(rows or _ph(after.shape[0])) / 2160.0
+    r = _roi(m, int(3 * FINE_THIN_MIX[-1][0] * sc) + 3)
+    if r is None:
+        return after
+    y0, y1, x0, x1 = r
+    b = np.ascontiguousarray(before[y0:y1, x0:x1], np.float32)
+    mix = np.zeros_like(b)
+    for sg, w in FINE_THIN_MIX:
+        mix += float(w) * cv2.GaussianBlur(b, (0, 0), max(0.5, float(sg) * sc))
+    out = after.astype(np.float32, copy=True)
+    out[y0:y1, x0:x1] -= float(amount) * np.clip(m[y0:y1, x0:x1], 0.0, 1.0) * (b - mix)
+    return out
+
+
 def _redness(Cb, Cr, Y, mC, mY, k: float, wf: float, cs: float):
     """Bring red patches (cheeks, around the nose) back to the face's own skin colour."""
     r = _roi(mC, 4)
@@ -7339,6 +7390,37 @@ def _nose_points_ok(L: np.ndarray, wf: float) -> np.ndarray:
     for i in (39, 42):
         ok[i] = float(np.linalg.norm(L[i] - t)) <= 0.45 * wf
     return ok
+
+
+# (1.27, LNGSHOT BEEP BEEP 11/27, the user: "코 뾰루지" in the list of what is to go) a pimple on the nose stayed: the blemish stage fills a red spot there
+# as anywhere on the skin, and the nose's give-back above (FINAL_NOSE) then took the fill back whole (the colour all of it, the light all but the finest),
+# as it takes back whatever a stage does to the nose. A red spot the blemish stage filled (detect's "red": compact, redder than the skin round it both
+# ways; the folds from the wings are not looked at) is now left out of the give-back, with the reach of its fill; inside the nostrils' own area nothing
+# is left out (a nostril's dark red inside is the nose's, and stays). Dark spots on the nose stay as they were (a nostril, a shade and a mole look alike
+# there). 0 = as before 1.27.
+NOSE_PIMPLE = 1.0
+
+
+def _nostril_zone(L: np.ndarray, shape, wf: float) -> Optional[np.ndarray]:
+    """0..1: the nostrils' own area (the ellipse skin._features_mask leaves out, grown by 0.02 of the face width, soft). L: (68, 2) px of shape."""
+    try:
+        ns = np.asarray(L[31:36], np.float64)
+        if not np.isfinite(ns).all() or not np.isfinite(L[[27, 33]]).all():
+            return None
+        nw = float(np.hypot(*(ns[-1] - ns[0])))
+        if nw < 2:
+            return None
+        up = np.asarray(L[27], np.float64) - np.asarray(L[33], np.float64)
+        up = up / max(float(np.hypot(*up)), 1e-6)
+        c = ns.mean(0) + up * 0.08 * nw
+        ang = float(np.degrees(np.arctan2(ns[-1][1] - ns[0][1], ns[-1][0] - ns[0][0])))
+        g = 0.02 * wf
+        m = np.zeros(shape, np.uint8)
+        cv2.ellipse(m, (int(round(c[0])), int(round(c[1]))), (max(1, int(round(nw * SK.NOSTRIL_RX + g))), max(1, int(round(nw * SK.NOSTRIL_RY + g)))),
+                    ang, 0, 360, 255, -1)
+        return cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0), max(0.8, 0.008 * wf))
+    except Exception:
+        return None
 
 
 def _nose_give_back(Y: np.ndarray, Y0: np.ndarray, w: np.ndarray, s: float) -> np.ndarray:
@@ -7892,8 +7974,9 @@ def _fold_heal(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, Y0: np.ndarray, ba
     return Y, Cb, Cr
 
 
-def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
-    """The last pass (FINAL_*): see the constants. Y0/Cb0/Cr0: the planes as they came in."""
+def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M, spots=None):
+    """The last pass (FINAL_*): see the constants. Y0/Cb0/Cr0: the planes as they came in. spots: {id(job): where the blemish stage filled a red
+    spot, 0..1 at Y's size} (NOSE_PIMPLE)."""
     slid_ = any(float(getattr(j_, "v", {}).get(k_, 0.0)) > 1e-4 for j_ in rf.jobs for k_ in ("bumps", "chin_lines", "nasolabial"))
     if not (FINAL_NOSE > 1e-4 or FINAL_MOLE > 1e-4 or FINAL_BUMP > 1e-4 or FINAL_LONG > 1e-4 or FINAL_CHIN > 1e-4 or FINAL_NASO > 1e-4 or FOLD_HEAL > 1e-4
             or slid_):
@@ -7911,6 +7994,27 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
                 nm = _nose_area(lmY, (hY, wY), wf)
                 if nm is not None:
                     nm = nm * float(np.clip(FINAL_NOSE, 0, 1))
+                    rs_ = spots.get(id(job)) if spots else None
+                    if rs_ is not None and NOSE_PIMPLE > 1e-4 and rs_.shape == nm.shape:
+                        # (NOSE_PIMPLE) a red spot filled on the nose stays filled: out of the give-back, with the fill's own reach
+                        try:
+                            rr_ = _roi(nm, 2)
+                            if rr_ is not None:
+                                c0, c1, d0, d1 = rr_
+                                sub_ = np.clip(rs_[c0:c1, d0:d1] * 2.0, 0.0, 1.0)
+                                if float(sub_.max()) > 0.1:
+                                    sz_ = float(spot_size(job, wf))
+                                    kd_ = max(3, int(round(0.6 * sz_)) | 1)
+                                    kp_ = cv2.dilate(sub_, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kd_, kd_)))
+                                    kp_ = cv2.GaussianBlur(kp_, (0, 0), max(1.0, 0.3 * sz_))
+                                    nz_ = _nostril_zone(lmY, (hY, wY), wf)
+                                    if nz_ is not None:
+                                        kp_ = kp_ * (1.0 - np.clip(nz_[c0:c1, d0:d1], 0.0, 1.0))
+                                    nm = nm.copy()
+                                    nm[c0:c1, d0:d1] *= 1.0 - float(np.clip(NOSE_PIMPLE, 0, 1)) * np.clip(kp_, 0.0, 1.0)
+                        except Exception:
+                            import traceback
+                            traceback.print_exc()
                     s_ = max(1.0, FINAL_NOSE_SIG * wf)
                     r_ = _roi(nm, int(3 * s_) + 2)
                     if r_ is not None:
@@ -8043,6 +8147,7 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
     Cb = Cb.astype(np.float32, copy=True)
     Cr = Cr.astype(np.float32, copy=True)
     Y_in, Cb_in, Cr_in = Y.copy(), Cb.copy(), Cr.copy()
+    red_filled_: dict = {}                         # id(job) -> where the blemish stage filled a red spot (NOSE_PIMPLE)
 
     def M(m, shape):
         if m.shape == shape:
@@ -8205,6 +8310,8 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                 R_ = R_ * (1.0 - prot_)
             Yin_, Cbin_, Crin_ = Y, Cb, Cr
             Y, Cb, Cr = _spot_fill(Y, Cb, Cr, reg, S_, R_, k, size, cs)
+            if NOSE_PIMPLE > 1e-4 and R_ is not None and reg is not None:
+                red_filled_[id(job)] = (np.clip(R_, 0, 1) * np.clip(reg * 1.5, 0, 1) * k).astype(np.float32)     # (for the last pass: a pimple on the nose stays filled)
             # the dips along the folds beside the mouth are the face's own shade, so the detector leaves them. But
             # when the user asked for those folds to go (팔자주름, 입가주름) they are to go too: there the spot finder
             # of before 1.19 still runs, as it did (2611 cut 011, j2721: the hollow at the mouth's corner was left
@@ -8376,6 +8483,7 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                 Ys1 = SK.smooth_channel(Ysi, mY, job.skin.strength, job.keep, r, relative=True)
                 if GRAIN_KEEP:
                     Ys1 = _keep_fine(Ysi, Ys1, mY)
+                Ys1 = _thin_fine(Ysi, Ys1, mY, fine_thin_amount(job.keep, job.skin.strength, wf * 2160.0 / max(1.0, float(_ph(hY)))))
                 dS = Ys1 - Ysi
                 if Ysi is not Ys0:
                     Ys1 = Ys0 + dS
@@ -8391,6 +8499,7 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                 Y = SK.smooth_channel(Yi_, mY, job.skin.strength, job.keep, r, relative=True)
                 if GRAIN_KEEP:
                     Y = _keep_fine(Yi_, Y, mY)
+                Y = _thin_fine(Yi_, Y, mY, fine_thin_amount(job.keep, job.skin.strength, wf * 2160.0 / max(1.0, float(_ph(hY)))))
                 if Yi_ is not Y0_:
                     Y = Y0_ + (Y - Yi_)
             rc = max(1, int(round(r * cs)))
@@ -8861,7 +8970,7 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                         for ci, Cx in enumerate((Cb, Cr)):
                             nc = _grain((c1 - c0, d1 - d0), sizec * 1.3, seed + 7 + ci)
                             Cx[c0:c1, d0:d1] += mC[c0:c1, d0:d1] * nc * (0.016 * cg)
-    Y, Cb, Cr = _final_pass(Y, Cb, Cr, Y_in, Cb_in, Cr_in, rf, y_per_src, M)
+    Y, Cb, Cr = _final_pass(Y, Cb, Cr, Y_in, Cb_in, Cr_in, rf, y_per_src, M, red_filled_)
     if holds:
         # Clip all accumulated retouch, including the last landmark-only passes and source-space lift.
         hold = holds[0].astype(np.float32)

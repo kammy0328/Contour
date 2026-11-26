@@ -593,6 +593,7 @@ class Cut:
     status: dict = field(default_factory=dict)   # beauty status: auto, reason, user, reviewed, metrics, work
     version: int = 1                              # work version (renders are named _v<version>)
     versions: dict = field(default_factory=dict)  # str(version) -> snapshot of the work at that version
+    replaced: dict = field(default_factory=dict)  # (1.27) the source before the last 소스 교체: {source, info, at, how} (core/replace.py)
 
     @property
     def n_frames(self) -> int:
@@ -638,6 +639,8 @@ class Cut:
         }
         if self.model_versions:
             d["model_versions"] = dict(self.model_versions)
+        if self.replaced:
+            d["replaced"] = dict(self.replaced)
         return d
 
     @classmethod
@@ -679,6 +682,7 @@ class Cut:
         c.status = dict(d.get("status") or {})
         c.version = max(1, int(d.get("version", 1)))
         c.versions = dict(d.get("versions") or {})
+        c.replaced = dict(d.get("replaced") or {})
         return c
 
 

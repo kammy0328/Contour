@@ -719,7 +719,8 @@ class ReshapeTab(_Tab):
         self.skin_detail = Wd.ParamRow("skin_detail", "질감 유지", 0, 100, 1, "pct", 45)
         self.skin_detail.name.setFixedWidth(64)
         self._retain(self.skin_detail)
-        self.skin_detail.name.setToolTip("피부결 보정에서 모공·잔결을 남기는 정도. 높을수록 자연스럽습니다")
+        self.skin_detail.name.setToolTip("피부결 보정에서 모공·잔결을 남기는 정도. 45(기본) 이상이면 고운 결과 그레인을 원본 그대로 두고, "
+                                         "낮출수록 고운 결까지 고르게 정리합니다 (15: LNGSHOT BANANAS 납품본 수준)")
         self.skin_detail.changed.connect(lambda k, val: self.ctl.set_skin("detail", val, False))
         self.skin_detail.committed.connect(lambda k, val: self.ctl.set_skin("detail", val, True))
         v.addWidget(self.skin_detail)
