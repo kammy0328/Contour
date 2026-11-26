@@ -5652,8 +5652,18 @@ FACE_LINES = 0.0       # 0..1: fill fine lines on the face skin (forehead, under
 CHIN_LO, CHIN_HI = 0.02, 0.045
 
 
+# (1.26.2, 2611 LNGSHOT QA 11/26: 046 t12, 065 t18, 026 t17 (a profile), 068 close-ups at 4K: with 턱주름 at 100 the chin's stages lifted the
+# shade right under the lower lip (the lip-chin crease) and the shade under the chin's outline, the chin came out flat; IWALY c005/c006 had the
+# same under the lip on small faces) the chin's zone stays CHIN_KEEP_LIP of the face width off the lower lip (the crease lies about a tenth of
+# the face width under it) and CHIN_KEEP_EDGE inside the face's outline: the crease and the outline are the chin's shape, the pebbles (the
+# chin's ball) lie between them. 0 = as before.
+CHIN_KEEP_LIP = 0.12
+CHIN_KEEP_EDGE = 0.05
+
+
 def chin_zone(shape, lm: np.ndarray, wf: float) -> Optional[np.ndarray]:
-    """The chin between the lower lip and the jaw (soft), lm in px of `shape`."""
+    """The chin between the lower lip and the jaw (soft), lm in px of `shape`: off the lower lip's shade and the face's outline
+    (CHIN_KEEP_LIP, CHIN_KEEP_EDGE)."""
     if lm is None or not np.isfinite(lm[[57, 8], :2]).all():
         return None
     a, b = lm[57, :2], lm[8, :2]
@@ -5665,7 +5675,30 @@ def chin_zone(shape, lm: np.ndarray, wf: float) -> Optional[np.ndarray]:
     m = np.zeros(shape, np.uint8)
     cv2.ellipse(m, (int(c[0]), int(c[1])), (max(2, int(0.42 * L)), max(2, int(0.24 * wf))),
                 float(np.degrees(np.arctan2(v[1], v[0]))), 0, 360, 255, -1)
-    return cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.03 * wf))
+    z = cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.03 * wf))
+    r = _roi(z, 2)
+    if r is None or (CHIN_KEEP_LIP <= 1e-4 and CHIN_KEEP_EDGE <= 1e-4):
+        return z
+    # (the zone's box, grown by what the blurs below reach: they work on that piece of the picture only)
+    g = int(max(CHIN_KEEP_LIP, CHIN_KEEP_EDGE) * wf * 2) + 8
+    y0, y1, x0, x1 = max(0, r[0] - g), min(shape[0], r[1] + g), max(0, r[2] - g), min(shape[1], r[3] + g)
+    o = np.float32([x0, y0])
+    keep = np.ones((y1 - y0, x1 - x0), np.float32)
+    if CHIN_KEEP_LIP > 1e-4 and np.isfinite(lm[48:60, :2]).all():
+        lip = np.zeros(keep.shape, np.uint8)
+        cv2.fillConvexPoly(lip, cv2.convexHull(np.round(lm[48:60, :2] - o).astype(np.int32)), 255)
+        kl = max(3, int(round(CHIN_KEEP_LIP * wf)) * 2 + 1)
+        lip = cv2.dilate(lip, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kl, kl)))
+        keep *= 1.0 - cv2.GaussianBlur(lip.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.15 * CHIN_KEEP_LIP * wf))
+    if CHIN_KEEP_EDGE > 1e-4 and np.isfinite(lm[0:17, :2]).all():
+        hull = np.zeros(keep.shape, np.uint8)
+        pts = lm[0:17, :2] if not np.isfinite(lm[17:27, :2]).all() else np.vstack([lm[0:17, :2], lm[17:27, :2]])
+        cv2.fillConvexPoly(hull, cv2.convexHull(np.round(pts - o).astype(np.int32)), 255)
+        ke = max(3, int(round(CHIN_KEEP_EDGE * wf)) * 2 + 1)
+        hull = cv2.erode(hull, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ke, ke)))
+        keep *= cv2.GaussianBlur(hull.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.25 * CHIN_KEEP_EDGE * wf))
+    z[y0:y1, x0:x1] *= keep
+    return z
 
 
 def _dimple_map(Y: np.ndarray, wf: float) -> np.ndarray:
@@ -7235,6 +7268,12 @@ FINAL_WHITE_K = 0.009   # of the face width: the dot's size scale (top-hat)
 FINAL_WHITE_THR = 0.025 # brighter than the local level by this share
 FINAL_WHITE_BUSY = 0.06 # share of the window round a dot that may light up too (more: hair, texture, a glint row: left)
 FINAL_BUMP_NOSE = 0.0   # 0..1: the raised-spot fill kept off the nose (its bridge's highlight is no bump; ENDING: it blinked). 0 = as before
+# (1.26.2, 2611 LNGSHOT QA 11/26, 4K 1:1: 046 t12 and 054 t18 a beanie's knit right above the brows, 054 t18 the cheek's outline against the hair,
+# 021 t13 and 046 t12 the jaw's edge: with 요철 at 100 the raised-spot fill took the knit's ridges and the light side of an outline for bumps; it looked
+# inside the face's outline from the landmarks (the hull of the jaw and the brows) as well as the skin mask) the raised spots are looked for on the skin
+# mask only, FINAL_BUMP_EDGE of the face width inside its edge (a bump's whole size on skin: an outline, a hat's edge, hair over the skin and the
+# features' holes are edges). None: inside the skin mask or the landmarks' outline, as before.
+FINAL_BUMP_EDGE = 0.03
 FINAL_BUMP_LIPS = 0.1   # of the face width (0 = off, as before): how far round the lips the raised-spot fill stays off (the mouth's corner and the lip's highlight are no bumps)
 
 
@@ -7326,7 +7365,11 @@ def _final_bumps(Y0: np.ndarray, region: np.ndarray, wf: float, lm: Optional[np.
     se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kb, kb))
     th = cv2.morphologyEx(rb, cv2.MORPH_TOPHAT, se) / base
     bh = cv2.morphologyEx(rb, cv2.MORPH_BLACKHAT, se) / base
-    cand = (th > FINAL_BUMP_LIGHT[0]) & (region[y0:y1, x0:x1] > 0.5)
+    reg_ = region[y0:y1, x0:x1] > 0.5
+    if FINAL_BUMP_EDGE is not None and FINAL_BUMP_EDGE > 1e-4:
+        ke_ = max(3, int(round(FINAL_BUMP_EDGE * wf)) * 2 + 1)
+        reg_ = cv2.erode(reg_.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ke_, ke_))) > 0
+    cand = (th > FINAL_BUMP_LIGHT[0]) & reg_
     if lm is not None:
         lmr = np.asarray(lm, np.float32)[:, :2] - [x0, y0]
         cand &= ~_feature_holes(lmr, roi.shape, wf)
@@ -7750,8 +7793,9 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M):
                     if lm_ is not None:
                         give = np.maximum(give, lm_ * float(np.clip(FINAL_LONG, 0, 1)))
             kbump_ = max(float(FINAL_BUMP), float(job.v.get("bumps", 0.0)))         # (1.26.2) the 요철 slider, or the setting for every face
-            if kbump_ > 1e-4 and spot_reg is not None and job.wf_src > 0:
-                bb = _final_bumps(Y0, spot_reg, wf, lmY, Y)
+            breg_ = spot_reg if (FINAL_BUMP_EDGE is None or skin is None) else skin       # (FINAL_BUMP_EDGE: the skin mask only)
+            if kbump_ > 1e-4 and breg_ is not None and job.wf_src > 0:
+                bb = _final_bumps(Y0, breg_, wf, lmY, Y)
                 if bb is not None:
                     bm, bf = bb
                     bm = bm * float(np.clip(kbump_, 0, 1)) * yaw_gate(job.face)
