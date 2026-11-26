@@ -55,6 +55,7 @@ class AppSettings:
     view: str = ""
     proxy_long_side: int = 1920
     gpu: str = "auto"                     # auto | cuda | dml | coreml | cpu (which a model gets: track/backend.py)
+    render_parallel: str = "auto"         # (1.26.3) auto: the people of a frame prepared side by side as the RAM allows (core/perf.py); off: one after the other
     accuracy: str = "high"                # high | balanced | fast
     # Both apply only inside a project where learning was switched on by hand (learn.allowed, 1.24): on their own
     # they start nothing. Switching one off here stops it in every project.

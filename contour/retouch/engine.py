@@ -2298,6 +2298,58 @@ STEADY_SIGMA = 1.0
 STEADY_LRU = 7
 
 
+PREWARM_WORKERS = 6     # (1.26.3) pictures read side by side for the people's skin colour models before a render (prewarm_models); 0: off
+
+
+def prewarm_models(cut, tracker, workers: Optional[int] = None) -> dict:
+    """(1.26.3, from the 2611 IWALY batch) The skin colour model of every person (skin.model_for) is made from up to 10 pictures spread over the cut,
+    each read by a reader started for it, person after person, by the thread that makes the first frame: 40 s a person at the start of a render of a
+    cut read from its original (c029: 4 minutes for six people; LNGSHOT: the first frame 50 to 80 s). The same pictures are read here first, side by
+    side, each by a reader of its own (SourceFrames.one) into the frame pool model_for reads from (same file, size and view: the same pixels).
+    Nothing changes in what model_for makes. Returns what was done (frames, seconds) for the render's report."""
+    import time as _time
+    workers = PREWARM_WORKERS if workers is None else int(workers)
+    st = getattr(tracker, "store", None)
+    px = getattr(tracker, "proxy", None)
+    one = getattr(px, "one", None)
+    if workers <= 0 or st is None or one is None or not getattr(st, "has_face", False):
+        return dict(frames=0)
+    cache = getattr(tracker, "_skin_models", None) or {}
+    picks = set()
+    for person in cut.targets():
+        if not st.has(person.id):
+            continue
+        p = st.index(person.id)
+        if p in cache:
+            continue
+        cand = np.nonzero(st.face_vis[p] > 0.5)[0]
+        if len(cand):
+            for t in cand[np.linspace(0, len(cand) - 1, min(10, len(cand))).astype(int)]:
+                if np.isfinite(st.face[p, t][:, :2]).any():
+                    picks.add(int(t))
+    if not picks:
+        return dict(frames=0)
+    from ..core import frames as _FRM
+    fb = int(px.w) * int(px.h) * 3
+    if len(picks) * fb > 0.75 * _FRM.pool().limit:
+        return dict(frames=0, skipped="pool")
+    peek = getattr(px, "peek", None)
+    todo = sorted(t for t in picks if peek is None or peek(t) is None)
+    t0 = _time.perf_counter()
+    errs = []
+
+    def rd(t):
+        try:
+            one(t)
+        except Exception as e:                    # (model_for reads that picture itself then)
+            errs.append(f"{t}: {str(e)[:80]}")
+    if todo:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=max(1, min(workers, len(todo))), thread_name_prefix="prewarm") as ex:
+            list(ex.map(rd, todo))
+    return dict(frames=len(todo), seconds=round(_time.perf_counter() - t0, 1), errors=errs[:3])
+
+
 def prepare(cut, tracker, t: int, cache: Optional[dict] = None, steady: bool = True, quick: bool = False) -> Optional[RetouchFrame]:
     """Values and masks for frame t, held steady through time.
 
@@ -2460,13 +2512,13 @@ def _steady(cut, tracker, st, rf: RetouchFrame, cache) -> RetouchFrame:
         for s in _steady_asks(st, j, t, N):
             if s not in raws:
                 raws[s] = _raw_cached(cut, tracker, s, cache)
-    n_thr = max(1, min(int(STEADY_THREADS or PREP_THREADS), len(faces)))
+    n_thr = max(1, min(int(STEADY_THREADS or _prep_n()), len(faces)))
     # the names of one person's masks side by side too: as many threads as the computer has to spare for the people steadied at once
     try:
         k_names = int(STEADY_NAME_THREADS) if STEADY_NAME_THREADS else max(1, min(8, (os.cpu_count() or 4) * 3 // (4 * n_thr)))
     except Exception:
         k_names = 1
-    if int(STEADY_THREADS or PREP_THREADS) <= 1 and not STEADY_NAME_THREADS:
+    if int(STEADY_THREADS or _prep_n()) <= 1 and not STEADY_NAME_THREADS:
         k_names = 1                             # (PREP_THREADS 1: everything one after the other, as it was)
     px = tracker.proxy
     k = np.array([px.sx, px.sy])
@@ -3395,21 +3447,37 @@ def _body_tok(tracker, st, p: int, t: int, reach: int = 0, extra=None) -> tuple:
     return (BS.track_token(st, t - r, t + r), mt, extra)
 
 
-try:
-    MASK_THREADS = int(os.environ.get("CONTOUR_MASK_THREADS", "0") or 0)
-except ValueError:
-    MASK_THREADS = 0
+MASK_THREADS: Optional[int] = None   # None (1.26.3): by the computer and the people of the frame (core.perf.mask_threads; CONTOUR_MASK_THREADS
+                                     # overrides); a number: that (0 / 1: one after the other, as before 1.26.3)
 # MASK_THREADS > 1: the masks of ONE person are made side by side as well (the tone, skin, blemish, under-eye, nasolabial, mouth-line and neck masks and
 # the body's area: each is made from the frame's shared maps and writes nothing shared, so they come out as one after the other gives). A person's
 # masks one after the other were 5 s a frame whatever the number of people: the floor of a render's speed. 0 / 1: one after the other, as ever. Not
 # used while the armpit stage is on (its skin is laid into the shared map by the skin mask).
-PREP_THREADS = 1           # people of one frame whose masks are made side by side (_prepare_raw: the face's maps and masks, the body's area, the
+PREP_THREADS: Optional[int] = None   # None (1.26.3): by the computer's memory and cores (core.perf.prep_threads: 4 with 28 GB or more, 2 with 20, else 1;
+                           # CONTOUR_PREP_THREADS overrides). A number: that. (The same result, one after the other or side by side: tests/test_prepare_threads.)
+                           # people of one frame whose masks are made side by side (_prepare_raw: the face's maps and masks, the body's area, the
                            # spots: each person's own, from the picture and the tracks). 1: one after the other, as ever. A batch sets it where the
                            # computer has cores to spare: the masks of one picture were the one thing a render did on a single core (j2815)
 BDET_PEOPLE = 4            # people of one frame whose body spots are looked for side by side, each on their own piece
                            # of the original (looking is most of what a frame of an export costs once the areas are
                            # made on the people's own pieces: 0.3 to 1 s a person, one after the other: j2796).
                            # 1: one after the other, as 1.23's first build
+
+
+def _prep_n() -> int:
+    """PREP_THREADS as it applies now (None: by the computer)."""
+    if PREP_THREADS is not None:
+        return max(1, int(PREP_THREADS))
+    from ..core import perf as _PF
+    return _PF.prep_threads()
+
+
+def _mask_n(people: int) -> int:
+    """MASK_THREADS as it applies to a frame of this many people (None: by the computer)."""
+    if MASK_THREADS is not None:
+        return int(MASK_THREADS)
+    from ..core import perf as _PF
+    return _PF.mask_threads(people)
 
 
 def _bdet_people(cut, px, t: int, later: list, cache: Optional[dict]) -> None:
@@ -3961,7 +4029,8 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
         # ---- MASK_THREADS: the masks asked for below, started now, side by side; get() hands each out where it is asked for (the same masks under the
         # same names: what is listed here is what the lines below ask for, under the same conditions)
         exm = None
-        if int(MASK_THREADS) > 1 and not arm_on:
+        mthr_ = _mask_n(len(people))
+        if mthr_ > 1 and not arm_on:
             plan = []
             if tone_on:
                 plan.append(("tone", mk_tone, f"{job.scope}:{fth:.2f}", None))
@@ -3987,7 +4056,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                     pass                    # (the body's block below meets the same and deals with it)
             if len(plan) > 1:
                 from concurrent.futures import ThreadPoolExecutor
-                exm = ThreadPoolExecutor(max_workers=min(int(MASK_THREADS), len(plan)), thread_name_prefix="mask")
+                exm = ThreadPoolExecutor(max_workers=min(mthr_, len(plan)), thread_name_prefix="mask")
                 for n_, fn_, ex_, tk_ in plan:
                     ahead[(n_, ex_)] = exm.submit(_get_now, n_, fn_, ex_, tk_)
 
@@ -4235,7 +4304,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             return job, bdet_here
         return None, bdet_here
 
-    n_thr = max(1, min(int(PREP_THREADS), len(people)))
+    n_thr = max(1, min(_prep_n(), len(people)))
     if n_thr > 1:
         _prime(tracker, st, px, t, people)
         from concurrent.futures import ThreadPoolExecutor
@@ -4293,7 +4362,7 @@ def knee_probe(rf: Optional["RetouchFrame"], px) -> Dict[tuple, float]:
         return sup
 
     # (each person's knees are read from that person's own area: the people side by side where the frame's people are prepared so, in their order)
-    n_thr = max(1, min(int(PREP_THREADS), len(todo)))
+    n_thr = max(1, min(_prep_n(), len(todo)))
     if n_thr > 1:
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=n_thr, thread_name_prefix="kneep") as ex:
