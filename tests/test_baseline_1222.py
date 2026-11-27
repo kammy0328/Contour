@@ -34,6 +34,10 @@ def _each_frame_on_its_own(monkeypatch):
     # tests/test_feedback_1127.py checks it
     from contour.retouch import engine as EN
     monkeypatch.setattr(EN, "BLEMISH_JAW_HOLD", False)
+    # (v2 review) the colour model's sure skin round a face whose outline misses it counts (profiles, heads thrown back): the synthetic face's sides
+    # are such skin; on purpose a change of the picture
+    from contour.retouch import skin as SK
+    monkeypatch.setattr(SK, "SIDE_REACH", None)
 
 
 @pytest.fixture
