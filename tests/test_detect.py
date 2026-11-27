@@ -232,7 +232,11 @@ def test_neck_mask_leaves_out_what_is_far_darker_than_the_face():
     rgb = np.full((h, w, 3), 150, np.uint8)            # the face and the neck: one skin
     rgb[:, 205:] = 45                                  # hair beside the neck
     rgb[330:, :] = 30                                  # a black top under it
-    parse = dict(neck=np.ones((h, w), np.float32), skin=np.zeros((h, w), np.float32), cover=np.ones((h, w), np.float32), trust=1.0)
+    # (1.27.1) the parser's sure neck is neck however dark it is (the side of a neck in the sun's shade, LNGSHOT BEEP BEEP c034: a quarter of the
+    # face's light); the hair and the top are not neck to it
+    nk = np.zeros((h, w), np.float32)
+    nk[:330, :205] = 1.0
+    parse = dict(neck=nk, skin=np.zeros((h, w), np.float32), cover=np.ones((h, w), np.float32), trust=1.0)
     old = RE.NECK_DARK
     try:
         RE.NECK_DARK = None
@@ -241,7 +245,7 @@ def test_neck_mask_leaves_out_what_is_far_darker_than_the_face():
         m1 = RE.neck_mask(lm, None, None, (h, w), 1.0, 1.0, prob, None, 1.5, rgb, None, parse)
     finally:
         RE.NECK_DARK = old
-    assert float(m0[290:320, 215:235].mean()) > 0.5, "before: the hair is taken for neck"
+    assert float(m0[290:320, 215:235].mean()) > float(m1[290:320, 215:235].mean()), "the dark gate takes the hair out"
     assert float(m1[290:320, 215:235].mean()) < 0.05, "now: it stays out"
     assert float(m1[300:325, 140:185].mean()) > 0.7, "the neck itself is kept"
     assert float(m1[340:400, 140:185].mean()) < 0.05, "and the black top under it is not"

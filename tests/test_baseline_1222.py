@@ -30,6 +30,10 @@ def _each_frame_on_its_own(monkeypatch):
     is each frame's own retouch, so the renders here are made without it (tests/test_temporal_steady.py checks the steadier)"""
     from contour.retouch import temporal as TM
     monkeypatch.setattr(TM, "STEADY", False)
+    # (1.27.1) the dark spots of the strip of neck under the jaw are left (the jaw's shade, LNGSHOT BEEP BEEP c024): on purpose a change of the picture;
+    # tests/test_feedback_1127.py checks it
+    from contour.retouch import engine as EN
+    monkeypatch.setattr(EN, "BLEMISH_JAW_HOLD", False)
 
 
 @pytest.fixture

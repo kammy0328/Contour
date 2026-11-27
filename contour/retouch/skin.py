@@ -132,6 +132,7 @@ def _turn(lm) -> float:
         return abs(a - b) / max(a + b, 1e-6)
     except Exception:
         return 0.0
+PARSE_FAR = 0.5        # (1.27.1) the parser's sure skin past the reach this much of what is inside it: the landmarks missed the face (None = off)
 PARSE_REACH = 0.25     # of the face width: how far past the landmark outline the parser's sure skin still counts
 PARSE_SOFT = 0.008     # of the face width: smoothing of the parser's map before that (was 0.012)
 NOSTRIL_RX, NOSTRIL_RY = 0.60, 0.26   # nostril ellipse, of the nostrils' span (was 0.66 x 0.36)
@@ -863,6 +864,24 @@ def skin_mask(job: SkinJob, rgb_proxy: np.ndarray, sx: float, sy: float, person_
                         wide = cv2.dilate(rt, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kr, kr)))
                         ps2 = np.clip((parse["skin"].astype(np.float32) - 0.6) / 0.25, 0, 1) * float(parse["trust"])
                         region = np.maximum(region, cv2.GaussianBlur(wide.astype(np.float32) / 255.0 * ps2, (k, k), 0) * job.face_w)
+                        if PARSE_FAR is not None:
+                            # (1.27.1, LNGSHOT BEEP BEEP BTv1 c034 f39, the head thrown back: the landmarks lay on the lips and the nose only, and
+                            # the jaw's whole underside, which the parser saw as the face's skin, was outside the outline and its reach: "요철" left
+                            # there) where the parser's sure skin past the reach is more than PARSE_FAR of what it has inside it, the landmarks
+                            # missed the face: the sure skin that runs on from the reach counts too
+                            try:
+                                # (seen from below the parser is less sure of the skin too: 0.4 to 0.6 on the jaw's underside)
+                                ps3_ = np.clip((parse["skin"].astype(np.float32) - 0.4) / 0.3, 0, 1) * float(parse["trust"])
+                                sure_ = (ps3_ > 0.3).astype(np.uint8)
+                                inn_ = float((sure_ & (wide > 0)).sum())
+                                out_ = float((sure_ & (wide == 0)).sum())
+                                if inn_ > 0 and out_ > PARSE_FAR * inn_:
+                                    nl_, lab_ = cv2.connectedComponents(sure_, connectivity=8)
+                                    hit_ = np.unique(lab_[(wide > 0) & (sure_ > 0)])
+                                    far_ = np.isin(lab_, hit_[hit_ > 0]).astype(np.float32)
+                                    region = np.maximum(region, cv2.GaussianBlur(far_ * np.clip(ps3_ / 0.6, 0, 1), (k, k), 0) * job.face_w)
+                            except Exception:
+                                pass
         # the nose and the skin between it and the upper lip: on a face in profile or turned well away the
         # nose stands out past the face outline and was left untouched (cut 037: a smooth face, a raw nose)
         if lm is not None and np.isfinite(lm[27:36, :2]).all() and np.isfinite(lm[48:55, :2]).all():
