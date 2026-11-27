@@ -6941,6 +6941,85 @@ FOREHEAD_CAP = 0.05
 FOREHEAD_FINE = 0.004    # of the face width: finer than this is the skin's grain, left as it is
 
 
+# (client's 1st PV feedback 11/28, c018 ~ c022: "이마 통째로 지운 흔적") the levelling along up took the lines and, with them, the forehead's own
+# texture between them, and drew the blur's columns: the lit forehead came out as a smooth, streaked patch. FOREHEAD_MODE "close": a line is a dark
+# valley lying across the face's up; the skin is closed along up with a line FOREHEAD_CLOSE[0] of the face width long (a valley narrower than that is
+# filled), the fill kept only where it runs across for FOREHEAD_CLOSE[1] of the face width (an opening along the across line: the pores, dots,
+# stay), softly capped at FOREHEAD_CLOSE[2]. Nothing else of the forehead is touched. "level" = as before (1.27.1).
+FOREHEAD_MODE = "close"
+FOREHEAD_CLOSE = (0.045, 0.06, 0.06)
+
+
+def _line_kernel(length: int, ang_deg: float) -> np.ndarray:
+    """a flat line structuring element length px long at ang_deg (picture coordinates)"""
+    n = max(3, int(length) | 1)
+    k = np.zeros((n, n), np.uint8)
+    c = n // 2
+    t = np.radians(ang_deg)
+    dx, dy = np.cos(t) * (n - 1) / 2.0, np.sin(t) * (n - 1) / 2.0
+    cv2.line(k, (int(round(c - dx)), int(round(c - dy))), (int(round(c + dx)), int(round(c + dy))), 1, 1)
+    return k
+
+
+def _forehead_close(Y: np.ndarray, m: np.ndarray, lm, scale: float, wf: float, k: float) -> np.ndarray:
+    """Y with the dark lines lying across the face's up inside the mask m filled (see FOREHEAD_MODE)"""
+    L_, A_, cap = FOREHEAD_CLOSE
+    lc = max(3, int(round(L_ * wf)))
+    la = max(3, int(round(A_ * wf)))
+    r = _roi(m, lc + la + 4)
+    if r is None or k <= 1e-4:
+        return Y
+    y0, y1, x0, x1 = r
+    Lm = np.asarray(lm[:, :2], np.float64) * scale
+    up = Lm[27] - Lm[8]
+    ang = float(np.degrees(np.arctan2(up[1], up[0])))
+    yc = Y[y0:y1, x0:x1].astype(np.float32)
+    mc = np.clip(m[y0:y1, x0:x1], 0, 1).astype(np.float32)
+    # outside the mask (the brows, the hair) the skin's own level, so the closing does not reach into them
+    inn = (mc > 0.2).astype(np.uint8)
+    if inn.sum() < 20:
+        return Y
+    fillv = cv2.inpaint(np.clip(yc * 255.0 / max(1e-6, float(yc.max())), 0, 255).astype(np.uint8), (1 - inn), 3, cv2.INPAINT_TELEA)
+    ys = np.where(inn > 0, yc, fillv.astype(np.float32) * max(1e-6, float(yc.max())) / 255.0)
+    ys = cv2.GaussianBlur(ys, (0, 0), max(0.5, 0.0025 * wf))
+    f = cv2.morphologyEx(ys, cv2.MORPH_CLOSE, _line_kernel(lc, ang)) - ys
+    f = np.maximum(f, 0.0)
+    f = cv2.morphologyEx(f, cv2.MORPH_OPEN, _line_kernel(la, ang + 90.0))
+    f = cv2.GaussianBlur(f, (0, 0), max(0.6, 0.003 * wf))
+    f = cap * np.tanh(f / cap)
+    out = Y.astype(np.float32, copy=True)
+    out[y0:y1, x0:x1] = yc + float(k) * mc * f
+    return out
+
+
+# (client's 1st PV feedback 11/28, c002 and c018 ~ c022: "이마 화장 경계선", "얼굴 톤 뜨는 부분") a hard edge in the forehead's tone (where the
+# foundation stops, a lit patch's rim) is softened into a ramp: where the tone's gradient at FOREHEAD_STEP[0] of the face width is FOREHEAD_STEP[2]
+# (to FOREHEAD_STEP[3]) times its gradient at FOREHEAD_STEP[1], the tone at the fine scale is replaced by the tone at the wide one (brightness and
+# colour; the texture finer than the fine scale stays). A smooth shading is as steep at both scales and stays. At the forehead slider's strength
+# times FOREHEAD_STEP[4]. None = off.
+FOREHEAD_STEP = (0.012, 0.07, 1.7, 3.0, 0.8)
+
+
+def _tone_step_soften(P: np.ndarray, w: np.ndarray, sel: np.ndarray, s1: float, s2: float) -> np.ndarray:
+    """P (a plane) with its tone at s1 replaced by its tone at s2 where sel (0..1), both measured on the mask w only"""
+    t1 = _gm(P, w, s1)
+    t2 = _gm(P, w, s2)
+    return P + sel * (t2 - t1)
+
+
+def _forehead_step_sel(Y: np.ndarray, w: np.ndarray, wf: float) -> np.ndarray:
+    """0..1: where the tone of Y inside w has a hard edge (see FOREHEAD_STEP)"""
+    s1, s2 = max(1.0, FOREHEAD_STEP[0] * wf), max(2.0, FOREHEAD_STEP[1] * wf)
+    t1 = _gm(Y, w, s1)
+    t2 = _gm(Y, w, s2)
+    g1 = np.hypot(cv2.Sobel(t1, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(t1, cv2.CV_32F, 0, 1, ksize=3)) / 8.0
+    g2 = np.hypot(cv2.Sobel(t2, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(t2, cv2.CV_32F, 0, 1, ksize=3)) / 8.0
+    # the edge's contrast over the fine scale: at least ~1 % of white across s1
+    sel = _ss(FOREHEAD_STEP[2], FOREHEAD_STEP[3], g1 / np.maximum(g2, 1e-5)) * _ss(0.006, 0.02, g1 * 2.0 * s1)
+    sel = cv2.dilate(sel, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * int(s1) + 1,) * 2))
+    return cv2.GaussianBlur(sel, (0, 0), s1)
+
+
 def _forehead_level(Y: np.ndarray, m: np.ndarray, lm, scale: float, wf: float, k: float) -> np.ndarray:
     """Y with the horizontal lines inside the mask m levelled along the face's up (see FOREHEAD_ALONG)"""
     r = _roi(m, int(4 * FOREHEAD_ALONG * wf) + 4)
@@ -6984,6 +7063,7 @@ TEXTURE_WIDE = 0.05       # (v2 review) the widest bump taken out (the grey clos
 TEXTURE_SMOOTH = 0.008
 TEXTURE_FINE = 0.004
 TEXTURE_CAP = 0.04
+TEXTURE_FINE_PX = 1.5      # px: the fine cut of the texture levelling is at most the grain's size (None = TEXTURE_FINE of the face width, as before)
 
 
 def _bump_base(yc: np.ndarray, D: int, smooth: float) -> np.ndarray:
@@ -7031,7 +7111,58 @@ MOUTH_SPOTS = (0.13, 0.018, 0.005, 0.015, 0.08)   # (BTv3 QC, c034 f4, c044 f26,
 # most it is lifted (luma); None = off. The spot finder leaves the corner alone (a fold's end, the lips' edge, the skin mask's edge all meet there)
 
 
+MOUTH_SPOTS_TOP = 0.9        # (client's 1st PV feedback 11/28, c046 "우측 입끝 뾰루지": a whitehead at the corner stayed at half) a raised pimple's light top taken down by this share
 MOUTH_SPOTS_K = 1.0          # the corners' pimples are filled at this more than the blemish slider (40 % left half of one: a pimple there is no mole)
+
+
+# (client's 1st PV feedback 11/28, c046 "오율 입술 각질") the person's 입술 각질 slider (lip_flakes): on the lips (the outer lips' polygon less the mouth's
+# opening, LIP_FLAKES[0] of the face width in from both), the small light flakes (narrower than LIP_FLAKES[1] of the face width) taken down to the
+# lip around them, their paleness (the red they lack) filled back; the lips' fine vertical lines (dark), their sheen (broad) and their edges stay.
+# The most taken: LIP_FLAKES[2] of white.
+LIP_FLAKES = (0.006, 0.016, 0.08)
+NECK_TONE = (0.03, 0.4, 0.03)     # 목 톤 맞춤: the most moved in the colour planes, the share of the brightness difference taken, its most (of white)
+
+
+def lip_zone(lm: Optional[np.ndarray], shape, wf: float) -> Optional[np.ndarray]:
+    """0..1: the lips themselves (outer lips less the opening), LIP_FLAKES[0] of the face width in from their edges. lm in the pixels of shape."""
+    if lm is None or len(lm) < 68 or not np.isfinite(lm[48:68, :2]).all():
+        return None
+    L = np.asarray(lm, np.float32)[:, :2]
+    o = np.zeros(shape, np.uint8)
+    _poly(o, L[48:60])
+    i = np.zeros(shape, np.uint8)
+    _poly(i, L[60:68])
+    d = max(1, int(round(LIP_FLAKES[0] * wf)))
+    se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * d + 1, 2 * d + 1))
+    z = (cv2.erode(o, se) > 0) & (cv2.dilate(i, se) == 0)
+    return cv2.GaussianBlur(z.astype(np.float32), (0, 0), max(0.8, 0.004 * wf))
+
+
+def _lip_flakes(Y, Cr, zY, zC, wf: float, cs: float, k: float):
+    """Y, Cr with the lips' light flakes inside zY (Y's grid) / zC (Cr's grid) taken down at k (see LIP_FLAKES)"""
+    n = max(3, int(round(LIP_FLAKES[1] * wf)) | 1)
+    r = _roi(zY, n + 6)
+    if r is None or k <= 1e-4:
+        return Y, Cr
+    y0, y1, x0, x1 = r
+    yc = Y[y0:y1, x0:x1].astype(np.float32)
+    se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (n, n))
+    wt = yc - cv2.morphologyEx(yc, cv2.MORPH_OPEN, se)
+    wt = cv2.GaussianBlur(wt, (0, 0), max(0.6, 0.002 * wf))
+    cap = float(LIP_FLAKES[2])
+    Yo = Y.astype(np.float32, copy=True)
+    Yo[y0:y1, x0:x1] = yc - float(k) * np.clip(zY[y0:y1, x0:x1], 0, 1) * cap * np.tanh(wt / cap)
+    rc = _roi(zC, max(3, int(n * cs)) + 4)
+    Co = Cr
+    if rc is not None:
+        c0, c1, d0, d1 = rc
+        cc = Cr[c0:c1, d0:d1].astype(np.float32)
+        nc = max(3, int(round(LIP_FLAKES[1] * wf * cs)) | 1)
+        bt = cv2.morphologyEx(cc, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (nc, nc))) - cc
+        bt = cv2.GaussianBlur(bt, (0, 0), max(0.6, 0.002 * wf * cs))
+        Co = Cr.astype(np.float32, copy=True)
+        Co[c0:c1, d0:d1] = cc + float(k) * np.clip(zC[c0:c1, d0:d1], 0, 1) * np.minimum(bt, 0.05)
+    return Yo, Co
 
 
 def mouth_corner_zone(lm: Optional[np.ndarray], shape, wf: float) -> Optional[np.ndarray]:
@@ -7080,7 +7211,7 @@ def _mouth_spots(Y: np.ndarray, zone: np.ndarray, wf: float, k: float) -> np.nda
     relt = wt / np.maximum(cv2.GaussianBlur(yc, (0, 0), max(1.0, 0.03 * wf)), 0.05)
     ww = np.clip((relt - 2 * MOUTH_SPOTS[2]) / max(1e-6, 2 * (MOUTH_SPOTS[3] - MOUTH_SPOTS[2])), 0, 1)
     out = Y.astype(np.float32, copy=True)
-    out[y0:y1, x0:x1] = yc + float(k) * zc * (w * np.minimum(bt, cap) - 0.5 * ww * np.minimum(wt, cap))
+    out[y0:y1, x0:x1] = yc + float(k) * zc * (w * np.minimum(bt, cap) - MOUTH_SPOTS_TOP * ww * np.minimum(wt, cap))
     return out
 
 
@@ -7095,7 +7226,10 @@ def _level(Y: np.ndarray, m: np.ndarray, wf: float, k: float, wide: float, fine:
     yc = Y[y0:y1, x0:x1].astype(np.float32)
     mc = np.clip(m[y0:y1, x0:x1], 0, 1).astype(np.float32)
     B = _bump_base(yc, D, TEXTURE_SMOOTH * wf)
-    d = cv2.GaussianBlur(B - yc, (0, 0), max(0.6, fine * wf))
+    # (client's 1st PV feedback 11/28, c023 f0 ~ 2 "화장한 부분에 색이 조금 깨집니다": the made-up chin's fine streaks, 3 px on a face 880 px wide,
+    # were finer than the fine cut there, 0.004 of the face, and stayed) the fine cut is the film's grain, no wider than TEXTURE_FINE_PX
+    fpx = fine * wf if TEXTURE_FINE_PX is None else min(fine * wf, float(TEXTURE_FINE_PX))
+    d = cv2.GaussianBlur(B - yc, (0, 0), max(0.6, fpx))
     d = float(cap) * np.tanh(d / float(cap))
     out = Y.astype(np.float32, copy=True)
     out[y0:y1, x0:x1] = yc + float(k) * mc * d
@@ -8821,6 +8955,15 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                 R_ = R_ * (1.0 - prot_)
             Yin_, Cbin_, Crin_ = Y, Cb, Cr
             Y, Cb, Cr = _spot_fill(Y, Cb, Cr, reg, S_, R_, k, size, cs)
+            if v.get("lip_flakes", 0) > 1e-4 and job.face is not None:
+                try:
+                    lzY_ = lip_zone(np.asarray(job.face, np.float32)[:, :2] * y_per_src, (hY, wY), wf)
+                    if lzY_ is not None:
+                        lzC_ = cv2.resize(lzY_, (wC, hC), interpolation=cv2.INTER_AREA)
+                        Y, Cr = _lip_flakes(Y, Cr, lzY_, lzC_, wf, cs, float(np.clip(v["lip_flakes"], 0, 1)))
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
             if MOUTH_SPOTS is not None and job.face is not None and reg is not None:
                 try:
                     mz_ = mouth_corner_zone(np.asarray(job.face, np.float32)[:, :2] * y_per_src, (hY, wY), wf)
@@ -9269,8 +9412,40 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                     if hd_ is not None:
                         mfh = mfh * (1.0 - np.maximum(hd_, he_))
                     kfh_ = float(np.clip(v["forehead_lines"], 0, 1))
-                    Y = _forehead_level(Y, mfh, job.face, y_per_src, wf, kfh_)
-                    Y, Cb, Cr = _crease_lift(Y, Cb, Cr, mfh, kfh_, max(1.5, FOREHEAD_SIG * wf), None, None)
+                    if FOREHEAD_STEP is not None:
+                        try:
+                            r_ = _roi(mfh, int(4 * FOREHEAD_STEP[1] * wf) + 4)
+                            if r_ is not None:
+                                y0_, y1_, x0_, x1_ = r_
+                                wq_ = (mfh[y0_:y1_, x0_:x1_] > 0.2).astype(np.float32)
+                                sel_ = _forehead_step_sel(Y[y0_:y1_, x0_:x1_].astype(np.float32), wq_, wf)
+                                sel_ = sel_ * np.clip(mfh[y0_:y1_, x0_:x1_], 0, 1) * (kfh_ * float(FOREHEAD_STEP[4]))
+                                s1_, s2_ = max(1.0, FOREHEAD_STEP[0] * wf), max(2.0, FOREHEAD_STEP[1] * wf)
+                                Yq_ = Y.astype(np.float32, copy=True)
+                                Yq_[y0_:y1_, x0_:x1_] = _tone_step_soften(Y[y0_:y1_, x0_:x1_].astype(np.float32), wq_, sel_, s1_, s2_)
+                                Y = Yq_
+                                # the colour too (a foundation's edge is one of colour as much)
+                                c0_, c1_, d0_, d1_ = int(y0_ * cs), int(np.ceil(y1_ * cs)), int(x0_ * cs), int(np.ceil(x1_ * cs))
+                                hc_, wc_ = c1_ - c0_, d1_ - d0_
+                                if hc_ > 4 and wc_ > 4:
+                                    selc_ = cv2.resize(sel_, (wc_, hc_), interpolation=cv2.INTER_AREA)
+                                    wqc_ = (cv2.resize(wq_, (wc_, hc_), interpolation=cv2.INTER_AREA) > 0.5).astype(np.float32)
+                                    for Pn_ in ("Cb", "Cr"):
+                                        P_ = Cb if Pn_ == "Cb" else Cr
+                                        Pq_ = P_.astype(np.float32, copy=True)
+                                        Pq_[c0_:c1_, d0_:d1_] = _tone_step_soften(P_[c0_:c1_, d0_:d1_].astype(np.float32), wqc_, selc_, max(0.7, s1_ * cs), max(1.5, s2_ * cs))
+                                        if Pn_ == "Cb":
+                                            Cb = Pq_
+                                        else:
+                                            Cr = Pq_
+                        except Exception:
+                            import traceback
+                            traceback.print_exc()
+                    if FOREHEAD_MODE == "close":
+                        Y = _forehead_close(Y, mfh, job.face, y_per_src, wf, kfh_)
+                    else:
+                        Y = _forehead_level(Y, mfh, job.face, y_per_src, wf, kfh_)
+                        Y, Cb, Cr = _crease_lift(Y, Cb, Cr, mfh, kfh_, max(1.5, FOREHEAD_SIG * wf), None, None)
             except Exception:
                 import traceback
                 traceback.print_exc()
@@ -9324,6 +9499,40 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
             mC = M(job.masks["knee"], (hC, wC))
             Cb = _lift(Cb, mC, k, max(1.0, sig * cs), keep=0.0)
             Cr = _lift(Cr, mC, k, max(1.0, sig * cs), keep=0.0)
+        # 3a'. (client's 1st PV feedback 11/28, c023 "우진이 얼굴-목톤") 목 톤 맞춤 (neck_tone): the neck's colour moved to the face's skin colour (the
+        # medians over the lit, unshaded skin of each), its brightness by NECK_TONE[1] of the difference; at most NECK_TONE[0] (of the colour planes'
+        # range) and NECK_TONE[2] of white; spread smoothly over the neck's mask, so the jaw's shadow and the neck's texture stay
+        if "neck" in job.masks and "skin" in job.masks and v.get("neck_tone", 0) > 1e-4:
+            try:
+                kt_ = float(np.clip(v["neck_tone"], 0, 1))
+                mNt_ = M(job.masks["neck"], (hY, wY))
+                mSt_ = M(job.masks["skin"], (hY, wY))
+                if exY is not None:
+                    mSt_ = mSt_ * (1.0 - exY)
+                fs_ = (mSt_ > 0.6) & (mNt_ < 0.2)
+                ns_ = mNt_ > 0.6
+                if fs_.sum() > 200 and ns_.sum() > 200:
+                    Yf_ = Y.astype(np.float32)
+                    lo_f, hi_f = np.percentile(Yf_[fs_], [20, 90])
+                    lo_n, hi_n = np.percentile(Yf_[ns_], [20, 90])
+                    fs2_ = fs_ & (Yf_ >= lo_f) & (Yf_ <= hi_f)
+                    ns2_ = ns_ & (Yf_ >= lo_n) & (Yf_ <= hi_n)
+                    if fs2_.sum() > 100 and ns2_.sum() > 100:
+                        dY_ = float(np.median(Yf_[fs2_]) - np.median(Yf_[ns2_]))
+                        dY_ = float(np.clip(dY_ * NECK_TONE[1], -NECK_TONE[2], NECK_TONE[2]))
+                        fsC_ = cv2.resize(fs2_.astype(np.uint8), (wC, hC), interpolation=cv2.INTER_NEAREST) > 0
+                        nsC_ = cv2.resize(ns2_.astype(np.uint8), (wC, hC), interpolation=cv2.INTER_NEAREST) > 0
+                        if fsC_.sum() > 30 and nsC_.sum() > 30:
+                            dCb_ = float(np.clip(np.median(Cb[fsC_]) - np.median(Cb[nsC_]), -NECK_TONE[0], NECK_TONE[0]))
+                            dCr_ = float(np.clip(np.median(Cr[fsC_]) - np.median(Cr[nsC_]), -NECK_TONE[0], NECK_TONE[0]))
+                            wN_ = cv2.GaussianBlur(np.clip(mNt_, 0, 1), (0, 0), max(1.0, 0.03 * wf)) * np.clip(mNt_ * 2.0, 0, 1)
+                            Y = Y + (kt_ * dY_) * wN_
+                            wNc_ = cv2.resize(wN_, (wC, hC), interpolation=cv2.INTER_AREA)
+                            Cb = Cb + (kt_ * dCb_) * wNc_
+                            Cr = Cr + (kt_ * dCr_) * wNc_
+            except Exception:
+                import traceback
+                traceback.print_exc()
         # 3b. neck lines
         if "neck" in job.masks and v.get("neck_lines", 0) > 1e-4 and _small_face_gate(wf, NECK_SMALL_WF) > 1e-4:
             k = float(np.clip(v["neck_lines"], 0, 1)) * _small_face_gate(wf, NECK_SMALL_WF)
