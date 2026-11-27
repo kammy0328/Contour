@@ -104,6 +104,8 @@ PARAMS: List[ParamDef] = [
     ParamDef("redness", "홍조", "skin", 0, 100, unit="pct", kind="skin",
              tip="볼·코 주변의 붉은 기를 얼굴 피부톤으로 가라앉힙니다 (입술은 그대로)"),
     ParamDef("forehead_lines", "이마주름", "skin", 0, 100, unit="pct", kind="skin", tip="이마의 가는 가로 주름을 메웁니다 (눈썹 위부터 이마 가운데까지, 머리카락은 그대로)"),
+    ParamDef("forehead_tone", "이마 톤 경계", "skin", 0, 100, unit="pct", kind="skin",
+             tip="이마의 급한 톤 경계(파운데이션이 끝나는 선, 햇빛 받은 부분의 테두리)를 완만하게 풉니다. 밝기와 색. 완만한 음영과 결은 그대로"),
     ParamDef("texture_level", "오돌토돌 정리", "skin", 0, 100, unit="pct", kind="skin", tip="얼굴과 목의 오돌토돌한 피부결(모공보다 크고 얼굴 굴곡보다 작은 요철)을 고르게 폅니다. 필요한 인물에만 올리세요"),
     ParamDef("neck_lines", "목주름", "skin", 0, 100, unit="pct", kind="skin",
              tip="목의 가로 주름 골만 주변 피부로 채웁니다 (목 그늘과 결은 그대로)"),

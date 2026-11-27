@@ -6996,7 +6996,7 @@ def _forehead_close(Y: np.ndarray, m: np.ndarray, lm, scale: float, wf: float, k
 # foundation stops, a lit patch's rim) is softened into a ramp: where the tone's gradient at FOREHEAD_STEP[0] of the face width is FOREHEAD_STEP[2]
 # (to FOREHEAD_STEP[3]) times its gradient at FOREHEAD_STEP[1], the tone at the fine scale is replaced by the tone at the wide one (brightness and
 # colour; the texture finer than the fine scale stays). A smooth shading is as steep at both scales and stays. At the forehead slider's strength
-# times FOREHEAD_STEP[4]. None = off.
+# times FOREHEAD_STEP[4] (the person's 이마 톤 경계, forehead_tone, since 11/28 evening). None = off.
 FOREHEAD_STEP = (0.012, 0.07, 1.7, 3.0, 0.8)
 
 
@@ -9402,7 +9402,7 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
             except Exception:
                 pass
         # 2a''. forehead lines (이마주름): the thin horizontal lines above the brows
-        if v.get("forehead_lines", 0) > 1e-4 and "skin" in job.masks and job.face is not None:
+        if (v.get("forehead_lines", 0) > 1e-4 or v.get("forehead_tone", 0) > 1e-4) and "skin" in job.masks and job.face is not None:
             try:
                 fhz_ = forehead_zone(job.face, (hY, wY), y_per_src, wf)
                 if fhz_ is not None:
@@ -9411,15 +9411,18 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                         mfh = mfh * (1.0 - exY)
                     if hd_ is not None:
                         mfh = mfh * (1.0 - np.maximum(hd_, he_))
-                    kfh_ = float(np.clip(v["forehead_lines"], 0, 1))
-                    if FOREHEAD_STEP is not None:
+                    kfh_ = float(np.clip(v.get("forehead_lines", 0), 0, 1))
+                    # (the user, 11/28: the tone's softening may not suit, so it is a value of its own, 이마 톤 경계 (forehead_tone), with the
+                    # lines' value it was tied to before; the same strength at 100 as the 11/28 renders had at 이마주름 100)
+                    kft_ = float(np.clip(v.get("forehead_tone", 0), 0, 1))
+                    if FOREHEAD_STEP is not None and kft_ > 1e-4:
                         try:
                             r_ = _roi(mfh, int(4 * FOREHEAD_STEP[1] * wf) + 4)
                             if r_ is not None:
                                 y0_, y1_, x0_, x1_ = r_
                                 wq_ = (mfh[y0_:y1_, x0_:x1_] > 0.2).astype(np.float32)
                                 sel_ = _forehead_step_sel(Y[y0_:y1_, x0_:x1_].astype(np.float32), wq_, wf)
-                                sel_ = sel_ * np.clip(mfh[y0_:y1_, x0_:x1_], 0, 1) * (kfh_ * float(FOREHEAD_STEP[4]))
+                                sel_ = sel_ * np.clip(mfh[y0_:y1_, x0_:x1_], 0, 1) * (kft_ * float(FOREHEAD_STEP[4]))
                                 s1_, s2_ = max(1.0, FOREHEAD_STEP[0] * wf), max(2.0, FOREHEAD_STEP[1] * wf)
                                 Yq_ = Y.astype(np.float32, copy=True)
                                 Yq_[y0_:y1_, x0_:x1_] = _tone_step_soften(Y[y0_:y1_, x0_:x1_].astype(np.float32), wq_, sel_, s1_, s2_)
@@ -9441,7 +9444,9 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                         except Exception:
                             import traceback
                             traceback.print_exc()
-                    if FOREHEAD_MODE == "close":
+                    if kfh_ <= 1e-4:
+                        pass
+                    elif FOREHEAD_MODE == "close":
                         Y = _forehead_close(Y, mfh, job.face, y_per_src, wf, kfh_)
                     else:
                         Y = _forehead_level(Y, mfh, job.face, y_per_src, wf, kfh_)
