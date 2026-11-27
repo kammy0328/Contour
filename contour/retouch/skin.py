@@ -115,6 +115,24 @@ PF_MOUTH_SOFT = 0.015  # (was 0.03)
 PF_EDGE = 0.025        # parser fill: kept this far inside the face outline (was 0.04)
 PARSE_STRICT = (0.36, 0.62)   # the parser's skin + neck share from which a pixel counts as skin (None: the old, wide gate)
 PARSE_OWN = False      # inside the face outline the parser's sure skin counts even where the person's matte misses it
+# (1.27.1, LNGSHOT BEEP BEEP c025 p0 f0..8 and c030 p0: a face in profile in hard light got no retouch: the person's matte held only half of the face
+# (0.48 to 0.53 inside its outline, the lit cheek outside it), while the parser was sure of the cheek's skin) PARSE_OWN for a face turned this far
+# (|left - right| / (left + right) of the nose tip's distances to the outline, 0 frontal .. 1 profile) or whose matte holds less than PARSE_OWN_MATTE
+# of its outline. None: as before.
+PARSE_OWN_TURN = 0.45
+PARSE_OWN_MATTE = 0.75
+
+
+def _turn(lm) -> float:
+    try:
+        L = np.asarray(lm, np.float64)[:, :2]
+        if L.shape[0] < 68 or not np.isfinite(L[[2, 14, 30]]).all():
+            return 0.0
+        a, b = float(np.hypot(*(L[30] - L[2]))), float(np.hypot(*(L[30] - L[14])))
+        return abs(a - b) / max(a + b, 1e-6)
+    except Exception:
+        return 0.0
+PARSE_FAR = 0.5        # (1.27.1) the parser's sure skin past the reach this much of what is inside it: the landmarks missed the face (None = off)
 PARSE_REACH = 0.25     # of the face width: how far past the landmark outline the parser's sure skin still counts
 PARSE_SOFT = 0.008     # of the face width: smoothing of the parser's map before that (was 0.012)
 NOSTRIL_RX, NOSTRIL_RY = 0.60, 0.26   # nostril ellipse, of the nostrils' span (was 0.66 x 0.36)
@@ -846,6 +864,24 @@ def skin_mask(job: SkinJob, rgb_proxy: np.ndarray, sx: float, sy: float, person_
                         wide = cv2.dilate(rt, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kr, kr)))
                         ps2 = np.clip((parse["skin"].astype(np.float32) - 0.6) / 0.25, 0, 1) * float(parse["trust"])
                         region = np.maximum(region, cv2.GaussianBlur(wide.astype(np.float32) / 255.0 * ps2, (k, k), 0) * job.face_w)
+                        if PARSE_FAR is not None:
+                            # (1.27.1, LNGSHOT BEEP BEEP BTv1 c034 f39, the head thrown back: the landmarks lay on the lips and the nose only, and
+                            # the jaw's whole underside, which the parser saw as the face's skin, was outside the outline and its reach: "요철" left
+                            # there) where the parser's sure skin past the reach is more than PARSE_FAR of what it has inside it, the landmarks
+                            # missed the face: the sure skin that runs on from the reach counts too
+                            try:
+                                # (seen from below the parser is less sure of the skin too: 0.4 to 0.6 on the jaw's underside)
+                                ps3_ = np.clip((parse["skin"].astype(np.float32) - 0.4) / 0.3, 0, 1) * float(parse["trust"])
+                                sure_ = (ps3_ > 0.3).astype(np.uint8)
+                                inn_ = float((sure_ & (wide > 0)).sum())
+                                out_ = float((sure_ & (wide == 0)).sum())
+                                if inn_ > 0 and out_ > PARSE_FAR * inn_:
+                                    nl_, lab_ = cv2.connectedComponents(sure_, connectivity=8)
+                                    hit_ = np.unique(lab_[(wide > 0) & (sure_ > 0)])
+                                    far_ = np.isin(lab_, hit_[hit_ > 0]).astype(np.float32)
+                                    region = np.maximum(region, cv2.GaussianBlur(far_ * np.clip(ps3_ / 0.6, 0, 1), (k, k), 0) * job.face_w)
+                            except Exception:
+                                pass
         # the nose and the skin between it and the upper lip: on a face in profile or turned well away the
         # nose stands out past the face outline and was left untouched (cut 037: a smooth face, a raw nose)
         if lm is not None and np.isfinite(lm[27:36, :2]).all() and np.isfinite(lm[48:55, :2]).all():
@@ -861,7 +897,20 @@ def skin_mask(job: SkinJob, rgb_proxy: np.ndarray, sx: float, sy: float, person_
         return np.zeros((h, w), np.float32)
     if person_alpha is not None:
         a_ = person_alpha
-        if PARSE_OWN and parse is not None and parse.get("trust", 0) > 0 and lm is not None and job.face_w > 0.3:
+        own_ = PARSE_OWN
+        if not own_ and parse is not None and lm is not None and job.face_w > 0.3:
+            try:
+                if PARSE_OWN_TURN is not None and _turn(lm) >= PARSE_OWN_TURN:
+                    own_ = True
+                elif PARSE_OWN_MATTE is not None:
+                    pz_ = face_polygon(lm)
+                    if pz_ is not None:
+                        zz_ = np.zeros((h, w), np.uint8)
+                        cv2.fillPoly(zz_, [np.round(pz_).astype(np.int32)], 255)
+                        own_ = bool((zz_ > 0).any()) and float(np.asarray(person_alpha, np.float32)[zz_ > 0].mean()) < PARSE_OWN_MATTE
+            except Exception:
+                own_ = False
+        if own_ and parse is not None and parse.get("trust", 0) > 0 and lm is not None and job.face_w > 0.3:
             # the person's matte can miss part of its own face (cut 112, seen from below: half the face was outside
             # the matte and stayed raw). Inside the face's own outline, what the parser is sure is skin belongs to it
             try:

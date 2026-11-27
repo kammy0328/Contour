@@ -24,6 +24,18 @@ PLANE_TOL = 2          # of 1023: a rounding step either way in the warp's resam
 PREVIEW_TOL = 1        # of 255
 
 
+@pytest.fixture(autouse=True)
+def _each_frame_on_its_own(monkeypatch):
+    """(1.27.1) the retouch held steady through time (retouch.temporal) changes a rendered frame by its neighbours, on purpose; what is held here
+    is each frame's own retouch, so the renders here are made without it (tests/test_temporal_steady.py checks the steadier)"""
+    from contour.retouch import temporal as TM
+    monkeypatch.setattr(TM, "STEADY", False)
+    # (1.27.1) the dark spots of the strip of neck under the jaw are left (the jaw's shade, LNGSHOT BEEP BEEP c024): on purpose a change of the picture;
+    # tests/test_feedback_1127.py checks it
+    from contour.retouch import engine as EN
+    monkeypatch.setattr(EN, "BLEMISH_JAW_HOLD", False)
+
+
 @pytest.fixture
 def golden():
     with np.load(FIX / "golden.npz", allow_pickle=False) as d:

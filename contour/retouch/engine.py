@@ -103,6 +103,7 @@ class Job:
     tone: Optional[dict] = None            # where the knees and the belly are (retouch.bodytone.person_geometry), source px
     focus_w: float = 1.0                   # the share of the retouch this person gets by the focus of its face (FOCUS_GATE), kept so prepare() can apply it again after it reads the slider values
     naso_pres: Optional[float] = None      # how far a nasolabial crease is there on this frame (FOLD_PRESENT), measured once
+    turn: Optional[float] = None           # the face's turn (face_turn) held steady over the frames round this one (TURN_STEADY); None: this frame's own
     arm_axes: Optional[list] = None        # the armpit stage's hanging arms (ARMPIT_LINE_HOLD): [(the upper arm's angle from the vertical in degrees, weight 0..1, zone centre x, y, zone radius)] in proxy px
 
 
@@ -1593,6 +1594,8 @@ def body_regions(regions: set, kp: np.ndarray, hand: Optional[np.ndarray], shape
 
 NECK_SHADE = True          # the parser's neck counts where the colour model misses a broad stretch of it (shade)
 NECK_DARK = (0.40, 0.58)    # of the face's own skin brightness: the neck mask fades out between these (hair, a black top)
+NECK_DARK_PARSED = True     # (1.27.1) where the parser is sure of neck, NECK_DARK does not take it out
+NECK_TURN = (0.25, 0.6)     # (1.27.1) face turn from .. to which the neck band moves under the jaw's middle and widens to it (None = off)
 NECK_SHADE_MIN = 0.045     # of the face width: narrower stretches the colour model leaves out stay out (hair, a chain)
 
 
@@ -1632,6 +1635,7 @@ def neck_mask(lm: np.ndarray, kp: np.ndarray, widths, shape, sx: float, sy: floa
                 hw = m_
     # how far down: about three quarters of a face width, less where the shoulders really are higher up
     length = 0.75 * Wf
+    uN_ = None                                   # where the neck's base is across (along ex, from the chin), when the shoulders say so
     if kp is not None:
         ls, rs = kp[S.L_SH, :2], kp[S.R_SH, :2]
         if np.isfinite(ls).all() and np.isfinite(rs).all():
@@ -1640,14 +1644,31 @@ def neck_mask(lm: np.ndarray, kp: np.ndarray, widths, shape, sx: float, sy: floa
             d = float((N - L[8]) @ down)
             if 1.2 * Wf < sw < 4.0 * Wf and 0.25 * Wf < d < 1.4 * Wf:
                 length = min(length, d + 0.05 * Wf)
+                uN_ = float((N - L[8]) @ ex)
     # the top follows the jaw (the skin right under it is neck), kept to the neck's width
     jaw = L[3:14]
     top = jaw + down * 0.02 * Wf
     c = L[8] + down * 0.3 * Wf
+    shift_ = 0.0
+    if NECK_TURN is not None:
+        # (1.27.1, LNGSHOT BEEP BEEP BTv1 c025, c024 p2, c034: a face turned to a side has its neck behind the chin, towards the ear: the neck's band
+        # centred under the chin missed most of it) on a turned face the band is centred between the jaw's ends and as wide as the jaw seen
+        tu_ = face_turn(lm)
+        g_ = float(np.clip((tu_ - NECK_TURN[0]) / max(1e-3, NECK_TURN[1] - NECK_TURN[0]), 0.0, 1.0))
+        if g_ > 0:
+            uj_ = (jaw - L[8]) @ ex
+            shift_ = g_ * 0.5 * float(uj_.min() + uj_.max())
+            hw = max(hw, (1.0 - g_) * hw + g_ * 0.45 * float(uj_.max() - uj_.min()))
+            c = c + ex * shift_
     u = (top - c) @ ex
     keep = np.abs(u) <= hw * 1.25
     top = top[keep] if keep.sum() >= 3 else top
-    base = L[8] + down * length
+    bshift_ = shift_
+    if NECK_TURN is not None and uN_ is not None and shift_ != 0.0:
+        # (1.27.1, c025 f5 p0, a face in profile: the neck runs from under the ear down to between the shoulders, past the jaw's middle) on a turned
+        # face the band's foot is where the shoulders put the neck's base
+        bshift_ = shift_ + g_ * (float(np.clip(uN_, -1.0 * Wf, 1.0 * Wf)) - shift_)
+    base = L[8] + down * length + ex * bshift_
     bot = [base + ex * hw * 1.1, base - ex * hw * 1.1]
     m = np.zeros(shape, np.uint8)
     _poly(m, np.vstack([top, bot]))
@@ -1693,7 +1714,17 @@ def neck_mask(lm: np.ndarray, kp: np.ndarray, widths, shape, sx: float, sy: floa
                 # A neck in shade is darker than the face too, but not by this much (measured on a log clip seen
                 # in Rec.709: shaded necks 0.6 to 0.9 times the face, hair and black cloth under 0.45)
                 Ys = cv2.GaussianBlur(Yl, (0, 0), max(1.0, 0.012 * Wf))
-                f = f * _ss(NECK_DARK[0] * yref, NECK_DARK[1] * yref, Ys)
+                dg_ = _ss(NECK_DARK[0] * yref, NECK_DARK[1] * yref, Ys)
+                if NECK_DARK_PARSED and parse is not None and parse.get("trust", 0) > 0:
+                    # (1.27.1, c034 f10, c087 f30: the neck's side in the sun's shade is darker than this, and was no neck) where the parser is sure
+                    # of neck the darkness does not count (hair and a black top are not neck to the parser)
+                    try:
+                        sn_ = _ss(0.55, 0.85, cv2.GaussianBlur(parse["neck"].astype(np.float32), (0, 0), max(1.0, 0.015 * Wf))
+                                  * cv2.GaussianBlur(parse["cover"].astype(np.float32), (0, 0), max(1.0, 0.04 * Wf))) * float(parse["trust"])
+                        dg_ = np.maximum(dg_, sn_)
+                    except Exception:
+                        pass
+                f = f * dg_
     if parse is not None and parse.get("trust", 0) > 0 and f.max() > 0.01:
         # the face parser tells the neck from the collar, the shirt, a necklace, hair and a hand in front of it,
         # which the skin colour cannot when they share the skin's colour. Below its crop it sees nothing: there
@@ -2267,6 +2298,27 @@ FACE_GAP_BRIDGE = 2
 
 def _vis_w(vis: float) -> float:
     return float(np.clip((float(vis) - VIS_LO) / (VIS_FULL - VIS_LO), 0.0, 1.0))
+
+
+# (1.27.1, LNGSHOT BEEP BEEP 11/27: c084 f36 the head turned from 0.60 to 0.83 in one frame and 자갈턱 넓게 went off on that frame; the landmarks of a face
+# turning fast or blurred swing from frame to frame) the stages that go by the face's turn (yaw_gate: the folds, the raised spots; _pebble_share) take
+# it as the mean over TURN_STEADY frames on each side (weighted, nearer frames more; only frames where the face has landmarks). 0: this frame's own.
+TURN_STEADY = 3
+
+
+def _turn_steady(st, p: int, t: int, n: int) -> Optional[float]:
+    """face_turn of person p round frame t: the weighted mean over the frames t-n..t+n that have the face (None when frame t has none)"""
+    T = st.face.shape[1]
+    if not (0 <= t < T) or not np.isfinite(st.face[p, t, :, :2]).all():
+        return None
+    num = den = 0.0
+    for s_ in range(max(0, t - n), min(T, t + n + 1)):
+        if not np.isfinite(st.face[p, s_, :, :2]).all():
+            continue
+        w_ = float(np.exp(-0.5 * ((s_ - t) / max(0.5, n / 1.5)) ** 2))
+        num += w_ * face_turn(st.face[p, s_])
+        den += w_
+    return num / den if den > 0 else None
 
 
 def _face_bridge(st, p: int, t: int, n: int):
@@ -3620,6 +3672,11 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                   body_keep=float(np.clip(getattr(pp, "body_detail", 60.0) / 100.0, 0, 1)),
                   body_size=float(np.clip(getattr(pp, "body_blemish_size", 40.0) / 100.0, 0, 1)))
         job.focus_w = float(fg_)
+        if face is not None and TURN_STEADY > 0:
+            try:
+                job.turn = _turn_steady(st, p, t, TURN_STEADY)
+            except Exception:
+                job.turn = None
         fth = pp.feather_factor() if hasattr(pp, "feather_factor") else 1.5
         if face is not None:
             job.wf_src = float(np.hypot(*(face[16, :2] - face[0, :2])))
@@ -4874,6 +4931,12 @@ NECK_CAP = (0.015, 0.006)
 #    underside of a raised chin is a broad shadow, not a fold
 NECK_BROAD = 0.5
 NECK_UNDER_CHIN = (0.05, 0.30)
+# (1.27.1, the user 11/27 on LNGSHOT BEEP BEEP c059: "목 가로 주름 제거와 목 피부결 보정은 별도야. 목 피부결은 과했고 주름은 제거가 맞아".) The cap above was
+# laid on the whole of the neck lines' change, the thin creases' filling with it, so a crease 3 % deep came out half filled. Now NECK_CAP holds the broad
+# steps only (the neck's own modelling, what IWALY's review was about); the creases' filling (_crease_lift) has a cap of its own, NECK_CREASE_CAP (most
+# lighter, most darker; None: not capped), as deep as a crease of the neck gets.
+NECK_CREASE_CAP = (0.05, 0.008)
+NECK_CREASE_JAW = 1.0       # the jaw line's hold for the creases' filling, of its width (1: as the broad steps)
 
 
 def jaw_under(lm: Optional[np.ndarray], shape, scale: float, wf: float, reach) -> Optional[np.ndarray]:
@@ -5799,7 +5862,7 @@ CHIN_PEBBLE_CAP = 0.05
 CHIN_PEBBLE_YAW = (0.60, 0.80)
 
 
-def _pebble_share(lm: Optional[np.ndarray], v: Optional[dict] = None) -> float:
+def _pebble_share(lm: Optional[np.ndarray], v: Optional[dict] = None, turn: Optional[float] = None) -> float:
     """0..1: how far the chin's stages work the pebbled way on this face: the person's 자갈턱 넓게 (or CHIN_PEBBLE), none of it on a face turned away
     (CHIN_PEBBLE_YAW)."""
     g = float(np.clip(max(float(CHIN_PEBBLE), float((v or {}).get("chin_pebble", 0.0) or 0.0)), 0.0, 1.0))
@@ -5807,16 +5870,19 @@ def _pebble_share(lm: Optional[np.ndarray], v: Optional[dict] = None) -> float:
         return 0.0
     if CHIN_PEBBLE_YAW is not None:
         lo, hi = float(CHIN_PEBBLE_YAW[0]), float(CHIN_PEBBLE_YAW[1])
-        g *= float(1.0 - np.clip((face_turn(lm) - lo) / max(hi - lo, 1e-3), 0.0, 1.0))
+        tu = face_turn(lm) if turn is None else float(turn)
+        g *= float(1.0 - np.clip((tu - lo) / max(hi - lo, 1e-3), 0.0, 1.0))
     return g
 
 
-def chin_zone(shape, lm: np.ndarray, wf: float, pebble: bool = False) -> Optional[np.ndarray]:
+def chin_zone(shape, lm: np.ndarray, wf: float, pebble: bool = False, keep=None) -> Optional[np.ndarray]:
     """The chin between the lower lip and the jaw (soft), lm in px of `shape`: off the lower lip's shade and the face's outline
     (CHIN_KEEP_LIP, CHIN_KEEP_EDGE; pebble: CHIN_PEBBLE_KEEP, the zone of the pebbled way)."""
     if lm is None or not np.isfinite(lm[[57, 8], :2]).all():
         return None
     keep_lip, keep_edge = (float(CHIN_PEBBLE_KEEP[0]), float(CHIN_PEBBLE_KEEP[1])) if pebble else (float(CHIN_KEEP_LIP), float(CHIN_KEEP_EDGE))
+    if keep is not None:
+        keep_lip, keep_edge = float(keep[0]), float(keep[1])
     a, b = lm[57, :2], lm[8, :2]
     c = 0.4 * a + 0.6 * b
     v = b - a
@@ -5992,15 +6058,15 @@ def _window(shape, pts: np.ndarray, margin: float):
     return max(0, x0), max(0, y0), min(w, x1), min(h, y1)
 
 
-def jaw_hold(lm: Optional[np.ndarray], shape, scale: float, wf: float) -> Optional[np.ndarray]:
+def jaw_hold(lm: Optional[np.ndarray], shape, scale: float, wf: float, width: float = 1.0) -> Optional[np.ndarray]:
     """1 off the jaw line, 0 on it (soft): the shadow line under the jaw and chin is the face's outline, not a
     neck line, and stays. lm in source px, scale = px of `shape` per source px, wf in px of `shape`."""
     if lm is None or not np.isfinite(lm[2:15, :2]).all():
         return None
     def make():
         pts = np.round(lm[2:15, :2] * scale).astype(np.int32)
-        th = max(1, int(round(0.07 * wf)))
-        sig = max(1.0, 0.025 * wf)
+        th = max(1, int(round(0.07 * wf * width)))
+        sig = max(1.0, 0.025 * wf * width)
         x0, y0, x1, y1 = _window(shape, pts, th + 8 * sig + 4)
         out = np.ones(shape[:2], np.float32)
         if x1 <= x0 or y1 <= y0:
@@ -6009,8 +6075,34 @@ def jaw_hold(lm: Optional[np.ndarray], shape, scale: float, wf: float) -> Option
         cv2.polylines(m, [pts - np.array([x0, y0], np.int32)], False, 255, th, cv2.LINE_AA)
         out[y0:y1, x0:x1] = 1.0 - cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0), sig)
         return out
-    return _cached("jaw", lm, shape, scale, wf, make)
+    return _cached("jaw" if width == 1.0 else "jaw%.3f" % width, lm, shape, scale, wf, make)
 
+
+
+def under_jaw_hold(lm: Optional[np.ndarray], shape, scale: float, wf: float, band=(0.16, 0.30)) -> Optional[np.ndarray]:
+    """1 away from the jaw, 0 on the strip of neck right under the jaw line (band: distance from the line, of the face width, where the hold
+    fades out), and on the line itself. The jaw casts its shadow there: its dark bits are the outline's shade, not spots."""
+    if lm is None or not np.isfinite(lm[2:15, :2]).all():
+        return None
+    def make():
+        pts = np.round(lm[2:15, :2] * scale).astype(np.int32)
+        far = int(band[1] * wf) + 4
+        x0, y0, x1, y1 = _window(shape, pts, far)
+        out = np.ones(shape[:2], np.float32)
+        if x1 <= x0 or y1 <= y0:
+            return out
+        m = np.full((y1 - y0, x1 - x0), 255, np.uint8)
+        cv2.polylines(m, [pts - np.array([x0, y0], np.int32)], False, 0, 2, cv2.LINE_8)
+        dist = cv2.distanceTransform(m, cv2.DIST_L2, 5) / max(1.0, wf)
+        face = np.zeros_like(m)
+        hull = cv2.convexHull(np.round(lm[:27, :2] * scale).astype(np.int32) - np.array([x0, y0], np.int32))
+        cv2.fillConvexPoly(face, hull, 1)
+        a, b = float(band[0]), float(band[1])
+        h = np.clip((dist - a) / max(1e-6, b - a), 0, 1)
+        h = np.where(face > 0, np.clip(dist / max(1e-6, 0.07), 0, 1), h)   # inside the face: only the line itself
+        out[y0:y1, x0:x1] = cv2.GaussianBlur(h.astype(np.float32), (0, 0), max(1.0, 0.01 * wf))
+        return out
+    return _cached("underjaw%.3f_%.3f" % (band[0], band[1]), lm, shape, scale, wf, make)
 
 GLINT_LO, GLINT_HI = 0.22, 0.38   # a thin bright thing on the skin (a light hair, a chain's glint)
 THING_MIN_LEN = 0.07        # of the face width: shorter than this is no "thing" lying on the skin
@@ -6766,6 +6858,106 @@ def frown_zone(lm: Optional[np.ndarray], shape, scale: float, wf: float) -> Opti
         return out
     return _cached("frown", lm, shape, scale, wf, make)
 
+
+
+# (1.27.1, LNGSHOT BEEP BEEP BTv1 review 11/27: "이마 주름 제거" on c002, c018, c020, the short-haired member's forehead lines) the person's 이마주름 slider
+# (forehead_lines): the thin horizontal lines of the forehead filled (_crease_lift) inside the skin mask, from FOREHEAD_ZONE[0] to FOREHEAD_ZONE[1] face
+# widths above the brows, the brows themselves and the hairline kept out by the skin mask. The line's scale FOREHEAD_SIG of the face width.
+FOREHEAD_ZONE = (0.03, 0.55)
+FOREHEAD_SIG = 0.016
+# The forehead's lines are soft (a few % deep, as wide as 1 to 3 % of the face) and the thin-crease filler hardly takes them. Their filling: the skin
+# levelled along the face's up only (a blur along up, FOREHEAD_ALONG of the face width, across it FOREHEAD_ACROSS; normalised by the mask so the brows and
+# the hair do not run in), the difference to it taken out at the slider's strength, softly capped at FOREHEAD_CAP of white. Broad shading (a gradient
+# over the forehead) is level along a line and stays.
+FOREHEAD_ALONG = 0.035
+FOREHEAD_ACROSS = 0.006
+FOREHEAD_CAP = 0.05
+FOREHEAD_FINE = 0.004    # of the face width: finer than this is the skin's grain, left as it is
+
+
+def _forehead_level(Y: np.ndarray, m: np.ndarray, lm, scale: float, wf: float, k: float) -> np.ndarray:
+    """Y with the horizontal lines inside the mask m levelled along the face's up (see FOREHEAD_ALONG)"""
+    r = _roi(m, int(4 * FOREHEAD_ALONG * wf) + 4)
+    if r is None or k <= 1e-4:
+        return Y
+    y0, y1, x0, x1 = r
+    L = np.asarray(lm[:, :2], np.float64) * scale
+    up = L[27] - L[8]
+    ang = float(np.degrees(np.arctan2(up[1], up[0])))      # the direction of up in the picture
+    sa, sc = max(1.0, FOREHEAD_ALONG * wf), max(0.6, FOREHEAD_ACROSS * wf)
+    n = int(2 * round(3 * sa) + 1)
+    ker = np.zeros((n, n), np.float32)
+    c = n // 2
+    yy, xx = np.mgrid[0:n, 0:n].astype(np.float32) - c
+    t = np.radians(ang)
+    a_ = xx * np.cos(t) + yy * np.sin(t)                    # along up
+    b_ = -xx * np.sin(t) + yy * np.cos(t)                   # across
+    ker = np.exp(-0.5 * ((a_ / sa) ** 2 + (b_ / sc) ** 2)).astype(np.float32)
+    ker /= float(ker.sum())
+    yc = Y[y0:y1, x0:x1].astype(np.float32)
+    mc = np.clip(m[y0:y1, x0:x1], 0, 1).astype(np.float32)
+    w_ = (mc > 0.2).astype(np.float32)
+    num = cv2.filter2D(yc * w_, -1, ker, borderType=cv2.BORDER_REFLECT)
+    den = cv2.filter2D(w_, -1, ker, borderType=cv2.BORDER_REFLECT)
+    B = num / np.maximum(den, 1e-3)
+    d = B - yc
+    # the grain and the finest texture stay (only what is as wide as a line is taken): the difference without what is finer than FOREHEAD_FINE
+    d = cv2.GaussianBlur(d, (0, 0), max(0.6, FOREHEAD_FINE * wf))
+    cap = float(FOREHEAD_CAP)
+    d = cap * np.tanh(d / cap)
+    out = Y.astype(np.float32, copy=True)
+    out[y0:y1, x0:x1] = yc + float(k) * mc * np.clip(den / 0.5, 0, 1) * d
+    return out
+
+
+# (1.27.1, the same review: "콧대 오돌토돌 피부결" c026, "오돌토돌 피부결" c027, "입가 옆 피부결" c030, "목 오돌토돌" c025, c046, c087) the person's
+# 오돌토돌 정리 slider (texture_level): the skin's relief between the grain and TEXTURE_WIDE of the face width levelled on the face's skin and the neck
+# (the features, the hair and the hold maps kept out), capped softly at TEXTURE_CAP of white. Wider than the skin smoothing's bands, narrower than the
+# face's modelling.
+TEXTURE_WIDE = 0.025
+TEXTURE_FINE = 0.004
+TEXTURE_CAP = 0.04
+
+
+def _level(Y: np.ndarray, m: np.ndarray, wf: float, k: float, wide: float, fine: float, cap: float) -> np.ndarray:
+    """Y with its relief between fine and wide (of the face width) inside the mask m taken out at k (blur normalised by the mask)"""
+    r = _roi(m, int(4 * wide * wf) + 4)
+    if r is None or k <= 1e-4:
+        return Y
+    y0, y1, x0, x1 = r
+    yc = Y[y0:y1, x0:x1].astype(np.float32)
+    mc = np.clip(m[y0:y1, x0:x1], 0, 1).astype(np.float32)
+    w_ = (mc > 0.15).astype(np.float32)
+    sb = max(1.5, wide * wf)
+    B = cv2.GaussianBlur(yc * w_, (0, 0), sb) / np.maximum(cv2.GaussianBlur(w_, (0, 0), sb), 1e-3)
+    d = cv2.GaussianBlur(B - yc, (0, 0), max(0.6, fine * wf))
+    d = float(cap) * np.tanh(d / float(cap))
+    out = Y.astype(np.float32, copy=True)
+    out[y0:y1, x0:x1] = yc + float(k) * mc * d
+    return out
+
+def forehead_zone(lm: Optional[np.ndarray], shape, scale: float, wf: float) -> Optional[np.ndarray]:
+    """0..1: the band above the brows (FOREHEAD_ZONE), following the head's tilt (the brows' line moved along the face's up)"""
+    if lm is None or not np.isfinite(lm[[8, 17, 21, 22, 26, 27], :2]).all():
+        return None
+
+    def make():
+        L = np.asarray(lm[:, :2], np.float64) * scale
+        up = L[27] - L[8]
+        up = up / max(1e-6, float(np.hypot(*up)))
+        br = L[17:27]
+        poly = np.vstack([br + up * (FOREHEAD_ZONE[0] * wf), (br + up * (FOREHEAD_ZONE[1] * wf))[::-1]])
+        poly = np.round(poly).astype(np.int32)
+        sig = max(1.0, 0.03 * wf)
+        x0, y0, x1, y1 = _window(shape, poly.reshape(-1, 2), 6 * sig + 4)
+        out = np.zeros(shape[:2], np.float32)
+        if x1 <= x0 or y1 <= y0:
+            return out
+        m = np.zeros((y1 - y0, x1 - x0), np.uint8)
+        cv2.fillPoly(m, [poly - np.array([x0, y0], np.int32)], 255)
+        out[y0:y1, x0:x1] = cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0), sig)
+        return out
+    return _cached("forehead", lm, shape, scale, wf, make)
 
 # 2611 IWALY c001 (2026-11-22, user, 00:00:31:14: the red circle on the eye, "mask error"): on a three-quarter view the brow and nose landmarks sit on the eye, so the frown zone
 # (their hull) lay over the eye's outer half and its lash fan, and the thin-line filler took every lash for a crease and lifted it by up to 7 % of the picture's brightness (the
@@ -7555,6 +7747,10 @@ FINAL_WHITE_K = 0.009   # of the face width: the dot's size scale (top-hat)
 FINAL_WHITE_THR = 0.025 # brighter than the local level by this share
 FINAL_WHITE_BUSY = 0.06 # share of the window round a dot that may light up too (more: hair, texture, a glint row: left)
 FINAL_BUMP_NOSE = 0.0   # 0..1: the raised-spot fill kept off the nose (its bridge's highlight is no bump; ENDING: it blinked). 0 = as before
+BUMP_NOSTRIL = 0.16      # (1.27.1) of the face width: the nostrils' hull grown by this is no ground of the bump fill (0 = off)
+BUMP_LIFT_CAP = 0.02     # (1.27.1) most the bump fill lightens a point, softly (luma 0..1; None = no cap)
+BLEMISH_JAW_BAND = (0.16, 0.30)  # of the face width under the jaw line: the dark spots held there (the jaw's cast shadow), fading out
+BLEMISH_JAW_HOLD = True  # (1.27.1, c024 f3 p2) the dark spots of the blemish removal kept off the strip of neck the jaw shades (under_jaw_hold)
 # (1.26.2, 2611 LNGSHOT QA 11/26, 4K 1:1: 046 t12 and 054 t18 a beanie's knit right above the brows, 054 t18 the cheek's outline against the hair,
 # 021 t13 and 046 t12 the jaw's edge: with 요철 at 100 the raised-spot fill took the knit's ridges and the light side of an outline for bumps; it looked
 # inside the face's outline from the landmarks (the hull of the jaw and the brows) as well as the skin mask) the raised spots are looked for on the skin
@@ -7576,14 +7772,15 @@ def face_turn(lm) -> float:
         return 0.0
 
 
-def yaw_gate(lm) -> float:
-    """1 .. 0 with the face's turn (FOLD_YAW), 1 when off"""
+def yaw_gate(lm, turn: Optional[float] = None) -> float:
+    """1 .. 0 with the face's turn (FOLD_YAW; turn: the turn held steady over frames, Job.turn), 1 when off"""
     if FOLD_YAW is None or lm is None:
         return 1.0
     if __import__("os").environ.get("IWALY_YAW_LOG"):
         print("face_turn", round(face_turn(lm), 3), flush=True)
     lo, hi = float(FOLD_YAW[0]), float(FOLD_YAW[1])
-    return float(1.0 - np.clip((face_turn(lm) - lo) / max(hi - lo, 1e-3), 0.0, 1.0))
+    tu = face_turn(lm) if turn is None else float(turn)
+    return float(1.0 - np.clip((tu - lo) / max(hi - lo, 1e-3), 0.0, 1.0))
 
 
 def _alone(cen: np.ndarray, ids: list, wf: float, iso: float) -> list:
@@ -7822,6 +8019,41 @@ def _final_chin(Y: np.ndarray, lm: np.ndarray, skin: np.ndarray, wf: float, k: f
         out[y0:y1, x0:x1] = roi - (corr + float(np.clip(share, 0, 1)) * (cap * np.tanh(corr / cap) - corr))
     else:
         out[y0:y1, x0:x1] = roi - m * band
+    return out
+
+
+
+# (1.27.1, LNGSHOT BEEP BEEP BTv1 review: c030 f7, c034 f10, c044, c087: "턱 주름 보정", the pebbles still there with 자갈턱 넓게 at 100) for a person with
+# 자갈턱 넓게, after the chin's own stages the chin's skin levelled: what is wider than the grain (CHIN_LEVEL_FINE of the face width) and narrower than
+# CHIN_LEVEL_WIDE taken out at the slider's share (the skin blurred inside the pebbled way's zone, normalised by it, so the lip and the outline do not
+# run in), capped softly at CHIN_LEVEL_CAP of white. The chin's own roundness (wider) stays.
+CHIN_LEVEL_WIDE = 0.06
+CHIN_LEVEL_FINE = 0.004
+CHIN_LEVEL_CAP = 0.07
+CHIN_LEVEL_KEEP = (0.04, 0.0)     # (off the lower lip, off the outline) of the face width: the levelling reaches the chin's edge
+
+
+def _chin_level(Y: np.ndarray, lm: np.ndarray, skin: np.ndarray, wf: float, k: float) -> np.ndarray:
+    if k <= 1e-4 or lm is None:
+        return Y
+    z = chin_zone(Y.shape, lm, wf, pebble=True, keep=CHIN_LEVEL_KEEP)
+    if z is None:
+        return Y
+    m = z * np.clip(skin, 0, 1)
+    r = _roi(m, int(4 * CHIN_LEVEL_WIDE * wf) + 4)
+    if r is None:
+        return Y
+    y0, y1, x0, x1 = r
+    yc = Y[y0:y1, x0:x1].astype(np.float32)
+    mc = m[y0:y1, x0:x1].astype(np.float32)
+    w_ = (mc > 0.15).astype(np.float32)
+    sb = max(1.5, CHIN_LEVEL_WIDE * wf)
+    B = cv2.GaussianBlur(yc * w_, (0, 0), sb) / np.maximum(cv2.GaussianBlur(w_, (0, 0), sb), 1e-3)
+    d = cv2.GaussianBlur(B - yc, (0, 0), max(0.6, CHIN_LEVEL_FINE * wf))
+    cap = float(CHIN_LEVEL_CAP)
+    d = cap * np.tanh(d / cap)
+    out = Y.astype(np.float32, copy=True)
+    out[y0:y1, x0:x1] = yc + float(k) * mc * d
     return out
 
 
@@ -8109,7 +8341,7 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M, spots=None):
                 bb = _final_bumps(Y0, breg_, wf, lmY, Y)
                 if bb is not None:
                     bm, bf = bb
-                    bm = bm * float(np.clip(kbump_, 0, 1)) * yaw_gate(job.face)
+                    bm = bm * float(np.clip(kbump_, 0, 1)) * yaw_gate(job.face, getattr(job, 'turn', None))
                     if FINAL_BUMP_NOSE > 1e-4 and lmY is not None:
                         # (ENDING 03:37:09, user 11/24: the nose bridge's highlight blinked) a highlight on the nose sits right at the bump's brightness threshold and
                         # is filled on some frames only: no bump fill on the nose
@@ -8119,7 +8351,23 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M, spots=None):
                                 bm = bm * (1.0 - float(np.clip(FINAL_BUMP_NOSE, 0, 1)) * np.clip(na_, 0, 1))
                         except Exception:
                             pass
-                    Y = Y + bm * (bf - Y)
+                    if BUMP_NOSTRIL > 1e-4 and lmY is not None and np.isfinite(lmY[31:36, :2]).all():
+                        # (1.27.1, LNGSHOT BEEP BEEP BTv1 c026 f29: "흰색 점 오류": a nose wing's lit edge taken for a bump's top and the nostril beside it
+                        # for its shade, lifted by 33 levels) no bump fill in the nostrils and round them
+                        try:
+                            nm_ = np.zeros((hY, wY), np.uint8)
+                            cv2.fillConvexPoly(nm_, cv2.convexHull(np.round(lmY[31:36, :2]).astype(np.int32)), 255)
+                            kn_ = max(3, int(BUMP_NOSTRIL * wf) | 1)
+                            nm_ = cv2.GaussianBlur(cv2.dilate(nm_, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kn_, kn_))).astype(np.float32) / 255.0, (0, 0), max(1.0, 0.25 * kn_))
+                            bm = bm * (1.0 - nm_)
+                        except Exception:
+                            pass
+                    dbf_ = bm * (bf - Y)
+                    if BUMP_LIFT_CAP is not None:
+                        # what the fill lightens (a bump's shade side) softly capped: a pit is a few levels deep, a dark thing it lifted far is no pit
+                        cl_ = float(BUMP_LIFT_CAP)
+                        dbf_ = np.where(dbf_ > 0, cl_ * np.tanh(dbf_ / cl_), dbf_)
+                    Y = Y + dbf_
             if FINAL_WHITE > 1e-4 and spot_reg is not None and lmY is not None and job.wf_src > 0:
                 try:
                     wm_ = _final_whiteheads(Y0, spot_reg, wf, lmY, (hY, wY))
@@ -8132,7 +8380,7 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M, spots=None):
             in_band_ = FINAL_NASO_IN_BAND > 1e-4
             kfn_ = max(float(FINAL_NASO), float(np.clip(job.v.get("nasolabial", 0.0), 0, 1)))     # (1.26.2) the 팔자주름 slider drives the last pass too (the batch had FINAL_NASO 1 with the amount 100)
             if kfn_ > 1e-4 and lmY is not None and job.wf_src > 0 and (not in_band_ or "naso" in job.masks):
-                kn_ = float(np.clip(kfn_, 0, 1)) * yaw_gate(job.face)
+                kn_ = float(np.clip(kfn_, 0, 1)) * yaw_gate(job.face, getattr(job, 'turn', None))
                 if FOLD_PRESENT is not None:
                     kn_ *= _naso_pres_job(job, Y0, wf, y_per_src)
                 if kn_ > 1e-4:
@@ -8149,7 +8397,7 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M, spots=None):
                         Y = Y_p_ + (1.0 - float(FINAL_NASO_SKIN) * (1.0 - g_)) * (Y - Y_p_)
             if FOLD_HEAL > 1e-4 and lmY is not None and job.wf_src > 0 and "naso" in job.masks:
                 # a small face's crease, healed (after the nose's give-back: the top of the crease lies inside the nose's area)
-                kh_ = float(np.clip(FOLD_HEAL, 0, 1)) * float(np.clip(job.v.get("nasolabial", 0.0), 0, 1)) * (1.0 - _face_big(job.face, wf, y_per_src)) * yaw_gate(job.face)
+                kh_ = float(np.clip(FOLD_HEAL, 0, 1)) * float(np.clip(job.v.get("nasolabial", 0.0), 0, 1)) * (1.0 - _face_big(job.face, wf, y_per_src)) * yaw_gate(job.face, getattr(job, 'turn', None))
                 if kh_ > 1e-4 and FOLD_PRESENT is not None:
                     kh_ *= _naso_pres_job(job, Y0, wf, y_per_src)
                 if kh_ > 1e-4 and FOLD_BIG_AMOUNT is not None:
@@ -8159,7 +8407,10 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M, spots=None):
                     Y, Cb, Cr = _fold_heal(Y, Cb, Cr, Y0, M(job.masks["naso"], (hY, wY)), lmY, wf, kh_)
             kfc_ = max(float(FINAL_CHIN), float(job.v.get("chin_lines", 0.0)))     # (1.26.2) the 턱주름 slider, or the setting for every face
             if kfc_ > 1e-4 and lmY is not None and skin is not None:
-                Y = _final_chin(Y, lmY, skin, wf, float(np.clip(kfc_, 0, 1)) * _face_big(job.face, wf, y_per_src), _pebble_share(job.face, job.v))
+                Y = _final_chin(Y, lmY, skin, wf, float(np.clip(kfc_, 0, 1)) * _face_big(job.face, wf, y_per_src), _pebble_share(job.face, job.v, getattr(job, 'turn', None)))
+                psh_ = _pebble_share(job.face, job.v, getattr(job, 'turn', None))
+                if psh_ > 1e-4:
+                    Y = _chin_level(Y, lmY, skin, wf, float(np.clip(kfc_, 0, 1)) * psh_ * _face_big(job.face, wf, y_per_src))
         except Exception:
             import traceback
             traceback.print_exc()
@@ -8363,6 +8614,15 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                 except Exception:
                     import traceback
                     traceback.print_exc()
+            if BLEMISH_JAW_HOLD and job.face is not None:
+                # (1.27.1, LNGSHOT BEEP BEEP BTv1 c024 f3 p2: "턱 선 아래 밝아짐 오류": a dark bit of the shadow line under the jaw filled as a spot, a light
+                # patch under the jaw) the jaw's shadow line is the face's outline: no dark spot is filled on it
+                try:
+                    jh2_ = under_jaw_hold(job.face, (hY, wY), y_per_src, wf, BLEMISH_JAW_BAND)
+                    if jh2_ is not None:
+                        dk_ = dk_ * jh2_
+                except Exception:
+                    pass
             S_ = np.maximum(dk_, det["bump"])
             R_ = det["red"]
             if prot_ is not None:
@@ -8684,7 +8944,7 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                 k = float(np.clip(v[key], 0, 1))
                 if job.face is not None:
                     k *= 1.0 - (1.0 - MOUTH_OPEN_KEEP) * mouth_open(job.face)
-                    k *= yaw_gate(job.face)
+                    k *= yaw_gate(job.face, getattr(job, 'turn', None))
                     if k < 1e-4:
                         continue
                     if FOLD_BIG_AMOUNT is not None:
@@ -8777,7 +9037,7 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                 Y, Cb, Cr = _crease_lift(Y, Cb, Cr, mfl, float(np.clip(FACE_LINES, 0, 1)), max(1.5, 0.012 * wf),
                                          None, jaw_hold(job.face, (hY, wY), y_per_src, wf))
             if kchin_ > 1e-4:
-                Y = _chin_dimple(Y, lmY, skY, wf, float(np.clip(kchin_, 0, 1)) * _face_big(job.face, wf, y_per_src), _pebble_share(job.face, v))
+                Y = _chin_dimple(Y, lmY, skY, wf, float(np.clip(kchin_, 0, 1)) * _face_big(job.face, wf, y_per_src), _pebble_share(job.face, v, getattr(job, 'turn', None)))
         # 2a'. frown lines between the brows and across the top of the nose (thin creases only)
         if FROWN_LINES > 1e-4 and "skin" in job.masks and job.face is not None and v["skin"] > 1e-4:
             try:
@@ -8798,6 +9058,38 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                                              None, None)
             except Exception:
                 pass
+        # 2a''. forehead lines (이마주름): the thin horizontal lines above the brows
+        if v.get("forehead_lines", 0) > 1e-4 and "skin" in job.masks and job.face is not None:
+            try:
+                fhz_ = forehead_zone(job.face, (hY, wY), y_per_src, wf)
+                if fhz_ is not None:
+                    mfh = fhz_ * M(job.masks["skin"], (hY, wY))
+                    if exY is not None:
+                        mfh = mfh * (1.0 - exY)
+                    if hd_ is not None:
+                        mfh = mfh * (1.0 - np.maximum(hd_, he_))
+                    kfh_ = float(np.clip(v["forehead_lines"], 0, 1))
+                    Y = _forehead_level(Y, mfh, job.face, y_per_src, wf, kfh_)
+                    Y, Cb, Cr = _crease_lift(Y, Cb, Cr, mfh, kfh_, max(1.5, FOREHEAD_SIG * wf), None, None)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+        # 2a4. 오돌토돌 정리 (texture_level): the skin's and the neck's relief levelled
+        if v.get("texture_level", 0) > 1e-4 and ("skin" in job.masks or "neck" in job.masks):
+            try:
+                mt_ = np.zeros((hY, wY), np.float32)
+                if "skin" in job.masks:
+                    mt_ = np.maximum(mt_, M(job.masks["skin"], (hY, wY)))
+                if "neck" in job.masks:
+                    mt_ = np.maximum(mt_, M(job.masks["neck"], (hY, wY)))
+                if exY is not None:
+                    mt_ = mt_ * (1.0 - exY)
+                if hd_ is not None:
+                    mt_ = mt_ * (1.0 - np.maximum(hd_, he_))
+                Y = _level(Y, mt_, wf, float(np.clip(v["texture_level"], 0, 1)), TEXTURE_WIDE, TEXTURE_FINE, TEXTURE_CAP)
+            except Exception:
+                import traceback
+                traceback.print_exc()
         # 2b. dark circles: lift the under-eye shading to the cheek's level, cool/purple cast to skin colour
         if "dark" in job.masks and v.get("dark_circle", 0) > 1e-4:
             k = float(np.clip(v["dark_circle"], 0, 1))
@@ -8858,7 +9150,13 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                     acw_ = _across_weight(Y, mN, neck_axis(lmj), wf)
                 except Exception:
                     acw_ = None
-            Y, Cb, Cr = _crease_lift(Y, Cb, Cr, mN, k, max(1.5, 0.018 * wf), None, jh_, extra=ex_)
+            jhc_ = jh_
+            if NECK_CREASE_JAW != 1.0 and lmj is not None:
+                try:
+                    jhc_ = jaw_hold(lmj, (hY, wY), y_per_src, wf, NECK_CREASE_JAW)
+                except Exception:
+                    jhc_ = jh_
+            Y, Cb, Cr = _crease_lift(Y, Cb, Cr, mN, k, max(1.5, 0.018 * wf), None, jhc_, extra=ex_)
             Y_cr_ = Y
             if det and det.get("fold") is not None:
                 fo_ = det["fold"] if prot_ is None else det["fold"] * (1.0 - prot_)
@@ -8890,7 +9188,10 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
             if bw_ is not None:
                 Y = (Y_cr_ + (Y - Y_cr_) * bw_).astype(np.float32)
             if NECK_CAP is not None:
-                Y = _cap_change(Y_pre_, Y, mN, NECK_CAP)
+                # the creases' filling (Y_cr_ - Y_pre_) and the broad steps (Y - Y_cr_) capped each by its own (NECK_CREASE_CAP, NECK_CAP)
+                Yc_ = Y_cr_ if NECK_CREASE_CAP is None else _cap_change(Y_pre_, Y_cr_, mN, NECK_CREASE_CAP)
+                Yb_ = _cap_change(Y_cr_, Y, mN, NECK_CAP)
+                Y = (Yc_ + (Yb_ - Y_cr_)).astype(np.float32)
         # 3b'. goose bumps on the neck: softened, never wiped
         if "neck" in job.masks and v.get("neck_bumps", 0) > 1e-4 and _small_face_gate(wf, NECK_SMALL_WF) > 1e-4:
             k = float(np.clip(v["neck_bumps"], 0, 1)) * _small_face_gate(wf, NECK_SMALL_WF)

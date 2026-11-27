@@ -28,6 +28,7 @@ class RenderReport:
     warnings: List[str] = field(default_factory=list)
     cancelled: bool = False
     accel: str = ""                       # how the warp ran (GPU / CPU, and why)
+    qa: Optional[dict] = None             # (1.27.1) the check of the rendered file (core.renderqa.check), when made
 
 
 def output_base(project: Project, cut: Cut, out: OutputSettings) -> Path:
@@ -372,6 +373,12 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
                 pass
             rep.accel = (rep.accel + " · " if rep.accel else "") + f"준비 도우미 {st_.get('helpers')}개 ({st_.get('taken')}/{st_.get('taken', 0) + st_.get('local', 0)})"
 
+    # (1.27.1) the retouch held steady through time (retouch.temporal): a frame's retouch made the median of its own and its neighbours', so what
+    # fools a stage on one frame only does not blink. The frames are warped and written after it, in order.
+    from ..retouch import temporal as TM
+    steadier = TM.Steadier(subs, maxv) if TM.STEADY else None
+    held_fr = {}
+
     def process(t_, planes_):
         with gate.frame(t_):
             return _process(t_, planes_)
@@ -404,7 +411,25 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
                     warper[0], line = choose(planes_, subs, fr_, maxv)
                     rep.accel = line
                     warper[1] = True
+        if steadier is not None:
+            return planes_, fr_, None              # warped after the steadying
         return planes_, fr_, do_warp(planes_, fr_)
+
+    def emit(t_, src_, planes_, fr_, outp_=None, alpha_out_=None):
+        """a retouched frame in order: through the steadier (when on), then warped and written"""
+        if steadier is None:
+            write_frame(t_, outp_ if outp_ is not None else do_warp(planes_, fr_), fr_, alpha_out_)
+            return
+        held_fr[t_] = fr_
+        for tt_, pl_ in steadier.push(t_, src_, planes_):
+            f_ = held_fr.pop(tt_)
+            write_frame(tt_, do_warp(pl_, f_), f_)
+
+    def emit_end():
+        if steadier is not None:
+            for tt_, pl_ in steadier.flush():
+                f_ = held_fr.pop(tt_)
+                write_frame(tt_, do_warp(pl_, f_), f_)
 
     last_preview = [0.0]
 
@@ -450,15 +475,18 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
                 if planes is None:
                     rep.warnings.append(f"프레임 {t}에서 디코딩이 끝났습니다.")
                     break
-                pending.append((t, pool.submit(process, t, planes)))
-                while len(pending) > n_workers * 2 or (pending and pending[0][1].done()):
-                    t0_, fut = pending.popleft()
-                    _, fr0, outp0 = fut.result()
-                    write_frame(t0_, outp0, fr0)
+                src_copy = [np.array(p_, copy=True) for p_ in planes] if steadier is not None else None
+                pending.append((t, src_copy, pool.submit(process, t, planes)))
+                while len(pending) > n_workers * 2 or (pending and pending[0][2].done()):
+                    t0_, s0_, fut = pending.popleft()
+                    pl0, fr0, outp0 = fut.result()
+                    emit(t0_, s0_, pl0, fr0, outp0)
             while pending and not rep.cancelled:
-                t0_, fut = pending.popleft()
-                _, fr0, outp0 = fut.result()
-                write_frame(t0_, outp0, fr0)
+                t0_, s0_, fut = pending.popleft()
+                pl0, fr0, outp0 = fut.result()
+                emit(t0_, s0_, pl0, fr0, outp0)
+            if not rep.cancelled:
+                emit_end()
         except Exception:
             if knee_look is not None:
                 knee_look.stop()
@@ -489,6 +517,7 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
             if planes is None:
                 rep.warnings.append(f"프레임 {t}에서 디코딩이 끝났습니다.")
                 break
+            src_copy = [np.array(p_, copy=True) for p_ in planes] if steadier is not None else None
             rf = RE.prepare(cut, tracker, t)
             if rf is not None:
                 planes = RE.apply_planes(planes, subs, maxv, pf, rf, 1.0, disp_, info.color_range)
@@ -500,11 +529,16 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
                 warper[0], line = choose(planes, subs, fr, maxv)
                 rep.accel = line
                 warper[1] = True
+            if steadier is not None and not out.matte_person:
+                emit(t, src_copy, planes, fr)
+                continue
             outp = do_warp(planes, fr)
             if out.matte_person:
                 ta = target_alpha(t, planes)
                 alpha_out = np.clip(F.warp_planes([ta], [(1, 1)], fr, 1.0)[0], 0, 1) if not fr.empty() else ta
             write_frame(t, outp, fr, alpha_out)
+        if not rep.cancelled:
+            emit_end()
     except Exception:
         stop_raw()
         reader.close()
