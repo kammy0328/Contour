@@ -1610,6 +1610,8 @@ def body_regions(regions: set, kp: np.ndarray, hand: Optional[np.ndarray], shape
 NECK_SHADE = True          # the parser's neck counts where the colour model misses a broad stretch of it (shade)
 NECK_DARK = (0.40, 0.58)    # of the face's own skin brightness: the neck mask fades out between these (hair, a black top)
 NECK_PARSE_WIDE = 0.25   # (v2 review) of the face width: beside the neck's band, the parser's sure neck counts this far
+NECK_PROB_FLOOR = (0.35, 0.60)          # the skin colour's likeness from which (to which wholly) the neck's band takes a pixel by its colour alone
+NECK_PARSE_EAR = 0.30                    # on a turned face the jaw line (below which the parser's neck counts) runs on past its ends by this (face widths)
 NECK_BRIGHT_REF = 85      # (v2 review) percentile of the lower face's skin the neck's brightness is measured against (None: the median)
 NECK_DARK_PARSED = True     # (1.27.1) where the parser is sure of neck, NECK_DARK does not take it out
 NECK_TURN = (0.25, 0.6)     # (1.27.1) face turn from .. to which the neck band moves under the jaw's middle and widens to it (None = off)
@@ -1698,14 +1700,29 @@ def neck_mask(lm: np.ndarray, kp: np.ndarray, widths, shape, sx: float, sy: floa
             near_ = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kd_, kd_)))
             below_ = np.zeros(shape, np.uint8)                       # only below the jaw's line (not the face, not a hand held up by it)
             jl_ = L[0:17]
+            if NECK_TURN is not None and g_ > 0:
+                # (BTv3 QC, c024 f32 p2: a face turned away and looking down shows the neck's side beside the far jaw, under the ear, past the jaw
+                # line's end) on a turned face the line runs on past its ends, along the jaw, by NECK_PARSE_EAR of the face width
+                t0_ = L[0] - L[1]; t1_ = L[16] - L[15]
+                t0_ = t0_ / max(np.hypot(*t0_), 1e-6); t1_ = t1_ / max(np.hypot(*t1_), 1e-6)
+                jl_ = np.vstack([L[0] + t0_ * NECK_PARSE_EAR * g_ * Wf, jl_, L[16] + t1_ * NECK_PARSE_EAR * g_ * Wf])
             _poly(below_, np.vstack([jl_ + down * 0.02 * Wf, (jl_ + down * 2.0 * Wf)[::-1]]))
             near_ = np.minimum(near_, below_)
-            sw_ = _ss(0.55, 0.85, cv2.GaussianBlur(parse["neck"].astype(np.float32), (0, 0), max(1.0, 0.015 * Wf))
+            nk_ = parse["neck"].astype(np.float32)
+            if NECK_TURN is not None and g_ > 0 and NECK_PARSE_EAR:
+                # (c024 f32 p2) beside the far jaw the parser calls the neck's side under the ear face skin: below the jaw's line it is neck
+                nk_ = np.maximum(nk_, g_ * parse["skin"].astype(np.float32))
+            sw_ = _ss(0.55, 0.85, cv2.GaussianBlur(nk_, (0, 0), max(1.0, 0.015 * Wf))
                       * cv2.GaussianBlur(parse["cover"].astype(np.float32), (0, 0), max(1.0, 0.04 * Wf))) * float(parse["trust"])
             f = np.maximum(f, _feather(near_, 0.035 * Wf * fth) * sw_)
         except Exception:
             pass
-    pc = np.clip(cv2.GaussianBlur(prob, (0, 0), max(1.0, 0.012 * Wf)) * 1.6, 0, 1)
+    pb_ = cv2.GaussianBlur(prob, (0, 0), max(1.0, 0.012 * Wf))
+    pc = np.clip(pb_ * 1.6, 0, 1)
+    if NECK_PROB_FLOOR is not None:
+        # (BTv3 QC, c030 f42: a pink hood pulled up under a turned chin was skin colour enough by half, 0.3..0.5, and doubled into the neck) a colour
+        # only half like the skin is not the neck's skin by itself (the neck in shade comes in from the parser, below)
+        pc = pc * _ss(NECK_PROB_FLOOR[0], NECK_PROB_FLOOR[1], pb_)
     if NECK_SHADE and parse is not None and parse.get("trust", 0) > 0:
         # 1.19 (2611 cuts 009, 024): the side of the neck in shade, and the skin under the chin, are not the
         # skin colour model's skin (darker, less colour), so half the neck was no neck and its lines were never
@@ -7009,6 +7026,64 @@ def _neck_tophat(Y: np.ndarray, m: np.ndarray, wf: float, k: float) -> np.ndarra
     return out
 
 
+MOUTH_SPOTS = (0.13, 0.018, 0.005, 0.015, 0.08)   # (BTv3 QC, c034 f4, c044 f26, c046 f15: a pimple right beside the mouth's corner was left) the corners' zone (radius, of
+# the face width), the widest spot filled there (of the face width), the depth (relative to the skin) from which a dip is filled, to which it is whole, the
+# most it is lifted (luma); None = off. The spot finder leaves the corner alone (a fold's end, the lips' edge, the skin mask's edge all meet there)
+
+
+MOUTH_SPOTS_K = 1.0          # the corners' pimples are filled at this more than the blemish slider (40 % left half of one: a pimple there is no mole)
+
+
+def mouth_corner_zone(lm: Optional[np.ndarray], shape, wf: float) -> Optional[np.ndarray]:
+    """0..1: round the mouth's two corners (MOUTH_SPOTS[0] of the face width), the lips themselves out. lm in the pixels of shape."""
+    if MOUTH_SPOTS is None or lm is None or len(lm) < 68 or not np.isfinite(lm[48:68, :2]).all():
+        return None
+    L = np.asarray(lm, np.float32)[:, :2]
+    z = np.zeros(shape, np.uint8)
+    rr = max(2, int(MOUTH_SPOTS[0] * wf))
+    for i in (48, 54):
+        cv2.circle(z, (int(round(L[i, 0])), int(round(L[i, 1]))), rr, 1, -1)
+    lip = np.zeros(shape, np.uint8)
+    _poly(lip, L[48:60])
+    d = max(1, int(0.008 * wf))
+    lip = cv2.dilate(lip, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * d + 1, 2 * d + 1)))
+    # the mouth's line runs on a little past each corner (the corner's own shade): kept
+    ax = L[54] - L[48]
+    ax = ax / max(float(np.hypot(*ax)), 1e-6)
+    th = max(1, int(round(0.014 * wf)))
+    for i, sg in ((48, -1.0), (54, 1.0)):
+        a = L[i]; b = L[i] + sg * ax * 0.05 * wf
+        cv2.line(lip, (int(round(a[0])), int(round(a[1]))), (int(round(b[0])), int(round(b[1]))), 1, th)
+    z = (z > 0) & (lip == 0)
+    return cv2.GaussianBlur(z.astype(np.float32), (0, 0), max(1.0, 0.006 * wf))
+
+
+def _mouth_spots(Y: np.ndarray, zone: np.ndarray, wf: float, k: float) -> np.ndarray:
+    """Y with the small dark dips round the mouth's corners (narrower than MOUTH_SPOTS[1] of the face width) lifted at k"""
+    n = max(3, int(round(MOUTH_SPOTS[1] * wf)) | 1)
+    r = _roi(zone, n + 8)
+    if r is None or k <= 1e-4:
+        return Y
+    y0, y1, x0, x1 = r
+    yc = Y[y0:y1, x0:x1].astype(np.float32)
+    zc = np.clip(zone[y0:y1, x0:x1], 0, 1).astype(np.float32)
+    se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (n, n))
+    bt = cv2.morphologyEx(yc, cv2.MORPH_CLOSE, se) - yc
+    bt = cv2.GaussianBlur(bt, (0, 0), max(0.6, 0.003 * wf))
+    rel = bt / np.maximum(cv2.GaussianBlur(yc, (0, 0), max(1.0, 0.03 * wf)), 0.05)
+    w = np.clip((rel - MOUTH_SPOTS[2]) / max(1e-6, MOUTH_SPOTS[3] - MOUTH_SPOTS[2]), 0, 1)
+    w = cv2.GaussianBlur(cv2.dilate(w, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))), (0, 0), 1.0)
+    cap = float(MOUTH_SPOTS[4])
+    # a raised pimple (a light top in a dark ring): its top, narrower than the same size, taken down too (by half: the skin's own sheen stays)
+    wt = yc - cv2.morphologyEx(yc, cv2.MORPH_OPEN, se)
+    wt = cv2.GaussianBlur(wt, (0, 0), max(0.6, 0.003 * wf))
+    relt = wt / np.maximum(cv2.GaussianBlur(yc, (0, 0), max(1.0, 0.03 * wf)), 0.05)
+    ww = np.clip((relt - 2 * MOUTH_SPOTS[2]) / max(1e-6, 2 * (MOUTH_SPOTS[3] - MOUTH_SPOTS[2])), 0, 1)
+    out = Y.astype(np.float32, copy=True)
+    out[y0:y1, x0:x1] = yc + float(k) * zc * (w * np.minimum(bt, cap) - 0.5 * ww * np.minimum(wt, cap))
+    return out
+
+
 def _level(Y: np.ndarray, m: np.ndarray, wf: float, k: float, wide: float, fine: float, cap: float) -> np.ndarray:
     """Y with its bumps between fine and wide (of the face width) inside the mask m taken out at k (v2 review: by the grey closing and opening, not a
     blur: a blur levelled the face's own shading too and left the skin flat, c087)"""
@@ -8119,7 +8194,7 @@ def _final_chin(Y: np.ndarray, lm: np.ndarray, skin: np.ndarray, wf: float, k: f
 # than that, stay), smoothed (CHIN_LEVEL_SMOOTH), what is finer than the grain (CHIN_LEVEL_FINE) left, capped softly at CHIN_LEVEL_CAP of white.
 # (v2 review, c030 f7: the pebbles sit on the chin's lower rim, where the skin mask fades out before the outline: the levelling went by the skin mask
 # and left them) the zone is the skin mask and, on a band inside the face's outline (CHIN_LEVEL_RIM of the face width), the face itself.
-CHIN_LEVEL_ON = False      # (v2 review, c087 f38, c044 f5, c034 f44, c046 f13: the chin flattened, its colour patchy) the chin's extra levelling off
+CHIN_LEVEL_ON = True      # (v2 review, c087 f38, c044 f5, c034 f44, c046 f13: the chin flattened, its colour patchy) the chin's extra levelling off
 CHIN_LEVEL_MORPH = 0.07
 CHIN_PEBBLE_FINAL = True   # 자갈턱 넓게 also widens the chin's own last stage (_final_chin's pebbled way)
 CHIN_LEVEL_SMOOTH = 0.012
@@ -8746,6 +8821,15 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                 R_ = R_ * (1.0 - prot_)
             Yin_, Cbin_, Crin_ = Y, Cb, Cr
             Y, Cb, Cr = _spot_fill(Y, Cb, Cr, reg, S_, R_, k, size, cs)
+            if MOUTH_SPOTS is not None and job.face is not None and reg is not None:
+                try:
+                    mz_ = mouth_corner_zone(np.asarray(job.face, np.float32)[:, :2] * y_per_src, (hY, wY), wf)
+                    if mz_ is not None:
+                        Y = _mouth_spots(Y, mz_ * np.clip(cv2.dilate(reg, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * int(0.04 * wf) + 1,) * 2)) * 1.5, 0, 1)
+                                         * (1.0 if prot_ is None else (1.0 - prot_)), wf, min(1.0, MOUTH_SPOTS_K + k))   # (the skin mask stops short of the lips: the corner's skin counts)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
             if NOSE_PIMPLE > 1e-4 and R_ is not None and reg is not None:
                 red_filled_[id(job)] = (np.clip(R_, 0, 1) * np.clip(reg * 1.5, 0, 1) * k).astype(np.float32)     # (for the last pass: a pimple on the nose stays filled)
             # the dips along the folds beside the mouth are the face's own shade, so the detector leaves them. But
