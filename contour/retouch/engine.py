@@ -281,6 +281,7 @@ HAND_GUARD_REACH = 0.45     # of the forearm (elbow -> wrist): how far past the 
 HAND_GUARD_RADIUS = 0.32    # of the forearm: the hand's half width
 HAND_GUARD_MAXWF = (0.45, 0.22)  # (v2 review) of the face width: the most a hand reaches past the wrist and its half width
 DARK_CHROMA = 0.3           # how far the under-eye's colour is taken to the cheek's (11/24, INT_c006: "눈 아래 색 빠짐" at 0.8); 0.8 = as before
+NASO_SHADE_GUARD = (0.55, 0.72, 0.05)   # (11/28) the nasolabial band is left where it lies in a broad shadow: luma at this share of the face width's blur below [0] (to [1]) of the face's lit skin (None = off)
 NASO_NOSTRIL_HOLD = 0.03     # of the face width: the nostrils and the nose's base grown by this are out of the nasolabial band (0 = off)
 GPU_MASKS = None            # (11/24) 1: the Gaussian blurs of the mask making and the apply on the GPU (gpuops; same result as OpenCV); 0: OpenCV; None: env IWALY_GPU_MASKS
 SKIN_FS_G = (1.35, 0.7, 0.3, 0.2, 0.2, 0.45)            # (2611 IWALY INT, 11/24: the pebbled skin of INT_c001 / c006 / c007 / c010 stayed) the gains of the skin stage's texture bands (skin.FS_G, finest
@@ -4126,6 +4127,31 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                                        max(1.0, 0.4 * NASO_NOSTRIL_HOLD * wfm_))
                     if loc_ is not None:
                         m_ = _times_local(m_, loc_[0], 1.0 - loc_[1])
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+            if NASO_SHADE_GUARD is not None and m_ is not None and lm is not None and np.isfinite(lm[[0, 16], :2]).all():
+                # (the check of the 1128 files, c087 f34: a hand's shadow lay over the cheek and its edge beside the nasolabial band, and the band's
+                # filler lifted a light stripe into the shadow for one frame) a fold's shade is narrow and a little darker than the skin round it; a
+                # cast shadow is broad and far darker: where the band lies in one, it is left
+                try:
+                    r_ = _roi(m_, int(3 * NASO_SHADE_GUARD[2] * float(np.hypot(*(lm[16, :2] - lm[0, :2])))) + 4)
+                    b_ = base()
+                    if r_ is not None and "rgbf" in b_ and b_.get("prob0") is not None:
+                        y0_, y1_, x0_, x1_ = r_
+                        wfm_ = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
+                        Yf_ = b_["rgbf"] @ np.array([0.2126, 0.7152, 0.0722], np.float32)
+                        pz_ = SK.face_polygon(lm)
+                        if pz_ is not None:
+                            fz_ = np.zeros(shape, np.uint8)
+                            cv2.fillPoly(fz_, [np.round(pz_).astype(np.int32)], 1)
+                            sel_ = (fz_ > 0) & (np.asarray(b_["prob0"]) > 0.6)
+                            if int(sel_.sum()) > 50:
+                                ref_ = float(np.percentile(Yf_[sel_], 70))
+                                Yb_ = cv2.GaussianBlur(Yf_[y0_:y1_, x0_:x1_], (0, 0), max(1.0, NASO_SHADE_GUARD[2] * wfm_))
+                                g_ = _ss(NASO_SHADE_GUARD[0] * ref_, NASO_SHADE_GUARD[1] * ref_, Yb_)
+                                if float(g_.min()) < 0.999:
+                                    m_ = _times_local(m_, r_, g_)
                 except Exception:
                     import traceback
                     traceback.print_exc()
