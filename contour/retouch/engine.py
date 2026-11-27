@@ -1727,7 +1727,15 @@ def neck_mask(lm: np.ndarray, kp: np.ndarray, widths, shape, sx: float, sy: floa
         # closes a hole a few pixels wide
         f = f * (1.0 - NECK_PROTECT * np.clip(protect, 0.0, 1.0))
     if alpha is not None:
-        f = f * alpha
+        a_ = np.asarray(alpha, np.float32)
+        if NECK_DARK_PARSED and parse is not None and parse.get("trust", 0) > 0:
+            # (v3 trial, c025 f0: the person's matte had a hole over the sunlit neck, as over the face, and the neck's lines were left) where the parser is
+            # sure of neck, the matte's hole does not count
+            try:
+                a_ = np.maximum(a_, _ss(0.55, 0.85, cv2.GaussianBlur(parse["neck"].astype(np.float32), (0, 0), max(1.0, 0.015 * Wf))) * float(parse["trust"]))
+            except Exception:
+                pass
+        f = f * a_
     if rgb is not None and f.max() > 0.01:
         # clearly brighter than the skin of the lower face: a white fur collar or a white shirt under the same
         # light, which the skin colour alone lets through (necks measured 0.6 to 1.0 times the face, fur and
@@ -4977,7 +4985,7 @@ NECK_UNDER_CHIN = (0.05, 0.30)
 # steps only (the neck's own modelling, what IWALY's review was about); the creases' filling (_crease_lift) has a cap of its own, NECK_CREASE_CAP (most
 # lighter, most darker; None: not capped), as deep as a crease of the neck gets.
 NECK_CREASE_CAP = (0.05, 0.008)
-NECK_CREASE_JAW = 1.0       # the jaw line's hold for the creases' filling, of its width (1: as the broad steps)
+NECK_CREASE_JAW = 0.6       # the jaw line's hold for the creases' filling, of its width (1: as the broad steps)
 
 
 def jaw_under(lm: Optional[np.ndarray], shape, scale: float, wf: float, reach) -> Optional[np.ndarray]:
@@ -6969,8 +6977,8 @@ def _bump_base(yc: np.ndarray, D: int, smooth: float) -> np.ndarray:
     return cv2.GaussianBlur(B, (0, 0), max(1.0, smooth))
 
 
-NECK_TOPHAT = (0.045, 0.004, 0.08)   # (widest line, the grain kept finer than this, the most it lifts: luma) of the face width; None = off
-NECK_TOPHAT_COH = (0.25, 0.55)       # the line's coherence: from here the lift starts, to here it is whole
+NECK_TOPHAT = (0.06, 0.004, 0.12)   # (widest line, the grain kept finer than this, the most it lifts: luma) of the face width; None = off
+NECK_TOPHAT_COH = (0.15, 0.40)       # the line's coherence: from here the lift starts, to here it is whole
 NECK_TOPHAT_DEEP = (0.10, 0.16)      # a line darker than this (luma) is a strand of hair or a chain: the lift fades out to nothing
 
 
