@@ -875,6 +875,27 @@ def _capsule(m: np.ndarray, a, b, r: float):
         cv2.circle(m, (int(round(q[0])), int(round(q[1]))), int(round(r)), 255, -1, cv2.LINE_AA)
 
 
+def _limb(m: np.ndarray, a, b, r: float, end: Optional[float] = None):
+    """a limb from a to b, r wide (radius): a capsule, or (end: the share of r at b) round at a, narrowing to b and flat there (a forearm at the wrist)"""
+    if end is None:
+        _capsule(m, a, b, r)
+        return
+    if not (np.isfinite(a).all() and np.isfinite(b).all()) or r < 1:
+        return
+    a = np.asarray(a, np.float64)
+    b = np.asarray(b, np.float64)
+    v = b - a
+    L = float(np.hypot(*v))
+    if L < 1:
+        cv2.circle(m, (int(round(a[0])), int(round(a[1]))), int(round(r)), 255, -1, cv2.LINE_AA)
+        return
+    n = np.array([-v[1], v[0]]) / L
+    rb = float(end) * r
+    quad = np.array([a + n * r, b + n * rb, b - n * rb, a - n * r])
+    cv2.fillConvexPoly(m, np.round(quad).astype(np.int32), 255, cv2.LINE_AA)
+    cv2.circle(m, (int(round(a[0])), int(round(a[1]))), int(round(r)), 255, -1, cv2.LINE_AA)
+
+
 def face_owned(st, t: int, p: int, lm: np.ndarray, alpha: np.ndarray, shape, sx: float, sy: float) -> np.ndarray:
     """The person matte, with this person's clearly visible face always theirs.
 
@@ -921,10 +942,25 @@ HAND_RAW_MIN = 2.2    # confidence of the whole-body model's hand points to coun
                       # lower face (1.4 and 1.7), and mouth, chin and jaw lost their retouch; real ones are 2.6 and up)
 
 
-HAND_TRUST_CONF = float(__import__('os').environ.get('IWALY_HAND_TRUST', '0'))   # 0 = off. Mean confidence of the whole-body model's 21 hand points from which they are the hand whatever the forearm says
+HAND_TRUST_CONF = float(__import__('os').environ.get('IWALY_HAND_TRUST', '3.0'))   # 0 = off. Mean confidence of the whole-body model's 21 hand points from which they are the hand whatever the forearm says
+                             # (11/28: on by default, 3.0; c026's hands held together at the mouth, foreshortened forearms: the points (3.4 and 4.7) were thrown out and a
+                             # blob the forearm's length wide round the wrist took the cheeks beside the fingers; cut 069's false hands were 1.4 to 1.7)
 HAND_TRUST_SPAN = 2.0        # of the face width: a hand points' span beyond this is no hand
-HAND_SHAPE = (0.22, 0.06)      # (11/28) a hand with all its points: fingers drawn this thick (of the palm's width, radius), the whole widened by this share of its span (None: the points' hull)
+HAND_SHAPE = (0.18, 0.04)      # (11/28) a hand with all its points: fingers drawn this thick (of the palm's width, radius), the whole widened by this share of its span (None: the points' hull)
 LIMB_OTHER_SKIN = 0.6         # (11/28) somebody else's limb or hand over more than this share of the face's skin the parser is sure of lies behind the head (None = off)
+# (11/28, the second check: c024's hands laid on both cheeks and c026's held at the mouth; the client's marks there are the lines under the eyes and the spots beside the
+# fingers, and that skin was left as it was) the hand points of a hand pressed to the face are a little off (c024 f20: the ring and little fingers' points 30..40 px
+# beside the fingers, over the cheek under the eye and the mouth's corner), and the drawn hand took a band of the face with it
+HAND_CORE = 0.10              # of the palm's width: the finger's own middle line this thick (radius) and the palm are the hand whatever the parser says (None: the drawn hand as it is)
+HAND_PARSE_TRIM = 0.5         # the rest of the drawn hand goes back to the face where the face parser is sure of this face's skin, fully from this trust of the parser on (None = off)
+HAND_SOFT_TRIM = (0.5, 0.85)  # the parser's skin from which .. to which the rest of the drawn hand goes back to the face
+HAND_CORE_TRIM = (0.8, 0.95)  # ... and the core itself, where the parser is all but certain (c023's heart: the palm's points 40..60 px inside the hands, on the cheeks;
+                              # the parser saw the cheeks as the face's own to their edges), None: the core is the hand whatever the parser says
+LIMB_R_ANATOMY = 1.0          # a limb's capsule at most this times its anatomical half-width (body.SEGMENTS: a share of its length): the person matte gives an arm in front of
+                              # the body or the face the body's width (c024: a forearm drawn half as wide again as it is, over the jaw and the chin), None = off
+LIMB_WRIST = 0.65             # a forearm ends flat at the wrist, this narrow there (of its width at the elbow), not with a round cap as wide as the forearm that lay over the
+                              # cheek past the wrist (c021 f16); the hand from the wrist on is the hand's own (None: a capsule as before)
+LIMB_SOFT = 0.02              # of the face width: the cover's soft edge (0.03 before 11/28)
 
 
 def limb_cover(st, t: int, lm: np.ndarray, shape, sx: float, sy: float, p_self: Optional[int] = None,
@@ -955,30 +991,36 @@ def limb_cover(st, t: int, lm: np.ndarray, shape, sx: float, sy: float, p_self: 
     cv2.fillConvexPoly(face, zone, 255)
     x0, y0 = zone[:, 0].min(0) - 0.2 * Wf
     x1, y1 = zone[:, 0].max(0) + 0.2 * Wf
-    m = np.zeros(shape, np.uint8)
+    m = np.zeros(shape, np.uint8)            # limbs, the hands' cores: the cover whatever the parser says
+    m_core = np.zeros(shape, np.uint8)       # the hands' cores (HAND_CORE): given back only where the parser is all but certain of this face's skin
+    m_soft = np.zeros(shape, np.uint8)       # the drawn hands round their cores: given back where the parser is sure of this face's skin
     hit = False
     # (the check of the 1128 files, c002 f74 / f76: the shoulder and upper arm of somebody standing behind lay over the face's cheek in the picture,
     # their joints called seen, and the cheek lost its retouch for twenty frames) somebody else's limb is in front of this face only where the parser
     # does not see this face's skin under it (it leaves anything in front of the face out of its skin)
-    sure_ = None
+    psure_ = None                            # the parser's sure skin of this face, its trust laid on (0..1)
+    pskin_ = None
+    ptrust_ = 0.0
     fzm_ = None
-    if LIMB_OTHER_SKIN is not None and p_self is not None and parse is not None and float(parse.get("trust", 0)) > 0 and "skin" in parse:
+    if p_self is not None and parse is not None and float(parse.get("trust", 0)) > 0 and "skin" in parse:
         try:
             fzm_ = np.zeros(shape, np.uint8)
             cv2.fillPoly(fzm_, [np.round(poly).astype(np.int32)], 1)
-            sure_ = np.clip((np.asarray(parse["skin"], np.float32) - 0.5) / 0.35, 0.0, 1.0) * float(parse["trust"])
+            pskin_ = np.asarray(parse["skin"], np.float32)
+            ptrust_ = float(parse["trust"])
+            psure_ = np.clip((pskin_ - 0.5) / 0.35, 0.0, 1.0) * ptrust_
         except Exception:
-            sure_ = None
+            psure_, pskin_ = None, None
 
     def _behind(q_, draw) -> bool:
         """somebody else's limb or hand (draw(mask) puts it on a mask) that lies over this face's sure skin: it is behind the head"""
-        if sure_ is None or int(q_) == int(p_self):
+        if LIMB_OTHER_SKIN is None or psure_ is None or int(q_) == int(p_self):
             return False
         tm_ = np.zeros(shape, np.uint8)
         draw(tm_)
         on_ = (tm_ > 0) & (fzm_ > 0)
         n_ = float(on_.sum())
-        return n_ > 20 and float((sure_[on_] > 0.5).sum()) / n_ > float(LIMB_OTHER_SKIN)
+        return n_ > 20 and float((psure_[on_] > 0.5).sum()) / n_ > float(LIMB_OTHER_SKIN)
 
     for q in np.nonzero(st.present[:, t])[0]:
         kp = st.final[q, t]
@@ -1003,11 +1045,17 @@ def limb_cover(st, t: int, lm: np.ndarray, shape, sx: float, sy: float, p_self: 
                 sc = float(st.scale[q, t]) if np.isfinite(st.scale[q, t]) else 0.0
                 r = 0.06 * sc * sx
             r = min(r, 0.6 * Wf)
+            if LIMB_R_ANATOMY is not None:
+                ra_ = float(LIMB_R_ANATOMY) * float(s.fallback) * float(np.hypot(*((kp[jb, :2] - kp[ja, :2]) * [sx, sy])))
+                if ra_ > 2:
+                    r = min(r, ra_)
             if r < 2:
                 continue
-            if _behind(q, lambda mm_, a=a, b=b, r=r: _capsule(mm_, a, b, 0.9 * r)):
+            wr_ = LIMB_WRIST if name.startswith("forearm") else None
+            draw_ = (lambda mm_, a=a, b=b, r=r, wr_=wr_: _limb(mm_, a, b, 0.9 * r, wr_))
+            if _behind(q, draw_):
                 continue
-            _capsule(m, a, b, 0.9 * r)
+            draw_(m)
             hit = True
         # hands: tracked hand points, else the whole-body model's hand points where it is sure of them
         tracked = getattr(st, "has_hands", False) and np.isfinite(st.hand[q, t, :, :2]).any()
@@ -1034,8 +1082,10 @@ def limb_cover(st, t: int, lm: np.ndarray, shape, sx: float, sy: float, p_self: 
                 ref_ = fore if fore and fore > 4 else 0.25 * float(np.nan_to_num(st.scale[q, t])) * sx
                 # ... unless the model is sure of all 21 points of this hand (a hand held close to the camera in front of the face is longer than the forearm
                 # that foreshortening makes short, c057: confidences 3.7 and up; the false hands of cut 069 had 1.4 to 1.7): then the points are the hand
-                sure_ = HAND_TRUST_CONF > 0 and int(okh.sum()) >= 20 and float(np.nanmean(hh[okh, 2])) >= HAND_TRUST_CONF and span <= HAND_TRUST_SPAN * Wf
-                if sure_:
+                # (the name was sure_, the parser's map's own name since 11/28: once a hand had been looked at, a limb of somebody else over this face
+                # failed the cover of this face as a whole)
+                all_sure_ = HAND_TRUST_CONF > 0 and int(okh.sum()) >= 20 and float(np.nanmean(hh[okh, 2])) >= HAND_TRUST_CONF and span <= HAND_TRUST_SPAN * Wf
+                if all_sure_:
                     pass
                 elif ref_ <= 0 or span > 1.1 * ref_:
                     pts = None
@@ -1060,6 +1110,7 @@ def limb_cover(st, t: int, lm: np.ndarray, shape, sx: float, sy: float, p_self: 
                 _capsule(m, pts[0], pts[1], 0.5 * float(np.hypot(*(pts[1] - pts[0]))))
             else:
                 hm = np.zeros(shape, np.uint8)
+                hc_ = None                   # the hand's core (with HAND_CORE): the cover whatever the parser says; hm is then its soft part
                 span = float(np.ptp(pts, 0).max())
                 if HAND_SHAPE is not None and len(pts) == 21 and okh.all():
                     # (the check of the 1128 files: c023's hands making a heart round the face, c024's on both cheeks, c026's held together at the mouth:
@@ -1067,26 +1118,53 @@ def limb_cover(st, t: int, lm: np.ndarray, shape, sx: float, sy: float, p_self: 
                     # whose 21 points are all there is its palm and its fingers, as thick as a finger and a little more, not their hull
                     hp_ = hh[:, :2] * [sx, sy]
                     pw_ = max(2.0, float(np.hypot(*(hp_[5] - hp_[17]))), 0.25 * span)
-                    cv2.fillPoly(hm, [np.round(hp_[[0, 1, 2, 5, 9, 13, 17]]).astype(np.int32)], 255, cv2.LINE_AA)
+                    palm_ = [np.round(hp_[[0, 1, 2, 5, 9, 13, 17]]).astype(np.int32)]
+                    cv2.fillPoly(hm, palm_, 255, cv2.LINE_AA)
                     rf_ = HAND_SHAPE[0] * pw_
-                    for ch_ in ((0, 1, 2, 3, 4), (5, 6, 7, 8), (9, 10, 11, 12), (13, 14, 15, 16), (17, 18, 19, 20), (0, 5), (0, 17)):
-                        for a_i, b_i in zip(ch_[:-1], ch_[1:]):
-                            _capsule(hm, hp_[a_i], hp_[b_i], rf_)
+                    bones_ = [(a_i, b_i) for ch_ in ((0, 1, 2, 3, 4), (5, 6, 7, 8), (9, 10, 11, 12), (13, 14, 15, 16), (17, 18, 19, 20), (0, 5), (0, 17))
+                              for a_i, b_i in zip(ch_[:-1], ch_[1:])]
+                    for a_i, b_i in bones_:
+                        _capsule(hm, hp_[a_i], hp_[b_i], rf_)
                     k = max(3, int(HAND_SHAPE[1] * span) | 1)
+                    if HAND_CORE is not None:
+                        # the core: the palm and each bone along its middle line
+                        hc_ = np.zeros(shape, np.uint8)
+                        cv2.fillPoly(hc_, palm_, 255, cv2.LINE_AA)
+                        rc_ = float(HAND_CORE) * pw_
+                        for a_i, b_i in bones_:
+                            _capsule(hc_, hp_[a_i], hp_[b_i], rc_)
                 else:
                     cv2.fillConvexPoly(hm, cv2.convexHull(np.round(pts).astype(np.int32)), 255, cv2.LINE_AA)
                     k = max(3, int(0.15 * span) | 1)
                 hm = cv2.dilate(hm, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
                 if _behind(q, lambda mm_, hm=hm: np.copyto(mm_, hm)):
                     continue
-                m = np.maximum(m, hm)
+                if hc_ is not None:
+                    m_core = np.maximum(m_core, hc_)
+                    m_soft = np.maximum(m_soft, hm)
+                else:
+                    m = np.maximum(m, hm)
             hit = True
     if not hit:
         return None
-    m = cv2.bitwise_and(m, cv2.dilate(face, np.ones((max(3, int(0.1 * Wf) | 1),) * 2, np.uint8)))
-    if not m.any():
+    zone_ = cv2.dilate(face, np.ones((max(3, int(0.1 * Wf) | 1),) * 2, np.uint8))
+    mf = cv2.bitwise_and(m, zone_).astype(np.float32) / 255.0
+    tr_ = min(1.0, ptrust_ / max(1e-3, float(HAND_PARSE_TRIM))) if (HAND_PARSE_TRIM is not None and pskin_ is not None) else 0.0
+
+    def _given(x_, lohi):
+        # a hand's part (0..1) with the face the parser is sure of given back
+        if lohi is None or tr_ <= 0:
+            return x_
+        lo_, hi_ = float(lohi[0]), float(lohi[1])
+        return x_ * (1.0 - np.clip((pskin_ - lo_) / max(1e-3, hi_ - lo_), 0.0, 1.0) * tr_)
+
+    if m_core.any():
+        mf = np.maximum(mf, _given(cv2.bitwise_and(m_core, zone_).astype(np.float32) / 255.0, HAND_CORE_TRIM))
+    if m_soft.any():
+        mf = np.maximum(mf, _given(cv2.bitwise_and(m_soft, zone_).astype(np.float32) / 255.0, HAND_SOFT_TRIM))
+    if not (mf > 0.004).any():
         return None
-    return cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.03 * Wf))
+    return cv2.GaussianBlur(mf.astype(np.float32), (0, 0), max(1.0, float(LIMB_SOFT) * Wf))
 
 
 ARMPIT = 0.0          # 0 = off. Skin retouch on the armpits too (cut 055: raised arms, user 2026-11-14); the render script
