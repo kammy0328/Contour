@@ -922,9 +922,12 @@ HAND_RAW_MIN = 2.2    # confidence of the whole-body model's hand points to coun
 
 HAND_TRUST_CONF = float(__import__('os').environ.get('IWALY_HAND_TRUST', '0'))   # 0 = off. Mean confidence of the whole-body model's 21 hand points from which they are the hand whatever the forearm says
 HAND_TRUST_SPAN = 2.0        # of the face width: a hand points' span beyond this is no hand
+HAND_SHAPE = (0.22, 0.06)      # (11/28) a hand with all its points: fingers drawn this thick (of the palm's width, radius), the whole widened by this share of its span (None: the points' hull)
+LIMB_OTHER_SKIN = 0.6         # (11/28) somebody else's limb or hand over more than this share of the face's skin the parser is sure of lies behind the head (None = off)
 
 
-def limb_cover(st, t: int, lm: np.ndarray, shape, sx: float, sy: float) -> Optional[np.ndarray]:
+def limb_cover(st, t: int, lm: np.ndarray, shape, sx: float, sy: float, p_self: Optional[int] = None,
+               parse: Optional[dict] = None) -> Optional[np.ndarray]:
     """0..1 over the face and neck where an arm, a leg or a hand (this person's or anyone's) passes in front.
 
     A leg in a high kick, a forearm across the face, a hand at the cheek: skin coloured, so the colour model
@@ -953,6 +956,29 @@ def limb_cover(st, t: int, lm: np.ndarray, shape, sx: float, sy: float) -> Optio
     x1, y1 = zone[:, 0].max(0) + 0.2 * Wf
     m = np.zeros(shape, np.uint8)
     hit = False
+    # (the check of the 1128 files, c002 f74 / f76: the shoulder and upper arm of somebody standing behind lay over the face's cheek in the picture,
+    # their joints called seen, and the cheek lost its retouch for twenty frames) somebody else's limb is in front of this face only where the parser
+    # does not see this face's skin under it (it leaves anything in front of the face out of its skin)
+    sure_ = None
+    fzm_ = None
+    if LIMB_OTHER_SKIN is not None and p_self is not None and parse is not None and float(parse.get("trust", 0)) > 0 and "skin" in parse:
+        try:
+            fzm_ = np.zeros(shape, np.uint8)
+            cv2.fillPoly(fzm_, [np.round(poly).astype(np.int32)], 1)
+            sure_ = np.clip((np.asarray(parse["skin"], np.float32) - 0.5) / 0.35, 0.0, 1.0) * float(parse["trust"])
+        except Exception:
+            sure_ = None
+
+    def _behind(q_, draw) -> bool:
+        """somebody else's limb or hand (draw(mask) puts it on a mask) that lies over this face's sure skin: it is behind the head"""
+        if sure_ is None or int(q_) == int(p_self):
+            return False
+        tm_ = np.zeros(shape, np.uint8)
+        draw(tm_)
+        on_ = (tm_ > 0) & (fzm_ > 0)
+        n_ = float(on_.sum())
+        return n_ > 20 and float((sure_[on_] > 0.5).sum()) / n_ > float(LIMB_OTHER_SKIN)
+
     for q in np.nonzero(st.present[:, t])[0]:
         kp = st.final[q, t]
         for name in COVER_SEGS:
@@ -977,6 +1003,8 @@ def limb_cover(st, t: int, lm: np.ndarray, shape, sx: float, sy: float) -> Optio
                 r = 0.06 * sc * sx
             r = min(r, 0.6 * Wf)
             if r < 2:
+                continue
+            if _behind(q, lambda mm_, a=a, b=b, r=r: _capsule(mm_, a, b, 0.9 * r)):
                 continue
             _capsule(m, a, b, 0.9 * r)
             hit = True
@@ -1026,13 +1054,31 @@ def limb_cover(st, t: int, lm: np.ndarray, shape, sx: float, sy: float) -> Optio
             if pts[:, 0].max() < x0 or pts[:, 0].min() > x1 or pts[:, 1].max() < y0 or pts[:, 1].min() > y1:
                 continue
             if len(pts) == 2:
+                if _behind(q, lambda mm_, pts=pts: _capsule(mm_, pts[0], pts[1], 0.5 * float(np.hypot(*(pts[1] - pts[0]))))):
+                    continue
                 _capsule(m, pts[0], pts[1], 0.5 * float(np.hypot(*(pts[1] - pts[0]))))
             else:
                 hm = np.zeros(shape, np.uint8)
-                cv2.fillConvexPoly(hm, cv2.convexHull(np.round(pts).astype(np.int32)), 255, cv2.LINE_AA)
                 span = float(np.ptp(pts, 0).max())
-                k = max(3, int(0.15 * span) | 1)
-                m = np.maximum(m, cv2.dilate(hm, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))))
+                if HAND_SHAPE is not None and len(pts) == 21 and okh.all():
+                    # (the check of the 1128 files: c023's hands making a heart round the face, c024's on both cheeks, c026's held together at the mouth:
+                    # the hull of the hand's points took in the face between the fingers and beside the thumb, and that skin lost its retouch) a hand
+                    # whose 21 points are all there is its palm and its fingers, as thick as a finger and a little more, not their hull
+                    hp_ = hh[:, :2] * [sx, sy]
+                    pw_ = max(2.0, float(np.hypot(*(hp_[5] - hp_[17]))), 0.25 * span)
+                    cv2.fillPoly(hm, [np.round(hp_[[0, 1, 2, 5, 9, 13, 17]]).astype(np.int32)], 255, cv2.LINE_AA)
+                    rf_ = HAND_SHAPE[0] * pw_
+                    for ch_ in ((0, 1, 2, 3, 4), (5, 6, 7, 8), (9, 10, 11, 12), (13, 14, 15, 16), (17, 18, 19, 20), (0, 5), (0, 17)):
+                        for a_i, b_i in zip(ch_[:-1], ch_[1:]):
+                            _capsule(hm, hp_[a_i], hp_[b_i], rf_)
+                    k = max(3, int(HAND_SHAPE[1] * span) | 1)
+                else:
+                    cv2.fillConvexPoly(hm, cv2.convexHull(np.round(pts).astype(np.int32)), 255, cv2.LINE_AA)
+                    k = max(3, int(0.15 * span) | 1)
+                hm = cv2.dilate(hm, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+                if _behind(q, lambda mm_, hm=hm: np.copyto(mm_, hm)):
+                    continue
+                m = np.maximum(m, hm)
             hit = True
     if not hit:
         return None
@@ -1616,6 +1662,7 @@ NECK_BRIGHT_REF = 85      # (v2 review) percentile of the lower face's skin the 
 NECK_DARK_PARSED = True     # (1.27.1) where the parser is sure of neck, NECK_DARK does not take it out
 NECK_TURN = (0.25, 0.6)     # (1.27.1) face turn from .. to which the neck band moves under the jaw's middle and widens to it (None = off)
 NECK_SHADE_MIN = 0.045     # of the face width: narrower stretches the colour model leaves out stay out (hair, a chain)
+NECK_UP_PARSED = True      # (11/28) a face short from the brows to the chin (bowed, or thrown back): the parser's sure neck stays neck (False: none)
 
 
 NECK_PROTECT = 1.0         # how far the hair strands and paint the skin mask leaves out are kept out of the neck's mask (0 = as before:
@@ -1823,8 +1870,18 @@ def neck_mask(lm: np.ndarray, kp: np.ndarray, widths, shape, sx: float, sy: floa
     up_ = L[27] - L[8]
     up_ = up_ / max(1e-6, float(np.linalg.norm(up_)))
     span = float(abs((L[8] - L[17:27].mean(0)) @ up_)) / max(Wf, 1e-6)
-    f = f * float(np.clip((span - 0.55) / 0.2, 0, 1))
-    return f
+    gs_ = float(np.clip((span - 0.55) / 0.2, 0, 1))
+    if gs_ < 1.0 and NECK_UP_PARSED and parse is not None and parse.get("trust", 0) > 0:
+        # (client's 1st PV feedback 11/28, the check of the 1128 files, c034 f40: the head thrown back, seen from below, is as short from the brows to
+        # the chin as a head bowed, and the whole neck under the jaw, which the PDF marks for 목 닭살 / 목 결, was taken out) where the parser is sure
+        # of the neck it is the neck, whichever way the head is tilted
+        try:
+            sn_ = _ss(0.55, 0.85, cv2.GaussianBlur(parse["neck"].astype(np.float32), (0, 0), max(1.0, 0.015 * Wf))
+                      * cv2.GaussianBlur(parse["cover"].astype(np.float32), (0, 0), max(1.0, 0.04 * Wf))) * float(parse["trust"])
+            return f * np.maximum(gs_, sn_)
+        except Exception:
+            pass
+    return f * gs_
 
 
 def makeup_masks(lm: np.ndarray, shape, prob: np.ndarray, excl: np.ndarray, which, fth: float = 1.5):
@@ -3804,7 +3861,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 if lm is not None:
                     # an arm, a leg or a hand in front of the face: skin coloured, but not this face's skin
                     try:
-                        cv_ = limb_cover(st, t, lm, shape, px.sx, px.sy)
+                        cv_ = limb_cover(st, t, lm, shape, px.sx, px.sy, p, fmaps)
                     except Exception:
                         cv_ = None
                     if cv_ is not None and fmaps is not None:
@@ -7120,6 +7177,9 @@ MOUTH_SPOTS_K = 1.0          # the corners' pimples are filled at this more than
 # lip around them, their paleness (the red they lack) filled back; the lips' fine vertical lines (dark), their sheen (broad) and their edges stay.
 # The most taken: LIP_FLAKES[2] of white.
 LIP_FLAKES = (0.006, 0.016, 0.08)
+LIP_OPEN_MARGIN = 0.02            # (11/28 check) of the face width: an open mouth's opening is kept this far out of the lip flakes' zone (0 = LIP_FLAKES[0])
+LIP_FLAKES_TOP = (0.15, 0.02)     # (11/28 check) of white: a light spot standing out of the lip by more than [0] is no flake (the teeth): it and its rim stay; nor is a
+                                  # speck lighter by [1] that runs on out of the zone (teeth, skin) (None = off)
 NECK_TONE = (0.03, 0.4, 0.03)     # 목 톤 맞춤: the most moved in the colour planes, the share of the brightness difference taken, its most (of white)
 
 
@@ -7134,7 +7194,13 @@ def lip_zone(lm: Optional[np.ndarray], shape, wf: float) -> Optional[np.ndarray]
     _poly(i, L[60:68])
     d = max(1, int(round(LIP_FLAKES[0] * wf)))
     se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * d + 1, 2 * d + 1))
-    z = (cv2.erode(o, se) > 0) & (cv2.dilate(i, se) == 0)
+    di = d
+    if LIP_OPEN_MARGIN and float(np.hypot(*(L[66] - L[62]))) > 0.01 * wf:
+        # (the check of the 1128 files, c046 f5: the mouth open, the inner lips' points a few pixels into the teeth: the teeth's top edge inside the zone
+        # was taken for a row of light flakes and darkened) an open mouth's opening is kept out by LIP_OPEN_MARGIN of the face width
+        di = max(d, int(round(LIP_OPEN_MARGIN * wf)))
+    sei = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * di + 1, 2 * di + 1))
+    z = (cv2.erode(o, se) > 0) & (cv2.dilate(i, sei) == 0)
     return cv2.GaussianBlur(z.astype(np.float32), (0, 0), max(0.8, 0.004 * wf))
 
 
@@ -7147,8 +7213,26 @@ def _lip_flakes(Y, Cr, zY, zC, wf: float, cs: float, k: float):
     y0, y1, x0, x1 = r
     yc = Y[y0:y1, x0:x1].astype(np.float32)
     se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (n, n))
-    wt = yc - cv2.morphologyEx(yc, cv2.MORPH_OPEN, se)
-    wt = cv2.GaussianBlur(wt, (0, 0), max(0.6, 0.002 * wf))
+    wt0 = yc - cv2.morphologyEx(yc, cv2.MORPH_OPEN, se)
+    wt = cv2.GaussianBlur(wt0, (0, 0), max(0.6, 0.002 * wf))
+    if LIP_FLAKES_TOP is not None:
+        # (the check of the 1128 files, c046 f5 / f8: the teeth's tips and the gaps between them by the lips' inner edge stood out of the lip by a third of
+        # white and were darkened as flakes) a flake is a little lighter than the lip; what stands out far more (the teeth) is left alone, with its rim
+        big = (wt0 > float(LIP_FLAKES_TOP[0])).astype(np.uint8)
+        if len(LIP_FLAKES_TOP) > 1:
+            # ... and a light speck that runs on out of the zone (the teeth past the inner edge, the skin past the outer one: c046 f10) is no flake on the lip
+            cand = (wt0 > float(LIP_FLAKES_TOP[1])).astype(np.uint8)
+            n_, lab_ = cv2.connectedComponents(cand, connectivity=8)
+            if n_ > 1:
+                out_ = (cand > 0) & (zY[y0:y1, x0:x1] <= 0.5)
+                hit_ = np.unique(lab_[out_])
+                hit_ = hit_[hit_ > 0]
+                if hit_.size:
+                    big = np.maximum(big, np.isin(lab_, hit_).astype(np.uint8))
+        if big.any():
+            kb = max(3, int(round(0.008 * wf)) | 1)
+            big = cv2.dilate(big, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kb, kb)))
+            wt = wt * (1.0 - np.clip(cv2.GaussianBlur(big.astype(np.float32), (0, 0), max(0.6, 0.002 * wf)) * 1.5, 0, 1))
     cap = float(LIP_FLAKES[2])
     Yo = Y.astype(np.float32, copy=True)
     Yo[y0:y1, x0:x1] = yc - float(k) * np.clip(zY[y0:y1, x0:x1], 0, 1) * cap * np.tanh(wt / cap)
