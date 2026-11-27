@@ -91,6 +91,7 @@ class QueueItem:
     version: int = 0
     src_cs: str = ""              # the source colour space as the cut reads it
     matte: str = ""               # "old": render with the matte as saved, though edits wait for a refresh (§4)
+    qa_folder: str = ""           # (1.27.1) where the check after the render put its report and sheets
 
 
 STATUS_TEXT = {"wait": "대기", "running": "렌더 중", "done": "완료", "failed": "실패", "cancelled": "취소됨"}
@@ -562,9 +563,16 @@ class RenderQueuePage(QWidget):
         a_path = m.addAction("출력 폴더 바꾸기…")
         a_fmt = m.addAction("코덱 바꾸기…")
         a_open = m.addAction("출력 폴더 열기")
+        qa_dir = next((self.items[r].qa_folder for r in rows if 0 <= r < len(self.items) and getattr(self.items[r], "qa_folder", "")), "")
+        a_qa = m.addAction("검수 결과 폴더 열기") if qa_dir else None
         m.addSeparator()
         a_rm = m.addAction("목록에서 제거")
         act = m.exec(self.table.viewport().mapToGlobal(pos))
+        if a_qa is not None and act == a_qa:
+            from PySide6.QtCore import QUrl
+            from PySide6.QtGui import QDesktopServices
+            QDesktopServices.openUrl(QUrl.fromLocalFile(qa_dir))
+            return
         if act == a_path:
             self._change_path(rows)
         elif act == a_fmt:
@@ -684,8 +692,17 @@ class RenderQueuePage(QWidget):
             px = frames_for(prj, cut)              # the masks' frames: its proxy, else the original
             tr = CutTracker(prj, cut, px)
             out = OutputSettings.from_dict(nxt.output)
-            return render_cut(prj, cut, tr, out, progress, cancelled,
+            rep_ = render_cut(prj, cut, tr, out, progress, cancelled,
                               preview=lambda t_, rgb: self.previewed.emit(nxt.id, t_, rgb))
+            # (1.27.1) the rendered file checked right after (core.renderqa): the frames, every face's retouch frame by frame, what blinks
+            if not rep_.cancelled and rep_.out_path and _qa_on():
+                try:
+                    from ..core import renderqa as RQ
+                    a_, b_ = cut.work_range
+                    rep_.qa = RQ.check(prj, cut, tr, rep_.out_path, a_, b_, progress, cancelled)
+                except Exception as e:
+                    rep_.qa = dict(ok=False, problems=[f"검수를 하지 못했습니다 ({e.__class__.__name__})"])
+            return rep_
 
         self.job = Job(work, self)
         self.job.progressed.connect(self._prog)
@@ -719,7 +736,14 @@ class RenderQueuePage(QWidget):
             it.seconds = rep.seconds
             warn = f" · {rep.warnings[0]}" if rep.warnings else ""
             acc = f" · {rep.accel}" if getattr(rep, "accel", "") else ""
-            it.message = f"{Path(rep.out_path).name if rep.out_path else '출력 없음'} · {rep.seconds:.0f}초{warn}{acc}"
+            qa_ = getattr(rep, "qa", None)
+            qtxt = ""
+            if qa_:
+                qtxt = " · 검수 이상 없음" if qa_.get("ok") else " · 검수: " + "; ".join(qa_.get("problems", [])[:2])
+                it.qa_folder = qa_.get("folder", "")
+            it.message = f"{Path(rep.out_path).name if rep.out_path else '출력 없음'} · {rep.seconds:.0f}초{qtxt}{warn}{acc}"
+            if qa_ and not qa_.get("ok"):
+                self.main.toast(f"렌더 검수: {it.cut_name} · " + "; ".join(qa_.get("problems", [])[:2]) + "  (컷 폴더의 qa)", kind="warn")
             if it.kind == "timeline":
                 it.message = (f"{len(rep.paths)}개 파일 · 리터칭 {rep.retouched} · 원본 {rep.original} · 투명 "
                               f"{rep.transparent} · 제외 {rep.skipped} · {rep.seconds:.0f}초{warn}")
@@ -751,6 +775,15 @@ class RenderQueuePage(QWidget):
     def cancel_current(self):
         if self.job:
             self.job.cancel()
+
+
+def _qa_on() -> bool:
+    """the check after a render (core.renderqa), on unless the settings say "render_qa": false"""
+    try:
+        from ..core.settings import settings as _settings
+        return bool(getattr(_settings(), "render_qa", True))
+    except Exception:
+        return True
 
 
 def _log_error(text: str) -> None:

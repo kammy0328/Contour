@@ -28,6 +28,7 @@ class RenderReport:
     warnings: List[str] = field(default_factory=list)
     cancelled: bool = False
     accel: str = ""                       # how the warp ran (GPU / CPU, and why)
+    qa: Optional[dict] = None             # (1.27.1) the check of the rendered file (core.renderqa.check), when made
 
 
 def output_base(project: Project, cut: Cut, out: OutputSettings) -> Path:
