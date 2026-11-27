@@ -7747,8 +7747,8 @@ FINAL_WHITE_K = 0.009   # of the face width: the dot's size scale (top-hat)
 FINAL_WHITE_THR = 0.025 # brighter than the local level by this share
 FINAL_WHITE_BUSY = 0.06 # share of the window round a dot that may light up too (more: hair, texture, a glint row: left)
 FINAL_BUMP_NOSE = 0.0   # 0..1: the raised-spot fill kept off the nose (its bridge's highlight is no bump; ENDING: it blinked). 0 = as before
-BUMP_NOSTRIL = 0.06      # (1.27.1) of the face width: the nostrils' hull grown by this is no ground of the bump fill (0 = off)
-BUMP_LIFT_CAP = 0.03     # (1.27.1) most the bump fill lightens a point, softly (luma 0..1; None = no cap)
+BUMP_NOSTRIL = 0.16      # (1.27.1) of the face width: the nostrils' hull grown by this is no ground of the bump fill (0 = off)
+BUMP_LIFT_CAP = 0.02     # (1.27.1) most the bump fill lightens a point, softly (luma 0..1; None = no cap)
 BLEMISH_JAW_BAND = (0.16, 0.30)  # of the face width under the jaw line: the dark spots held there (the jaw's cast shadow), fading out
 BLEMISH_JAW_HOLD = True  # (1.27.1, c024 f3 p2) the dark spots of the blemish removal kept off the strip of neck the jaw shades (under_jaw_hold)
 # (1.26.2, 2611 LNGSHOT QA 11/26, 4K 1:1: 046 t12 and 054 t18 a beanie's knit right above the brows, 054 t18 the cheek's outline against the hair,
