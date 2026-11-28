@@ -157,3 +157,65 @@ def test_a_hands_margin_goes_back_to_the_face_where_the_parser_is_sure():
     assert float(c0[marg].mean()) > 2.5 * float(c1[marg].mean()), "the margin on the face the parser is sure of is given back"
     on_f = (fing > 0) & (face > 0)
     assert float(c1[on_f].mean()) > 0.85, "the fingers themselves stay covered"
+
+
+
+def _thumb(st, q, start, step, conf, i0=0):
+    """the hand's thumb (points 1..4) from `start`, `step` apart, all of this confidence"""
+    for j in range(4):
+        st.hand_raw[q, 0, i0 + 1 + j, :2] = np.asarray(start, np.float64) + np.asarray(step, np.float64) * j
+        st.hand_raw[q, 0, i0 + 1 + j, 2] = conf
+
+
+def _cover_at(st, lm, pts, held):
+    old = RE.HAND_THUMB_HELD
+    try:
+        RE.HAND_THUMB_HELD = held
+        cv_ = RE.limb_cover(st, 0, lm, (600, 700), 1.0, 1.0, 0, None)
+    finally:
+        RE.HAND_THUMB_HELD = old
+    assert cv_ is not None
+    return np.array([float(cv_[int(round(y)), int(round(x))]) for x, y in pts])
+
+
+def _hand_on_cheek():
+    """a hand on the face's left cheek, fingers up (the index finger at x 289, the little finger at 332), its forearm from below"""
+    st = _Store(1)
+    _put_arm(st, 0, (300.0, 590.0), (300.0, 430.0), 30.0, "L")
+    pts = _put_hand(st, 0, (300.0, 430.0), up=(0.0, -1.0), size=150.0, conf=5.0)
+    return st, pts
+
+
+def test_a_thumb_out_on_the_face_alone_is_held_to_the_hand():
+    """c024 f6: the right hand on the cheek, its fingers up; the model's thumb (less sure than the fingers) from the jaw up beside the mouth to the nose,
+    parallel to the fingers and out on the face alone: the cheek there is not covered (it was, the client's circle at 48:20)"""
+    lm = _face_lm()
+    st, pts = _hand_on_cheek()
+    _thumb(st, 0, (230.0, 400.0), (0.0, -35.0), 3.4)                    # 59 px beside the index finger, along it
+    on_thumb = [(230.0, 330.0), (230.0, 300.0)]
+    c_old = _cover_at(st, lm, on_thumb, None)
+    c_new = _cover_at(st, lm, on_thumb, RE.HAND_THUMB_HELD)
+    assert (c_old > 0.9).all(), "without the rule the thumb's strip is covered"
+    assert (c_new < 0.1).all(), "the cheek under the model's lone thumb keeps its retouch"
+    fing = [tuple(pts[1 + 4 * k + 2]) for k in range(1, 5)]
+    assert (_cover_at(st, lm, fing, RE.HAND_THUMB_HELD) > 0.9).all(), "the fingers stay covered"
+
+
+def test_a_thumb_the_model_is_sure_of_or_at_an_angle_stays():
+    """the same thumb, but the model as sure of it as of the fingers (c023's heart, c021's at the chin), or at an angle to them (c022's under the lip): covered"""
+    lm = _face_lm()
+    st, _ = _hand_on_cheek()
+    _thumb(st, 0, (230.0, 400.0), (0.0, -35.0), 4.6)                    # sure
+    assert (_cover_at(st, lm, [(230.0, 330.0), (230.0, 300.0)], RE.HAND_THUMB_HELD) > 0.9).all()
+    st2, _ = _hand_on_cheek()
+    _thumb(st2, 0, (270.0, 420.0), (-30.0, -20.0), 3.4)                 # unsure, out at 56 degrees to the fingers
+    assert (_cover_at(st2, lm, [(225.0, 390.0), (195.0, 370.0)], RE.HAND_THUMB_HELD) > 0.9).all()
+
+
+def test_a_thumb_laid_against_the_index_finger_stays():
+    """an unsure thumb along the fingers but against the index finger (the hand flat on the cheek, the thumb closed): still the hand"""
+    lm = _face_lm()
+    st, pts = _hand_on_cheek()
+    xi = float(pts[5:9, 0].mean())
+    _thumb(st, 0, (xi - 11.0, 395.0), (0.0, -30.0), 3.4)
+    assert (_cover_at(st, lm, [(xi - 11.0, 350.0), (xi - 11.0, 320.0)], RE.HAND_THUMB_HELD) > 0.9).all()

@@ -896,6 +896,22 @@ def _limb(m: np.ndarray, a, b, r: float, end: Optional[float] = None):
     cv2.circle(m, (int(round(a[0])), int(round(a[1]))), int(round(r)), 255, -1, cv2.LINE_AA)
 
 
+def _thumb_held(conf, xy) -> bool:
+    """HAND_THUMB_HELD: the 21 points' thumb (1..4) less sure than the share of the four fingers' (5..20) and running along the middle finger"""
+    if HAND_THUMB_HELD is None:
+        return False
+    c = np.nan_to_num(np.asarray(conf, np.float64))
+    fi = float(c[5:21].mean())
+    if not fi > 0 or float(c[1:5].mean()) >= float(HAND_THUMB_HELD[0]) * fi:
+        return False
+    xy = np.asarray(xy, np.float64)
+    a, b = xy[4] - xy[1], xy[12] - xy[9]
+    n = float(np.hypot(*a) * np.hypot(*b))
+    if not n > 1e-6:
+        return False
+    return float(np.degrees(np.arccos(np.clip(float(np.dot(a, b)) / n, -1.0, 1.0)))) < float(HAND_THUMB_HELD[1])
+
+
 def face_owned(st, t: int, p: int, lm: np.ndarray, alpha: np.ndarray, shape, sx: float, sy: float) -> np.ndarray:
     """The person matte, with this person's clearly visible face always theirs.
 
@@ -952,6 +968,12 @@ LIMB_OTHER_SKIN = 0.6         # (11/28) somebody else's limb or hand over more t
 # fingers, and that skin was left as it was) the hand points of a hand pressed to the face are a little off (c024 f20: the ring and little fingers' points 30..40 px
 # beside the fingers, over the cheek under the eye and the mouth's corner), and the drawn hand took a band of the face with it
 HAND_CORE = 0.10              # of the palm's width: the finger's own middle line this thick (radius) and the palm are the hand whatever the parser says (None: the drawn hand as it is)
+HAND_THUMB_HELD = (0.85, 25.0)  # (11/28, the third check: c024 f0..11, the right hand on the cheek: the model laid its thumb from the jaw up beside the mouth to the nose,
+                                # where the client circled the cheek to be smoothed, and that cheek kept its lines; the thumb is under the jaw) a thumb the model is
+                                # less sure of than this share of the four fingers' confidence that runs along the fingers (under this angle to the middle finger,
+                                # degrees) is drawn only as far as a finger's width beyond the rest of the hand: a thumb laid against the index finger stays, one
+                                # out on the face alone goes (c024's were 0.62 .. 0.72 and 2 .. 4 degrees; real ones out on the face, c021's at the chin, c022's under
+                                # the lip, c023's heart, at an angle of 27 degrees and more or 0.85 and more sure); None = off
 HAND_PARSE_TRIM = 0.5         # the rest of the drawn hand goes back to the face where the face parser is sure of this face's skin, fully from this trust of the parser on (None = off)
 HAND_SOFT_TRIM = (0.5, 0.85)  # the parser's skin from which .. to which the rest of the drawn hand goes back to the face
 HAND_CORE_TRIM = (0.8, 0.95)  # ... and the core itself, where the parser is all but certain (c023's heart: the palm's points 40..60 px inside the hands, on the cheeks;
@@ -1118,21 +1140,37 @@ def limb_cover(st, t: int, lm: np.ndarray, shape, sx: float, sy: float, p_self: 
                     # whose 21 points are all there is its palm and its fingers, as thick as a finger and a little more, not their hull
                     hp_ = hh[:, :2] * [sx, sy]
                     pw_ = max(2.0, float(np.hypot(*(hp_[5] - hp_[17]))), 0.25 * span)
-                    palm_ = [np.round(hp_[[0, 1, 2, 5, 9, 13, 17]]).astype(np.int32)]
-                    cv2.fillPoly(hm, palm_, 255, cv2.LINE_AA)
                     rf_ = HAND_SHAPE[0] * pw_
-                    bones_ = [(a_i, b_i) for ch_ in ((0, 1, 2, 3, 4), (5, 6, 7, 8), (9, 10, 11, 12), (13, 14, 15, 16), (17, 18, 19, 20), (0, 5), (0, 17))
-                              for a_i, b_i in zip(ch_[:-1], ch_[1:])]
-                    for a_i, b_i in bones_:
-                        _capsule(hm, hp_[a_i], hp_[b_i], rf_)
+                    fingers_ = [(a_i, b_i) for ch_ in ((5, 6, 7, 8), (9, 10, 11, 12), (13, 14, 15, 16), (17, 18, 19, 20), (0, 5), (0, 17))
+                                for a_i, b_i in zip(ch_[:-1], ch_[1:])]
+                    thumb_ = [(0, 1), (1, 2), (2, 3), (3, 4)]
+                    held_ = _thumb_held(hh[:, 2], hp_)
+
+                    def _draw(mm_, r_):
+                        # the palm and the bones, this thick; a held thumb only a finger's width beyond the rest of the hand
+                        if not held_:
+                            cv2.fillPoly(mm_, [np.round(hp_[[0, 1, 2, 5, 9, 13, 17]]).astype(np.int32)], 255, cv2.LINE_AA)
+                            for a_i, b_i in fingers_ + thumb_:
+                                _capsule(mm_, hp_[a_i], hp_[b_i], r_)
+                            return
+                        rest_ = np.zeros(shape, np.uint8)
+                        cv2.fillPoly(rest_, [np.round(hp_[[0, 5, 9, 13, 17]]).astype(np.int32)], 255, cv2.LINE_AA)
+                        for a_i, b_i in fingers_:
+                            _capsule(rest_, hp_[a_i], hp_[b_i], r_)
+                        th_ = np.zeros(shape, np.uint8)
+                        cv2.fillPoly(th_, [np.round(hp_[[0, 1, 2, 5]]).astype(np.int32)], 255, cv2.LINE_AA)
+                        for a_i, b_i in thumb_:
+                            _capsule(th_, hp_[a_i], hp_[b_i], r_)
+                        kr_ = max(3, int(2 * rf_) | 1)
+                        reach_ = cv2.dilate(rest_, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kr_, kr_)))
+                        np.maximum(mm_, np.maximum(rest_, cv2.bitwise_and(th_, reach_)), out=mm_)
+
+                    _draw(hm, rf_)
                     k = max(3, int(HAND_SHAPE[1] * span) | 1)
                     if HAND_CORE is not None:
                         # the core: the palm and each bone along its middle line
                         hc_ = np.zeros(shape, np.uint8)
-                        cv2.fillPoly(hc_, palm_, 255, cv2.LINE_AA)
-                        rc_ = float(HAND_CORE) * pw_
-                        for a_i, b_i in bones_:
-                            _capsule(hc_, hp_[a_i], hp_[b_i], rc_)
+                        _draw(hc_, float(HAND_CORE) * pw_)
                 else:
                     cv2.fillConvexPoly(hm, cv2.convexHull(np.round(pts).astype(np.int32)), 255, cv2.LINE_AA)
                     k = max(3, int(0.15 * span) | 1)
