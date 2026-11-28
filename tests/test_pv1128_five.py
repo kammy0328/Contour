@@ -214,6 +214,9 @@ def test_a_face_held_by_two_tracks_takes_the_landmarks_found_on_the_frame():
     assert RE._double_face(st, 0, 1) is None
     st.face[1, 1, :, :2] = st.face[0, 1, :, :2] + np.float32([8.0, 6.0])
     assert RE._double_face(st, 0, 1) is not None
+    st.face[1, 1, :, :2] = st.face[0, 1, :, :2] + np.float32([36.0, 27.0])    # 45 px apart, 0.22: two faces crossing (c022 f11)
+    assert RE._same_face(st, 1, 0, 1) and RE._double_face(st, 0, 1) is None
+    st.face[1, 1, :, :2] = st.face[0, 1, :, :2] + np.float32([8.0, 6.0])
     old = RE.DOUBLE_SURER
     try:
         RE.DOUBLE_SURER = None

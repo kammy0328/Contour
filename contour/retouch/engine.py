@@ -3696,8 +3696,8 @@ DOUBLE_DIST = 0.3     # face centres closer than this share of the face width: o
 # out of the face's skin, was taken for neck, and the neck's tone darkened it by 8 levels for that frame.) A face held by two tracks takes, on each
 # frame, the landmarks that were found on it: where this track's score is DOUBLE_SURER[0] or less and the other's [1] or more, the other's, when
 # the two jaw lines lie [2] of the face width or more apart (carried landmarks that sit where the found ones do are left: c003's, 0.01 to 0.03
-# apart on faces 90 px wide). None = off.
-DOUBLE_SURER = (0.1, 0.5, 0.03)
+# apart on faces 90 px wide) and no more than [3] (c022 f11: two tracks whose faces lay 0.22 apart are two faces crossing, not one). None = off.
+DOUBLE_SURER = (0.1, 0.5, 0.03, 0.10)
 
 
 def _double_face(st, p: int, t: int) -> Optional[np.ndarray]:
@@ -3708,7 +3708,7 @@ def _double_face(st, p: int, t: int) -> Optional[np.ndarray]:
     F = st.face
     if not np.isfinite(F[p, t, :, :2]).all():
         return None
-    lo, hi, apart = float(DOUBLE_SURER[0]), float(DOUBLE_SURER[1]), float(DOUBLE_SURER[2])
+    lo, hi, apart, far = (float(x_) for x_ in DOUBLE_SURER)
     if not float(np.nan_to_num(F[p, t, :, 2]).mean()) <= lo:
         return None
     best, bs = None, hi
@@ -3723,7 +3723,7 @@ def _double_face(st, p: int, t: int) -> Optional[np.ndarray]:
         return None
     d = F[best, t, :17, :2] - F[p, t, :17, :2]
     wf = float(np.hypot(*(F[p, t, 16, :2] - F[p, t, 0, :2])))
-    if wf <= 0 or float(np.hypot(d[:, 0], d[:, 1]).mean()) < apart * wf:
+    if wf <= 0 or not (apart * wf <= float(np.hypot(d[:, 0], d[:, 1]).mean()) <= far * wf):
         return None
     return F[best, t]
 
