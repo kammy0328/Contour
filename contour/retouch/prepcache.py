@@ -13,7 +13,7 @@ on the skin, for the caller to decide a cut must be prepared again.
 
 A folder holds one range of one cut with one set of values: meta.json (the cut, the range, the values' signature, the code's tag) and t00000.pz ... A render takes from it
 only when the cut, the range and the values are the same (Reader.open); anything else is prepared as ever. CONTOUR_PREP_CACHE (the root folder)
-with CONTOUR_PREP_CACHE_MODE "read" switches the render's use on (warp.render)."""
+with CONTOUR_PREP_CACHE_MODE "read" switches the render's use on (warp.render); "write" has a render save what it prepares."""
 from __future__ import annotations
 
 import hashlib
@@ -67,18 +67,22 @@ def _unbox(v):
     return v
 
 
-def _pack(rf) -> bytes:
-    """A prepared frame as bytes: its jobs' masks boxed (the frame itself is not changed)."""
+def _pickled(rf) -> bytes:
+    """A prepared frame pickled now, its jobs' masks boxed (the frame itself is not changed; what is done to it afterwards is not in the bytes)."""
     import copy
     if rf is None:
-        return zlib.compress(pickle.dumps(None, protocol=5), LEVEL)
+        return pickle.dumps(None, protocol=5)
     r2 = copy.copy(rf)
     r2.jobs = []
     for j in rf.jobs:
         jj = copy.copy(j)
         jj.masks = {k: _box(v) for k, v in j.masks.items()}
         r2.jobs.append(jj)
-    return zlib.compress(pickle.dumps(r2, protocol=5), LEVEL)
+    return pickle.dumps(r2, protocol=5)
+
+
+def _pack(rf) -> bytes:
+    return zlib.compress(_pickled(rf), LEVEL)
 
 
 def _unpack(b: bytes):
@@ -122,6 +126,8 @@ class Writer:
         self.d, self.meta = d, meta
         self.q = Q.Queue(maxsize=max(1, queue))
         self.err = None
+        self.lock = threading.Lock()
+        self.seen = set()
         self.bytes = 0
         self.n = 0
         self.th = threading.Thread(target=self._run, daemon=True, name="prep-cache")
@@ -132,9 +138,9 @@ class Writer:
             it = self.q.get()
             if it is None:
                 return
-            t, rf = it
+            t, raw = it
             try:
-                b = _pack(rf)
+                b = zlib.compress(raw, LEVEL)
                 p = _fpath(self.d, t)
                 with open(p + ".tmp", "wb") as f:
                     f.write(b)
@@ -145,16 +151,22 @@ class Writer:
                 self.err = e
 
     def put(self, t: int, rf) -> None:
+        """The frame as it is now (pickled here: the render goes on to retouch with it), written by the thread."""
         if self.err is not None:
             raise self.err
-        self.q.put((int(t), rf))
+        with self.lock:
+            if int(t) in self.seen:
+                return
+            self.seen.add(int(t))
+        self.q.put((int(t), _pickled(rf)))
 
     def close(self, ok: bool = True) -> dict:
         self.q.put(None)
         self.th.join()
         if self.err is not None:
             raise self.err
-        if ok:
+        want = self.meta.get("b", 0) - self.meta.get("a", 0)
+        if ok and self.n == want:
             m = dict(self.meta, frames=self.n, bytes=self.bytes)
             tmp = os.path.join(self.d, "meta.json.tmp")
             with open(tmp, "w", encoding="utf-8") as f:
@@ -240,6 +252,36 @@ def reader_for_render(cut, a: int, b: int, warnings: Optional[list] = None) -> O
     if r is None and warnings is not None:
         warnings.append("저장된 분석을 쓰지 않음: " + why)
     return r
+
+
+def writer_for_render(cut, a: int, b: int, warnings: Optional[list] = None) -> Optional[Writer]:
+    """(CONTOUR_PREP_CACHE_MODE write) the render saves each frame's analysis as it prepares it, so the cut can be rendered again on a new grade
+    from it (a render that is cancelled or fails leaves a folder that is never read)."""
+    if mode() != "write":
+        return None
+    try:
+        root = os.environ["CONTOUR_PREP_CACHE"]
+        if not _room(root):
+            if warnings is not None:
+                warnings.append("분석 저장 안 함: 디스크 공간 부족")
+            return None
+        return Writer(folder(root, cut, a, b), _meta(cut, a, b, os.environ.get("CONTOUR_PREP_CACHE_TAG", "")))
+    except Exception as e:      # noqa: BLE001
+        if warnings is not None:
+            warnings.append("분석 저장 안 함: " + str(e)[:120])
+        return None
+
+
+MIN_FREE_GB = 20.0
+
+
+def _room(root: str) -> bool:
+    import shutil
+    try:
+        os.makedirs(root, exist_ok=True)
+        return shutil.disk_usage(root).free / 2 ** 30 >= MIN_FREE_GB
+    except OSError:
+        return False
 
 
 def check_grade(old_rgb: np.ndarray, new_rgb: np.ndarray, mask: Optional[np.ndarray]) -> dict:

@@ -123,3 +123,42 @@ def test_check_grade():
     m[20:, 20:] = 1.0                                              # the skin
     assert PC.check_grade(a, b, m)["p99"] == 0.0
     assert PC.check_grade(a, b, None)["p99"] == 20.0
+
+
+@pytest.mark.parametrize("threads", ["1", "3"])
+def test_a_render_that_saves_its_analysis_gives_the_same_file_and_a_folder_a_later_render_reads(monkeypatch, threads):
+    monkeypatch.setenv("CONTOUR_RENDER_THREADS", threads)
+    monkeypatch.setattr(perf, "free_gb", lambda *a, **k: 64.0)
+    monkeypatch.setattr(PC, "MIN_FREE_GB", 0.0)
+    root = tempfile.mkdtemp()
+    prj = _project()
+    cut = prj.cuts[0]
+    a, b = cut.work_range
+    with BU.NoModels():
+        base = BU.render_planes(prj, cut)
+        monkeypatch.setenv("CONTOUR_PREP_CACHE", root)
+        monkeypatch.setenv("CONTOUR_PREP_CACHE_MODE", "write")
+        saving = BU.render_planes(prj, cut)
+        assert np.array_equal(base, saving)
+        r, why = PC.Reader.open(root, cut, a, b)
+        assert r is not None, why
+        called = []
+        prep = E.prepare
+        monkeypatch.setattr(E, "prepare", lambda *a_, **k: (called.append(a_[2]), prep(*a_, **k))[1])
+        monkeypatch.setenv("CONTOUR_PREP_CACHE_MODE", "read")
+        cached = BU.render_planes(prj, cut)
+        assert called == [] and np.array_equal(base, cached)
+
+
+def test_a_cancelled_render_leaves_no_folder_to_read(monkeypatch):
+    monkeypatch.setattr(perf, "free_gb", lambda *a, **k: 64.0)
+    monkeypatch.setattr(PC, "MIN_FREE_GB", 0.0)
+    root = tempfile.mkdtemp()
+    prj = _project()
+    cut = prj.cuts[0]
+    a, b = cut.work_range
+    d = PC.folder(root, cut, a, b)
+    w = PC.Writer(d, PC._meta(cut, a, b, ""))
+    w.put(a, None)
+    w.close(ok=True)                                               # one frame of several: not complete
+    assert PC.Reader.open(root, cut, a, b)[0] is None

@@ -337,17 +337,27 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
     # and nothing is prepared ahead for it; a frame not found is prepared as ever
     from ..retouch import prepcache as PCACHE
     pc_reader = PCACHE.reader_for_render(cut, a, b, rep.warnings)
+    pc_writer = PCACHE.writer_for_render(cut, a, b, rep.warnings) if pc_reader is None else None
+
+    def prepare_(t_):
+        rf_p = RE.prepare(cut, tracker, t_)
+        if pc_writer is not None:
+            try:
+                pc_writer.put(t_, rf_p)
+            except Exception as e:          # noqa: BLE001  (the render goes on without saving)
+                rep.warnings.append("분석 저장 오류: " + str(e)[:120])
+        return rf_p
 
     def prep_frame(t_):
         if pc_reader is not None:
             ok_, rf_c = pc_reader.get(t_)
             if ok_:
                 return rf_c
-        return RE.prepare(cut, tracker, t_)
+        return prepare_(t_)
 
     knee_look = None
     if pc_reader is None and parallel and n_workers > 1 and getattr(RE.BTN, "KNEE_ENV", False):
-        knee_look = RE.KneeLook(lambda t_: RE.prepare(cut, tracker, t_), lambda t_: F.build_input(cut, tracker, t_), prep_lock, a, b, tracker.proxy)
+        knee_look = RE.KneeLook(prepare_, lambda t_: F.build_input(cut, tracker, t_), prep_lock, a, b, tracker.proxy)
 
     # the raw frames (each frame's masks on their own, most of the serial stage) made ahead in helper processes when the environment asks for them
     # (CONTOUR_RAW_PROCS): retouch.rawpool. What a frame gets is the same; a frame no helper made is made here as before.
@@ -362,7 +372,13 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
     from ..retouch import applypool as AP
     apply_pool = AP.start_for_render(subs, maxv, pf, disp_, info.color_range) if parallel and n_workers > 1 else None
 
-    def stop_raw():
+    def stop_raw(ok=False):
+        if pc_writer is not None and not getattr(rep, "_pc_closed", False):
+            rep._pc_closed = True
+            try:
+                pc_writer.close(ok and not rep.cancelled)
+            except Exception as e:          # noqa: BLE001
+                rep.warnings.append("분석 저장 오류: " + str(e)[:120])
         if pc_reader is not None and not getattr(rep, "_pc_said", False):
             rep._pc_said = True
             rep.accel = (rep.accel + " · " if rep.accel else "") + f"저장된 분석 {pc_reader.hit}/{pc_reader.hit + pc_reader.miss}"
@@ -409,7 +425,7 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
                 fi_ = F.build_input(cut, tracker, t_)
         else:
             with prep_lock:                    # tracker caches are not shared between threads
-                rf_ = RE.prepare(cut, tracker, t_)
+                rf_ = prepare_(t_)
                 fi_ = F.build_input(cut, tracker, t_)
         if rf_ is not None and not rf_.empty():
             # (1.27) how many frames are retouched at once goes by the memory the computer has left (perf.FrameGate): told
@@ -568,7 +584,7 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
         for w in matte_writers.values():
             w.abort()
         raise
-    stop_raw()
+    stop_raw(ok=rep.frames >= n)
     reader.close()
     if not rep.cancelled and rep.frames < n:
         # the source ended early: a shorter file is not this cut (in an edited timeline every later shot would move)
