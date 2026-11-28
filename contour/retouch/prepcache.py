@@ -248,10 +248,18 @@ def reader_for_render(cut, a: int, b: int, warnings: Optional[list] = None) -> O
     """The render's reader when the environment asks for it (CONTOUR_PREP_CACHE, CONTOUR_PREP_CACHE_MODE read) and the folder fits."""
     if mode() != "read":
         return None
-    r, why = Reader.open(os.environ["CONTOUR_PREP_CACHE"], cut, a, b, os.environ.get("CONTOUR_PREP_CACHE_TAG"))
-    if r is None and warnings is not None:
+    why = ""
+    for root in roots():                       # (several folders: "C:\\a;Y:\\b", the first that has this range)
+        r, why = Reader.open(root, cut, a, b, os.environ.get("CONTOUR_PREP_CACHE_TAG"))
+        if r is not None:
+            return r
+    if warnings is not None:
         warnings.append("저장된 분석을 쓰지 않음: " + why)
-    return r
+    return None
+
+
+def roots() -> list:
+    return [r for r in (os.environ.get("CONTOUR_PREP_CACHE") or "").split(";") if r.strip()]
 
 
 def writer_for_render(cut, a: int, b: int, warnings: Optional[list] = None) -> Optional[Writer]:
@@ -260,7 +268,7 @@ def writer_for_render(cut, a: int, b: int, warnings: Optional[list] = None) -> O
     if mode() != "write":
         return None
     try:
-        root = os.environ["CONTOUR_PREP_CACHE"]
+        root = roots()[0]
         if not _room(root):
             if warnings is not None:
                 warnings.append("분석 저장 안 함: 디스크 공간 부족")

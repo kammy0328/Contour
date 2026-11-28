@@ -66,7 +66,7 @@ def test_a_render_from_the_saved_analysis_is_the_same_render(monkeypatch, thread
         called = []
         prep = E.prepare
         monkeypatch.setattr(E, "prepare", lambda *a, **k: (called.append(a[2]), prep(*a, **k))[1])
-        monkeypatch.setenv("CONTOUR_PREP_CACHE", root)
+        monkeypatch.setenv("CONTOUR_PREP_CACHE", tempfile.mkdtemp() + ";" + root)      # (the second of two folders has it)
         monkeypatch.setenv("CONTOUR_PREP_CACHE_MODE", "read")
         cached = BU.render_planes(prj, cut)
         assert called == []                                       # nothing prepared again
