@@ -395,6 +395,7 @@ def raw_ahead(people: int = 1, ram: Optional[float] = None, cores: Optional[int]
     """(frames, threads): the next frames' own masks made ahead of the render's serial stage (retouch/rawahead.py, 1.27).
     A frame in the making takes about a gigabyte and as many threads as it has people, so only where both are there:
 
+        RAM >= 28 GB and 18 cores or more: 5 frames ahead on 4 threads (1.28.1)
         RAM >= 28 GB and 16 cores or more: 3 frames ahead on 2 threads
         less: none, as before 1.27
 
@@ -403,6 +404,9 @@ def raw_ahead(people: int = 1, ram: Optional[float] = None, cores: Optional[int]
     takes cores from the frames being finished, so the serial stage waited on it; there is no tier with one thread.
     The computer's memory went to 30.7 of 31 GB in that run (16 GB of it other programs'), so while the render runs frames are
     made ahead only as long as RAW_AHEAD_MIN_FREE_GB of memory is free (rawahead.RawAhead.take).
+
+    (1.28.1) LNGSHOT BEEP BEEP c026 (4 faces, 4K, 35 frames, the same PC, 11/28, the engine of that day): 3 on 2 threads 7.55 s a frame,
+    4 on 3 6.67, 5 on 4 6.46, every frame of the file the same (j2935d). Measured on 18 cores only, so the wider tier starts there.
 
     CONTOUR_RAW_AHEAD "frames" or "frames:threads" overrides (0: none); render_parallel off: none."""
     v = os.environ.get("CONTOUR_RAW_AHEAD", "").strip()
@@ -417,6 +421,8 @@ def raw_ahead(people: int = 1, ram: Optional[float] = None, cores: Optional[int]
         return 0, 0
     ram = ram_gb() if ram is None else float(ram)
     cores = int(cores or os.cpu_count() or 1)
+    if ram >= 28 and cores >= 18:
+        return 5, 4
     if ram >= 28 and cores >= 16:
         return 3, 2
     return 0, 0

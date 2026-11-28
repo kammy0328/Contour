@@ -21,7 +21,8 @@ def _alive():
 
 def test_which_computers(monkeypatch):
     monkeypatch.delenv("CONTOUR_RAW_AHEAD", raising=False)
-    assert perf.raw_ahead(4, ram=31, cores=18) == (3, 2)
+    assert perf.raw_ahead(4, ram=31, cores=18) == (5, 4)          # (1.28.1: the wider tier where it was measured)
+    assert perf.raw_ahead(4, ram=31, cores=16) == (3, 2)
     # one thread ahead made the render slower (j2895c: 9.98 s a frame against 9.41 without): no tier with one
     assert perf.raw_ahead(4, ram=31, cores=8) == (0, 0)
     assert perf.raw_ahead(4, ram=24, cores=18) == (0, 0) and perf.raw_ahead(4, ram=31, cores=6) == (0, 0)
