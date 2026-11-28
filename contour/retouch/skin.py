@@ -158,9 +158,41 @@ SKIN_LINK_THR = 0.25       # how sure the skin it runs on through is (the colour
 SKIN_LINK_IN = 0.08        # of the face width: from this far inside the face's outline (its own skin, not a corner of it lying on the background)
 PARSE_FILL = (0.5, 0.8)    # (11/28) inside the face's outline the parser's skin from (to wholly) this sure fills the colour model's holes (None = off)
 PARSE_FILL_FEAT = 0.03     # of the face width: that fill keeps this far from the eyes, the brows and the lips
+# (11/28, c024 f12..16: a cheek in the sun beside the fingers of a hand laid on it, a hole of the colour model, was filled on the frames round these
+# and left on these five: the fill goes by the parser's trust, the share of the inner face the parser calls skin, and with both hands on the cheeks
+# and the mouth and chin between them not seen that share was 0.28 (trust 0.15); the cheek itself it saw, 0.92 sure.) A parser that sees less of a
+# face is not wrong where it does see skin; what makes it wrong is skin beside the face (landmarks or a crop that slid off it). For the fill the trust
+# is also the share of the parser's sure skin that lies inside the face's outline grown by [3] of the face width: none under [0], whole from [1],
+# when the sure skin is at least [2] of the inner face; the higher of the two trusts holds. None = off.
+PARSE_FILL_INSIDE = (0.80, 0.95, 0.15, 0.05)
 PARSE_REACH = 0.25     # of the face width: how far past the landmark outline the parser's sure skin still counts
 PARSE_SOFT = 0.008     # of the face width: smoothing of the parser's map before that (was 0.012)
 NOSTRIL_RX, NOSTRIL_RY = 0.60, 0.26   # nostril ellipse, of the nostrils' span (was 0.66 x 0.36)
+
+
+def parse_trust_inside(skin: np.ndarray, lm: np.ndarray, shape, rule=None) -> float:
+    """0..1: how far the parser's skin (0..1 at shape) is this face's by where it lies (PARSE_FILL_INSIDE; rule: its four values): the share of its
+    sure skin inside the face's outline (face_polygon(lm), grown), 0 when there is too little sure skin to tell."""
+    rule = PARSE_FILL_INSIDE if rule is None else rule
+    if rule is None or skin is None or lm is None:
+        return 0.0
+    lo, hi, least, grow = (float(x) for x in rule)
+    poly = face_polygon(lm)
+    if poly is None:
+        return 0.0
+    h, w = shape
+    Wf = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
+    fz = np.zeros((h, w), np.uint8)
+    cv2.fillPoly(fz, [np.round(poly).astype(np.int32)], 1)
+    inner = (fz > 0) & (_features_mask(lm, (h, w)) == 0)
+    n_in = int(inner.sum())
+    sure = np.clip((np.asarray(skin, np.float32) - 0.5) / 0.35, 0.0, 1.0)
+    tot = float(sure.sum())
+    if n_in <= 30 or tot < least * n_in:
+        return 0.0
+    kg = max(3, int(round(grow * Wf)) * 2 + 1)
+    grown = cv2.dilate(fz, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kg, kg))) > 0
+    return float(np.clip((float(sure[grown].sum()) / tot - lo) / max(1e-3, hi - lo), 0.0, 1.0))
 
 
 def _features_mask(lm: np.ndarray, shape: Tuple[int, int]) -> np.ndarray:
@@ -1050,7 +1082,10 @@ def skin_mask(job: SkinJob, rgb_proxy: np.ndarray, sx: float, sy: float, person_
                 cv2.fillPoly(fz_, [np.round(own_).astype(np.int32)], 255)
                 Wp_ = max(8.0, float(np.hypot(*(lm[16, :2] - lm[0, :2]))))
                 fzf_ = cv2.GaussianBlur(fz_.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.02 * Wp_))
-                ps_ = np.clip((parse["skin"].astype(np.float32) - PARSE_FILL[0]) / max(1e-6, PARSE_FILL[1] - PARSE_FILL[0]), 0, 1) * float(parse["trust"])
+                tp_ = float(parse["trust"])
+                if PARSE_FILL_INSIDE is not None and tp_ < 1.0:
+                    tp_ = max(tp_, parse_trust_inside(parse["skin"], lm, (h, w)))      # (PARSE_FILL_INSIDE) sure skin that lies inside the face
+                ps_ = np.clip((parse["skin"].astype(np.float32) - PARSE_FILL[0]) / max(1e-6, PARSE_FILL[1] - PARSE_FILL[0]), 0, 1) * tp_
                 fill_ = region * fzf_ * ps_
                 if cover is not None:
                     fill_ = fill_ * (1.0 - cover)

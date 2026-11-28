@@ -4,16 +4,14 @@
     sides do not count as one.
   - CHIN_PEBBLE_SLIP (c030 f41..43): landmarks that sit off the path of the frames before and after them have slid; the pebbled way of the chin's
     stages fades out on that frame. Job.slip is set by prepare() and, on a frame read from a saved analysis, by late().
-  - LIMB_SAME_FACE (c023 f2): the hands of a track that holds this same face are this person's own.
-  - HAND_TRUST_LOCAL (c024 f12..16): the parser's trust for the drawn hands' rim is also measured on the face the hands leave free."""
+  - DOUBLE_SURER (c023 f2): a face held by two tracks takes the landmarks found on the frame.
+  - PARSE_FILL_INSIDE (c024 f12..16): the parser's fill of the colour model's holes also goes by how much of its sure skin lies inside the face."""
 import numpy as np
 import cv2
 
 from contour.retouch import engine as RE
-from contour.track import skeleton as S
-from contour.warp.body import SEGMENTS
 
-from test_pv1128_hands import _face_lm, _put_hand
+from test_pv1128_hands import _face_lm
 
 
 # --------------------------------------------------------------------------- NECK_STRAND
@@ -133,95 +131,56 @@ def test_a_frame_read_from_a_saved_analysis_gets_its_slip():
     assert RE.late(None, _Tracker()) is None
 
 
-# --------------------------------------------------------------------------- hands
+# --------------------------------------------------------------------------- PARSE_FILL_INSIDE
 
-class _Store:
-    def __init__(self, n):
-        self.present = np.zeros((n, 1), bool)
-        self.final = np.full((n, 1, S.K, 3), np.nan, np.float32)
-        self.vis = np.zeros((n, 1, S.K), np.uint8)
-        self.widths = np.full((n, 1, len(SEGMENTS), 2), np.nan, np.float32)
-        self.scale = np.full((n, 1), 400.0, np.float32)
-        self.hand_raw = np.full((n, 1, 42, 3), np.nan, np.float32)
-        self.hand = np.full((n, 1, 42, 3), np.nan, np.float32)
-        self.has_hands = False
-        self.has_face = True
-        self.face = np.full((n, 1, 68, 3), np.nan, np.float32)
-        self.pids = np.arange(n)
-
-
-def _polygon_skin(lm, shape):
-    sk = np.zeros(shape, np.float32)
-    cv2.fillPoly(sk, [np.round(RE.SK.face_polygon(lm)).astype(np.int32)], 1.0)
-    return sk
+def _sunlit_cheek():
+    """A face whose colour model leaves a cheek in the sun out, and a parser that sees its upper half only (hands on the cheeks, the mouth and the chin
+    between them not seen)"""
+    h, w = 600, 700
+    lm = _face_lm(350.0, 280.0, 240.0)
+    face = np.zeros((h, w), np.float32)
+    cv2.fillPoly(face, [np.round(RE.SK.face_polygon(lm)).astype(np.int32)], 1.0)
+    patch = np.zeros((h, w), np.float32)
+    cv2.circle(patch, (425, 270), 22, 1.0, -1)
+    upper = face.copy()
+    upper[300:] = 0.0
+    return h, w, lm, face, patch > 0.5, upper
 
 
-def test_the_hand_of_a_track_holding_the_same_face_is_this_persons_own():
-    """c023 f2: the palm lies along the jaw, part of it over skin the parser is sure of; held by the other track of the same person it counted as
-    somebody else's hand behind the head and the palm beside the jaw was left to the retouch"""
-    h, w = 800, 800
-    lm = _face_lm(400.0, 300.0, 300.0)
-    st = _Store(2)
-    st.present[:, 0] = True
-    st.face[0, 0] = lm
-    st.face[1, 0] = lm + np.float32([6.0, 4.0, 0.0])                       # the same face, a few px off
-    pts = _put_hand(st, 1, (330.0, 700.0), size=300.0)                     # the other track's hand, from below up over the jaw
-    parse = dict(skin=_polygon_skin(lm, (h, w)), trust=1.0)
-    inside = parse["skin"] > 0.5
-    palm = np.zeros((h, w), np.uint8)
-    cv2.fillPoly(palm, [np.round(pts[[0, 5, 9, 13, 17]]).astype(np.int32)], 1)
-    below = (palm > 0) & ~inside                                           # the palm under the jaw: no face skin
-    assert int(below.sum()) > 500
-    cov = RE.limb_cover(st, 0, lm, (h, w), 1.0, 1.0, 0, parse)
-    assert cov is not None and float(np.asarray(cov)[below].mean()) > 0.8, "the palm beside the jaw is covered"
-    old = RE.LIMB_SAME_FACE
+def test_sure_skin_inside_the_face_is_trusted_however_little_of_the_face_it_is():
+    h, w, lm, face, patch, upper = _sunlit_cheek()
+    SK = RE.SK
+    assert SK.parse_trust_inside(upper, lm, (h, w)) > 0.99, "the upper face alone: all of it inside"
+    assert SK.parse_trust_inside(face, lm, (h, w)) > 0.99
+    assert SK.parse_trust_inside(np.roll(upper, 150, axis=1), lm, (h, w)) < 0.01, "skin beside the face: the landmarks or the crop slid"
+    few = np.zeros((h, w), np.float32)
+    few[250:262, 340:352] = 1.0
+    assert SK.parse_trust_inside(few, lm, (h, w)) == 0.0, "too little sure skin to tell"
+    assert SK.parse_trust_inside(upper, lm, (h, w), rule=None) > 0.99 and SK.parse_trust_inside(None, lm, (h, w)) == 0.0
+
+
+def test_the_parsers_fill_of_a_cheek_in_the_sun_holds_when_hands_take_its_share_of_the_face_down():
+    """c024 f12..16: PARSE_FILL went by the parser's trust (0.15 with both hands on the cheeks) and the cheek in the sun beside the fingers, filled
+    on the frames round them, was left for five frames"""
+    h, w, lm, face, patch, upper = _sunlit_cheek()
+    SK = RE.SK
+    prob0 = face * (1.0 - patch.astype(np.float32))
+    rgb = np.full((h, w, 3), 128, np.uint8)
+    job = SK.SkinJob(0, 0.7, 0.5, "face", lm.copy(), 1.0, 400.0)
+
+    def mask(skin, trust):
+        return SK.skin_mask(job, rgb, 1.0, 1.0, None, None, dict(skin=skin, trust=trust), None, None, prob0)
+
+    full = float(mask(face, 1.0)[patch].mean())
+    assert full > 0.7, "a trusted parser fills the cheek"
+    assert abs(float(mask(upper, 0.15)[patch].mean()) - full) < 0.02, "... and so does one that sees the upper face only"
+    assert float(mask(np.roll(upper, 150, axis=1), 0.15)[patch].mean()) < 0.25, "skin beside the face stays at its trust"
+    old = SK.PARSE_FILL_INSIDE
     try:
-        RE.LIMB_SAME_FACE = False
-        cov0 = RE.limb_cover(st, 0, lm, (h, w), 1.0, 1.0, 0, parse)
-        assert cov0 is None or float(np.asarray(cov0)[below].mean()) < 0.1, "(as somebody else's it lay behind the head)"
+        SK.PARSE_FILL_INSIDE = None
+        assert float(mask(upper, 0.15)[patch].mean()) < 0.25, "(as before: by the trust alone)"
     finally:
-        RE.LIMB_SAME_FACE = old
-    # somebody else's face elsewhere is somebody else
-    st.face[1, 0] = _face_lm(400.0 + 200.0, 300.0, 300.0)
-    assert not RE._same_face(st, 0, 0, 1)
-    cov1 = RE.limb_cover(st, 0, lm, (h, w), 1.0, 1.0, 0, parse)
-    assert cov1 is None or float(np.asarray(cov1)[below].mean()) < 0.1
-
-
-def test_the_drawn_hands_rim_goes_by_the_trust_of_the_face_they_leave_free():
-    """c024 f12..16: both hands on the cheeks; the parser sees the face's skin right up to the fingers, but its trust (the share of the inner face it
-    calls skin) is low because the hands lie on it"""
-    h, w = 800, 800
-    lm = _face_lm(400.0, 300.0, 300.0)
-    st = _Store(1)
-    pl = _put_hand(st, 0, (290.0, 640.0), size=300.0, i0=0)
-    pr = _put_hand(st, 0, (510.0, 640.0), size=300.0, i0=21)
-    # what the hands really cover: palm and fingers, 9 px thick (the drawn rim reaches about 20)
-    real = np.zeros((h, w), np.uint8)
-    for pts in (pl, pr):
-        cv2.fillPoly(real, [np.round(pts[[0, 1, 2, 5, 9, 13, 17]]).astype(np.int32)], 1)
-        for ch in ((1, 2, 3, 4), (5, 6, 7, 8), (9, 10, 11, 12), (13, 14, 15, 16), (17, 18, 19, 20), (0, 5), (0, 17)):
-            for a, b in zip(ch[:-1], ch[1:]):
-                cv2.line(real, tuple(int(round(x)) for x in pts[a]), tuple(int(round(x)) for x in pts[b]), 1, 18)
-    skin = _polygon_skin(lm, (h, w)) * (1.0 - real)
-    parse = dict(skin=skin, trust=0.15)
-    cov = np.asarray(RE.limb_cover(st, 0, lm, (h, w), 1.0, 1.0, 0, parse))
-    old = RE.HAND_TRUST_LOCAL
-    try:
-        RE.HAND_TRUST_LOCAL = None
-        cov0 = np.asarray(RE.limb_cover(st, 0, lm, (h, w), 1.0, 1.0, 0, parse))
-    finally:
-        RE.HAND_TRUST_LOCAL = old
-    rim = (cov0 > 0.5) & (skin > 0.99) & (cv2.dilate(real, np.ones((13, 13), np.uint8)) == 0)       # the face's skin in the drawn rim, clear of the hand
-    assert int(rim.sum()) > 300
-    assert float(cov[rim].mean()) < 0.15, "the cheek beside the fingers is the face's again"
-    hand = cv2.erode(real, np.ones((9, 9), np.uint8)) > 0
-    assert float(cov[hand].mean()) > 0.85 and float((cov0 - cov)[hand].mean()) < 0.03, "the hands stay covered (the rim's soft edge at the fingertips aside)"
-    assert float((cov - cov0).max()) < 1e-4, "nothing is covered that was not"
-    # a face the parser does not see where the hands leave it free: its trust stays low
-    parse2 = dict(skin=skin * 0.3, trust=0.0)
-    c2 = np.asarray(RE.limb_cover(st, 0, lm, (h, w), 1.0, 1.0, 0, parse2))
-    assert float(c2[rim].mean()) > 0.5
+        SK.PARSE_FILL_INSIDE = old
 
 
 # --------------------------------------------------------------------------- DOUBLE_SURER

@@ -996,12 +996,6 @@ HAND_PARSE_TRIM = 0.5         # the rest of the drawn hand goes back to the face
 HAND_SOFT_TRIM = (0.5, 0.85)  # the parser's skin from which .. to which the rest of the drawn hand goes back to the face
 HAND_CORE_TRIM = (0.8, 0.95)  # ... and the core itself, where the parser is all but certain (c023's heart: the palm's points 40..60 px inside the hands, on the cheeks;
                               # the parser saw the cheeks as the face's own to their edges), None: the core is the hand whatever the parser says
-# (11/28, c024 f12..16, both hands laid on the cheeks: the cheek under the eye's outer corner, above a fingertip, lay in the drawn hand's rim and kept only a
-# third of its smoothing for five frames, the frames round them all of it. The parser's trust is the share of the inner face it calls skin, and the two hands
-# took that share to 0.39 (trust 0.15): the rim goes back to the face in proportion to the trust.) Hands over the face are no fault of the parser's: for the
-# drawn hands' rim the trust is also measured on the inner face the drawn hands and limbs leave free, when that is at least HAND_TRUST_LOCAL of the inner
-# face, and the higher of the two holds. The hands' cores go by the whole face's trust as before. None = off.
-HAND_TRUST_LOCAL = 0.25
 LIMB_R_ANATOMY = 1.0          # a limb's capsule at most this times its anatomical half-width (body.SEGMENTS: a share of its length): the person matte gives an arm in front of
                               # the body or the face the body's width (c024: a forearm drawn half as wide again as it is, over the jaw and the chin), None = off
 LIMB_WRIST = 0.65             # a forearm ends flat at the wrist, this narrow there (of its width at the elbow), not with a round cap as wide as the forearm that lay over the
@@ -1010,7 +1004,7 @@ LIMB_SOFT = 0.02              # of the face width: the cover's soft edge (0.03 b
 
 
 def limb_cover(st, t: int, lm: np.ndarray, shape, sx: float, sy: float, p_self: Optional[int] = None,
-               parse: Optional[dict] = None, dbg: Optional[dict] = None) -> Optional[np.ndarray]:
+               parse: Optional[dict] = None) -> Optional[np.ndarray]:
     """0..1 over the face and neck where an arm, a leg or a hand (this person's or anyone's) passes in front.
 
     A leg in a high kick, a forearm across the face, a hand at the cheek: skin coloured, so the colour model
@@ -1058,21 +1052,10 @@ def limb_cover(st, t: int, lm: np.ndarray, shape, sx: float, sy: float, p_self: 
         except Exception:
             psure_, pskin_ = None, None
 
-    # (11/28, LNGSHOT BEEP BEEP c023 f2: one person held by two tracks for the cut's first four frames; the face went from one to the other on f2, the
-    # hands stayed with the first, and to the second they were somebody else's: lying along the jaw, over skin the parser is sure of, they counted as
-    # behind the head, and for a frame the palm beside the jaw was retouched as the face's own skin) a track that holds this same face on this frame
-    # (_same_face) is this person: its limbs and hands are this person's own
-    same_ = set()
-    if p_self is not None and LIMB_SAME_FACE:
-        try:
-            same_ = {int(q_) for q_ in np.nonzero(st.present[:, t])[0] if int(q_) != int(p_self) and _same_face(st, t, int(p_self), int(q_))}
-        except Exception:
-            same_ = set()
-
     def _behind(q_, draw) -> bool:
         """somebody else's limb or hand (draw(mask) puts it on a mask) that lies over this face's sure skin, or belongs to somebody clearly farther
         from the camera (LIMB_OTHER_FAR): it is behind the head"""
-        if p_self is None or int(q_) == int(p_self) or int(q_) in same_:
+        if p_self is None or int(q_) == int(p_self):
             return False
         if LIMB_OTHER_FAR is not None:
             try:
@@ -1233,37 +1216,17 @@ def limb_cover(st, t: int, lm: np.ndarray, shape, sx: float, sy: float, p_self: 
     zone_ = cv2.dilate(face, np.ones((max(3, int(0.1 * Wf) | 1),) * 2, np.uint8))
     mf = cv2.bitwise_and(m, zone_).astype(np.float32) / 255.0
     tr_ = min(1.0, ptrust_ / max(1e-3, float(HAND_PARSE_TRIM))) if (HAND_PARSE_TRIM is not None and pskin_ is not None) else 0.0
-    tr_soft_ = tr_
-    if HAND_TRUST_LOCAL is not None and HAND_PARSE_TRIM is not None and pskin_ is not None and fzm_ is not None and tr_ < 1.0 and m_soft.any():
-        # (HAND_TRUST_LOCAL) the parser's trust measured on the face the drawn hands and limbs leave free
-        try:
-            inner_ = (fzm_ > 0) & (SK._features_mask(lm, shape) == 0)
-            free_ = inner_ & (m_soft == 0) & (m_core == 0) & (m == 0)
-            n_in_, n_free_ = int(inner_.sum()), int(free_.sum())
-            if dbg is not None:
-                dbg.update(trust=ptrust_, inner=n_in_, free=n_free_, skin_free=float(pskin_[free_].mean()) if n_free_ else None,
-                           skin_inner=float(pskin_[inner_].mean()) if n_in_ else None)
-            if n_free_ > 30 and n_free_ >= float(HAND_TRUST_LOCAL) * n_in_:
-                t_free_ = float(np.clip((float(pskin_[free_].mean()) - 0.35) / 0.25, 0.0, 1.0))
-                tr_soft_ = max(tr_, min(1.0, t_free_ / max(1e-3, float(HAND_PARSE_TRIM))))
-        except Exception:
-            tr_soft_ = tr_
-
-    def _given(x_, lohi, t_=None):
-        # a hand's part (0..1) with the face the parser is sure of given back (t_: the parser's trust for it, tr_ when None)
-        t_ = tr_ if t_ is None else t_
-        if lohi is None or t_ <= 0:
+    def _given(x_, lohi):
+        # a hand's part (0..1) with the face the parser is sure of given back
+        if lohi is None or tr_ <= 0:
             return x_
         lo_, hi_ = float(lohi[0]), float(lohi[1])
-        return x_ * (1.0 - np.clip((pskin_ - lo_) / max(1e-3, hi_ - lo_), 0.0, 1.0) * t_)
+        return x_ * (1.0 - np.clip((pskin_ - lo_) / max(1e-3, hi_ - lo_), 0.0, 1.0) * tr_)
 
-    if dbg is not None:
-        dbg.update(tr=tr_, tr_soft=tr_soft_, core=int((m_core > 0).sum()), soft=int((m_soft > 0).sum()), limbs=int((m > 0).sum()),
-                   has_parse=pskin_ is not None)
     if m_core.any():
         mf = np.maximum(mf, _given(cv2.bitwise_and(m_core, zone_).astype(np.float32) / 255.0, HAND_CORE_TRIM))
     if m_soft.any():
-        mf = np.maximum(mf, _given(cv2.bitwise_and(m_soft, zone_).astype(np.float32) / 255.0, HAND_SOFT_TRIM, tr_soft_))
+        mf = np.maximum(mf, _given(cv2.bitwise_and(m_soft, zone_).astype(np.float32) / 255.0, HAND_SOFT_TRIM))
     if not (mf > 0.004).any():
         return None
     return cv2.GaussianBlur(mf.astype(np.float32), (0, 0), max(1.0, float(LIMB_SOFT) * Wf))
@@ -3725,7 +3688,6 @@ def _parse_now(rgb_u8: np.ndarray, lm: np.ndarray) -> Optional[dict]:
 
 
 DOUBLE_DIST = 0.3     # face centres closer than this share of the face width: one face held by two tracks
-LIMB_SAME_FACE = True # limb_cover: the limbs and hands of a track that holds this same face on the frame are this person's own (False: somebody else's, as before)
 
 
 # (11/28, LNGSHOT BEEP BEEP c023 f2: one person held by two tracks for the cut's first four frames. The face finder's face of a frame goes to one of
