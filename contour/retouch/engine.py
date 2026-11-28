@@ -973,6 +973,11 @@ HAND_TRUST_CONF = float(__import__('os').environ.get('IWALY_HAND_TRUST', '3.0'))
 HAND_TRUST_SPAN = 2.0        # of the face width: a hand points' span beyond this is no hand
 HAND_SHAPE = (0.18, 0.04)      # (11/28) a hand with all its points: fingers drawn this thick (of the palm's width, radius), the whole widened by this share of its span (None: the points' hull)
 LIMB_OTHER_SKIN = 0.6         # (11/28) somebody else's limb or hand over more than this share of the face's skin the parser is sure of lies behind the head (None = off)
+# (11/28, the check of the d18 tone files: c002 f56..105, 률 looking down, the upper arm of p3 standing behind him reached over his lower jaw; with the parser's
+# trust low there LIMB_OTHER_SKIN did not see it behind and the jaw was left out (the d13 file had it only because the sure_ bug took every cover away))
+# somebody else whose size (the tracker's person scale) is under LIMB_OTHER_FAR of this person's stands farther from the camera: their limbs and hands are
+# behind this face. None = off.
+LIMB_OTHER_FAR = 0.75
 # (11/28, the second check: c024's hands laid on both cheeks and c026's held at the mouth; the client's marks there are the lines under the eyes and the spots beside the
 # fingers, and that skin was left as it was) the hand points of a hand pressed to the face are a little off (c024 f20: the ring and little fingers' points 30..40 px
 # beside the fingers, over the cheek under the eye and the mouth's corner), and the drawn hand took a band of the face with it
@@ -1047,8 +1052,18 @@ def limb_cover(st, t: int, lm: np.ndarray, shape, sx: float, sy: float, p_self: 
             psure_, pskin_ = None, None
 
     def _behind(q_, draw) -> bool:
-        """somebody else's limb or hand (draw(mask) puts it on a mask) that lies over this face's sure skin: it is behind the head"""
-        if LIMB_OTHER_SKIN is None or psure_ is None or int(q_) == int(p_self):
+        """somebody else's limb or hand (draw(mask) puts it on a mask) that lies over this face's sure skin, or belongs to somebody clearly farther
+        from the camera (LIMB_OTHER_FAR): it is behind the head"""
+        if p_self is None or int(q_) == int(p_self):
+            return False
+        if LIMB_OTHER_FAR is not None:
+            try:
+                sq_, sp_ = float(st.scale[q_, t]), float(st.scale[p_self, t])
+                if np.isfinite(sq_) and np.isfinite(sp_) and sp_ > 0 and sq_ < float(LIMB_OTHER_FAR) * sp_:
+                    return True
+            except Exception:
+                pass
+        if LIMB_OTHER_SKIN is None or psure_ is None:
             return False
         tm_ = np.zeros(shape, np.uint8)
         draw(tm_)

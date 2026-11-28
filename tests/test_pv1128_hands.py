@@ -240,3 +240,30 @@ def test_a_heart_thumb_leaving_the_palm_at_an_angle_stays():
     assert RE._thumb_held(st.hand_raw[0, 0, :21, 2], pts) is False
     assert (_cover_at(st, lm, on_thumb, RE.HAND_THUMB_HELD) > 0.9).all(), "the heart's thumb is covered"
     assert (_cover_at(st, lm, on_thumb, RE.HAND_THUMB_HELD[:2]) < 0.1).all(), "(without the palm's angle the rule took it)"
+
+
+def test_an_arm_of_somebody_farther_away_does_not_cover_the_face():
+    """(LIMB_OTHER_FAR, the d18 tone check: c002 f56..105, the upper arm of the person standing behind 률 reached over his jaw and the parser's trust was too
+    low there for LIMB_OTHER_SKIN to see it behind) somebody clearly smaller (farther from the camera) is behind the face; somebody as big or bigger is not."""
+    h, w = 600, 700
+    lm = _face_lm()
+    covers = {}
+    for other_scale in (250.0, 400.0, 520.0):
+        st = _Store(2)
+        st.scale[0, 0] = 400.0
+        st.scale[1, 0] = other_scale
+        _put_arm(st, 1, (520.0, 300.0), (360.0, 330.0), 25.0, "L")      # a forearm across the lower face
+        cov = RE.limb_cover(st, 0, lm, (h, w), 1.0, 1.0, 0, None)
+        covers[other_scale] = 0.0 if cov is None else float((np.asarray(cov) > 0.5).sum())
+    assert covers[250.0] == 0.0, "a farther person's arm is behind the head"
+    assert covers[400.0] > 500 and covers[520.0] > 500, "somebody as near (or nearer) can have an arm in front"
+    old = RE.LIMB_OTHER_FAR
+    try:
+        RE.LIMB_OTHER_FAR = None
+        st = _Store(2)
+        st.scale[0, 0], st.scale[1, 0] = 400.0, 250.0
+        _put_arm(st, 1, (520.0, 300.0), (360.0, 330.0), 25.0, "L")
+        cov = RE.limb_cover(st, 0, lm, (h, w), 1.0, 1.0, 0, None)
+        assert cov is not None and float((np.asarray(cov) > 0.5).sum()) > 500, "off: as before"
+    finally:
+        RE.LIMB_OTHER_FAR = old
