@@ -223,3 +223,68 @@ def test_a_face_held_by_two_tracks_takes_the_landmarks_found_on_the_frame():
         assert RE._double_face(st, 0, 1) is None
     finally:
         RE.DOUBLE_SURER = old
+
+
+# --------------------------------------------------------------------------- the forehead (11/29: 이마 보정 경계면, 이마 점, 뾰루지)
+
+def _forehead(h=360, w=480, hairline=60, level=0.6):
+    """A forehead lit evenly, hair above it; its mask, the skin below the hairline"""
+    Y = np.full((h, w), level, np.float32)
+    Y[:hairline] = 0.08
+    Y = cv2.GaussianBlur(Y, (0, 0), 6)                     # the hairline's ramp
+    m = np.zeros((h, w), np.float32)
+    m[hairline + 4:h - 30, 30:w - 30] = 1.0
+    return Y, cv2.GaussianBlur(m, (0, 0), 3)
+
+
+def test_the_tone_softening_leaves_the_masks_border_and_a_patch_of_sun():
+    wf = 400.0
+    Y, m = _forehead()
+    w = (m > 0.2).astype(np.float32)
+    sel = RE._forehead_step_sel(Y, w, wf)
+    assert float(sel[64:90].max()) < 0.05, "the hairline's ramp at the mask's border"
+    Y2 = Y.copy()
+    Y2[150:, 260:] += 0.25                                  # a patch of sun: a step of 40 %
+    Y2 = cv2.GaussianBlur(Y2, (0, 0), 2)
+    assert float(RE._forehead_step_sel(Y2, w, wf)[150:300, 230:290].max()) < 0.05
+    Y3 = Y.copy()
+    Y3[150:, :] -= 0.02                                     # a foundation's line: 3 %
+    Y3 = cv2.GaussianBlur(Y3, (0, 0), 1.5)
+    assert float(RE._forehead_step_sel(Y3, w, wf)[140:160, 150:330].max()) > 0.5, "a faint line in the middle is softened"
+    old = (RE.FOREHEAD_STEP_EDGE, RE.FOREHEAD_STEP_HIGH)
+    try:
+        RE.FOREHEAD_STEP_EDGE, RE.FOREHEAD_STEP_HIGH = None, None
+        assert float(RE._forehead_step_sel(Y2, w, wf)[150:300, 230:290].max()) > 0.3, "(before: the sun's rim was taken)"
+    finally:
+        RE.FOREHEAD_STEP_EDGE, RE.FOREHEAD_STEP_HIGH = old
+
+
+def test_a_blot_on_the_forehead_is_filled_and_the_hairline_and_the_sun_stay():
+    wf = 400.0
+    Y, m = _forehead()
+    Y[180:300, 280:] += 0.2                                  # a patch of sun, its shade beside it
+    blot = np.zeros_like(Y)
+    cv2.circle(blot, (180, 170), 9, 1.0, -1)
+    Yb = Y - 0.03 * cv2.GaussianBlur(blot, (0, 0), 3)        # a brown mark 3 levels in 100 deep, 0.05 of the face wide
+    out = RE._forehead_blot(Yb, m, wf, 1.0)
+    assert float(Yb[170, 180] - Y[170, 180]) < -0.02
+    assert abs(float(out[170, 180] - Y[170, 180])) < 0.006, "the blot is filled"
+    assert float(np.abs(out - Yb)[50:75].max()) < 0.004, "the hairline is left"
+    assert float(np.abs(out - Yb)[180:300, 270:290].max()) < 0.004, "the edge of the sun is left"
+    Cb = np.zeros_like(Yb)
+    Cb[blot > 0.5] = 0.02
+    y2, cb2, cr2 = RE._forehead_blot(Yb, m, wf, 1.0, (Cb, Cb.copy(), 1.0))
+    assert float(cb2[170, 180]) < 0.008, "and its colour"
+
+
+def test_the_forehead_zone_reaches_past_the_brows_ends_whatever_their_order():
+    lm = _face_lm(300.0, 300.0, 200.0)
+    z = RE.forehead_zone(lm, (600, 600), 1.0, 200.0)
+    ends = lm[[17, 26], 0]
+    up_y = lm[17, 1] - 40
+    assert float(z[int(up_y), int(ends.min()) - 12]) > 0.5 and float(z[int(up_y), int(ends.max()) + 12]) > 0.5
+    lm2 = lm.copy()
+    lm2[17:27] = lm2[[19, 17, 22, 18, 21, 20, 26, 23, 25, 24]]  # the brows' points out of order (a hand at the face)
+    RE._cache_clear() if hasattr(RE, "_cache_clear") else None
+    z2 = RE.forehead_zone(lm2, (600, 600), 1.0, 200.0)
+    assert float(np.abs(z2 - z).max()) < 0.05

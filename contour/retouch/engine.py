@@ -7372,6 +7372,19 @@ def frown_zone(lm: Optional[np.ndarray], shape, scale: float, wf: float) -> Opti
 # widths above the brows, the brows themselves and the hairline kept out by the skin mask. The line's scale FOREHEAD_SIG of the face width.
 FOREHEAD_ZONE = (0.03, 0.55)
 FOREHEAD_SIG = 0.016
+# (11/29, c022 f24: a blot on the forehead above the outer end of the brow was outside the zone, which ran only above the brows' own landmarks) the
+# zone reaches FOREHEAD_ZONE_WIDE of the face width past the outer ends of the brows, along the brows' line (the skin mask still keeps the hair out).
+# 0 = as before.
+FOREHEAD_ZONE_WIDE = 0.10
+# (11/29, the user on c002 f116 and c022 f24, "뾰루지 안 지워져 있어": the marks of old pimples on 률's forehead, brown blots a few per cent darker
+# than the skin, 0.03 to 0.06 of the face wide: too shallow and too wide for the spot finder, and the darkest of them given back as a mole by the
+# last pass) for a person with 이마 톤 경계 (forehead_tone), the forehead's blots are filled: the skin closed with a disc FOREHEAD_BLOT[0] of the face
+# width (what is narrower and darker fills), only where that is no more than [1]..[2] of the brightness (the shade between patches of sun is far
+# more and stays), away from the mask's border ([3]..[4] of the disc: the hairline's ramp), softly capped at [5]; at the value's strength. A blot's
+# colour (brown, the old pimple's) goes to the skin's round it as far as its brightness is filled. In the
+# same zone the last pass gives no mole back for such a person. None = off.
+FOREHEAD_BLOT = (0.10, 0.08, 0.12, 0.03, 0.10, 0.06)
+FOREHEAD_BLOT_FULL = 0.01         # (11/29) the blot fill and the forehead without moles given back are whole from 이마 톤 경계 1 on (the tone step itself goes with the value): a version with almost no tone matching keeps the forehead clean
 # The forehead's lines are soft (a few % deep, as wide as 1 to 3 % of the face) and the thin-crease filler hardly takes them. Their filling: the skin
 # levelled along the face's up only (a blur along up, FOREHEAD_ALONG of the face width, across it FOREHEAD_ACROSS; normalised by the mask so the brows and
 # the hair do not run in), the difference to it taken out at the slider's strength, softly capped at FOREHEAD_CAP of white. Broad shading (a gradient
@@ -7439,6 +7452,14 @@ def _forehead_close(Y: np.ndarray, m: np.ndarray, lm, scale: float, wf: float, k
 # colour; the texture finer than the fine scale stays). A smooth shading is as steep at both scales and stays. At the forehead slider's strength
 # times FOREHEAD_STEP[4] (the person's 이마 톤 경계, forehead_tone, since 11/28 evening). None = off.
 FOREHEAD_STEP = (0.012, 0.07, 1.7, 3.0, 0.8)
+# (11/29, the user on the d18 tone files: "이마 보정 경계면이 보이고 이전 버전에서는 안 보였던 점이 보여", c018 f17, c022 f1) the softening worked on the
+# forehead's own borders and on a patch of sun: the tone at the wide scale is measured on the mask only, so at the hairline (the skin's ramp up out
+# of the hair) and above the brows it is one-sided, and the hairline came out lifted by 7 levels in a band right under it, the forehead above the
+# brows taken down by 3, both ending where the mask ends; the rim of a patch of sun (a step of 20 to 40 levels) was taken down round it, with a dark
+# dot where the rim turned. Now the softening keeps FOREHEAD_STEP_EDGE[0]..[1] of the wide scale away from the mask's border (none within [0], all
+# from [1]), and leaves a step higher than FOREHEAD_STEP_HIGH[0]..[1] of the brightness alone (a foundation's line is a few per cent). None = off.
+FOREHEAD_STEP_EDGE = (0.6, 1.5)
+FOREHEAD_STEP_HIGH = (0.05, 0.09)
 
 
 def _tone_step_soften(P: np.ndarray, w: np.ndarray, sel: np.ndarray, s1: float, s2: float) -> np.ndarray:
@@ -7456,9 +7477,69 @@ def _forehead_step_sel(Y: np.ndarray, w: np.ndarray, wf: float) -> np.ndarray:
     g1 = np.hypot(cv2.Sobel(t1, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(t1, cv2.CV_32F, 0, 1, ksize=3)) / 8.0
     g2 = np.hypot(cv2.Sobel(t2, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(t2, cv2.CV_32F, 0, 1, ksize=3)) / 8.0
     # the edge's contrast over the fine scale: at least ~1 % of white across s1
-    sel = _ss(FOREHEAD_STEP[2], FOREHEAD_STEP[3], g1 / np.maximum(g2, 1e-5)) * _ss(0.006, 0.02, g1 * 2.0 * s1)
+    con = g1 * 2.0 * s1
+    sel = _ss(FOREHEAD_STEP[2], FOREHEAD_STEP[3], g1 / np.maximum(g2, 1e-5)) * _ss(0.006, 0.02, con)
+    if FOREHEAD_STEP_HIGH is not None:
+        # (FOREHEAD_STEP_HIGH) a step this high, of the brightness there, is light and shade (a patch of sun), not a foundation's line
+        rel = con / np.maximum(cv2.GaussianBlur(Y, (0, 0), s2), 0.02)
+        hi = cv2.dilate(_ss(float(FOREHEAD_STEP_HIGH[0]), float(FOREHEAD_STEP_HIGH[1]), rel), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * int(s2) + 1,) * 2))
+        sel = sel * (1.0 - hi)
     sel = cv2.dilate(sel, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * int(s1) + 1,) * 2))
-    return cv2.GaussianBlur(sel, (0, 0), s1)
+    sel = cv2.GaussianBlur(sel, (0, 0), s1)
+    if FOREHEAD_STEP_EDGE is not None:
+        # (FOREHEAD_STEP_EDGE) away from the mask's border, where the wide tone is one-sided
+        dist = cv2.distanceTransform((w > 0.5).astype(np.uint8), cv2.DIST_L2, 3)
+        sel = sel * _ss(float(FOREHEAD_STEP_EDGE[0]) * s2, float(FOREHEAD_STEP_EDGE[1]) * s2, dist)
+    return sel
+
+
+def _forehead_blot(Y: np.ndarray, m: np.ndarray, wf: float, k: float, planes=None):
+    """Y with the blots inside the mask m filled (see FOREHEAD_BLOT). planes: (Cb, Cr, cs) the colour planes and their scale to Y: then (Y, Cb, Cr)
+    are returned, the blots' colour taken to the skin's round them."""
+    D_, lo_, hi_, e0_, e1_, cap = (float(x_) for x_ in FOREHEAD_BLOT)
+    kd = max(3, int(round(D_ * wf)) | 1)
+    r = _roi(m, kd + 8)
+    same = (lambda: Y) if planes is None else (lambda: (Y, planes[0], planes[1]))
+    if r is None or k <= 1e-4:
+        return same()
+    y0, y1, x0, x1 = r
+    yc = Y[y0:y1, x0:x1].astype(np.float32)
+    mc = np.clip(m[y0:y1, x0:x1], 0, 1).astype(np.float32)
+    inn = (mc > 0.2).astype(np.uint8)
+    if inn.sum() < 20:
+        return same()
+    top = max(1e-6, float(yc.max()))
+    # outside the mask the skin's own level (the hair, the brows do not reach into the closing)
+    fillv = cv2.inpaint(np.clip(yc * 255.0 / top, 0, 255).astype(np.uint8), (1 - inn), 3, cv2.INPAINT_TELEA).astype(np.float32) * top / 255.0
+    sm = max(0.6, 0.004 * wf)
+    ys = cv2.GaussianBlur(np.where(inn > 0, yc, fillv), (0, 0), sm)
+    se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kd, kd))
+    cl = cv2.morphologyEx(ys, cv2.MORPH_CLOSE, se)
+    f = np.maximum(cl - ys, 0.0)
+    f = f * (1.0 - _ss(lo_, hi_, cv2.dilate(f / np.maximum(cl, 0.02), se)))
+    f = f * _ss(e0_ * kd, e1_ * kd, cv2.distanceTransform(inn, cv2.DIST_L2, 3))
+    f = cv2.GaussianBlur(f, (0, 0), max(0.8, sm))
+    f = cap * np.tanh(f / cap)
+    out = Y.astype(np.float32, copy=True)
+    out[y0:y1, x0:x1] = yc + float(k) * mc * f
+    if planes is None:
+        return out
+    Cb, Cr, cs = planes
+    wq = np.clip(f / 0.015, 0.0, 1.0) * float(k) * mc
+    c0, c1, d0, d1 = int(y0 * cs), int(np.ceil(y1 * cs)), int(x0 * cs), int(np.ceil(x1 * cs))
+    hc, wc = c1 - c0, d1 - d0
+    if hc < 4 or wc < 4 or float(wq.max()) < 1e-3:
+        return out, Cb, Cr
+    wqc = cv2.resize(wq, (wc, hc), interpolation=cv2.INTER_LINEAR)
+    wsk = cv2.resize(inn.astype(np.float32), (wc, hc), interpolation=cv2.INTER_AREA) * (1.0 - wqc)      # the skin round the blots
+    res = []
+    for P_ in (Cb, Cr):
+        Pq = P_.astype(np.float32, copy=True)
+        pc = Pq[c0:c1, d0:d1]
+        ref = _gm(pc, wsk, max(1.5, 0.5 * kd * cs))
+        Pq[c0:c1, d0:d1] = pc + wqc * (ref - pc)
+        res.append(Pq)
+    return out, res[0], res[1]
 
 
 def _forehead_level(Y: np.ndarray, m: np.ndarray, lm, scale: float, wf: float, k: float) -> np.ndarray:
@@ -7713,6 +7794,14 @@ def forehead_zone(lm: Optional[np.ndarray], shape, scale: float, wf: float) -> O
         up = L[27] - L[8]
         up = up / max(1e-6, float(np.hypot(*up)))
         br = L[17:27]
+        if FOREHEAD_ZONE_WIDE and FOREHEAD_ZONE_WIDE > 1e-4:
+            # (FOREHEAD_ZONE_WIDE) on past the brows' outer ends, along their line (across the face's up); the points in their order along it (a
+            # hand at the face can leave them out of order: c022 f24)
+            ax_ = np.array([-up[1], up[0]])
+            if float(np.dot(br[-1] - br[0], ax_)) < 0:
+                ax_ = -ax_
+            br = br[np.argsort(br @ ax_)]
+            br = np.vstack([br[0] - ax_ * (FOREHEAD_ZONE_WIDE * wf), br, br[-1] + ax_ * (FOREHEAD_ZONE_WIDE * wf)])
         poly = np.vstack([br + up * (FOREHEAD_ZONE[0] * wf), (br + up * (FOREHEAD_ZONE[1] * wf))[::-1]])
         poly = np.round(poly).astype(np.int32)
         sig = max(1.0, 0.03 * wf)
@@ -9282,6 +9371,12 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M, spots=None):
             if FINAL_MOLE > 1e-4 and spot_reg is not None and job.wf_src > 0:
                 mm = _final_moles(Y0, Cr0Y, spot_reg, wf, lmY)
                 if mm is not None:
+                    kft_ = float(np.clip(job.v.get("forehead_tone", 0.0), 0, 1))
+                    if FOREHEAD_BLOT is not None and kft_ > 1e-4 and job.face is not None:
+                        # (FOREHEAD_BLOT) the forehead's dark spots of a person with 이마 톤 경계 are pimples' marks: none given back there
+                        fz_ = forehead_zone(job.face, (hY, wY), y_per_src, wf)
+                        if fz_ is not None:
+                            mm = mm * (1.0 - min(1.0, kft_ / FOREHEAD_BLOT_FULL) * np.clip(fz_ * 1.5, 0, 1))
                     give = np.maximum(give, mm * float(np.clip(FINAL_MOLE, 0, 1)))
             if FINAL_LONG > 1e-4:
                 reg = None
@@ -10082,6 +10177,12 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                                             Cb = Pq_
                                         else:
                                             Cr = Pq_
+                        except Exception:
+                            import traceback
+                            traceback.print_exc()
+                    if FOREHEAD_BLOT is not None and kft_ > 1e-4:
+                        try:
+                            Y, Cb, Cr = _forehead_blot(Y, mfh, wf, min(1.0, kft_ / FOREHEAD_BLOT_FULL), (Cb, Cr, cs))          # (FOREHEAD_BLOT) the old pimples' marks
                         except Exception:
                             import traceback
                             traceback.print_exc()

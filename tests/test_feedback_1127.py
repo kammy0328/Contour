@@ -37,7 +37,12 @@ def _forehead_scene():
 def test_forehead_lines_are_levelled_and_the_shading_stays():
     from contour.retouch import engine as RE
     sc = _forehead_scene()
-    z = RE.forehead_zone(sc["lm"], sc["Y"].shape, 1.0, sc["wf"])
+    old_ = RE.FOREHEAD_ZONE_WIDE
+    RE.FOREHEAD_ZONE_WIDE = 0.0                              # (the zone of 11/27: the lines lie above the brows only)
+    try:
+        z = RE.forehead_zone(sc["lm"] + np.float32(1e-3), sc["Y"].shape, 1.0, sc["wf"])
+    finally:
+        RE.FOREHEAD_ZONE_WIDE = old_
     assert z is not None and z.max() > 0.9
     out = RE._forehead_level(sc["Y"], z, sc["lm"], 1.0, sc["wf"], 1.0)
     inside = z > 0.95
