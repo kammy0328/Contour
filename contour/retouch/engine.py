@@ -106,6 +106,7 @@ class Job:
     turn: Optional[float] = None           # the face's turn (face_turn) held steady over the frames round this one (TURN_STEADY); None: this frame's own
     arm_axes: Optional[list] = None        # the armpit stage's hanging arms (ARMPIT_LINE_HOLD): [(the upper arm's angle from the vertical in degrees, weight 0..1, zone centre x, y, zone radius)] in proxy px
     chinrim: bool = False                  # (CHIN_RIM_MASK) the chin level's rim was made with this frame's masks (masks["chinrim"]; none there: no rim)
+    slip: Optional[float] = None           # (CHIN_PEBBLE_SLIP) how far the face's landmarks lie off the path the frames before and after give them, in face widths (_face_slip); None: not known
 
 
 @dataclass
@@ -995,6 +996,12 @@ HAND_PARSE_TRIM = 0.5         # the rest of the drawn hand goes back to the face
 HAND_SOFT_TRIM = (0.5, 0.85)  # the parser's skin from which .. to which the rest of the drawn hand goes back to the face
 HAND_CORE_TRIM = (0.8, 0.95)  # ... and the core itself, where the parser is all but certain (c023's heart: the palm's points 40..60 px inside the hands, on the cheeks;
                               # the parser saw the cheeks as the face's own to their edges), None: the core is the hand whatever the parser says
+# (11/28, c024 f12..16, both hands laid on the cheeks: the cheek under the eye's outer corner, above a fingertip, lay in the drawn hand's rim and kept only a
+# third of its smoothing for five frames, the frames round them all of it. The parser's trust is the share of the inner face it calls skin, and the two hands
+# took that share to 0.39 (trust 0.15): the rim goes back to the face in proportion to the trust.) Hands over the face are no fault of the parser's: for the
+# drawn hands' rim the trust is also measured on the inner face the drawn hands and limbs leave free, when that is at least HAND_TRUST_LOCAL of the inner
+# face, and the higher of the two holds. The hands' cores go by the whole face's trust as before. None = off.
+HAND_TRUST_LOCAL = 0.25
 LIMB_R_ANATOMY = 1.0          # a limb's capsule at most this times its anatomical half-width (body.SEGMENTS: a share of its length): the person matte gives an arm in front of
                               # the body or the face the body's width (c024: a forearm drawn half as wide again as it is, over the jaw and the chin), None = off
 LIMB_WRIST = 0.65             # a forearm ends flat at the wrist, this narrow there (of its width at the elbow), not with a round cap as wide as the forearm that lay over the
@@ -1051,10 +1058,21 @@ def limb_cover(st, t: int, lm: np.ndarray, shape, sx: float, sy: float, p_self: 
         except Exception:
             psure_, pskin_ = None, None
 
+    # (11/28, LNGSHOT BEEP BEEP c023 f2: one person held by two tracks for the cut's first four frames; the face went from one to the other on f2, the
+    # hands stayed with the first, and to the second they were somebody else's: lying along the jaw, over skin the parser is sure of, they counted as
+    # behind the head, and for a frame the palm beside the jaw was retouched as the face's own skin) a track that holds this same face on this frame
+    # (_same_face) is this person: its limbs and hands are this person's own
+    same_ = set()
+    if p_self is not None and LIMB_SAME_FACE:
+        try:
+            same_ = {int(q_) for q_ in np.nonzero(st.present[:, t])[0] if int(q_) != int(p_self) and _same_face(st, t, int(p_self), int(q_))}
+        except Exception:
+            same_ = set()
+
     def _behind(q_, draw) -> bool:
         """somebody else's limb or hand (draw(mask) puts it on a mask) that lies over this face's sure skin, or belongs to somebody clearly farther
         from the camera (LIMB_OTHER_FAR): it is behind the head"""
-        if p_self is None or int(q_) == int(p_self):
+        if p_self is None or int(q_) == int(p_self) or int(q_) in same_:
             return False
         if LIMB_OTHER_FAR is not None:
             try:
@@ -1215,18 +1233,31 @@ def limb_cover(st, t: int, lm: np.ndarray, shape, sx: float, sy: float, p_self: 
     zone_ = cv2.dilate(face, np.ones((max(3, int(0.1 * Wf) | 1),) * 2, np.uint8))
     mf = cv2.bitwise_and(m, zone_).astype(np.float32) / 255.0
     tr_ = min(1.0, ptrust_ / max(1e-3, float(HAND_PARSE_TRIM))) if (HAND_PARSE_TRIM is not None and pskin_ is not None) else 0.0
+    tr_soft_ = tr_
+    if HAND_TRUST_LOCAL is not None and HAND_PARSE_TRIM is not None and pskin_ is not None and fzm_ is not None and tr_ < 1.0 and m_soft.any():
+        # (HAND_TRUST_LOCAL) the parser's trust measured on the face the drawn hands and limbs leave free
+        try:
+            inner_ = (fzm_ > 0) & (SK._features_mask(lm, shape) == 0)
+            free_ = inner_ & (m_soft == 0) & (m_core == 0) & (m == 0)
+            n_in_, n_free_ = int(inner_.sum()), int(free_.sum())
+            if n_free_ > 30 and n_free_ >= float(HAND_TRUST_LOCAL) * n_in_:
+                t_free_ = float(np.clip((float(pskin_[free_].mean()) - 0.35) / 0.25, 0.0, 1.0))
+                tr_soft_ = max(tr_, min(1.0, t_free_ / max(1e-3, float(HAND_PARSE_TRIM))))
+        except Exception:
+            tr_soft_ = tr_
 
-    def _given(x_, lohi):
-        # a hand's part (0..1) with the face the parser is sure of given back
-        if lohi is None or tr_ <= 0:
+    def _given(x_, lohi, t_=None):
+        # a hand's part (0..1) with the face the parser is sure of given back (t_: the parser's trust for it, tr_ when None)
+        t_ = tr_ if t_ is None else t_
+        if lohi is None or t_ <= 0:
             return x_
         lo_, hi_ = float(lohi[0]), float(lohi[1])
-        return x_ * (1.0 - np.clip((pskin_ - lo_) / max(1e-3, hi_ - lo_), 0.0, 1.0) * tr_)
+        return x_ * (1.0 - np.clip((pskin_ - lo_) / max(1e-3, hi_ - lo_), 0.0, 1.0) * t_)
 
     if m_core.any():
         mf = np.maximum(mf, _given(cv2.bitwise_and(m_core, zone_).astype(np.float32) / 255.0, HAND_CORE_TRIM))
     if m_soft.any():
-        mf = np.maximum(mf, _given(cv2.bitwise_and(m_soft, zone_).astype(np.float32) / 255.0, HAND_SOFT_TRIM))
+        mf = np.maximum(mf, _given(cv2.bitwise_and(m_soft, zone_).astype(np.float32) / 255.0, HAND_SOFT_TRIM, tr_soft_))
     if not (mf > 0.004).any():
         return None
     return cv2.GaussianBlur(mf.astype(np.float32), (0, 0), max(1.0, float(LIMB_SOFT) * Wf))
@@ -3688,6 +3719,22 @@ def _parse_now(rgb_u8: np.ndarray, lm: np.ndarray) -> Optional[dict]:
 
 
 DOUBLE_DIST = 0.3     # face centres closer than this share of the face width: one face held by two tracks
+LIMB_SAME_FACE = True # limb_cover: the limbs and hands of a track that holds this same face on the frame are this person's own (False: somebody else's, as before)
+
+
+def _same_face(st, t: int, a: int, b: int) -> bool:
+    """Tracks a and b hold one face on frame t: both have landmarks there, of about one size (within 1.6 times), their centres within DOUBLE_DIST of
+    the face width (the test _double_faces goes by)."""
+    F = getattr(st, "face", None)
+    if F is None or not getattr(st, "has_face", True):
+        return False
+    Fa, Fb = F[a, t, :, :2], F[b, t, :, :2]
+    if not (np.isfinite(Fa).all() and np.isfinite(Fb).all()):
+        return False
+    wa, wb = float(np.hypot(*(Fa[16] - Fa[0]))), float(np.hypot(*(Fb[16] - Fb[0])))
+    if min(wa, wb) <= 0 or max(wa, wb) / min(wa, wb) > 1.6:
+        return False
+    return float(np.hypot(*(Fa.mean(0) - Fb.mean(0)))) <= DOUBLE_DIST * max(wa, wb)
 
 
 def _double_faces(st, tracker, t: int) -> set:
@@ -4021,6 +4068,11 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 job.turn = _turn_steady(st, p, t, TURN_STEADY)
             except Exception:
                 job.turn = None
+        if face is not None:
+            try:
+                job.slip = _face_slip(st, p, t)
+            except Exception:
+                job.slip = None
         fth = pp.feather_factor() if hasattr(pp, "feather_factor") else 1.5
         if face is not None:
             job.wf_src = float(np.hypot(*(face[16, :2] - face[0, :2])))
@@ -4615,7 +4667,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                     job.masks["neck"] = nm_ * fw
             if CHIN_RIM_MASK and CHIN_LEVEL_ON and CHIN_LEVEL_RIM is not None \
                     and max(float(FINAL_CHIN), float(v.get("chin_lines", 0.0))) > 1e-4 \
-                    and _pebble_share(face, v, getattr(job, "turn", None)) > 1e-4:
+                    and _pebble_share(face, v, getattr(job, "turn", None), getattr(job, "slip", None)) > 1e-4:
                 # (CHIN_RIM_MASK) the chin level's rim with this frame's hand cover taken off (a fingertip at the chin is no chin)
                 cr_ = get("chinrim", lambda: _chin_rim_mask(shape, lm, base().get("cover")), "")
                 job.chinrim = True
@@ -6256,11 +6308,53 @@ CHIN_PEBBLE = 0.0
 CHIN_PEBBLE_KEEP = (0.05, 0.03)
 CHIN_PEBBLE_CAP = 0.05
 CHIN_PEBBLE_YAW = (0.60, 0.80)
+# (11/28, LNGSHOT BEEP BEEP c030 f41..43: the head swings round and for two frames the face's fit slides down onto the collar, 0.2 and 0.5 of the face
+# width off, back on the third. The pebbled way has no keep-outs: on f42 it levelled the dark gap between the collar and the neck by 25 levels, a patch
+# for one frame. The frame itself does not tell a chin from what the landmarks call one (the zone's skin share and brightness are those of a chin in hard
+# light); the frames round it do: landmarks that sit CHIN_PEBBLE_SLIP[0] of the face width or more off the middle of the frames before and after them
+# (_face_slip: 0.17, 0.23, 0.13 on f41..43; a head moving a third of its width a frame with its landmarks on it stays under 0.06) have slid, and the
+# pebbled way fades out up to [1]: the chin keeps the stages of 1.26.2 on that frame. None = off.
+CHIN_PEBBLE_SLIP = (0.10, 0.18)
+_SLIP_PTS = (0, 8, 16, 27, 30, 57)
 
 
-def _pebble_share(lm: Optional[np.ndarray], v: Optional[dict] = None, turn: Optional[float] = None) -> float:
+def _face_slip(st, p: int, t: int) -> Optional[float]:
+    """How far person p's landmarks at t lie off the middle of those of the frames before and after, in face widths (the median over the jaw's ends and
+    tip, the nose's bridge and tip, the lower lip); None where one of the three frames has no face."""
+    F = getattr(st, "face", None)
+    if F is None:
+        return None
+    T = F.shape[1]
+    if not (0 < t < T - 1):
+        return None
+    a, b, c = F[p, t - 1, :, :2], F[p, t, :, :2], F[p, t + 1, :, :2]
+    if not (np.isfinite(a).all() and np.isfinite(b).all() and np.isfinite(c).all()):
+        return None
+    wf = float(np.hypot(*(b[16] - b[0])))
+    if wf < 1.0:
+        return None
+    i = list(_SLIP_PTS)
+    d = b[i] - 0.5 * (a[i] + c[i])
+    return float(np.median(np.hypot(d[:, 0], d[:, 1]))) / wf
+
+
+def late(rf, tracker):
+    """What a prepared frame takes from the tracks alone, set again on a frame read from a saved analysis (prepcache): a frame saved by an earlier
+    version gets what prepare() gives it now (Job.slip)."""
+    st = getattr(tracker, "store", None)
+    if rf is None or st is None:
+        return rf
+    for job in rf.jobs:
+        try:
+            job.slip = _face_slip(st, job.p, rf.t) if job.face is not None else None
+        except Exception:
+            job.slip = None
+    return rf
+
+
+def _pebble_share(lm: Optional[np.ndarray], v: Optional[dict] = None, turn: Optional[float] = None, slip: Optional[float] = None) -> float:
     """0..1: how far the chin's stages work the pebbled way on this face: the person's 자갈턱 넓게 (or CHIN_PEBBLE), none of it on a face turned away
-    (CHIN_PEBBLE_YAW)."""
+    (CHIN_PEBBLE_YAW) or on landmarks that slid on this frame (CHIN_PEBBLE_SLIP, slip: _face_slip)."""
     g = float(np.clip(max(float(CHIN_PEBBLE), float((v or {}).get("chin_pebble", 0.0) or 0.0)), 0.0, 1.0))
     if g <= 1e-4 or lm is None:
         return 0.0
@@ -6268,6 +6362,10 @@ def _pebble_share(lm: Optional[np.ndarray], v: Optional[dict] = None, turn: Opti
         lo, hi = float(CHIN_PEBBLE_YAW[0]), float(CHIN_PEBBLE_YAW[1])
         tu = face_turn(lm) if turn is None else float(turn)
         g *= float(1.0 - np.clip((tu - lo) / max(hi - lo, 1e-3), 0.0, 1.0))
+    if CHIN_PEBBLE_SLIP is not None and slip is not None:
+        lo, hi = float(CHIN_PEBBLE_SLIP[0]), float(CHIN_PEBBLE_SLIP[1])
+        x = float(np.clip((float(slip) - lo) / max(hi - lo, 1e-3), 0.0, 1.0))
+        g *= 1.0 - x * x * (3.0 - 2.0 * x)
     return g
 
 
@@ -8994,12 +9092,129 @@ def _fold_heal(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, Y0: np.ndarray, ba
     return Y, Cb, Cr
 
 
+# (11/28, LNGSHOT BEEP BEEP c046 f5: one thin strand of hair hanging across the neck, 12 levels darker than the skin beside it, was lifted by 10.7 of them
+# for a frame: 6 by 목주름 (its line filler and its top-hat, which take every thin dark line of the neck for a crease), the rest by the neck's bumps, the
+# texture levelling and the smoothing. The masks cannot hold it: a strand that moves is steadied away. A neck's creases run across it; a thin dark line
+# that runs along the face's own axis (within NECK_STRAND[1] degrees), is long (NECK_STRAND[0] of the face width, NECK_STRAND[2] times longer than wide)
+# and comes out of something dark (the hair it hangs from, a collar: NECK_STRAND_DARK) with the same skin on both its sides (NECK_STRAND_SIDES) is a strand or
+# a cord: its fine detail is given back at the end (the soft light and shade stays the retouch's). None = off.
+NECK_STRAND = (0.15, 35.0, 5.0, 0.03)     # (length, angle to the axis, times longer than wide, how much darker than what lies round it: relative)
+NECK_STRAND_DARK = (0.45, 0.05)           # darker than [0] of the neck's own brightness within [1] of the face width of the line; None: not asked for
+NECK_STRAND_SIDES = 1.2                   # a thing lying on the skin has the same skin on both sides: the two sides differ by at most this many times the line's own
+                                          # depth. A fold of the neck or its contour stands between two differently lit sides (c044 f26's line from the ear to the
+                                          # collarbone: 1.9, a jaw's edge 2.6, c030 f71's fold 1.3; c046 f5's strand 0.8, hair tips and a necklace 0.3 to 1.0). None: not asked for
+NECK_STRAND_SIG = 0.03                    # of the face width: the detail finer than this is given back along the line (0.012 left the strand at 7 of its 12 levels, 0.03 at 10)
+
+
+def _neck_strands(Y0: np.ndarray, m: np.ndarray, axis, wf: float) -> Optional[np.ndarray]:
+    """0..1: the thin dark lines of Y0 inside the neck's mask m that run along axis (a unit vector, picture coordinates) and hang from something
+    dark: strands of hair, cords. None: none."""
+    if NECK_STRAND is None or axis is None or wf <= 1:
+        return None
+    span, ang, elong, thr = NECK_STRAND
+    r = _roi(m, int(span * wf) + 8)
+    if r is None:
+        return None
+    y0, y1, x0, x1 = r
+    roi = Y0[y0:y1, x0:x1].astype(np.float32)
+    mm = m[y0:y1, x0:x1] > 0.3
+    if int(mm.sum()) < 16:
+        return None
+    w = max(1.5, 0.008 * wf)
+    # where a line is looked at: the neck's mask down to its faint rim (the strand of c046 f5 came out of the hair where the mask is 0.1 to 0.4,
+    # and was lifted there too)
+    kz = max(3, int(round(0.02 * wf)) | 1)
+    zone = cv2.dilate((m[y0:y1, x0:x1] > 0.05).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kz, kz))).astype(bool)
+    rb = cv2.GaussianBlur(roi, (0, 0), max(0.7, 0.3 * w))
+    k = max(3, int(round(3.0 * w)) | 1)
+    base = cv2.GaussianBlur(roi, (0, 0), max(2.0, 2.0 * w)) + 0.02
+    bh = cv2.morphologyEx(rb, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))) / base
+    # which way a line runs where it is: across its own gradient (the structure tensor at the line's width)
+    gx = cv2.Sobel(rb, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(rb, cv2.CV_32F, 0, 1, ksize=3)
+    sg = max(1.0, 1.2 * w)
+    jxx, jyy, jxy = (cv2.GaussianBlur(a_, (0, 0), sg) for a_ in (gx * gx, gy * gy, gx * gy))
+    phi = 0.5 * np.arctan2(2.0 * jxy, jxx - jyy)                       # the gradient's direction
+    along = np.abs(-np.sin(phi) * float(axis[0]) + np.cos(phi) * float(axis[1]))      # |line direction . axis|
+    coh = np.sqrt((jxx - jyy) ** 2 + 4.0 * jxy ** 2) / (jxx + jyy + 1e-9)
+    cmin = float(np.cos(np.deg2rad(ang)))
+    cand = ((bh > thr) & (along >= cmin) & (coh > 0.3) & zone).astype(np.uint8)
+    n, lab, st, _c = cv2.connectedComponentsWithStats(cand, connectivity=8)
+    if n <= 1:
+        return None
+    dark = None
+    if NECK_STRAND_DARK is not None:
+        med = float(np.median(roi[mm]))
+        dk_ = (roi < NECK_STRAND_DARK[0] * med).astype(np.uint8)
+        kr = max(3, int(round(2.0 * NECK_STRAND_DARK[1] * wf)) | 1)
+        dark = cv2.dilate(dk_, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kr, kr))).astype(bool)
+    keep = np.zeros(n, bool)
+    span_min = span * wf
+    for i in range(1, n):
+        if max(st[i, 2], st[i, 3]) < 0.5 * span_min or st[i, 4] < 8:
+            continue
+        sub = lab[st[i, 1]:st[i, 1] + st[i, 3], st[i, 0]:st[i, 0] + st[i, 2]] == i
+        ys, xs = np.nonzero(sub)
+        pts = np.c_[xs, ys].astype(np.float64)
+        ev, evec = np.linalg.eigh(np.cov((pts - pts.mean(0)).T))
+        length, width = 4.0 * float(np.sqrt(max(ev[1], 1e-9))), 4.0 * float(np.sqrt(max(ev[0], 1e-9)))
+        if length < span_min or length < elong * max(width, 1.0):
+            continue
+        if abs(float(evec[0, 1]) * float(axis[0]) + float(evec[1, 1]) * float(axis[1])) < cmin:
+            continue
+        if dark is not None and not (dark[st[i, 1]:st[i, 1] + st[i, 3], st[i, 0]:st[i, 0] + st[i, 2]] & sub).any():
+            continue
+        if NECK_STRAND_SIDES is not None:
+            # the skin either side of the line (2 to 5 line widths off its darkest point, every 3 px along it) against the line's own depth
+            d_ = evec[:, 1]
+            nrm = np.array([-d_[1], d_[0]])
+            pp = pts + np.array([st[i, 0], st[i, 1]], np.float64)
+            tt = (pp - pp.mean(0)) @ d_
+            Ls, Rs, Cs = [], [], []
+            hh, ww = roi.shape
+            for a_ in np.arange(tt.min() + 2.0, tt.max() - 2.0, 3.0):
+                sel = np.abs(tt - a_) < 1.5
+                if int(sel.sum()) < 2:
+                    continue
+                q = pp[sel]
+                vals = rb[q[:, 1].astype(int), q[:, 0].astype(int)]
+                c_ = q[int(vals.argmin())]
+                side = []
+                for sg_ in (-1.0, 1.0):
+                    v_ = []
+                    for o_ in np.arange(2.0 * w, 5.0 * w, 1.0):
+                        xi, yi = int(round(c_[0] + sg_ * nrm[0] * o_)), int(round(c_[1] + sg_ * nrm[1] * o_))
+                        if 0 <= yi < hh and 0 <= xi < ww:
+                            v_.append(float(rb[yi, xi]))
+                    side.append(float(np.mean(v_)) if v_ else np.nan)
+                Ls.append(side[0]); Rs.append(side[1]); Cs.append(float(vals.min()))
+            Ls, Rs, Cs = np.array(Ls), np.array(Rs), np.array(Cs)
+            ok_ = np.isfinite(Ls) & np.isfinite(Rs)
+            if int(ok_.sum()) < 4:
+                continue
+            mid = 0.5 * (Ls[ok_] + Rs[ok_]) + 1e-6
+            depth = float(np.median((mid - Cs[ok_]) / mid))
+            differ = float(np.median(np.abs(Ls[ok_] - Rs[ok_]) / mid))
+            if depth <= 1e-4 or differ > NECK_STRAND_SIDES * depth:
+                continue
+        keep[i] = True
+    if not keep.any():
+        return None
+    H = keep[lab].astype(np.uint8)
+    kd = max(3, int(round(2.0 * w)) | 1)
+    H = cv2.dilate(H, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kd, kd))).astype(np.float32)
+    out = np.zeros(Y0.shape, np.float32)
+    out[y0:y1, x0:x1] = np.clip(cv2.GaussianBlur(H, (0, 0), max(1.0, 0.7 * w)) * 1.3, 0, 1)
+    return out
+
+
 def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M, spots=None):
     """The last pass (FINAL_*): see the constants. Y0/Cb0/Cr0: the planes as they came in. spots: {id(job): where the blemish stage filled a red
     spot, 0..1 at Y's size} (NOSE_PIMPLE)."""
     slid_ = any(float(getattr(j_, "v", {}).get(k_, 0.0)) > 1e-4 for j_ in rf.jobs for k_ in ("bumps", "chin_lines", "nasolabial"))
+    neck_ = NECK_STRAND is not None and any("neck" in getattr(j_, "masks", {}) for j_ in rf.jobs)
     if not (FINAL_NOSE > 1e-4 or FINAL_MOLE > 1e-4 or FINAL_BUMP > 1e-4 or FINAL_LONG > 1e-4 or FINAL_CHIN > 1e-4 or FINAL_NASO > 1e-4 or FOLD_HEAL > 1e-4
-            or slid_):
+            or slid_ or neck_):
         return Y, Cb, Cr
     hY, wY = Y.shape
     hC, wC = Cb.shape
@@ -9136,14 +9351,19 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M, spots=None):
             kfc_ = max(float(FINAL_CHIN), float(job.v.get("chin_lines", 0.0)))     # (1.26.2) the 턱주름 slider, or the setting for every face
             if kfc_ > 1e-4 and lmY is not None and skin is not None:
                 Y = _final_chin(Y, lmY, skin, wf, float(np.clip(kfc_, 0, 1)) * _face_big(job.face, wf, y_per_src),
-                                _pebble_share(job.face, job.v, getattr(job, 'turn', None)) if CHIN_PEBBLE_FINAL else 0.0)
-                psh_ = _pebble_share(job.face, job.v, getattr(job, 'turn', None)) if CHIN_LEVEL_ON else 0.0
+                                _pebble_share(job.face, job.v, getattr(job, 'turn', None), getattr(job, 'slip', None)) if CHIN_PEBBLE_FINAL else 0.0)
+                psh_ = _pebble_share(job.face, job.v, getattr(job, 'turn', None), getattr(job, 'slip', None)) if CHIN_LEVEL_ON else 0.0
                 if psh_ > 1e-4:
                     rim_ = None
                     if CHIN_RIM_MASK and getattr(job, "chinrim", False):
                         # (CHIN_RIM_MASK) the rim made with the frame's masks: none where the hand cover took it all
                         rim_ = M(job.masks["chinrim"], (hY, wY)) if "chinrim" in job.masks else 0.0
                     Y = _chin_level(Y, lmY, skin, wf, float(np.clip(kfc_, 0, 1)) * psh_ * _face_big(job.face, wf, y_per_src), rim=rim_)
+            if NECK_STRAND is not None and "neck" in job.masks and lmY is not None and job.wf_src > 0 and _small_face_gate(wf, NECK_SMALL_WF) > 1e-4:
+                # (NECK_STRAND) a strand of hair hanging across the neck keeps its line, whatever stage lifted it
+                ns_ = _neck_strands(Y0, M(job.masks["neck"], (hY, wY)), neck_axis(lmY), wf)
+                if ns_ is not None:
+                    Y = _line_restore(Y, Y0, ns_, max(2.0, NECK_STRAND_SIG * wf))
         except Exception:
             import traceback
             traceback.print_exc()
@@ -9788,7 +10008,7 @@ def _process_ycc(Y: np.ndarray, Cb: np.ndarray, Cr: np.ndarray, rf: RetouchFrame
                 Y, Cb, Cr = _crease_lift(Y, Cb, Cr, mfl, float(np.clip(FACE_LINES, 0, 1)), max(1.5, 0.012 * wf),
                                          None, jaw_hold(job.face, (hY, wY), y_per_src, wf))
             if kchin_ > 1e-4:
-                Y = _chin_dimple(Y, lmY, skY, wf, float(np.clip(kchin_, 0, 1)) * _face_big(job.face, wf, y_per_src), _pebble_share(job.face, v, getattr(job, 'turn', None)))
+                Y = _chin_dimple(Y, lmY, skY, wf, float(np.clip(kchin_, 0, 1)) * _face_big(job.face, wf, y_per_src), _pebble_share(job.face, v, getattr(job, 'turn', None), getattr(job, 'slip', None)))
         # 2a'. frown lines between the brows and across the top of the nose (thin creases only)
         if FROWN_LINES > 1e-4 and "skin" in job.masks and job.face is not None and v["skin"] > 1e-4:
             try:

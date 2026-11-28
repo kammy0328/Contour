@@ -367,7 +367,7 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
         if pc_reader is not None:
             ok_, rf_c = pc_reader.get(t_)
             if ok_:
-                return rf_c
+                return RE.late(rf_c, tracker)      # (what goes by the tracks alone is set as prepare() sets it now)
         return prepare_(t_)
 
     # (the knee look takes its frames from the saved analysis too: what it does to them, the knees' strength through time, is done as ever)
@@ -435,6 +435,8 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
             rf_, fi_ = knee_look.get(t_)
         elif pc_reader is not None:
             ok_, rf_ = pc_reader.get(t_)       # (read and unpacked side by side: the folder is not the tracker)
+            if ok_:
+                rf_ = RE.late(rf_, tracker)        # (the tracks' landmarks only: read without the lock)
             with prep_lock:
                 if not ok_:
                     rf_ = RE.prepare(cut, tracker, t_)
