@@ -222,3 +222,32 @@ def test_the_drawn_hands_rim_goes_by_the_trust_of_the_face_they_leave_free():
     parse2 = dict(skin=skin * 0.3, trust=0.0)
     c2 = np.asarray(RE.limb_cover(st, 0, lm, (h, w), 1.0, 1.0, 0, parse2))
     assert float(c2[rim].mean()) > 0.5
+
+
+# --------------------------------------------------------------------------- DOUBLE_SURER
+
+def test_a_face_held_by_two_tracks_takes_the_landmarks_found_on_the_frame():
+    """c023 f0..3: the face finder's face goes to one of the two tracks a frame; the other's landmarks are carried there (score 0)"""
+    st = _Faces([[(300.0, 260.0)] * 3, [(306.0, 264.0)] * 3, [(700.0, 260.0)] * 3])
+    st.face[0, :, :, 2] = 0.8
+    st.face[1, :, :, 2] = 0.8
+    st.face[2, :, :, 2] = 0.9
+    st.face[0, 1, :, 2] = 0.0                      # track 0's landmarks of frame 1 were carried there
+    assert RE._double_face(st, 0, 0) is None, "found on the frame: its own"
+    got = RE._double_face(st, 0, 1)
+    assert got is not None and np.allclose(got, st.face[1, 1]), "carried: the other track's, found there"
+    assert RE._double_face(st, 1, 1) is None
+    st.face[1, 1, :, 2] = 0.3                      # the other track's are not sure either
+    assert RE._double_face(st, 0, 1) is None
+    st.face[1, 1, :, 2] = 0.8
+    st.face[2, 1, :, 2] = 0.0
+    assert RE._double_face(st, 2, 1) is None, "somebody else's face elsewhere is not this face"
+    st.present[1, 1] = False
+    assert RE._double_face(st, 0, 1) is None, "a track that is not there on the frame"
+    old = RE.DOUBLE_SURER
+    try:
+        st.present[1, 1] = True
+        RE.DOUBLE_SURER = None
+        assert RE._double_face(st, 0, 1) is None
+    finally:
+        RE.DOUBLE_SURER = old

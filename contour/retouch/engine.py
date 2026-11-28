@@ -1010,7 +1010,7 @@ LIMB_SOFT = 0.02              # of the face width: the cover's soft edge (0.03 b
 
 
 def limb_cover(st, t: int, lm: np.ndarray, shape, sx: float, sy: float, p_self: Optional[int] = None,
-               parse: Optional[dict] = None) -> Optional[np.ndarray]:
+               parse: Optional[dict] = None, dbg: Optional[dict] = None) -> Optional[np.ndarray]:
     """0..1 over the face and neck where an arm, a leg or a hand (this person's or anyone's) passes in front.
 
     A leg in a high kick, a forearm across the face, a hand at the cheek: skin coloured, so the colour model
@@ -1240,6 +1240,9 @@ def limb_cover(st, t: int, lm: np.ndarray, shape, sx: float, sy: float, p_self: 
             inner_ = (fzm_ > 0) & (SK._features_mask(lm, shape) == 0)
             free_ = inner_ & (m_soft == 0) & (m_core == 0) & (m == 0)
             n_in_, n_free_ = int(inner_.sum()), int(free_.sum())
+            if dbg is not None:
+                dbg.update(trust=ptrust_, inner=n_in_, free=n_free_, skin_free=float(pskin_[free_].mean()) if n_free_ else None,
+                           skin_inner=float(pskin_[inner_].mean()) if n_in_ else None)
             if n_free_ > 30 and n_free_ >= float(HAND_TRUST_LOCAL) * n_in_:
                 t_free_ = float(np.clip((float(pskin_[free_].mean()) - 0.35) / 0.25, 0.0, 1.0))
                 tr_soft_ = max(tr_, min(1.0, t_free_ / max(1e-3, float(HAND_PARSE_TRIM))))
@@ -1254,6 +1257,9 @@ def limb_cover(st, t: int, lm: np.ndarray, shape, sx: float, sy: float, p_self: 
         lo_, hi_ = float(lohi[0]), float(lohi[1])
         return x_ * (1.0 - np.clip((pskin_ - lo_) / max(1e-3, hi_ - lo_), 0.0, 1.0) * t_)
 
+    if dbg is not None:
+        dbg.update(tr=tr_, tr_soft=tr_soft_, core=int((m_core > 0).sum()), soft=int((m_soft > 0).sum()), limbs=int((m > 0).sum()),
+                   has_parse=pskin_ is not None)
     if m_core.any():
         mf = np.maximum(mf, _given(cv2.bitwise_and(m_core, zone_).astype(np.float32) / 255.0, HAND_CORE_TRIM))
     if m_soft.any():
@@ -3722,6 +3728,36 @@ DOUBLE_DIST = 0.3     # face centres closer than this share of the face width: o
 LIMB_SAME_FACE = True # limb_cover: the limbs and hands of a track that holds this same face on the frame are this person's own (False: somebody else's, as before)
 
 
+# (11/28, LNGSHOT BEEP BEEP c023 f2: one person held by two tracks for the cut's first four frames. The face finder's face of a frame goes to one of
+# the two, the other's landmarks are carried there from the frames beside it (their score 0); the face itself stays with the track the person's matte
+# gives it to. On f2 that was the track with the carried landmarks, their jaw 0.035 of the face width inside the real one: a band of the jaw fell
+# out of the face's skin, was taken for neck, and the neck's tone darkened it by 8 levels for that frame.) A face held by two tracks takes, on each
+# frame, the landmarks that were found on it: where this track's score is DOUBLE_SURER[0] or less and the other's [1] or more, the other's. None = off.
+DOUBLE_SURER = (0.1, 0.5)
+
+
+def _double_face(st, p: int, t: int) -> Optional[np.ndarray]:
+    """The landmarks (68, 3) of another track that holds person p's face on frame t (_same_face) and found it there, when p's own were only carried to
+    the frame (DOUBLE_SURER); None otherwise."""
+    if DOUBLE_SURER is None or not getattr(st, "has_face", False):
+        return None
+    F = st.face
+    if not np.isfinite(F[p, t, :, :2]).all():
+        return None
+    lo, hi = float(DOUBLE_SURER[0]), float(DOUBLE_SURER[1])
+    if not float(np.nan_to_num(F[p, t, :, 2]).mean()) <= lo:
+        return None
+    best, bs = None, hi
+    for q in np.nonzero(st.present[:, t])[0]:
+        q = int(q)
+        if q == int(p) or not _same_face(st, t, int(p), q):
+            continue
+        sq = float(np.nan_to_num(F[q, t, :, 2]).mean())
+        if sq >= bs:
+            best, bs = q, sq
+    return None if best is None else F[best, t]
+
+
 def _same_face(st, t: int, a: int, b: int) -> bool:
     """Tracks a and b hold one face on frame t: both have landmarks there, of about one size (within 1.6 times), their centres within DOUBLE_DIST of
     the face width (the test _double_faces goes by)."""
@@ -4025,6 +4061,13 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
         bridge_ = _face_bridge(st, p, t, FACE_GAP_BRIDGE) if (FACE_GAP_BRIDGE > 0 and p not in doubles) else None
         if st.has_face and np.isfinite(st.face[p, t, :, :2]).all() and p not in doubles:
             face = st.face[p, t]
+            if DOUBLE_SURER is not None:
+                try:
+                    fd_ = _double_face(st, p, t)      # (DOUBLE_SURER) the landmarks found on this frame, by the other track of this face
+                    if fd_ is not None:
+                        face = fd_
+                except Exception:
+                    pass
             # face visibility as a strength: full strength once the face is reasonably sure, so the retouch does
             # not breathe with small confidence changes (a zoom, a turn); it still fades out where the face is
             # really doubtful (heavily covered, carried by motion alone for many frames)
