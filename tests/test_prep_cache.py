@@ -227,3 +227,89 @@ def test_a_changed_analysis_is_not_read(monkeypatch):
         r, w = PC.for_project_render(prj, cut, a, b, warn)
         assert r is None and w is not None and "분석이 바뀜" in warn[0]
         w.close(ok=False)
+
+
+def test_with_the_knee_look_on_a_render_from_the_saved_analysis_is_the_same_render(monkeypatch):
+    """The render's look ahead for the knee tone (bodytone.KNEE_ENV) takes its frames from the saved analysis as it takes them from prepare: the
+    masks wait in float16 there and the knees' strength is set through time, saved or not."""
+    from contour.retouch import bodytone as BTN
+    monkeypatch.setattr(BTN, "KNEE_ENV", True)
+    monkeypatch.setenv("CONTOUR_RENDER_THREADS", "3")
+    monkeypatch.setattr(perf, "free_gb", lambda *a, **k: 64.0)
+    monkeypatch.setattr(PC, "MIN_FREE_GB", 0.0)
+    root = tempfile.mkdtemp()
+    prj = _project()
+    cut = prj.cuts[0]
+    with BU.NoModels():
+        base = BU.render_planes(prj, cut)
+        monkeypatch.setenv("CONTOUR_PREP_CACHE", root)
+        monkeypatch.setenv("CONTOUR_PREP_CACHE_MODE", "write")
+        assert np.array_equal(base, BU.render_planes(prj, cut))
+        assert PC.Reader.open(root, cut, *cut.work_range)[0] is not None
+        called = []
+        prep = E.prepare
+        monkeypatch.setattr(E, "prepare", lambda *a_, **k: (called.append(a_[2]), prep(*a_, **k))[1])
+        monkeypatch.setenv("CONTOUR_PREP_CACHE_MODE", "read")
+        assert np.array_equal(base, BU.render_planes(prj, cut)) and called == []
+
+
+def test_the_cut_work_and_the_app_version_are_part_of_what_a_saved_analysis_is_for(monkeypatch):
+    from contour.core.settings import settings
+    monkeypatch.setattr(perf, "free_gb", lambda *a, **k: 64.0)
+    monkeypatch.setattr(PC, "MIN_FREE_GB", 0.0)
+    monkeypatch.delenv("CONTOUR_PREP_CACHE", raising=False)
+    monkeypatch.setattr(settings(), "keep_analysis", True)
+    prj = _project()
+    cut = prj.cuts[0]
+    a, b = cut.work_range
+    with BU.NoModels():
+        BU.render_planes(prj, cut)
+    assert PC.for_project_render(prj, cut, a, b)[0] is not None
+    # an app with another engine
+    monkeypatch.setattr(PC, "_app_version", lambda: "9.9.9")
+    warn = []
+    r, w = PC.for_project_render(prj, cut, a, b, warn)
+    assert r is None and w is not None and "앱 버전" in warn[0]
+    w.close(ok=False)
+    monkeypatch.undo()
+
+
+def test_work_sig_follows_the_people_and_the_protect_settings():
+    prj = _project()
+    cut = prj.cuts[0]
+    s0 = PC.work_sig(cut)
+    assert s0 == PC.work_sig(cut)
+    cut.persons[0].name = "another name"                           # a name is not the work
+    assert PC.work_sig(cut) == s0
+    old = cut.persons[0].role
+    cut.persons[0].role = "ignore" if old != "ignore" else "protect"
+    assert PC.work_sig(cut) != s0
+    cut.persons[0].role = old
+    cut.protect.others = not cut.protect.others
+    assert PC.work_sig(cut) != s0
+
+
+def test_one_saved_analysis_a_cut_and_the_cache_clearing_takes_it(monkeypatch):
+    from contour.core import projects as PJ
+    from contour.core.settings import settings
+    from contour.core.project import Curve
+    monkeypatch.setattr(perf, "free_gb", lambda *a, **k: 64.0)
+    monkeypatch.setattr(PC, "MIN_FREE_GB", 0.0)
+    monkeypatch.delenv("CONTOUR_PREP_CACHE", raising=False)
+    monkeypatch.setattr(settings(), "keep_analysis", True)
+    prj = _project()
+    cut = prj.cuts[0]
+    a, b = cut.work_range
+    root = prj.cut_dir(cut) / "prep_cache"
+    with BU.NoModels():
+        BU.render_planes(prj, cut)
+        first = sorted(os.listdir(root))
+        assert len(first) == 1
+        pid = cut.targets()[0].id
+        cut.params_for(pid).amounts["skin"] = Curve(base=cut.params_for(pid).amount("skin", a) + 9.0)
+        BU.render_planes(prj, cut)                                 # other values: saved anew, the folder of before gone
+    second = sorted(os.listdir(root))
+    assert len(second) == 1 and second != first
+    assert PJ.sizes(str(prj.folder))["proxy"] > 0
+    PJ.clear_proxies(str(prj.folder))
+    assert not root.exists()

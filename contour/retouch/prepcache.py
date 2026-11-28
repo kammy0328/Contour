@@ -335,6 +335,33 @@ def analysis_sig(project, cut) -> str:
     return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
+def work_sig(cut) -> str:
+    """The cut's work that the prepared frames depend on and the values' signature does not hold: who the people are (role, still, held), the
+    joints set by hand and their locks, the protect settings, the colour space and LUT, the mode."""
+    def plain(v):
+        if hasattr(v, "to_dict"):
+            return plain(v.to_dict())
+        if isinstance(v, dict):
+            return {str(k): plain(x) for k, x in sorted(v.items(), key=lambda kv: str(kv[0]))}
+        if isinstance(v, (list, tuple)):
+            return [plain(x) for x in v]
+        if isinstance(v, (str, int, float, bool)) or v is None:
+            return v
+        return str(v)
+    d = dict(persons=[[p.id, getattr(p, "role", ""), bool(getattr(p, "still", False)), getattr(p, "hold", "")] for p in getattr(cut, "persons", [])])
+    for k in ("joint_keys", "locked", "confirmed", "hidden", "protect", "input_cs", "lut_path", "mode", "removed", "edit_points"):
+        d[k] = plain(getattr(cut, k, None))
+    return hashlib.sha1(json.dumps(d, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")).hexdigest()[:16]
+
+
+def _app_version() -> str:
+    try:
+        from ..core.settings import APP_VERSION
+        return str(APP_VERSION)
+    except Exception:
+        return ""
+
+
 def look(info, a: int, b: int):
     """Three frames of the cut's source (first, middle, last of the range) small: their outlines (edges whatever the colours) and the pictures."""
     from ..core import media as MD
@@ -371,6 +398,20 @@ def same_picture(saved, now) -> "tuple[bool, str]":
     return True, "윤곽 일치 %.2f, 색 차이 %.1f레벨" % (min(shape), col)
 
 
+def _drop_others(root: str, keep: str) -> None:
+    """The cut's own prep_cache holds one saved analysis: the folders of other values or ranges (each 10~25 MB a frame) go when a new one is
+    written. Only folders this module made (t*.pz, meta.json, look.npz) under the cut's prep_cache."""
+    import shutil
+    try:
+        for nm in os.listdir(root):
+            d = os.path.join(root, nm)
+            if os.path.isdir(d) and os.path.normcase(os.path.abspath(d)) != os.path.normcase(os.path.abspath(keep)):
+                if all(f.endswith((".pz", ".tmp")) or f in ("meta.json", "look.npz") for f in os.listdir(d)):
+                    shutil.rmtree(d, ignore_errors=True)
+    except OSError:
+        pass
+
+
 def for_project_render(project, cut, a: int, b: int, warnings: Optional[list] = None):
     """(설정 > 렌더할 때 분석 저장) the render's (reader, writer) in the cut's folder: a reader when a saved analysis fits (cut, range, values,
     analysis, the same shot with close colours), else a writer that saves this render's. (None, None) when the setting is off or the environment
@@ -383,10 +424,15 @@ def for_project_render(project, cut, a: int, b: int, warnings: Optional[list] = 
             return None, None
         root = str(project.cut_dir(cut) / "prep_cache")
         sig = analysis_sig(project, cut)
-        r, why = Reader.open(root, cut, a, b)
+        more = dict(analysis=sig, work=work_sig(cut), app=_app_version())      # (what else the saved frames are for: the analysis files, the
+        r, why = Reader.open(root, cut, a, b)                                  # cut's work, the app whose engine prepared them)
         if r is not None:
             if r.meta.get("analysis") != sig:
                 why = "분석이 바뀜"
+            elif r.meta.get("work") != more["work"]:
+                why = "인물 설정이나 보호 설정이 바뀜"
+            elif r.meta.get("app") != more["app"]:
+                why = "앱 버전이 바뀜"
             else:
                 try:
                     z = np.load(os.path.join(r.d, "look.npz"))
@@ -403,7 +449,8 @@ def for_project_render(project, cut, a: int, b: int, warnings: Optional[list] = 
                 warnings.append("분석 저장 안 함: 디스크 공간 부족")
             return None, None
         d = folder(root, cut, a, b)
-        w = Writer(d, dict(_meta(cut, a, b, ""), analysis=sig))
+        _drop_others(root, d)
+        w = Writer(d, dict(_meta(cut, a, b, ""), **more))
         lk = look(cut.info, a, b)
         if lk is not None:
             np.savez(os.path.join(d, "look.npz"), outline=lk[0], pic=lk[1])

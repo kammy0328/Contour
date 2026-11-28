@@ -351,12 +351,15 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
             n_workers = n_ra
             gate = PF.FrameGate(n_workers, people=sum(1 for p_ in cut.targets()) or 1, megapixels=W * H / 1e6)
 
+    pc_off = [False]
+
     def prepare_(t_):
         rf_p = RE.prepare(cut, tracker, t_)
-        if pc_writer is not None:
+        if pc_writer is not None and not pc_off[0]:
             try:
                 pc_writer.put(t_, rf_p)
-            except Exception as e:          # noqa: BLE001  (the render goes on without saving)
+            except Exception as e:          # noqa: BLE001  (the render goes on without saving; said once)
+                pc_off[0] = True
                 rep.warnings.append("분석 저장 오류: " + str(e)[:120])
         return rf_p
 
@@ -367,9 +370,10 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
                 return rf_c
         return prepare_(t_)
 
+    # (the knee look takes its frames from the saved analysis too: what it does to them, the knees' strength through time, is done as ever)
     knee_look = None
-    if pc_reader is None and parallel and n_workers > 1 and getattr(RE.BTN, "KNEE_ENV", False):
-        knee_look = RE.KneeLook(prepare_, lambda t_: F.build_input(cut, tracker, t_), prep_lock, a, b, tracker.proxy)
+    if parallel and n_workers > 1 and getattr(RE.BTN, "KNEE_ENV", False):
+        knee_look = RE.KneeLook(prep_frame, lambda t_: F.build_input(cut, tracker, t_), prep_lock, a, b, tracker.proxy)
 
     # the raw frames (each frame's masks on their own, most of the serial stage) made ahead in helper processes when the environment asks for them
     # (CONTOUR_RAW_PROCS): retouch.rawpool. What a frame gets is the same; a frame no helper made is made here as before.
@@ -388,7 +392,7 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
         if pc_writer is not None and not getattr(rep, "_pc_closed", False):
             rep._pc_closed = True
             try:
-                pc_writer.close(ok and not rep.cancelled)
+                pc_writer.close(ok and not rep.cancelled and not pc_off[0])
             except Exception as e:          # noqa: BLE001
                 rep.warnings.append("분석 저장 오류: " + str(e)[:120])
         if pc_reader is not None and not getattr(rep, "_pc_said", False):
