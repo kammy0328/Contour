@@ -124,6 +124,9 @@ def pace_text(done: int, total: int, elapsed: float) -> str:
     return f"{done}/{total} · {pace} · 남은 시간 {left}"
 
 
+READ_WORKERS = 8          # (1.28) frames side by side when the analysis is read from what a render saved (retouch.prepcache)
+
+
 def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progress: Progress = None,
                cancel: Optional[Callable[[], bool]] = None, ext_writer=None,
                preview: Optional[Callable[[int, np.ndarray], None]] = None) -> RenderReport:
@@ -333,24 +336,68 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
 
     # the knee tone through time (1.26): the pictures are prepared a few ahead, in a thread of their own, and a picture is worked on when the pictures round it
     # have been looked at (retouch.engine.KneeLook); off, every picture is prepared by the one that works on it
+    # (11/28) the frames' analysis saved before (retouch.prepcache, CONTOUR_PREP_CACHE / _MODE read): a frame found there is not prepared again,
+    # and nothing is prepared ahead for it; a frame not found is prepared as ever
+    from ..retouch import prepcache as PCACHE
+    pc_reader = PCACHE.reader_for_render(cut, a, b, rep.warnings)
+    pc_writer = PCACHE.writer_for_render(cut, a, b, rep.warnings) if pc_reader is None else None
+    if pc_reader is None and pc_writer is None:            # (1.28) 설정 > 렌더할 때 분석 저장: the cut's own folder
+        pc_reader, pc_writer = PCACHE.for_project_render(project, cut, a, b, rep.warnings)
+    # (1.28) from the saved analysis nothing is prepared in the frames' lock, so more frames go side by side: 8 on 18 cores (c026, 4 people,
+    # 35 frames: 4 at once 3.16, 6 2.64, 8 2.46 s a frame, every frame the same); the gate still takes slots away when memory runs short
+    if pc_reader is not None and parallel and not os.environ.get("CONTOUR_RENDER_THREADS", "").isdigit():
+        n_ra = max(1, min(READ_WORKERS, (os.cpu_count() or 2) // 2))
+        if n_ra > n_workers:
+            n_workers = n_ra
+            gate = PF.FrameGate(n_workers, people=sum(1 for p_ in cut.targets()) or 1, megapixels=W * H / 1e6)
+
+    pc_off = [False]
+
+    def prepare_(t_):
+        rf_p = RE.prepare(cut, tracker, t_)
+        if pc_writer is not None and not pc_off[0]:
+            try:
+                pc_writer.put(t_, rf_p)
+            except Exception as e:          # noqa: BLE001  (the render goes on without saving; said once)
+                pc_off[0] = True
+                rep.warnings.append("분석 저장 오류: " + str(e)[:120])
+        return rf_p
+
+    def prep_frame(t_):
+        if pc_reader is not None:
+            ok_, rf_c = pc_reader.get(t_)
+            if ok_:
+                return rf_c
+        return prepare_(t_)
+
+    # (the knee look takes its frames from the saved analysis too: what it does to them, the knees' strength through time, is done as ever)
     knee_look = None
     if parallel and n_workers > 1 and getattr(RE.BTN, "KNEE_ENV", False):
-        knee_look = RE.KneeLook(lambda t_: RE.prepare(cut, tracker, t_), lambda t_: F.build_input(cut, tracker, t_), prep_lock, a, b, tracker.proxy)
+        knee_look = RE.KneeLook(prep_frame, lambda t_: F.build_input(cut, tracker, t_), prep_lock, a, b, tracker.proxy)
 
     # the raw frames (each frame's masks on their own, most of the serial stage) made ahead in helper processes when the environment asks for them
     # (CONTOUR_RAW_PROCS): retouch.rawpool. What a frame gets is the same; a frame no helper made is made here as before.
     from ..retouch import rawpool as RP
-    raw_pool = RP.start_for_render(project, cut, tracker, a, b)
+    raw_pool = RP.start_for_render(project, cut, tracker, a, b) if pc_reader is None else None
     # (1.27) without helper processes: the next frames' own masks made ahead in threads of this process, where the computer has
     # the memory and the cores (retouch.rawahead, core.perf.raw_ahead). The same masks; the serial stage waits on them less.
     from ..retouch import rawahead as RA
-    raw_ahead = RA.start_for_render(cut, tracker, a, b) if raw_pool is None else None
+    raw_ahead = RA.start_for_render(cut, tracker, a, b) if raw_pool is None and pc_reader is None else None
 
     # the retouch of each frame done in helper processes when the environment asks for them (CONTOUR_APPLY_PROCS): retouch.applypool
     from ..retouch import applypool as AP
     apply_pool = AP.start_for_render(subs, maxv, pf, disp_, info.color_range) if parallel and n_workers > 1 else None
 
-    def stop_raw():
+    def stop_raw(ok=False):
+        if pc_writer is not None and not getattr(rep, "_pc_closed", False):
+            rep._pc_closed = True
+            try:
+                pc_writer.close(ok and not rep.cancelled and not pc_off[0])
+            except Exception as e:          # noqa: BLE001
+                rep.warnings.append("분석 저장 오류: " + str(e)[:120])
+        if pc_reader is not None and not getattr(rep, "_pc_said", False):
+            rep._pc_said = True
+            rep.accel = (rep.accel + " · " if rep.accel else "") + f"저장된 분석 {pc_reader.hit}/{pc_reader.hit + pc_reader.miss}"
         if apply_pool is not None:
             try:
                 sa_ = apply_pool.close()
@@ -386,9 +433,15 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
     def _process(t_, planes_):
         if knee_look is not None:
             rf_, fi_ = knee_look.get(t_)
+        elif pc_reader is not None:
+            ok_, rf_ = pc_reader.get(t_)       # (read and unpacked side by side: the folder is not the tracker)
+            with prep_lock:
+                if not ok_:
+                    rf_ = RE.prepare(cut, tracker, t_)
+                fi_ = F.build_input(cut, tracker, t_)
         else:
             with prep_lock:                    # tracker caches are not shared between threads
-                rf_ = RE.prepare(cut, tracker, t_)
+                rf_ = prepare_(t_)
                 fi_ = F.build_input(cut, tracker, t_)
         if rf_ is not None and not rf_.empty():
             # (1.27) how many frames are retouched at once goes by the memory the computer has left (perf.FrameGate): told
@@ -518,7 +571,7 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
                 rep.warnings.append(f"프레임 {t}에서 디코딩이 끝났습니다.")
                 break
             src_copy = [np.array(p_, copy=True) for p_ in planes] if steadier is not None else None
-            rf = RE.prepare(cut, tracker, t)
+            rf = prep_frame(t)
             if rf is not None:
                 planes = RE.apply_planes(planes, subs, maxv, pf, rf, 1.0, disp_, info.color_range)
             fi = F.build_input(cut, tracker, t)
@@ -547,7 +600,7 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
         for w in matte_writers.values():
             w.abort()
         raise
-    stop_raw()
+    stop_raw(ok=rep.frames >= n)
     reader.close()
     if not rep.cancelled and rep.frames < n:
         # the source ended early: a shorter file is not this cut (in an edited timeline every later shot would move)

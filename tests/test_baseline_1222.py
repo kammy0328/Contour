@@ -34,6 +34,16 @@ def _each_frame_on_its_own(monkeypatch):
     # tests/test_feedback_1127.py checks it
     from contour.retouch import engine as EN
     monkeypatch.setattr(EN, "BLEMISH_JAW_HOLD", False)
+    # (v2 review) the colour model's sure skin round a face whose outline misses it counts (profiles, heads thrown back): the synthetic face's sides
+    # are such skin; on purpose a change of the picture
+    from contour.retouch import skin as SK
+    monkeypatch.setattr(SK, "SIDE_REACH", None)
+    # (BTv3 QC, d11) the mouth corners' pimple pass, the neck's colour floor and its reach under a turned face's ear, the chin's levelling: stages the
+    # 1222 render did not have
+    monkeypatch.setattr(EN, "MOUTH_SPOTS", None)
+    monkeypatch.setattr(EN, "NECK_PROB_FLOOR", None)
+    monkeypatch.setattr(EN, "NECK_PARSE_EAR", 0.0)
+    monkeypatch.setattr(EN, "CHIN_LEVEL_ON", False)
 
 
 @pytest.fixture

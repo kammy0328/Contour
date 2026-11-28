@@ -122,6 +122,16 @@ class SettingsDialog(QDialog):
         self.proxy_mode.setCurrentIndex(max(0, self.proxy_mode.findData(getattr(s, "proxy_mode", "auto"))))
         self.proxy_mode.setToolTip("컷은 원본으로 바로 열립니다. 프록시는 반복해서 읽을 때 빠르게 하려고 백그라운드에서만 만듭니다.")
         form.addRow("프록시 만들기", self.proxy_mode)
+        # (1.28) the render's analysis kept for the next render (retouch/prepcache.py)
+        self.keep_an = QCheckBox("렌더할 때 분석 저장 (다시 렌더할 때 빠르게)")
+        self.keep_an.setChecked(bool(getattr(s, "keep_analysis", False)))
+        self.keep_an.setToolTip("켜면 렌더할 때 프레임마다 분석한 결과(인물 마스크, 잡티 위치, 값)를 컷 폴더의 prep_cache에 저장합니다.\n"
+                                "같은 컷을 같은 범위·같은 보정값·같은 분석으로 다시 렌더하면 저장한 분석을 쓰고 보정만 해서 2배 안팎 빠릅니다. "
+                                "결과는 저장 없이 렌더한 것과 같습니다.\n"
+                                "색보정본을 받아 소스 교체한 컷도 같은 샷이고 색이 크게 바뀌지 않았으면 저장한 분석을 씁니다. "
+                                "화면이 다른 샷이거나 색이 많이 바뀌었으면 분석부터 다시 합니다.\n"
+                                "프로젝트 폴더에 프레임당 10~25MB를 씁니다 (4K, 얼굴 4명 기준). 디스크 여유가 20GB보다 적으면 저장하지 않습니다.")
+        form.addRow("", self.keep_an)
         # auto save
         self.autosave = QCheckBox("자동 저장")
         self.autosave.setChecked(bool(getattr(s, "autosave", True)))
@@ -366,6 +376,7 @@ class SettingsDialog(QDialog):
         s.view = self.view.currentText()
         s.proxy_long_side = int(self.proxy.currentData())
         s.proxy_mode = str(self.proxy_mode.currentData())
+        s.keep_analysis = self.keep_an.isChecked()
         s.autosave = self.autosave.isChecked()
         s.autosave_minutes = int(self.as_min.value())
         s.autosave_keep = int(self.as_keep.value())

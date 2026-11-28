@@ -132,7 +132,32 @@ def _turn(lm) -> float:
         return abs(a - b) / max(a + b, 1e-6)
     except Exception:
         return 0.0
+
+
+def _linked(wmap: np.ndarray, seed: np.ndarray, soft: float = 1.0, thr: float = 0.5) -> np.ndarray:
+    """0..1: the parts of wmap (above thr, 8-connected) that touch seed (bool), with a soft rim of about soft px; 0 elsewhere."""
+    b = (np.asarray(wmap, np.float32) > thr).astype(np.uint8)
+    if not b.any():
+        return np.zeros(b.shape, np.float32)
+    n_, lab_ = cv2.connectedComponents(b, connectivity=8)
+    hit_ = np.unique(lab_[(b > 0) & np.asarray(seed, bool)])
+    hit_ = hit_[hit_ > 0]
+    if hit_.size == 0:
+        return np.zeros(b.shape, np.float32)
+    keep = np.isin(lab_, hit_).astype(np.uint8)
+    k_ = max(3, int(4 * soft) | 1)
+    keep = cv2.dilate(keep, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_, k_)))
+    return cv2.GaussianBlur(keep.astype(np.float32), (0, 0), max(0.5, float(soft)))
+
+
+MATTE_HOLES = 0.5         # (v2 review) of the face's height: the matte's holes this near the face are filled (None = off)
+SIDE_REACH = (0.45, 0.85) # (v2 review) (how far round the outline, of the face width; below this share of the sure skin inside the outline) the colour model's skin counts
 PARSE_FAR = 0.5        # (1.27.1) the parser's sure skin past the reach this much of what is inside it: the landmarks missed the face (None = off)
+SKIN_LINKED = True         # (11/28) the side's reach and the matte's open holes take the colour's skin only where it runs on from the face (False: anywhere near)
+SKIN_LINK_THR = 0.25       # how sure the skin it runs on through is (the colour model's 0.3 .. 0.6, or the parser's skin 0.4 .. 0.7 where trusted, as 0 .. 1)
+SKIN_LINK_IN = 0.08        # of the face width: from this far inside the face's outline (its own skin, not a corner of it lying on the background)
+PARSE_FILL = (0.5, 0.8)    # (11/28) inside the face's outline the parser's skin from (to wholly) this sure fills the colour model's holes (None = off)
+PARSE_FILL_FEAT = 0.03     # of the face width: that fill keeps this far from the eyes, the brows and the lips
 PARSE_REACH = 0.25     # of the face width: how far past the landmark outline the parser's sure skin still counts
 PARSE_SOFT = 0.008     # of the face width: smoothing of the parser's map before that (was 0.012)
 NOSTRIL_RX, NOSTRIL_RY = 0.60, 0.26   # nostril ellipse, of the nostrils' span (was 0.66 x 0.36)
@@ -837,6 +862,7 @@ def skin_mask(job: SkinJob, rgb_proxy: np.ndarray, sx: float, sy: float, person_
     from ..core.project import scope_set
     regions = scope_set(job.scope)
     region = np.zeros((h, w), np.float32)
+    side_ = None
     if "face" in regions:
         poly = face_polygon(lm) if lm is not None else None
         if poly is not None:
@@ -882,6 +908,48 @@ def skin_mask(job: SkinJob, rgb_proxy: np.ndarray, sx: float, sy: float, person_
                                     region = np.maximum(region, cv2.GaussianBlur(far_ * np.clip(ps3_ / 0.6, 0, 1), (k, k), 0) * job.face_w)
                             except Exception:
                                 pass
+            if SIDE_REACH is not None and job.face_w > 0.3:
+                # (v2 review, c025 f0 in profile, c034 f33 / f42 thrown back, c030 f17: the cheek's side, the jaw towards the ear were outside the
+                # landmarks' outline, and the parser too saw only the front of the face: their bumps were left) where the outline holds less than
+                # SIDE_REACH[1] of the skin the colour model is sure of round the face (above the jaw's line, as far as SIDE_REACH[0] of the face
+                # width), that skin counts too
+                try:
+                    # (a face in profile: its width between the jaw's ends is a third of the head; the height from the brows' middle to the chin is not)
+                    Wfs_ = max(float(np.hypot(*(lm[16, :2] - lm[0, :2]))), 1.2 * float(np.hypot(*(lm[8, :2] - lm[27, :2]))))
+                    ks_ = max(3, int(2 * SIDE_REACH[0] * Wfs_) | 1)
+                    near_ = cv2.dilate(reg, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks_, ks_)))
+                    # above the chin's level (the face's up: from the chin to the brows' middle): the neck below stays to the neck's own mask
+                    up_ = lm[27, :2] - lm[8, :2]
+                    up_ = up_ / max(1e-6, float(np.hypot(*up_)))
+                    yy_, xx_ = np.mgrid[0:h, 0:w].astype(np.float32)
+                    above_ = (((xx_ - lm[8, 0]) * up_[0] + (yy_ - lm[8, 1]) * up_[1]) > -0.02 * Wfs_).astype(np.uint8) * 255
+                    near_ = np.minimum(near_, above_)
+                    sure_c = (prob > 0.6) & (near_ > 0)
+                    if sure_c.sum() > 50:
+                        frac_ = float(((region > 0.5) & sure_c).sum()) / float(sure_c.sum())
+                        if __import__("os").environ.get("SIDE_DEBUG"):
+                            print("side reach: frac", round(frac_, 3), "sure", int(sure_c.sum()), "Wfs", round(Wfs_, 1))
+                        if frac_ < SIDE_REACH[1]:
+                            # (the side in the sun: overexposed, its colour washed out, the colour model's 0.3 to 0.6 there) taken from 0.3 on
+                            pc_ = np.clip((prob - 0.3) / 0.3, 0, 1)
+                            if parse is not None and parse.get("trust", 0) > 0 and "hair" in parse:
+                                pc_ = pc_ * (1.0 - np.clip(parse["hair"].astype(np.float32) * 1.5, 0, 1) * float(parse["trust"]))
+                            if SKIN_LINKED:
+                                # (the check of the 1128 files, c024 f9 p1: both hands on the cheeks held the outline's share low, and the sunlit beige wall by
+                                # the beanie and the pink sleeve under a hand, skin to the colour model, became face skin) the side's skin is the face's only where
+                                # it runs on from the face itself
+                                ke_ = max(3, int(2 * SKIN_LINK_IN * Wfs_) | 1)
+                                seed_ = cv2.erode(reg, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ke_, ke_))) > 0
+                                via_ = pc_
+                                if parse is not None and parse.get("trust", 0) > 0:
+                                    via_ = np.maximum(via_, np.clip((parse["skin"].astype(np.float32) - 0.4) / 0.3, 0, 1) * float(parse["trust"]))
+                                pc_ = pc_ * _linked(via_ * (near_ > 0), seed_, max(1.0, 0.01 * Wfs_), SKIN_LINK_THR)
+                            side_ = cv2.GaussianBlur(near_.astype(np.float32) / 255.0 * pc_, (k, k), 0) * job.face_w
+                            region = np.maximum(region, side_)
+                except Exception:
+                    if __import__("os").environ.get("SIDE_DEBUG"):
+                        import traceback
+                        traceback.print_exc()
         # the nose and the skin between it and the upper lip: on a face in profile or turned well away the
         # nose stands out past the face outline and was left untouched (cut 037: a smooth face, a raw nose)
         if lm is not None and np.isfinite(lm[27:36, :2]).all() and np.isfinite(lm[48:55, :2]).all():
@@ -924,8 +992,77 @@ def skin_mask(job: SkinJob, rgb_proxy: np.ndarray, sx: float, sy: float, person_
                     a_ = np.maximum(a_, oz * sure)
             except Exception:
                 pass
+        if MATTE_HOLES is not None and lm is not None:
+            # (v2 review, c025 f0: the sunlit cheek and jaw in profile were a hole in the person's matte, and nothing of the face was retouched there)
+            # a hole the matte has inside the head (closed round by the matte itself), as far as MATTE_HOLES of the face's height round the face, is
+            # the person's
+            try:
+                Wh_ = max(float(np.hypot(*(lm[16, :2] - lm[0, :2]))), 1.2 * float(np.hypot(*(lm[8, :2] - lm[27, :2]))))
+                b_ = (np.asarray(a_, np.float32) > 0.5).astype(np.uint8)
+                ff_ = b_.copy()
+                msk_ = np.zeros((h + 2, w + 2), np.uint8)
+                for sx_, sy_ in ((0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)):
+                    if ff_[sy_, sx_] == 0:
+                        cv2.floodFill(ff_, msk_, (sx_, sy_), 2)
+                holes_ = (ff_ == 0).astype(np.uint8)                 # neither the matte nor reached from outside: enclosed by the matte
+                hz_ = np.zeros((h, w), np.uint8)
+                cv2.fillConvexPoly(hz_, cv2.convexHull(np.round(lm[:, :2]).astype(np.int32)), 255)
+                kz_ = max(3, int(2 * MATTE_HOLES * Wh_) | 1)
+                hz_ = cv2.dilate(hz_, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kz_, kz_)))
+                holes_ = holes_ * (hz_ > 0)
+                if holes_.any():
+                    a_ = np.maximum(np.asarray(a_, np.float32), cv2.GaussianBlur(holes_.astype(np.float32), (0, 0), max(1.0, 0.01 * Wh_)))
+                # a hole open to the background (the matte lost the lit side of the head where it meets a bright sky): round the face, what the colour
+                # model is sure is this face's skin
+                sz_ = np.clip((np.asarray(prob, np.float32) - 0.6) / 0.25, 0, 1) * (hz_ > 0)
+                if SKIN_LINKED:
+                    # (the check of the 1128 files, c024 f9 p1: a sunlit beige wall half a face from the head, skin to the colour model, became the
+                    # person's and then face skin) only the colour's sure skin that runs on from the face itself
+                    fo_ = np.zeros((h, w), np.uint8)
+                    pz2_ = face_polygon(lm)
+                    if pz2_ is not None:
+                        cv2.fillPoly(fo_, [np.round(pz2_).astype(np.int32)], 1)
+                        ke_ = max(3, int(2 * SKIN_LINK_IN * Wh_) | 1)
+                        fo_ = cv2.erode(fo_, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ke_, ke_)))
+                        via_ = np.clip((np.asarray(prob, np.float32) - 0.3) / 0.3, 0, 1)
+                        if parse is not None and parse.get("trust", 0) > 0:
+                            via_ = np.maximum(via_, np.clip((parse["skin"].astype(np.float32) - 0.4) / 0.3, 0, 1) * float(parse["trust"]))
+                        sz_ = sz_ * _linked(via_ * (hz_ > 0), fo_ > 0, max(1.0, 0.01 * Wh_), SKIN_LINK_THR)
+                a_ = np.maximum(np.asarray(a_, np.float32), cv2.GaussianBlur(sz_.astype(np.float32), (0, 0), max(1.0, 0.01 * Wh_)))
+            except Exception:
+                pass
         region = region * a_
+        if side_ is not None:
+            side_ = side_ * a_
     m = prob * region
+    if side_ is not None:
+        m = np.maximum(m, side_)          # the side's own weight (its colour already in it), not the colour model's again
+    fill_keep_ = None
+    if PARSE_FILL is not None and parse is not None and parse.get("trust", 0) > 0 and lm is not None and job.face_w > 0.3:
+        # (client's 1st PV feedback 11/28, the check of the 1128 files: c002 f74 / f76 a cheek lit by the stage's coloured light, c020 f15 a sun patch on
+        # a temple, were holes in the skin mask inside the face's own outline: the colour model, made from the face's middle, did not take them, and they
+        # stayed unretouched) inside the face's outline (up to the forehead the parser sees) where the parser is sure it is the face's skin, the colour
+        # model's doubt does not count: the parser's certainty is taken instead (an arm or a hand in front stays out)
+        try:
+            own_ = face_polygon(lm, FOREHEAD_PARSED)
+            if own_ is not None:
+                fz_ = np.zeros((h, w), np.uint8)
+                cv2.fillPoly(fz_, [np.round(own_).astype(np.int32)], 255)
+                Wp_ = max(8.0, float(np.hypot(*(lm[16, :2] - lm[0, :2]))))
+                fzf_ = cv2.GaussianBlur(fz_.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.02 * Wp_))
+                ps_ = np.clip((parse["skin"].astype(np.float32) - PARSE_FILL[0]) / max(1e-6, PARSE_FILL[1] - PARSE_FILL[0]), 0, 1) * float(parse["trust"])
+                fill_ = region * fzf_ * ps_
+                if cover is not None:
+                    fill_ = fill_ * (1.0 - cover)
+                # the lash lines, the brows and the lips' edges stay as the colour model has them: the parser's own edge there is coarse
+                ft_ = _features_mask(lm, (h, w))
+                kf_ = max(3, int(2 * PARSE_FILL_FEAT * Wp_) | 1)
+                ft_ = cv2.dilate(ft_, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kf_, kf_)))
+                fill_ = fill_ * (1.0 - cv2.GaussianBlur(ft_.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.01 * Wp_)))
+                m = np.maximum(m, fill_)
+                fill_keep_ = fill_
+        except Exception:
+            pass
     if lm is not None and np.isfinite(lm[:, :2]).any():
         feat = _features_mask(lm, (h, w))
         Wf = float(np.hypot(*(lm[16, :2] - lm[0, :2]))) if np.isfinite(lm[[0, 16], :2]).all() else 20.0
@@ -949,6 +1086,10 @@ def skin_mask(job: SkinJob, rgb_proxy: np.ndarray, sx: float, sy: float, person_
             m *= 1.0 - cv2.GaussianBlur(hm.astype(np.float32) / 255.0, (k, k), 0)
     if DARK_GUARD is not None and lm is not None and np.isfinite(lm[[0, 16], :2]).all():
         m = _dark_guard(m, rgb_proxy, lm)
+        if fill_keep_ is not None:
+            # (the check of the 1128 files, c084 f12, c087 f16: the face's side in deep shade, darker than the guard's share of the lit skin) what the
+            # parser is sure is this face's skin inside its outline is not hair or a black top
+            m = np.maximum(m, fill_keep_)
     # edge softening follows the face size (a fixed pixel blur washed a small face's mask out: during a zoom
     # the retouch faded in instead of holding its strength)
     sig = max(0.8, 0.0025 * h)

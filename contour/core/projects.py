@@ -93,6 +93,7 @@ def _proxy_files(path: str) -> List[Path]:
     root = Path(path)
     out = [p for p in root.glob("cuts/*/cache/proxy_*.u8")] + [p for p in root.glob("cuts/*/cache/proxy_meta.json")]
     out += [p for p in root.glob("cuts/*/cache/proxy_shared.json")]
+    out += [p for p in root.glob("cuts/*/prep_cache/*/*") if p.is_file()]      # (1.28) the renders' saved analysis: made again by a render
     bc = root / "bake_cache"
     if bc.exists():
         out += [p for p in bc.rglob("*") if p.is_file()]
@@ -133,6 +134,8 @@ def clear_proxies(path: str) -> int:
     bc = Path(path) / "bake_cache"
     if bc.exists():
         shutil.rmtree(bc, ignore_errors=True)
+    for pc in Path(path).glob("cuts/*/prep_cache"):
+        shutil.rmtree(pc, ignore_errors=True)
     lc = local_cache(path)
     if lc is not None:
         shutil.rmtree(lc, ignore_errors=True)

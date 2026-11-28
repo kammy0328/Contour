@@ -98,14 +98,17 @@ def test_neck_mask_keeps_a_strand_out_of_the_neck_even_when_the_blur_would_close
     prob = (1.0 - protect).astype(np.float32)
     parse = dict(neck=np.ones((h, w), np.float32), skin=np.zeros((h, w), np.float32), cover=np.ones((h, w), np.float32), trust=1.0)
     old = RE.NECK_PROTECT
+    oldf = RE.NECK_PROB_FLOOR
     try:
         RE.NECK_PROTECT = 0.0
+        RE.NECK_PROB_FLOOR = None        # (d11: the colour floor alone keeps such a strand out too; the hold is what is tested here)
         m0 = RE.neck_mask(lm, None, None, (h, w), 1.0, 1.0, prob, None, 1.5, None, None, parse, protect=protect)
         RE.NECK_PROTECT = 1.0
         m1 = RE.neck_mask(lm, None, None, (h, w), 1.0, 1.0, prob, None, 1.5, None, None, parse, protect=protect)
         m2 = RE.neck_mask(lm, None, None, (h, w), 1.0, 1.0, prob, None, 1.5, None, None, parse)
     finally:
         RE.NECK_PROTECT = old
+        RE.NECK_PROB_FLOOR = oldf
     assert float(m0[309:311, 189:191].mean()) > 0.3, "before: the blur closed the strand's hole"
     assert float(m1[309:311, 189:191].mean()) < 0.1, "now: the strand is out of the neck's mask"
     near = cv2.dilate((protect > 1e-3).astype(np.uint8), np.ones((31, 31), np.uint8)) > 0
