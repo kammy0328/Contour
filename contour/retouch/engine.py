@@ -2595,6 +2595,63 @@ def _face_bridge(st, p: int, t: int, n: int):
     if kb + kf - 1 > n:
         return None
     return fb + (ff - fb) * (kb / float(kb + kf)), min(_vis_w(vb), _vis_w(vf))
+
+
+# (11/28, the third check of the 1128 renders: c038 f45..48, 률's profile in plain sight, the cheek the client asked to clean at 01:21..01:23: the tracker kept
+# no landmarks for four frames (visibility 0) while both face models had the face, 4 % apart and as sure as on the frames round it, and the retouch went off
+# for those frames, between frames that had it) a face the tracker dropped for at most FACE_RAW_FILL[0] frames between frames it has is taken from the face
+# models' own points when both see it (mean confidence from [1] for the whole-body model, [2] for the face model), where the other does (the mean distance of
+# their points under [3] of the face width) and in line with the frames round it (its centre within [4] face widths of the line between them, its width
+# within [5] times theirs). Its weight is the lower of the two frames' round it, each as the frame's own job has it (the tracker's visibility, lifted by the
+# parser where it sees the face: VIS_PARSE). None = off.
+FACE_RAW_FILL = (6, 5.0, 0.6, 0.12, 0.5, 1.5)
+
+
+def _face_raw_fill(st, p: int, t: int):
+    """(the face at t from the two face models (their mean), (frame before, frame after) the gap) or None (FACE_RAW_FILL)"""
+    if FACE_RAW_FILL is None or not getattr(st, "has_face", False):
+        return None
+    n, c_body, c_face, agree, off, wr = FACE_RAW_FILL
+    raw = getattr(st, "face_raw", None)
+    r106 = getattr(st, "face106_raw", None)
+    if raw is None or r106 is None:
+        return None
+    T = st.present.shape[1]
+    ends = []
+    for step in (-1, 1):
+        u = t + step
+        while 0 <= u < T and abs(u - t) <= n and st.present[p, u] and not np.isfinite(st.face[p, u, :, :2]).all():
+            u += step
+        if not (0 <= u < T) or abs(u - t) > n or not st.present[p, u]:
+            return None
+        ends.append(u)
+    ub, uf = ends
+    if uf - ub - 1 > n:
+        return None
+    a = np.asarray(raw[p, t], np.float64)
+    b = np.asarray(r106[p, t], np.float64)
+    if a.shape[0] < 68 or b.shape[0] < 68 or not (np.isfinite(a[:68, :2]).all() and np.isfinite(b[:68, :2]).all()):
+        return None
+    if float(np.nanmean(a[:68, 2])) < c_body or float(np.nanmean(b[:68, 2])) < c_face:
+        return None
+    wa = float(np.hypot(*(a[16, :2] - a[0, :2])))
+    wb = float(np.hypot(*(b[16, :2] - b[0, :2])))
+    w = max(wa, wb, 1.0)
+    if float(np.mean(np.hypot(*(a[:68, :2] - b[:68, :2]).T))) > agree * w:
+        return None
+    face = 0.5 * (a[:68] + b[:68])
+    fb_, ff_ = np.asarray(st.face[p, ub], np.float64), np.asarray(st.face[p, uf], np.float64)
+    k = (t - ub) / float(uf - ub)
+    line = fb_[:, :2] + (ff_[:, :2] - fb_[:, :2]) * k
+    wl = float(np.hypot(*(line[16] - line[0])))
+    if wl < 1.0 or not (1.0 / wr <= w / wl <= wr):
+        return None
+    if float(np.hypot(*(face[:, :2].mean(0) - line.mean(0)))) > off * wl:
+        return None
+    face[:, 2] = np.minimum(a[:68, 2] / max(c_body, 1e-6), 1.0)
+    return face.astype(np.float32), (ub, uf)
+
+
 CACHE_BYTES = 900 * 2 ** 20   # the preview's mask cache
 STEADY_R = 2          # frames each side
 STEADY_SIGMA = 1.0
@@ -3916,6 +3973,19 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             # (FACE_GAP_BRIDGE) the landmarks lost for a frame or two: from the frames round it
             face, fw = bridge_[0], bridge_[1]
             fw_doubt = fw < 1.0
+        elif FACE_RAW_FILL is not None and st.has_face and p not in doubles:
+            # (FACE_RAW_FILL) dropped by the tracker for a few frames while both face models see it where the frames round it have it
+            fill_ = _face_raw_fill(st, p, t)
+            if fill_ is not None:
+                ws_ = []
+                for u_ in fill_[1]:
+                    w_u = float(np.clip((float(st.face_vis[p, u_]) - VIS_LO) / (VIS_FULL - VIS_LO), 0.0, 1.0))
+                    if w_u < 1.0 and VIS_PARSE:
+                        w_u = max(w_u, _parse_visible(tracker, person.id, u_, st.face[p, u_], px))
+                    ws_.append(w_u)
+                if min(ws_) > 0.0:
+                    face, fw = fill_[0], min(ws_)
+                    fw_doubt = fw < 1.0
         sc = float(st.scale[p, t]) if np.isfinite(st.scale[p, t]) else 0.0
         job = Job(p, person.id, v, float(np.clip(pp.skin_detail / 100.0, 0, 1)), pp.skin_scope,
                   float(pp.grain_size), face, fw, sc,
