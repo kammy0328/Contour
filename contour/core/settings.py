@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 APP_NAME = "DIAP"
-APP_VERSION = "1.27.1"
+APP_VERSION = "1.28.0"
 
 
 def default_data_dir() -> Path:
@@ -61,6 +61,9 @@ class AppSettings:
                                           # the same to IoU 0.9995, but what the analysis decides from them at its margins is not CUDA's (LNGSHOT 024: a face at the frame's
                                           # edge known on 26 frames, not 32; joints a couple of pixels off on a quarter of the points: j2897)
     accuracy: str = "high"                # high | balanced | fast
+    keep_analysis: bool = False           # (1.28) a render saves each frame's analysis in the cut's folder (prep_cache) and a later render of the
+                                          # same cut, range, values and analysis takes it from there (retouch.prepcache): 소스 교체 to a new grade
+                                          # renders with the retouch alone, about twice as fast; 10~25 MB a frame of the project's disk
     render_qa: bool = True                # (1.27.1) the rendered file checked right after a cut's render (core.renderqa): frames, faces, blinks
     # Both apply only inside a project where learning was switched on by hand (learn.allowed, 1.24): on their own
     # they start nothing. Switching one off here stops it in every project.

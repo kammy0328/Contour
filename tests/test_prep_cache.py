@@ -162,3 +162,68 @@ def test_a_cancelled_render_leaves_no_folder_to_read(monkeypatch):
     w.put(a, None)
     w.close(ok=True)                                               # one frame of several: not complete
     assert PC.Reader.open(root, cut, a, b)[0] is None
+
+
+def test_the_app_setting_saves_in_the_cut_folder_and_the_next_render_reads_it(monkeypatch):
+    """(1.28) 설정 > 렌더할 때 분석 저장: the first render saves, the next takes the saved analysis (nothing prepared, the same planes); other
+    values are prepared again (and saved anew); a saved folder whose pictures were another shot's is not read."""
+    from contour.core.settings import settings
+    monkeypatch.setattr(perf, "free_gb", lambda *a, **k: 64.0)
+    monkeypatch.setattr(PC, "MIN_FREE_GB", 0.0)
+    monkeypatch.delenv("CONTOUR_PREP_CACHE", raising=False)
+    monkeypatch.delenv("CONTOUR_PREP_CACHE_MODE", raising=False)
+    monkeypatch.setattr(settings(), "keep_analysis", True)
+    prj = _project()
+    cut = prj.cuts[0]
+    a, b = cut.work_range
+    with BU.NoModels():
+        base = BU.render_planes(prj, cut)                     # saves
+        d = PC.folder(str(prj.cut_dir(cut) / "prep_cache"), cut, a, b)
+        assert os.path.exists(os.path.join(d, "meta.json")) and os.path.exists(os.path.join(d, "look.npz"))
+        called = []
+        prep = E.prepare
+        monkeypatch.setattr(E, "prepare", lambda *a_, **k: (called.append(a_[2]), prep(*a_, **k))[1])
+        again = BU.render_planes(prj, cut)
+        assert called == [] and np.array_equal(base, again)
+        # another shot's pictures: not the same picture
+        saved = np.load(os.path.join(d, "look.npz"))
+        rng = np.random.default_rng(1)
+        other = (rng.standard_normal(saved["outline"].shape).astype(np.float32), saved["pic"])
+        ok, why = PC.same_picture((saved["outline"], saved["pic"]), other)
+        assert not ok and "다른 화면" in why
+        brighter = (saved["outline"], np.clip(saved["pic"].astype(np.int16) + 30, 0, 255).astype(np.uint8))
+        ok, why = PC.same_picture((saved["outline"], saved["pic"]), brighter)
+        assert not ok and "색" in why
+        assert PC.same_picture((saved["outline"], saved["pic"]), (saved["outline"], saved["pic"]))[0]
+
+
+def test_the_app_setting_off_does_nothing(monkeypatch):
+    from contour.core.settings import settings
+    monkeypatch.delenv("CONTOUR_PREP_CACHE", raising=False)
+    monkeypatch.setattr(settings(), "keep_analysis", False)
+    prj = _project()
+    cut = prj.cuts[0]
+    assert PC.for_project_render(prj, cut, *cut.work_range) == (None, None)
+    assert not (prj.cut_dir(cut) / "prep_cache").exists()
+
+
+def test_a_changed_analysis_is_not_read(monkeypatch):
+    from contour.core.settings import settings
+    monkeypatch.setattr(perf, "free_gb", lambda *a, **k: 64.0)
+    monkeypatch.setattr(PC, "MIN_FREE_GB", 0.0)
+    monkeypatch.delenv("CONTOUR_PREP_CACHE", raising=False)
+    monkeypatch.setattr(settings(), "keep_analysis", True)
+    prj = _project()
+    cut = prj.cuts[0]
+    a, b = cut.work_range
+    with BU.NoModels():
+        BU.render_planes(prj, cut)
+    r, w = PC.for_project_render(prj, cut, a, b)
+    assert r is not None and w is None
+    tp = prj.cut_dir(cut) / "tracks.npz"
+    if tp.exists():
+        os.utime(tp, ns=(tp.stat().st_atime_ns, tp.stat().st_mtime_ns + 10 ** 9))      # the analysis saved again (tracks edited)
+        warn = []
+        r, w = PC.for_project_render(prj, cut, a, b, warn)
+        assert r is None and w is not None and "분석이 바뀜" in warn[0]
+        w.close(ok=False)

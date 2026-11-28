@@ -309,3 +309,106 @@ def check_grade(old_rgb: np.ndarray, new_rgb: np.ndarray, mask: Optional[np.ndar
     if v.size == 0:
         return dict(n=0, mean=0.0, p99=0.0)
     return dict(n=int(v.size), mean=float(v.mean()), p99=float(np.percentile(v, 99)))
+
+
+# ---------------------------------------------------------------------------------------------------- (1.28) the app: 설정 > 렌더할 때 분석 저장
+
+COLOR_MAX = 8.0        # mean change of the picture (8-bit levels, the 3 frames looked at) past which a saved analysis is not used: a new grade much
+                       # brighter or of other colours would have the masks (the skin's colour model among them) of another picture
+SHAPE_MIN = 0.6        # outline correlation of each frame looked at (the same shot graded or cleaned: 0.88 ~ 0.99; another shot: about 0)
+LOOK_WH = (320, 180)
+
+
+def analysis_sig(project, cut) -> str:
+    """What else the prepared frames depend on: the cut's analysis files (tracks, identities, face layer, segmentation), by size and time."""
+    parts = [str(getattr(cut, "analysis_version", 0))]
+    try:
+        cd = project.cut_dir(cut)
+        for p in (cd / "tracks.npz", cd / "identity.npz", cd / "cache" / "facelayer.npz", cd / "cache" / "seg_meta.json", cd / "cache" / "seglab_alias.json"):
+            try:
+                st = os.stat(p)
+                parts.append("%s:%d:%d" % (p.name, st.st_size, st.st_mtime_ns))
+            except OSError:
+                parts.append(p.name + ":-")
+    except Exception:
+        parts.append("?")
+    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def look(info, a: int, b: int):
+    """Three frames of the cut's source (first, middle, last of the range) small: their outlines (edges whatever the colours) and the pictures."""
+    from ..core import media as MD
+    from ..core import replace as RPL
+    outs, pics = [], []
+    n = max(1, int(b) - int(a))
+    for t in sorted({int(a), int(a) + n // 2, int(a) + n - 1}):
+        rd = MD.FrameReader(info, t, 1, "rgb24", size=LOOK_WH, prefetch=0)
+        try:
+            pl = rd.read()
+        finally:
+            rd.close()
+        if pl is None:
+            return None
+        rgb = np.asarray(pl[0] if isinstance(pl, (list, tuple)) else pl)
+        if rgb.ndim == 1:
+            rgb = rgb.reshape(LOOK_WH[1], LOOK_WH[0], 3)
+        rgb = rgb.reshape(LOOK_WH[1], LOOK_WH[0], 3).astype(np.uint8)
+        outs.append(RPL._outline(rgb.astype(np.float32) / 255.0).ravel().astype(np.float32))
+        pics.append(rgb)
+    return np.stack(outs), np.stack(pics)
+
+
+def same_picture(saved, now) -> "tuple[bool, str]":
+    """Whether the source the analysis was saved from and the cut's source now are the same shot with colours close enough."""
+    if saved is None or now is None or saved[0].shape != now[0].shape:
+        return False, "화면을 비교할 수 없음"
+    shape = [float(np.mean(x * y)) for x, y in zip(saved[0], now[0])]
+    col = float(np.abs(saved[1].astype(np.float32) - now[1].astype(np.float32)).mean())
+    if min(shape) < SHAPE_MIN:
+        return False, "다른 화면 (윤곽 일치 %.2f)" % min(shape)
+    if col > COLOR_MAX:
+        return False, "색이 많이 바뀜 (평균 %.1f레벨)" % col
+    return True, "윤곽 일치 %.2f, 색 차이 %.1f레벨" % (min(shape), col)
+
+
+def for_project_render(project, cut, a: int, b: int, warnings: Optional[list] = None):
+    """(설정 > 렌더할 때 분석 저장) the render's (reader, writer) in the cut's folder: a reader when a saved analysis fits (cut, range, values,
+    analysis, the same shot with close colours), else a writer that saves this render's. (None, None) when the setting is off or the environment
+    decides (CONTOUR_PREP_CACHE)."""
+    if mode() or project is None:
+        return None, None
+    try:
+        from ..core.settings import settings
+        if not bool(getattr(settings(), "keep_analysis", False)):
+            return None, None
+        root = str(project.cut_dir(cut) / "prep_cache")
+        sig = analysis_sig(project, cut)
+        r, why = Reader.open(root, cut, a, b)
+        if r is not None:
+            if r.meta.get("analysis") != sig:
+                why = "분석이 바뀜"
+            else:
+                try:
+                    z = np.load(os.path.join(r.d, "look.npz"))
+                    saved = (z["outline"], z["pic"])
+                except Exception:
+                    saved = None
+                ok, why = same_picture(saved, look(cut.info, a, b))
+                if ok:
+                    return r, None
+            if warnings is not None:
+                warnings.append("저장된 분석을 쓰지 않고 다시 분석: " + why)
+        if not _room(root):
+            if warnings is not None:
+                warnings.append("분석 저장 안 함: 디스크 공간 부족")
+            return None, None
+        d = folder(root, cut, a, b)
+        w = Writer(d, dict(_meta(cut, a, b, ""), analysis=sig))
+        lk = look(cut.info, a, b)
+        if lk is not None:
+            np.savez(os.path.join(d, "look.npz"), outline=lk[0], pic=lk[1])
+        return None, w
+    except Exception as e:      # noqa: BLE001  (the render goes on as ever)
+        if warnings is not None:
+            warnings.append("분석 저장 안 함: " + str(e)[:120])
+        return None, None

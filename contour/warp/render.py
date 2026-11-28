@@ -124,6 +124,9 @@ def pace_text(done: int, total: int, elapsed: float) -> str:
     return f"{done}/{total} · {pace} · 남은 시간 {left}"
 
 
+READ_WORKERS = 8          # (1.28) frames side by side when the analysis is read from what a render saved (retouch.prepcache)
+
+
 def render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progress: Progress = None,
                cancel: Optional[Callable[[], bool]] = None, ext_writer=None,
                preview: Optional[Callable[[int, np.ndarray], None]] = None) -> RenderReport:
@@ -338,6 +341,15 @@ def _render_cut(project: Project, cut: Cut, tracker, out: OutputSettings, progre
     from ..retouch import prepcache as PCACHE
     pc_reader = PCACHE.reader_for_render(cut, a, b, rep.warnings)
     pc_writer = PCACHE.writer_for_render(cut, a, b, rep.warnings) if pc_reader is None else None
+    if pc_reader is None and pc_writer is None:            # (1.28) 설정 > 렌더할 때 분석 저장: the cut's own folder
+        pc_reader, pc_writer = PCACHE.for_project_render(project, cut, a, b, rep.warnings)
+    # (1.28) from the saved analysis nothing is prepared in the frames' lock, so more frames go side by side: 8 on 18 cores (c026, 4 people,
+    # 35 frames: 4 at once 3.16, 6 2.64, 8 2.46 s a frame, every frame the same); the gate still takes slots away when memory runs short
+    if pc_reader is not None and parallel and not os.environ.get("CONTOUR_RENDER_THREADS", "").isdigit():
+        n_ra = max(1, min(READ_WORKERS, (os.cpu_count() or 2) // 2))
+        if n_ra > n_workers:
+            n_workers = n_ra
+            gate = PF.FrameGate(n_workers, people=sum(1 for p_ in cut.targets()) or 1, megapixels=W * H / 1e6)
 
     def prepare_(t_):
         rf_p = RE.prepare(cut, tracker, t_)
