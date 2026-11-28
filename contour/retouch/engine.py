@@ -105,6 +105,7 @@ class Job:
     naso_pres: Optional[float] = None      # how far a nasolabial crease is there on this frame (FOLD_PRESENT), measured once
     turn: Optional[float] = None           # the face's turn (face_turn) held steady over the frames round this one (TURN_STEADY); None: this frame's own
     arm_axes: Optional[list] = None        # the armpit stage's hanging arms (ARMPIT_LINE_HOLD): [(the upper arm's angle from the vertical in degrees, weight 0..1, zone centre x, y, zone radius)] in proxy px
+    chinrim: bool = False                  # (CHIN_RIM_MASK) the chin level's rim was made with this frame's masks (masks["chinrim"]; none there: no rim)
 
 
 @dataclass
@@ -2605,6 +2606,11 @@ def _face_bridge(st, p: int, t: int, n: int):
 # within [5] times theirs). Its weight is the lower of the two frames' round it, each as the frame's own job has it (the tracker's visibility, lifted by the
 # parser where it sees the face: VIS_PARSE). None = off.
 FACE_RAW_FILL = (6, 5.0, 0.6, 0.12, 0.5, 1.5)
+# (1128 check of the d18 c038: on the filled frames the masks took in the necklace's pendant under the jaw and the face of somebody behind it, which the
+# frames round them, with the tracker's landmarks, did not: the pendant's sparkle was smoothed for four frames) on a frame whose face is filled the
+# retouch keeps to the face: no neck stage, every mask held inside the face's polygon (jaw and forehead arc) grown by FACE_RAW_FILL_HOLD of the face
+# width. None = as before.
+FACE_RAW_FILL_HOLD = 0.03
 
 
 def _face_raw_fill(st, p: int, t: int):
@@ -3953,6 +3959,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
         face = None
         fw = 0.0
         fw_doubt = False
+        filled_ = False
         bridge_ = _face_bridge(st, p, t, FACE_GAP_BRIDGE) if (FACE_GAP_BRIDGE > 0 and p not in doubles) else None
         if st.has_face and np.isfinite(st.face[p, t, :, :2]).all() and p not in doubles:
             face = st.face[p, t]
@@ -3986,6 +3993,7 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 if min(ws_) > 0.0:
                     face, fw = fill_[0], min(ws_)
                     fw_doubt = fw < 1.0
+                    filled_ = True
         sc = float(st.scale[p, t]) if np.isfinite(st.scale[p, t]) else 0.0
         job = Job(p, person.id, v, float(np.clip(pp.skin_detail / 100.0, 0, 1)), pp.skin_scope,
                   float(pp.grain_size), face, fw, sc,
@@ -4264,7 +4272,8 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
         skin_on = v["skin"] > 1e-4
         skinx_on = v.get("blemish", 0) > 1e-4 or v.get("shine", 0) > 1e-4
         face_on = lm is not None and fw > 0.05
-        neck_on = face_on and (v.get("neck_lines", 0) > 1e-4 or v.get("neck_bumps", 0) > 1e-4)
+        neck_on = face_on and (v.get("neck_lines", 0) > 1e-4 or v.get("neck_bumps", 0) > 1e-4) \
+            and not (filled_ and FACE_RAW_FILL_HOLD is not None)
         body_on = any(v.get(k_, 0) > 1e-4 for k_ in BODY_EFFECTS)
         sj = None
         if skin_on:
@@ -4589,6 +4598,14 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
                 nm_ = get("neck", mk_neck, f"{fth:.2f}")
                 if nm_.max() > 0.01:
                     job.masks["neck"] = nm_ * fw
+            if CHIN_RIM_MASK and CHIN_LEVEL_ON and CHIN_LEVEL_RIM is not None \
+                    and max(float(FINAL_CHIN), float(v.get("chin_lines", 0.0))) > 1e-4 \
+                    and _pebble_share(face, v, getattr(job, "turn", None)) > 1e-4:
+                # (CHIN_RIM_MASK) the chin level's rim with this frame's hand cover taken off (a fingertip at the chin is no chin)
+                cr_ = get("chinrim", lambda: _chin_rim_mask(shape, lm, base().get("cover")), "")
+                job.chinrim = True
+                if cr_ is not None and float(cr_.max()) > 0.01:
+                    job.masks["chinrim"] = cr_ * fw
             mk_which = [n for n, key in (("blush", "blush"), ("shade", "shading"), ("hilite", "highlight"))
                         if v.get(key, 0) > 1e-4]
             if mk_which:
@@ -4692,6 +4709,24 @@ def _prepare_raw(cut, tracker, t: int, cache: Optional[dict] = None, only: Optio
             km = get("knee", mk_knee)
             if km.max() > 0.01:
                 job.masks["knee"] = km
+        if filled_ and FACE_RAW_FILL_HOLD is not None and lm is not None and job.masks:
+            # (FACE_RAW_FILL_HOLD) the face of this frame taken from the face models: its retouch keeps to the face's own polygon
+            try:
+                poly_ = SK.face_polygon(lm)
+                if poly_ is not None:
+                    wfm_ = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
+                    g_ = max(1, int(round(float(FACE_RAW_FILL_HOLD) * wfm_)))
+                    hold_ = np.zeros(shape, np.uint8)
+                    cv2.fillPoly(hold_, [np.round(poly_).astype(np.int32)], 255)
+                    hold_ = cv2.dilate(hold_, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * g_ + 1, 2 * g_ + 1)))
+                    hold_ = cv2.GaussianBlur(hold_.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.5 * g_))
+                    for k_ in list(job.masks):
+                        if k_ in ("excl", "face_hold") or job.masks[k_] is None or np.asarray(job.masks[k_]).shape != hold_.shape:
+                            continue
+                        job.masks[k_] = (np.asarray(job.masks[k_], np.float32) * hold_).astype(np.float32)
+            except Exception:
+                import traceback
+                traceback.print_exc()
         if DET_ON and job.masks and lm is not None and _det_wanted(v):
             try:
                 job.det = get("det", lambda: _det_raw(cut, px, t, job, lm, base()["rgb"]),
@@ -8642,7 +8677,14 @@ CHIN_LEVEL_SMOOTH = 0.012
 CHIN_LEVEL_FINE = 0.004
 CHIN_LEVEL_CAP = 0.10
 CHIN_LEVEL_KEEP = (0.04, 0.0)     # (off the lower lip, off the outline) of the face width: the levelling reaches the chin's edge
-CHIN_LEVEL_RIM = (0.14, 0.015)    # of the face width: the band inside the outline taken as skin, and how far out past the outline
+CHIN_LEVEL_RIM = (0.14, 0.0)      # of the face width: the band inside the outline taken as skin, and how far out past the outline (1128 check: 0.015 -> 0, see below)
+# (1128 check, c084 f11..25, c030 f10..11 / f45: the levelling worked on the chin's outline itself, the shade under the jaw lifted and the lit rim above it
+# taken down by 15 to 30 levels, the place of that following the landmarks from frame to frame: the outline flickered; a fingertip at the chin was
+# levelled as well) the levelling fades out over CHIN_LEVEL_EDGE_IN of the face width inside the outline, and the rim is made with the frame's masks
+# (CHIN_RIM_MASK: job.masks["chinrim"]) without the hand cover and CHIN_RIM_COVER_MARGIN round it
+CHIN_LEVEL_EDGE_IN = 0.03
+CHIN_RIM_MASK = True
+CHIN_RIM_COVER_MARGIN = 0.035
 
 
 def _chin_rim(shape, lm: np.ndarray, wf: float) -> Optional[np.ndarray]:
@@ -8660,7 +8702,43 @@ def _chin_rim(shape, lm: np.ndarray, wf: float) -> Optional[np.ndarray]:
     return cv2.GaussianBlur(band, (0, 0), max(1.0, 0.01 * wf))
 
 
-def _chin_level(Y: np.ndarray, lm: np.ndarray, skin: np.ndarray, wf: float, k: float) -> np.ndarray:
+def _outline_inner(shape, lm: np.ndarray, wf: float, frac: float, box=None) -> Optional[np.ndarray]:
+    """0..1 on box (y0, y1, x0, x1; the whole picture when None): 1 inside the face's outline (landmarks 0..26), fading to nothing at it over about
+    2 x frac of the face width (eroded by frac, blurred by half that)."""
+    if lm is None or not np.isfinite(lm[0:27, :2]).all():
+        return None
+    y0, y1, x0, x1 = box if box is not None else (0, shape[0], 0, shape[1])
+    e = max(1, int(round(frac * wf)))
+    sg = max(1.0, 0.5 * e)
+    g = e + int(4 * sg) + 4
+    Y0, Y1, X0, X1 = max(0, y0 - g), min(shape[0], y1 + g), max(0, x0 - g), min(shape[1], x1 + g)
+    hull = np.zeros((Y1 - Y0, X1 - X0), np.uint8)
+    cv2.fillConvexPoly(hull, cv2.convexHull(np.round(np.asarray(lm[0:27, :2], np.float64) - [X0, Y0]).astype(np.int32)), 255)
+    inner = cv2.erode(hull, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * e + 1, 2 * e + 1)))
+    inner = cv2.GaussianBlur(inner.astype(np.float32) / 255.0, (0, 0), sg)
+    return inner[y0 - Y0:y1 - Y0, x0 - X0:x1 - X0]
+
+
+def _chin_rim_mask(shape, lm: np.ndarray, cover: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    """(CHIN_RIM_MASK) the chin level's rim (_chin_rim) without the hand cover and CHIN_RIM_COVER_MARGIN of the face width round it, lm in px of shape."""
+    if lm is None or not np.isfinite(lm[0:17, :2]).all():
+        return None
+    wf = float(np.hypot(*(lm[16, :2] - lm[0, :2])))
+    r_ = _chin_rim(shape, lm, wf)
+    if r_ is None:
+        return None
+    if cover is not None and tuple(np.asarray(cover).shape[:2]) == tuple(shape[:2]):
+        c = (np.asarray(cover, np.float32) > 0.15).astype(np.uint8)
+        if c.any():
+            rr = max(1, int(round(CHIN_RIM_COVER_MARGIN * wf)))
+            c = cv2.dilate(c, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rr + 1, 2 * rr + 1)))
+            g = cv2.GaussianBlur(c.astype(np.float32), (0, 0), max(1.0, 0.4 * rr))
+            r_ = r_ * (1.0 - np.clip(g * 1.25, 0.0, 1.0))
+    return r_.astype(np.float32)
+
+
+def _chin_level(Y: np.ndarray, lm: np.ndarray, skin: np.ndarray, wf: float, k: float, rim=None) -> np.ndarray:
+    """rim: the rim made with the frame's masks (CHIN_RIM_MASK, in px of Y; 0.0 for none); None: made here from the landmarks alone."""
     if k <= 1e-4 or lm is None:
         return Y
     z = chin_zone(Y.shape, lm, wf, pebble=True, keep=CHIN_LEVEL_KEEP)
@@ -8668,9 +8746,9 @@ def _chin_level(Y: np.ndarray, lm: np.ndarray, skin: np.ndarray, wf: float, k: f
         return Y
     sk = np.clip(skin, 0, 1) if skin is not None else np.zeros(Y.shape[:2], np.float32)
     if CHIN_LEVEL_RIM is not None:
-        rim = _chin_rim(Y.shape, lm, wf)
-        if rim is not None:
-            sk = np.maximum(sk, rim)
+        rim_ = _chin_rim(Y.shape, lm, wf) if rim is None else rim
+        if rim_ is not None:
+            sk = np.maximum(sk, rim_)
     m = z * sk
     D = max(3, int(round(CHIN_LEVEL_MORPH * wf)) | 1)
     r = _roi(m, D + int(3 * CHIN_LEVEL_SMOOTH * wf) + 8)
@@ -8679,6 +8757,10 @@ def _chin_level(Y: np.ndarray, lm: np.ndarray, skin: np.ndarray, wf: float, k: f
     y0, y1, x0, x1 = r
     yc = Y[y0:y1, x0:x1].astype(np.float32)
     mc = m[y0:y1, x0:x1].astype(np.float32)
+    if CHIN_LEVEL_EDGE_IN is not None and CHIN_LEVEL_EDGE_IN > 1e-4:
+        inn_ = _outline_inner(Y.shape, lm, wf, float(CHIN_LEVEL_EDGE_IN), (y0, y1, x0, x1))
+        if inn_ is not None:
+            mc = mc * inn_
     B = _bump_base(yc, D, CHIN_LEVEL_SMOOTH * wf)
     d = cv2.GaussianBlur(B - yc, (0, 0), max(0.6, CHIN_LEVEL_FINE * wf))
     cap = float(CHIN_LEVEL_CAP)
@@ -9042,7 +9124,11 @@ def _final_pass(Y, Cb, Cr, Y0, Cb0, Cr0, rf, y_per_src, M, spots=None):
                                 _pebble_share(job.face, job.v, getattr(job, 'turn', None)) if CHIN_PEBBLE_FINAL else 0.0)
                 psh_ = _pebble_share(job.face, job.v, getattr(job, 'turn', None)) if CHIN_LEVEL_ON else 0.0
                 if psh_ > 1e-4:
-                    Y = _chin_level(Y, lmY, skin, wf, float(np.clip(kfc_, 0, 1)) * psh_ * _face_big(job.face, wf, y_per_src))
+                    rim_ = None
+                    if CHIN_RIM_MASK and getattr(job, "chinrim", False):
+                        # (CHIN_RIM_MASK) the rim made with the frame's masks: none where the hand cover took it all
+                        rim_ = M(job.masks["chinrim"], (hY, wY)) if "chinrim" in job.masks else 0.0
+                    Y = _chin_level(Y, lmY, skin, wf, float(np.clip(kfc_, 0, 1)) * psh_ * _face_big(job.face, wf, y_per_src), rim=rim_)
         except Exception:
             import traceback
             traceback.print_exc()
