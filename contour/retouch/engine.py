@@ -3694,8 +3694,10 @@ DOUBLE_DIST = 0.3     # face centres closer than this share of the face width: o
 # the two, the other's landmarks are carried there from the frames beside it (their score 0); the face itself stays with the track the person's matte
 # gives it to. On f2 that was the track with the carried landmarks, their jaw 0.035 of the face width inside the real one: a band of the jaw fell
 # out of the face's skin, was taken for neck, and the neck's tone darkened it by 8 levels for that frame.) A face held by two tracks takes, on each
-# frame, the landmarks that were found on it: where this track's score is DOUBLE_SURER[0] or less and the other's [1] or more, the other's. None = off.
-DOUBLE_SURER = (0.1, 0.5)
+# frame, the landmarks that were found on it: where this track's score is DOUBLE_SURER[0] or less and the other's [1] or more, the other's, when
+# the two jaw lines lie [2] of the face width or more apart (carried landmarks that sit where the found ones do are left: c003's, 0.01 to 0.03
+# apart on faces 90 px wide). None = off.
+DOUBLE_SURER = (0.1, 0.5, 0.03)
 
 
 def _double_face(st, p: int, t: int) -> Optional[np.ndarray]:
@@ -3706,7 +3708,7 @@ def _double_face(st, p: int, t: int) -> Optional[np.ndarray]:
     F = st.face
     if not np.isfinite(F[p, t, :, :2]).all():
         return None
-    lo, hi = float(DOUBLE_SURER[0]), float(DOUBLE_SURER[1])
+    lo, hi, apart = float(DOUBLE_SURER[0]), float(DOUBLE_SURER[1]), float(DOUBLE_SURER[2])
     if not float(np.nan_to_num(F[p, t, :, 2]).mean()) <= lo:
         return None
     best, bs = None, hi
@@ -3717,7 +3719,13 @@ def _double_face(st, p: int, t: int) -> Optional[np.ndarray]:
         sq = float(np.nan_to_num(F[q, t, :, 2]).mean())
         if sq >= bs:
             best, bs = q, sq
-    return None if best is None else F[best, t]
+    if best is None:
+        return None
+    d = F[best, t, :17, :2] - F[p, t, :17, :2]
+    wf = float(np.hypot(*(F[p, t, 16, :2] - F[p, t, 0, :2])))
+    if wf <= 0 or float(np.hypot(d[:, 0], d[:, 1]).mean()) < apart * wf:
+        return None
+    return F[best, t]
 
 
 def _same_face(st, t: int, a: int, b: int) -> bool:

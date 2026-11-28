@@ -163,8 +163,11 @@ PARSE_FILL_FEAT = 0.03     # of the face width: that fill keeps this far from th
 # and the mouth and chin between them not seen that share was 0.28 (trust 0.15); the cheek itself it saw, 0.92 sure.) A parser that sees less of a
 # face is not wrong where it does see skin; what makes it wrong is skin beside the face (landmarks or a crop that slid off it). For the fill the trust
 # is also the share of the parser's sure skin that lies inside the face's outline grown by [3] of the face width: none under [0], whole from [1],
-# when the sure skin is at least [2] of the inner face; the higher of the two trusts holds. None = off.
+# when the sure skin is at least [2] of the inner face; the higher of the two trusts holds. Only on a frame where a limb or a hand in front takes
+# PARSE_FILL_COVER of the face's outline or more (0.15 to 0.20 on those frames): the trust falls for other reasons too (a face turned away, hair
+# over it), and over every cut the wider rule moved a few frames of most cuts. None = off.
 PARSE_FILL_INSIDE = (0.80, 0.95, 0.15, 0.05)
+PARSE_FILL_COVER = 0.08
 PARSE_REACH = 0.25     # of the face width: how far past the landmark outline the parser's sure skin still counts
 PARSE_SOFT = 0.008     # of the face width: smoothing of the parser's map before that (was 0.012)
 NOSTRIL_RX, NOSTRIL_RY = 0.60, 0.26   # nostril ellipse, of the nostrils' span (was 0.66 x 0.36)
@@ -1083,7 +1086,7 @@ def skin_mask(job: SkinJob, rgb_proxy: np.ndarray, sx: float, sy: float, person_
                 Wp_ = max(8.0, float(np.hypot(*(lm[16, :2] - lm[0, :2]))))
                 fzf_ = cv2.GaussianBlur(fz_.astype(np.float32) / 255.0, (0, 0), max(1.0, 0.02 * Wp_))
                 tp_ = float(parse["trust"])
-                if PARSE_FILL_INSIDE is not None and tp_ < 1.0:
+                if PARSE_FILL_INSIDE is not None and tp_ < 1.0 and cover is not None and float(np.asarray(cover, np.float32)[fz_ > 0].mean()) >= PARSE_FILL_COVER:
                     tp_ = max(tp_, parse_trust_inside(parse["skin"], lm, (h, w)))      # (PARSE_FILL_INSIDE) sure skin that lies inside the face
                 ps_ = np.clip((parse["skin"].astype(np.float32) - PARSE_FILL[0]) / max(1e-6, PARSE_FILL[1] - PARSE_FILL[0]), 0, 1) * tp_
                 fill_ = region * fzf_ * ps_

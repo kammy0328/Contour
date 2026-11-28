@@ -168,13 +168,19 @@ def test_the_parsers_fill_of_a_cheek_in_the_sun_holds_when_hands_take_its_share_
     rgb = np.full((h, w, 3), 128, np.uint8)
     job = SK.SkinJob(0, 0.7, 0.5, "face", lm.copy(), 1.0, 400.0)
 
-    def mask(skin, trust):
-        return SK.skin_mask(job, rgb, 1.0, 1.0, None, None, dict(skin=skin, trust=trust), None, None, prob0)
+    hand = np.zeros((h, w), np.float32)                 # a hand laid on the other cheek and the jaw: a fifth of the face
+    cv2.ellipse(hand, (275, 330), (50, 95), 20, 0, 360, 1.0, -1)
+    assert 0.12 < float(hand[face > 0].mean()) < 0.35
+
+    def mask(skin, trust, cover=hand):
+        return SK.skin_mask(job, rgb, 1.0, 1.0, None, None, dict(skin=skin, trust=trust), None, cover, prob0)
 
     full = float(mask(face, 1.0)[patch].mean())
     assert full > 0.7, "a trusted parser fills the cheek"
-    assert abs(float(mask(upper, 0.15)[patch].mean()) - full) < 0.02, "... and so does one that sees the upper face only"
+    assert abs(float(mask(upper, 0.15)[patch].mean()) - full) < 0.02, "... and so does one that sees the upper face only, a hand on the face"
     assert float(mask(np.roll(upper, 150, axis=1), 0.15)[patch].mean()) < 0.25, "skin beside the face stays at its trust"
+    assert float(mask(upper, 0.15, None)[patch].mean()) < 0.25, "no hand on the face: the trust fell for another reason, and holds"
+    assert float(mask(upper, 0.15, hand * 0.2)[patch].mean()) < 0.25, "... nor a hand that takes less than PARSE_FILL_COVER of it"
     old = SK.PARSE_FILL_INSIDE
     try:
         SK.PARSE_FILL_INSIDE = None
@@ -187,7 +193,7 @@ def test_the_parsers_fill_of_a_cheek_in_the_sun_holds_when_hands_take_its_share_
 
 def test_a_face_held_by_two_tracks_takes_the_landmarks_found_on_the_frame():
     """c023 f0..3: the face finder's face goes to one of the two tracks a frame; the other's landmarks are carried there (score 0)"""
-    st = _Faces([[(300.0, 260.0)] * 3, [(306.0, 264.0)] * 3, [(700.0, 260.0)] * 3])
+    st = _Faces([[(300.0, 260.0)] * 3, [(308.0, 266.0)] * 3, [(700.0, 260.0)] * 3])      # the two jaw lines 10 px apart: 0.05 of the face width
     st.face[0, :, :, 2] = 0.8
     st.face[1, :, :, 2] = 0.8
     st.face[2, :, :, 2] = 0.9
@@ -203,9 +209,13 @@ def test_a_face_held_by_two_tracks_takes_the_landmarks_found_on_the_frame():
     assert RE._double_face(st, 2, 1) is None, "somebody else's face elsewhere is not this face"
     st.present[1, 1] = False
     assert RE._double_face(st, 0, 1) is None, "a track that is not there on the frame"
+    st.present[1, 1] = True
+    st.face[1, 1, :, :2] = st.face[0, 1, :, :2] + np.float32([3.0, 2.0])      # 3.6 px apart, 0.018: carried landmarks that sit where the found ones do
+    assert RE._double_face(st, 0, 1) is None
+    st.face[1, 1, :, :2] = st.face[0, 1, :, :2] + np.float32([8.0, 6.0])
+    assert RE._double_face(st, 0, 1) is not None
     old = RE.DOUBLE_SURER
     try:
-        st.present[1, 1] = True
         RE.DOUBLE_SURER = None
         assert RE._double_face(st, 0, 1) is None
     finally:
