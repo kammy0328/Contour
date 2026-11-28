@@ -897,7 +897,7 @@ def _limb(m: np.ndarray, a, b, r: float, end: Optional[float] = None):
 
 
 def _thumb_held(conf, xy) -> bool:
-    """HAND_THUMB_HELD: the 21 points' thumb (1..4) less sure than the share of the four fingers' (5..20) and running along the middle finger"""
+    """HAND_THUMB_HELD: the 21 points' thumb (1..4) less sure than the share of the four fingers' (5..20), running along the middle finger and along the palm"""
     if HAND_THUMB_HELD is None:
         return False
     c = np.nan_to_num(np.asarray(conf, np.float64))
@@ -905,11 +905,19 @@ def _thumb_held(conf, xy) -> bool:
     if not fi > 0 or float(c[1:5].mean()) >= float(HAND_THUMB_HELD[0]) * fi:
         return False
     xy = np.asarray(xy, np.float64)
-    a, b = xy[4] - xy[1], xy[12] - xy[9]
-    n = float(np.hypot(*a) * np.hypot(*b))
-    if not n > 1e-6:
+
+    def _deg(a, b):
+        n = float(np.hypot(*a) * np.hypot(*b))
+        return None if not n > 1e-6 else float(np.degrees(np.arccos(np.clip(float(np.dot(a, b)) / n, -1.0, 1.0))))
+    th = xy[4] - xy[1]
+    a_mid = _deg(th, xy[12] - xy[9])
+    if a_mid is None or a_mid >= float(HAND_THUMB_HELD[1]):
         return False
-    return float(np.degrees(np.arccos(np.clip(float(np.dot(a, b)) / n, -1.0, 1.0)))) < float(HAND_THUMB_HELD[1])
+    if len(HAND_THUMB_HELD) > 2 and HAND_THUMB_HELD[2] is not None:
+        a_palm = _deg(th, xy[9] - xy[0])
+        if a_palm is None or a_palm >= float(HAND_THUMB_HELD[2]):
+            return False
+    return True
 
 
 def face_owned(st, t: int, p: int, lm: np.ndarray, alpha: np.ndarray, shape, sx: float, sy: float) -> np.ndarray:
@@ -968,12 +976,15 @@ LIMB_OTHER_SKIN = 0.6         # (11/28) somebody else's limb or hand over more t
 # fingers, and that skin was left as it was) the hand points of a hand pressed to the face are a little off (c024 f20: the ring and little fingers' points 30..40 px
 # beside the fingers, over the cheek under the eye and the mouth's corner), and the drawn hand took a band of the face with it
 HAND_CORE = 0.10              # of the palm's width: the finger's own middle line this thick (radius) and the palm are the hand whatever the parser says (None: the drawn hand as it is)
-HAND_THUMB_HELD = (0.85, 25.0)  # (11/28, the third check: c024 f0..11, the right hand on the cheek: the model laid its thumb from the jaw up beside the mouth to the nose,
+HAND_THUMB_HELD = (0.85, 25.0, 35.0)  # (11/28, the third check: c024 f0..11, the right hand on the cheek: the model laid its thumb from the jaw up beside the mouth to the nose,
                                 # where the client circled the cheek to be smoothed, and that cheek kept its lines; the thumb is under the jaw) a thumb the model is
                                 # less sure of than this share of the four fingers' confidence that runs along the fingers (under this angle to the middle finger,
                                 # degrees) is drawn only as far as a finger's width beyond the rest of the hand: a thumb laid against the index finger stays, one
                                 # out on the face alone goes (c024's were 0.62 .. 0.72 and 2 .. 4 degrees; real ones out on the face, c021's at the chin, c022's under
                                 # the lip, c023's heart, at an angle of 27 degrees and more or 0.85 and more sure); None = off
+                                # ... and (the third value) under this angle to the palm's own line, wrist to the middle finger's knuckle: the fingers of c023's
+                                # heart bend in, so their last bones run as the thumb does at the heart's foot (8 degrees at f10, the model 0.82 sure of it), but the
+                                # thumb leaves the palm at 46 .. 61 degrees there; c024's lay along the palm (6 .. 27)
 HAND_PARSE_TRIM = 0.5         # the rest of the drawn hand goes back to the face where the face parser is sure of this face's skin, fully from this trust of the parser on (None = off)
 HAND_SOFT_TRIM = (0.5, 0.85)  # the parser's skin from which .. to which the rest of the drawn hand goes back to the face
 HAND_CORE_TRIM = (0.8, 0.95)  # ... and the core itself, where the parser is all but certain (c023's heart: the palm's points 40..60 px inside the hands, on the cheeks;

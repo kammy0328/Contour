@@ -219,3 +219,24 @@ def test_a_thumb_laid_against_the_index_finger_stays():
     xi = float(pts[5:9, 0].mean())
     _thumb(st, 0, (xi - 11.0, 395.0), (0.0, -30.0), 3.4)
     assert (_cover_at(st, lm, [(xi - 11.0, 350.0), (xi - 11.0, 320.0)], RE.HAND_THUMB_HELD) > 0.9).all()
+
+
+def test_a_heart_thumb_leaving_the_palm_at_an_angle_stays():
+    """c023 f10, the heart: the fingers bend in, so the middle finger's last bones run as the thumb does at the heart's foot, and the model was 0.82 as sure
+    of the thumb as of the fingers; but the thumb leaves the palm's line (wrist to the middle knuckle) at about 40 degrees: it is the hand, covered"""
+    lm = _face_lm()
+    st = _Store(1)
+    pts = np.array([(230, 390),
+                    (260, 375), (297.6, 361.3), (335.2, 347.6), (372.8, 334),       # the thumb: 20 degrees up, along the heart's foot
+                    (285, 265), (300, 235), (325, 220), (350, 215),                # index
+                    (300, 260), (318, 228), (345, 213), (372, 210),                # middle: its last bones 35 degrees up
+                    (312, 265), (330, 238), (352, 225), (375, 222),                # ring
+                    (322, 275), (338, 253), (356, 242), (375, 238)], np.float32)   # little
+    st.present[0, 0] = True
+    st.hand_raw[0, 0, :21, :2] = pts
+    st.hand_raw[0, 0, :21, 2] = 5.0
+    st.hand_raw[0, 0, 1:5, 2] = 4.1                                         # 0.82 of the fingers
+    on_thumb = [(316.0, 354.0), (345.0, 344.0)]
+    assert RE._thumb_held(st.hand_raw[0, 0, :21, 2], pts) is False
+    assert (_cover_at(st, lm, on_thumb, RE.HAND_THUMB_HELD) > 0.9).all(), "the heart's thumb is covered"
+    assert (_cover_at(st, lm, on_thumb, RE.HAND_THUMB_HELD[:2]) < 0.1).all(), "(without the palm's angle the rule took it)"
